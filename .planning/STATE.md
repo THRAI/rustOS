@@ -5,32 +5,33 @@
 See: .planning/PROJECT.md (updated 2026-02-22)
 
 **Core value:** Boot on rv64 QEMU and run real applications without OOM panic or silent memory corruption under SMP
-**Current focus:** Phase 1: Boot + Executor + HAL Foundation
+**Current focus:** Phase 2: VM Core + PMAP
 
 ## Current Position
 
-Phase: 1 of 7 (Boot + Executor + HAL Foundation)
-Plan: 4 of 4 in current phase
-Status: Phase Complete
-Last activity: 2026-02-23 -- Completed 01-04-PLAN.md
+Phase: 2 of 7 (VM Core + PMAP)
+Plan: 2 of 5 in current phase
+Status: In Progress
+Last activity: 2026-02-23 -- Completed 02-02-PLAN.md
 
-Progress: [██████████] 100% (Phase 1)
+Progress: [████------] 40% (Phase 2)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: 7min
-- Total execution time: 0.45 hours
+- Total plans completed: 5
+- Average duration: 6min
+- Total execution time: 0.52 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
+| 2 | 1/5 | 4min | 4min |
 
 **Recent Trend:**
-- Last 5 plans: 8min, 6min, 7min, 6min
+- Last 5 plans: 6min, 7min, 6min, 4min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -59,6 +60,9 @@ Recent decisions affecting current work:
 - [01-04]: cpu_id-indexed boot stacks for secondary harts (mhartid unavailable in S-mode)
 - [01-04]: Hand-parsed FDT /cpus node (no external crate dependency)
 - [01-04]: needs_reschedule AtomicBool on PerCpu for cooperative preemption
+- [02-01]: core::mem::take over BTreeMap::drain (drain unstable in no_std nightly)
+- [02-01]: bitflags crate for MapPerm instead of manual bit manipulation
+- [02-01]: Adapted os/src/mm/vm/ paths to kernel/src/mm/vm/ (project uses kernel/ not os/)
 
 ### Pending Todos
 
@@ -71,5 +75,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Completed 01-04-PLAN.md (Phase 1 complete)
+Stopped at: Completed 02-01-PLAN.md
 Resume file: None

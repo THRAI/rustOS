@@ -35,11 +35,11 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 
 ### VM & PMAP
 
-- [ ] **VM-01**: VmMap using BTreeMap with sorted VmAreas
-- [ ] **VM-02**: VmArea with monotonic AtomicU64 ID for TOCTOU defense
-- [ ] **VM-03**: VmObject with shadow chain via Arc<RwLock<VmObject>>
-- [ ] **VM-04**: Iterative Drop via Arc::try_unwrap loop (no stack overflow on 500+ deep chains)
-- [ ] **VM-05**: PageOwnership enum distinguishes Anonymous (freed on drop) from Cached (page cache manages)
+- [x] **VM-01**: VmMap using BTreeMap with sorted VmAreas
+- [x] **VM-02**: VmArea with monotonic AtomicU64 ID for TOCTOU defense
+- [x] **VM-03**: VmObject with shadow chain via Arc<RwLock<VmObject>>
+- [x] **VM-04**: Iterative Drop via Arc::try_unwrap loop (no stack overflow on 500+ deep chains)
+- [x] **VM-05**: PageOwnership enum distinguishes Anonymous (freed on drop) from Cached (page cache manages)
 - [ ] **VM-06**: Frame allocator: buddy system + per-CPU magazine
 - [ ] **VM-07**: Dual frame_alloc API: frame_alloc() async (can yield) + frame_alloc_sync() (trap context, never yields)
 - [ ] **VM-08**: emergency_reclaim_sync() scans inactive queue for clean pages without yielding
@@ -179,11 +179,11 @@ Deferred post-competition.
 | HAL-09 | Phase 3 | Pending |
 | HAL-10 | Phase 3 | Pending |
 | HAL-11 | Phase 3 | Pending |
-| VM-01 | Phase 2 | Pending |
-| VM-02 | Phase 2 | Pending |
-| VM-03 | Phase 2 | Pending |
-| VM-04 | Phase 2 | Pending |
-| VM-05 | Phase 2 | Pending |
+| VM-01 | Phase 2 | Complete |
+| VM-02 | Phase 2 | Complete |
+| VM-03 | Phase 2 | Complete |
+| VM-04 | Phase 2 | Complete |
+| VM-05 | Phase 2 | Complete |
 | VM-06 | Phase 2 | Pending |
 | VM-07 | Phase 2 | Pending |
 | VM-08 | Phase 2 | Pending |

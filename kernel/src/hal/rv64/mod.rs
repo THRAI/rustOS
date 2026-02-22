@@ -3,3 +3,5 @@ pub mod uart;
 pub mod irq;
 pub mod trap;
 pub mod timer;
+pub mod tlb;
+pub mod cache;

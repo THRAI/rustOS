@@ -9,3 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 hal-common = { path = "../hal-common" }
+async-task = { version = "4.7", default-features = false }
+spin = "0.9"

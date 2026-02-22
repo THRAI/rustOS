@@ -58,3 +58,10 @@ pub fn hart_start(hartid: usize, start_addr: usize, opaque: usize) -> SbiRet {
 pub fn hart_status(hartid: usize) -> usize {
     sbi_call(EID_HSM, 2, [hartid, 0, 0]).value
 }
+
+/// Stop the calling hart. Returns to SBI stopped state.
+/// Can be restarted later via hart_start.
+/// EID=HSM, FID=1.
+pub fn hart_stop() -> SbiRet {
+    sbi_call(EID_HSM, 1, [0, 0, 0])
+}

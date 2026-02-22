@@ -17,11 +17,15 @@ global_asm!(include_str!("hal/rv64/boot.S"));
 // Include trap assembly
 global_asm!(include_str!("hal/rv64/trap.S"));
 
+/// Atomic flag: first hart to reach rust_main claims boot role.
+static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Entry point called from boot.S
 /// a0 = hartid, a1 = dtb_ptr
+/// OpenSBI can pick any hart as boot hart, so we use an atomic flag.
 #[no_mangle]
 pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
-    if hartid == 0 {
+    if !BOOT_HART_CLAIMED.swap(true, core::sync::atomic::Ordering::AcqRel) {
         hal::rv64::uart::init();
         kprintln!("hello world");
         kprintln!("[kernel] hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
@@ -35,11 +39,17 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Parse FDT to discover CPUs
         let (num_cpus, hartids) = hal::rv64::fdt::parse_cpus(dtb_ptr);
 
-        // Initialize per-CPU data for hart 0
+        // Pre-initialize PerCpu for ALL discovered harts.
+        // This must happen before spawning any cross-CPU tasks, because
+        // schedule_fn calls PerCpu::get(target_cpu) immediately.
+        for i in 0..num_cpus {
+            let hid = hartids[i];
+            let cid = hal::rv64::fdt::hart_to_cpu(hid).unwrap_or(i);
+            executor::init_per_cpu(cid, hid);
+        }
         let cpu0 = hal::rv64::fdt::hart_to_cpu(hartid).unwrap_or(0);
-        executor::init_per_cpu(cpu0, hartid);
         unsafe { executor::per_cpu::set_tp(cpu0) };
-        kprintln!("[kernel] per-cpu data initialized for hart {} (cpu {})", hartid, cpu0);
+        kprintln!("[kernel] per-cpu data initialized for {} harts", num_cpus);
 
         // Spawn a test kernel task to prove the executor path works
         executor::spawn_kernel_task(async {
@@ -85,7 +95,11 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         executor::executor_loop();
     }
 
-    // Secondary harts: park until SBI hart_start wakes them
+    // Non-boot harts: return to SBI stopped state so hart_start can restart them
+    // at secondary_entry. A wfi loop won't work because hart_start requires
+    // the hart to be in SBI "stopped" state.
+    hal::rv64::sbi::hart_stop();
+    // hart_stop should not return, but just in case:
     loop {
         unsafe {
             core::arch::asm!("wfi");

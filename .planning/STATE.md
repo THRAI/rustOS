@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 2 of 7 (VM Core + PMAP)
-Plan: 2 of 5 in current phase
+Plan: 3 of 5 in current phase
 Status: In Progress
-Last activity: 2026-02-23 -- Completed 02-02-PLAN.md
+Last activity: 2026-02-23 -- Completed 02-03-PLAN.md
 
-Progress: [████------] 40% (Phase 2)
+Progress: [██████----] 60% (Phase 2)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
+- Total plans completed: 7
 - Average duration: 6min
-- Total execution time: 0.58 hours
+- Total execution time: 0.72 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
-| 2 | 2/5 | 8min | 4min |
+| 2 | 3/5 | 16min | 5min |
 
 **Recent Trend:**
-- Last 5 plans: 7min, 6min, 4min, 4min
+- Last 5 plans: 6min, 4min, 4min, 8min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -66,6 +66,9 @@ Recent decisions affecting current work:
 - [02-02]: PhysAddr-based API (not PhysPageNum) — matches existing hal-common addr types
 - [02-02]: Static magazine array indexed by cpu_id (avoids modifying PerCpu struct)
 - [02-02]: IrqSafeSpinLock wrapping per-CPU magazines for IRQ safety
+- [02-03]: PteFlags bit positions mirror Sv39 hardware for zero-cost conversion
+- [02-03]: Leaked FrameTracker for PT pages (freed on pmap teardown, not RAII per-page)
+- [02-03]: Walk returns raw *mut PteRaw pointer + level for max caller flexibility
 
 ### Pending Todos
 
@@ -78,5 +81,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Completed 02-02-PLAN.md
+Stopped at: Completed 02-03-PLAN.md
 Resume file: None

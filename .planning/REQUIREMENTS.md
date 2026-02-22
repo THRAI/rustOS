@@ -45,8 +45,8 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [x] **VM-08**: emergency_reclaim_sync() scans inactive queue for clean pages without yielding
 - [ ] **VM-09**: sync_fault_handler resolves anonymous and cached-page faults on trap stack
 - [ ] **VM-10**: fault_in_page().await fetches file-backed pages via page cache asynchronously
-- [ ] **VM-11**: Shared page table walk parameterized by const LEVELS (3 for Sv39)
-- [ ] **VM-12**: pmap_enter, pmap_remove, pmap_protect, pmap_extract
+- [x] **VM-11**: Shared page table walk parameterized by const LEVELS (3 for Sv39)
+- [x] **VM-12**: pmap_enter, pmap_remove, pmap_protect, pmap_extract
 - [ ] **VM-13**: ASID allocator with generation-based rollover + synchronous IPI barrier
 - [ ] **VM-14**: pmap_shootdown via IPI + per-CPU ack
 - [ ] **VM-15**: Density-aware tree swap for shadow collapse (min(|C|,|P|) insertions)
@@ -189,8 +189,8 @@ Deferred post-competition.
 | VM-08 | Phase 2 | Complete |
 | VM-09 | Phase 2 | Pending |
 | VM-10 | Phase 3 | Pending |
-| VM-11 | Phase 2 | Pending |
-| VM-12 | Phase 2 | Pending |
+| VM-11 | Phase 2 | Complete |
+| VM-12 | Phase 2 | Complete |
 | VM-13 | Phase 2 | Pending |
 | VM-14 | Phase 2 | Pending |
 | VM-15 | Phase 5 | Pending |

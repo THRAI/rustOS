@@ -10,3 +10,6 @@
 	path = testsuits-for-oskernel
 	url = https://github.com/oscomp/testsuits-for-oskernel.git
 	branch = pre-2025
+[submodule "chronix"]
+	path = chronix
+	url = https://gitlab.eduxiji.net/educg-group-36002-2710490/T202518123995568-675.git

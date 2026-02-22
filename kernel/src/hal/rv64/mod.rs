@@ -1,3 +1,5 @@
-// rv64 HAL submodules -- boot.S is included via global_asm! in main.rs
+// rv64 HAL submodules -- boot.S and trap.S are included via global_asm! in main.rs
 pub mod uart;
 pub mod irq;
+pub mod trap;
+pub mod timer;

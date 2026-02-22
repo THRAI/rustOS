@@ -1,14 +1,20 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::arch::global_asm;
 
+mod alloc_early;
 mod hal;
 #[macro_use]
 mod console;
+mod trap;
 
 // Include boot assembly
 global_asm!(include_str!("hal/rv64/boot.S"));
+// Include trap assembly
+global_asm!(include_str!("hal/rv64/trap.S"));
 
 /// Entry point called from boot.S
 /// a0 = hartid, a1 = dtb_ptr
@@ -19,23 +25,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         kprintln!("hello world");
         kprintln!("[kernel] hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
 
-        // Exercise IRQ enable/disable to verify compilation
-        let was_enabled = hal::rv64::irq::is_enabled();
-        kprintln!("[kernel] IRQ enabled before test: {}", was_enabled);
+        // Initialize trap infrastructure (stvec + STIE)
+        trap::init();
 
+        // Enable global interrupts
         hal::rv64::irq::enable();
-        let enabled = hal::rv64::irq::is_enabled();
-        kprintln!("[kernel] IRQ enabled after enable(): {}", enabled);
-
-        let saved = hal::rv64::irq::disable_and_save();
-        let disabled = hal::rv64::irq::is_enabled();
-        kprintln!("[kernel] IRQ enabled after disable_and_save(): {}", disabled);
-
-        hal::rv64::irq::restore(saved);
-        let restored = hal::rv64::irq::is_enabled();
-        kprintln!("[kernel] IRQ enabled after restore(): {}", restored);
-
-        kprintln!("[kernel] boot complete, entering wfi loop");
+        kprintln!("[kernel] interrupts enabled, entering wfi loop");
     }
 
     loop {

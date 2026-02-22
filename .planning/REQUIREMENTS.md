@@ -122,7 +122,7 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [ ] **TEST-01**: Tier 1 host unit tests (cargo test --lib) for pure MI logic
 - [ ] **TEST-02**: Tier 1.5 host loom tests for lock-free structures and CAS state machines
 - [ ] **TEST-03**: Tier 2 QEMU kernel integration tests (custom_test_frameworks)
-- [ ] **TEST-04**: Tier 3a testsuits-for-oskernel basic (~33 tests) pass ≥80%
+- [ ] **TEST-04**: Tier 3a testsuits-for-oskernel basic (~33 tests) pass >=80%
 - [ ] **TEST-05**: Tier 3b libc-test (~463 tests) active
 - [ ] **TEST-06**: Tier 3c LTP subset (~366 categories) active
 - [ ] **TEST-07**: App tests: git, vim, gcc, rustc run on QEMU
@@ -250,10 +250,10 @@ Deferred post-competition.
 | APP-05 | Phase 7 | Pending |
 
 **Coverage:**
-- v1 requirements: 72 total
-- Mapped to phases: 72
-- Unmapped: 0 ✓
+- v1 requirements: 89 total
+- Mapped to phases: 89
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-22*
-*Last updated: 2026-02-22 after initial definition*
+*Last updated: 2026-02-22 after roadmap creation*

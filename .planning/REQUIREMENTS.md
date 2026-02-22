@@ -10,10 +10,10 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 ### Boot & Executor
 
 - [x] **BOOT-01**: Kernel boots on rv64 QEMU to UART output
-- [ ] **BOOT-02**: Per-CPU async executor polls futures from run queues
-- [ ] **BOOT-03**: Run queues protected by IrqSafeSpinLock (type-enforced IRQ masking)
-- [ ] **BOOT-04**: async-task crate integration (spawn, Runnable, schedule_fn callback)
-- [ ] **BOOT-05**: Timer wheel supports sleep/timeout futures
+- [x] **BOOT-02**: Per-CPU async executor polls futures from run queues
+- [x] **BOOT-03**: Run queues protected by IrqSafeSpinLock (type-enforced IRQ masking)
+- [x] **BOOT-04**: async-task crate integration (spawn, Runnable, schedule_fn callback)
+- [x] **BOOT-05**: Timer wheel supports sleep/timeout futures
 - [ ] **BOOT-06**: Timer IRQ fires and triggers cooperative preemption via yield_now
 - [ ] **BOOT-07**: IPI infrastructure (SBI send_ipi on rv64) for cross-CPU wake
 - [ ] **BOOT-08**: SMP boot (hart_start via SBI, secondary CPUs enter executor)
@@ -119,8 +119,8 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 
 ### Testing
 
-- [ ] **TEST-01**: Tier 1 host unit tests (cargo test --lib) for pure MI logic
-- [ ] **TEST-02**: Tier 1.5 host loom tests for lock-free structures and CAS state machines
+- [x] **TEST-01**: Tier 1 host unit tests (cargo test --lib) for pure MI logic
+- [x] **TEST-02**: Tier 1.5 host loom tests for lock-free structures and CAS state machines
 - [ ] **TEST-03**: Tier 2 QEMU kernel integration tests (custom_test_frameworks)
 - [ ] **TEST-04**: Tier 3a testsuits-for-oskernel basic (~33 tests) pass >=80%
 - [ ] **TEST-05**: Tier 3b libc-test (~463 tests) active
@@ -160,10 +160,10 @@ Deferred post-competition.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | BOOT-01 | Phase 1 | Complete |
-| BOOT-02 | Phase 1 | Pending |
-| BOOT-03 | Phase 1 | Pending |
-| BOOT-04 | Phase 1 | Pending |
-| BOOT-05 | Phase 1 | Pending |
+| BOOT-02 | Phase 1 | Complete |
+| BOOT-03 | Phase 1 | Complete |
+| BOOT-04 | Phase 1 | Complete |
+| BOOT-05 | Phase 1 | Complete |
 | BOOT-06 | Phase 1 | Pending |
 | BOOT-07 | Phase 1 | Pending |
 | BOOT-08 | Phase 1 | Pending |
@@ -236,8 +236,8 @@ Deferred post-competition.
 | SYS-04 | Phase 4 | Pending |
 | SYS-05 | Phase 4 | Pending |
 | SYS-06 | Phase 4 | Pending |
-| TEST-01 | Phase 1 | Pending |
-| TEST-02 | Phase 1 | Pending |
+| TEST-01 | Phase 1 | Complete |
+| TEST-02 | Phase 1 | Complete |
 | TEST-03 | Phase 2 | Pending |
 | TEST-04 | Phase 3 | Pending |
 | TEST-05 | Phase 5 | Pending |

@@ -19,18 +19,18 @@ Progress: [██████░░░░] 14%
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
+- Total plans completed: 3
 - Average duration: 7min
-- Total execution time: 0.23 hours
+- Total execution time: 0.35 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 | 2/4 | 14min | 7min |
+| 1 | 3/4 | 21min | 7min |
 
 **Recent Trend:**
-- Last 5 plans: 8min, 6min
+- Last 5 plans: 8min, 6min, 7min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -53,6 +53,9 @@ Recent decisions affecting current work:
 - [01-02]: SBI Timer extension (EID 0x54494D45) over legacy ecall for set_timer
 - [01-02]: 37-field TrapFrame (296 bytes) with compile-time size assert
 - [01-02]: Bump allocator for early boot (unblocks hal-common alloc dep)
+- [01-03]: async-task with default-features=false for no_std kernel target
+- [01-03]: spin::Once for PerCpu array (bypasses const-init limits of VecDeque/Vec)
+- [01-03]: Minimum 1 tick delay in timer wheel insert (prevents slot-0 miss)
 
 ### Pending Todos
 
@@ -64,6 +67,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-22
-Stopped at: Completed 01-02-PLAN.md
+Last session: 2026-02-23
+Stopped at: Completed 01-03-PLAN.md
 Resume file: None

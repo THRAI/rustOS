@@ -1,9 +1,15 @@
 //! Console output via kprint!/kprintln! macros.
 //!
-//! Uses the UART driver with IRQ-safe locking for concurrent access.
+//! Uses a global spinlock so SMP output is not interleaved.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::hal::rv64::uart;
+
+/// Global print lock — ensures only one hart writes at a time.
+/// We use a raw AtomicBool instead of IrqSafeSpinLock to avoid
+/// circular dependencies (print is used inside lock debug paths).
+static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
 
 struct LockedUartWriter;
 
@@ -20,12 +26,19 @@ impl Write for LockedUartWriter {
 }
 
 pub fn _print(args: fmt::Arguments) {
-    // Disable IRQs during print to prevent interleaved output
+    // Disable IRQs on this hart
     let saved: usize;
     unsafe {
         core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
     }
+    // Acquire cross-hart spinlock
+    while PRINT_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
     let _ = LockedUartWriter.write_fmt(args);
+    // Release
+    PRINT_LOCK.store(false, Ordering::Release);
+    // Restore IRQs
     if saved & 0x2 != 0 {
         unsafe {
             core::arch::asm!("csrsi sstatus, 0x2");

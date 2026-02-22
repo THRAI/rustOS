@@ -40,9 +40,9 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [x] **VM-03**: VmObject with shadow chain via Arc<RwLock<VmObject>>
 - [x] **VM-04**: Iterative Drop via Arc::try_unwrap loop (no stack overflow on 500+ deep chains)
 - [x] **VM-05**: PageOwnership enum distinguishes Anonymous (freed on drop) from Cached (page cache manages)
-- [ ] **VM-06**: Frame allocator: buddy system + per-CPU magazine
-- [ ] **VM-07**: Dual frame_alloc API: frame_alloc() async (can yield) + frame_alloc_sync() (trap context, never yields)
-- [ ] **VM-08**: emergency_reclaim_sync() scans inactive queue for clean pages without yielding
+- [x] **VM-06**: Frame allocator: buddy system + per-CPU magazine
+- [x] **VM-07**: Dual frame_alloc API: frame_alloc() async (can yield) + frame_alloc_sync() (trap context, never yields)
+- [x] **VM-08**: emergency_reclaim_sync() scans inactive queue for clean pages without yielding
 - [ ] **VM-09**: sync_fault_handler resolves anonymous and cached-page faults on trap stack
 - [ ] **VM-10**: fault_in_page().await fetches file-backed pages via page cache asynchronously
 - [ ] **VM-11**: Shared page table walk parameterized by const LEVELS (3 for Sv39)
@@ -51,7 +51,7 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [ ] **VM-14**: pmap_shootdown via IPI + per-CPU ack
 - [ ] **VM-15**: Density-aware tree swap for shadow collapse (min(|C|,|P|) insertions)
 - [ ] **VM-16**: Background collapse daemon: chunked (64 pages), bounded lock hold, yield between chunks
-- [ ] **VM-17**: Memory poisoning (debug builds) and trap stack canaries
+- [x] **VM-17**: Memory poisoning (debug builds) and trap stack canaries
 
 ### VFS & Disk
 
@@ -184,9 +184,9 @@ Deferred post-competition.
 | VM-03 | Phase 2 | Complete |
 | VM-04 | Phase 2 | Complete |
 | VM-05 | Phase 2 | Complete |
-| VM-06 | Phase 2 | Pending |
-| VM-07 | Phase 2 | Pending |
-| VM-08 | Phase 2 | Pending |
+| VM-06 | Phase 2 | Complete |
+| VM-07 | Phase 2 | Complete |
+| VM-08 | Phase 2 | Complete |
 | VM-09 | Phase 2 | Pending |
 | VM-10 | Phase 3 | Pending |
 | VM-11 | Phase 2 | Pending |
@@ -195,7 +195,7 @@ Deferred post-competition.
 | VM-14 | Phase 2 | Pending |
 | VM-15 | Phase 5 | Pending |
 | VM-16 | Phase 5 | Pending |
-| VM-17 | Phase 2 | Pending |
+| VM-17 | Phase 2 | Complete |
 | VFS-01 | Phase 3 | Pending |
 | VFS-02 | Phase 3 | Pending |
 | VFS-03 | Phase 3 | Pending |

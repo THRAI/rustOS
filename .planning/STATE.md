@@ -19,19 +19,19 @@ Progress: [████------] 40% (Phase 2)
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
+- Total plans completed: 6
 - Average duration: 6min
-- Total execution time: 0.52 hours
+- Total execution time: 0.58 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
-| 2 | 1/5 | 4min | 4min |
+| 2 | 2/5 | 8min | 4min |
 
 **Recent Trend:**
-- Last 5 plans: 6min, 7min, 6min, 4min
+- Last 5 plans: 7min, 6min, 4min, 4min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -63,6 +63,9 @@ Recent decisions affecting current work:
 - [02-01]: core::mem::take over BTreeMap::drain (drain unstable in no_std nightly)
 - [02-01]: bitflags crate for MapPerm instead of manual bit manipulation
 - [02-01]: Adapted os/src/mm/vm/ paths to kernel/src/mm/vm/ (project uses kernel/ not os/)
+- [02-02]: PhysAddr-based API (not PhysPageNum) — matches existing hal-common addr types
+- [02-02]: Static magazine array indexed by cpu_id (avoids modifying PerCpu struct)
+- [02-02]: IrqSafeSpinLock wrapping per-CPU magazines for IRQ safety
 
 ### Pending Todos
 
@@ -75,5 +78,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Completed 02-01-PLAN.md
+Stopped at: Completed 02-02-PLAN.md
 Resume file: None

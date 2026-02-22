@@ -7,4 +7,4 @@ pub mod vm_object;
 pub mod vm_map;
 
 pub use vm_object::{OwnedPage, PageOwnership, VmObject};
-pub use vm_map::{VmArea, VmAreaType, VmError, VmMap};
+pub use vm_map::{MapPerm, VmArea, VmAreaType, VmError, VmMap};

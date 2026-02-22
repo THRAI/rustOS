@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 1 of 7 (Boot + Executor + HAL Foundation)
-Plan: 0 of 3 in current phase
-Status: Ready to plan
-Last activity: 2026-02-22 -- Roadmap created
+Plan: 1 of 4 in current phase
+Status: Executing
+Last activity: 2026-02-22 -- Completed 01-01-PLAN.md
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██░░░░░░░░] 4%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
-- Average duration: -
-- Total execution time: 0 hours
+- Total plans completed: 1
+- Average duration: 8min
+- Total execution time: 0.13 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 1 | 1/4 | 8min | 8min |
 
 **Recent Trend:**
-- Last 5 plans: -
-- Trend: -
+- Last 5 plans: 8min
+- Trend: baseline
 
 *Updated after each plan completion*
 
@@ -47,6 +47,9 @@ Recent decisions affecting current work:
 - [Init]: Persistent task future model (no per-syscall spawn)
 - [Init]: Dual frame_alloc API (async + sync) for trap context safety
 - [Init]: From scratch build (not forking competitors)
+- [01-01]: slli over mul in boot.S (avoids M-extension in asm context)
+- [01-01]: Host target auto-detection in Makefile for portable testing
+- [01-01]: Inline IRQ masking in console.rs (avoids circular dep with hal-common)
 
 ### Pending Todos
 
@@ -59,5 +62,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-22
-Stopped at: Roadmap created, ready to plan Phase 1
+Stopped at: Completed 01-01-PLAN.md
 Resume file: None

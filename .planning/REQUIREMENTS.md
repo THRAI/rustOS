@@ -9,7 +9,7 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 
 ### Boot & Executor
 
-- [ ] **BOOT-01**: Kernel boots on rv64 QEMU to UART output
+- [x] **BOOT-01**: Kernel boots on rv64 QEMU to UART output
 - [ ] **BOOT-02**: Per-CPU async executor polls futures from run queues
 - [ ] **BOOT-03**: Run queues protected by IrqSafeSpinLock (type-enforced IRQ masking)
 - [ ] **BOOT-04**: async-task crate integration (spawn, Runnable, schedule_fn callback)
@@ -17,18 +17,18 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [ ] **BOOT-06**: Timer IRQ fires and triggers cooperative preemption via yield_now
 - [ ] **BOOT-07**: IPI infrastructure (SBI send_ipi on rv64) for cross-CPU wake
 - [ ] **BOOT-08**: SMP boot (hart_start via SBI, secondary CPUs enter executor)
-- [ ] **BOOT-09**: Debug infrastructure: kprintln! macro, GDB stub support, QEMU trace flags
+- [x] **BOOT-09**: Debug infrastructure: kprintln! macro, GDB stub support, QEMU trace flags
 
 ### HAL (Machine-Dependent)
 
 - [ ] **HAL-01**: Trap entry/exit assembly saves/restores 32 GPRs + CSRs
 - [ ] **HAL-02**: Separate user and kernel trap vectors (stvec switching)
 - [ ] **HAL-03**: Trap dispatch classifies cause (syscall, page fault, timer IRQ, external IRQ)
-- [ ] **HAL-04**: UART driver for console I/O
+- [x] **HAL-04**: UART driver for console I/O
 - [ ] **HAL-05**: Timer setup (set_oneshot for next timer IRQ)
 - [ ] **HAL-06**: TLB flush operations (flush_addr, flush_asid, flush_all)
 - [ ] **HAL-07**: Cache ops (dcache_wb, dcache_inv) for DMA correctness
-- [ ] **HAL-08**: IRQ enable/disable/scoped_disable
+- [x] **HAL-08**: IRQ enable/disable/scoped_disable
 - [ ] **HAL-09**: Exception fixup: pcb_onfault field on task struct, O(1) check in trap handler
 - [ ] **HAL-10**: #[naked] copy_user_chunk wrapping C memcpy with fixup landing pad (rv64)
 - [ ] **HAL-11**: uiomove: page-at-a-time chunked copy with explicit done counter, trinary return (Ok/Fault/NeedsIO)
@@ -159,7 +159,7 @@ Deferred post-competition.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| BOOT-01 | Phase 1 | Pending |
+| BOOT-01 | Phase 1 | Complete |
 | BOOT-02 | Phase 1 | Pending |
 | BOOT-03 | Phase 1 | Pending |
 | BOOT-04 | Phase 1 | Pending |
@@ -167,15 +167,15 @@ Deferred post-competition.
 | BOOT-06 | Phase 1 | Pending |
 | BOOT-07 | Phase 1 | Pending |
 | BOOT-08 | Phase 1 | Pending |
-| BOOT-09 | Phase 1 | Pending |
+| BOOT-09 | Phase 1 | Complete |
 | HAL-01 | Phase 1 | Pending |
 | HAL-02 | Phase 1 | Pending |
 | HAL-03 | Phase 1 | Pending |
-| HAL-04 | Phase 1 | Pending |
+| HAL-04 | Phase 1 | Complete |
 | HAL-05 | Phase 1 | Pending |
 | HAL-06 | Phase 1 | Pending |
 | HAL-07 | Phase 1 | Pending |
-| HAL-08 | Phase 1 | Pending |
+| HAL-08 | Phase 1 | Complete |
 | HAL-09 | Phase 3 | Pending |
 | HAL-10 | Phase 3 | Pending |
 | HAL-11 | Phase 3 | Pending |

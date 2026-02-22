@@ -14,9 +14,9 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [x] **BOOT-03**: Run queues protected by IrqSafeSpinLock (type-enforced IRQ masking)
 - [x] **BOOT-04**: async-task crate integration (spawn, Runnable, schedule_fn callback)
 - [x] **BOOT-05**: Timer wheel supports sleep/timeout futures
-- [ ] **BOOT-06**: Timer IRQ fires and triggers cooperative preemption via yield_now
-- [ ] **BOOT-07**: IPI infrastructure (SBI send_ipi on rv64) for cross-CPU wake
-- [ ] **BOOT-08**: SMP boot (hart_start via SBI, secondary CPUs enter executor)
+- [x] **BOOT-06**: Timer IRQ fires and triggers cooperative preemption via yield_now
+- [x] **BOOT-07**: IPI infrastructure (SBI send_ipi on rv64) for cross-CPU wake
+- [x] **BOOT-08**: SMP boot (hart_start via SBI, secondary CPUs enter executor)
 - [x] **BOOT-09**: Debug infrastructure: kprintln! macro, GDB stub support, QEMU trace flags
 
 ### HAL (Machine-Dependent)
@@ -164,9 +164,9 @@ Deferred post-competition.
 | BOOT-03 | Phase 1 | Complete |
 | BOOT-04 | Phase 1 | Complete |
 | BOOT-05 | Phase 1 | Complete |
-| BOOT-06 | Phase 1 | Pending |
-| BOOT-07 | Phase 1 | Pending |
-| BOOT-08 | Phase 1 | Pending |
+| BOOT-06 | Phase 1 | Complete |
+| BOOT-07 | Phase 1 | Complete |
+| BOOT-08 | Phase 1 | Complete |
 | BOOT-09 | Phase 1 | Complete |
 | HAL-01 | Phase 1 | Complete |
 | HAL-02 | Phase 1 | Complete |

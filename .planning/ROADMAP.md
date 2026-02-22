@@ -12,7 +12,7 @@ Seven phases take this kernel from first UART output to running git/vim/gcc/rust
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Boot + Executor + HAL Foundation** - Kernel boots on rv64 QEMU with async executor, SMP, trap handling, and debug infrastructure (~3K LOC)
+- [x] **Phase 1: Boot + Executor + HAL Foundation** - Kernel boots on rv64 QEMU with async executor, SMP, trap handling, and debug infrastructure (~3K LOC)
 - [ ] **Phase 2: VM Core + PMAP** - Virtual memory subsystem with page tables, ASID management, fault handling, and frame allocation (~6K LOC)
 - [ ] **Phase 3: Exception Fixup + VFS + Disk + Process** - User/kernel copy safety, filesystem, block I/O, and fork/exec/wait (~10K LOC, hard gate on fixup tests at 3a)
 - [ ] **Phase 4: Pipes + Signals + Full Syscalls** - IPC pipes, signal delivery, and remaining syscall surface for test suite compatibility (~4K LOC)
@@ -35,10 +35,10 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 4 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Project scaffold + boot to UART + hal-common types
-- [ ] 01-02-PLAN.md — Trap entry/exit asm + dispatch + timer + TLB/cache
-- [ ] 01-03-PLAN.md — Executor core + async-task + timer wheel + host tests
-- [ ] 01-04-PLAN.md — SMP boot + IPI + preemption + integration tests
+- [x] 01-01-PLAN.md — Project scaffold + boot to UART + hal-common types
+- [x] 01-02-PLAN.md — Trap entry/exit asm + dispatch + timer + TLB/cache
+- [x] 01-03-PLAN.md — Executor core + async-task + timer wheel + host tests
+- [x] 01-04-PLAN.md — SMP boot + IPI + preemption + integration tests
 
 ### Phase 2: VM Core + PMAP
 **Goal**: Virtual memory subsystem is complete -- page faults resolve, page tables map correctly, ASIDs avoid TLB aliasing, and frame allocation works under both async and sync contexts
@@ -149,7 +149,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Boot + Executor + HAL Foundation | 0/4 | Not started | - |
+| 1. Boot + Executor + HAL Foundation | 4/4 | Complete | 2026-02-23 |
 | 2. VM Core + PMAP | 0/3 | Not started | - |
 | 3. Exception Fixup + VFS + Disk + Process | 0/4 | Not started | - |
 | 4. Pipes + Signals + Full Syscalls | 0/3 | Not started | - |

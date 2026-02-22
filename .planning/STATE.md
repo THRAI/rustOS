@@ -10,27 +10,27 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 1 of 7 (Boot + Executor + HAL Foundation)
-Plan: 3 of 4 in current phase
-Status: Executing
-Last activity: 2026-02-23 -- Completed 01-03-PLAN.md
+Plan: 4 of 4 in current phase
+Status: Phase Complete
+Last activity: 2026-02-23 -- Completed 01-04-PLAN.md
 
-Progress: [██████░░░░] 14%
+Progress: [██████████] 100% (Phase 1)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
+- Total plans completed: 4
 - Average duration: 7min
-- Total execution time: 0.35 hours
+- Total execution time: 0.45 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 | 3/4 | 21min | 7min |
+| 1 | 4/4 | 27min | 7min |
 
 **Recent Trend:**
-- Last 5 plans: 8min, 6min, 7min
+- Last 5 plans: 8min, 6min, 7min, 6min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -56,6 +56,9 @@ Recent decisions affecting current work:
 - [01-03]: async-task with default-features=false for no_std kernel target
 - [01-03]: spin::Once for PerCpu array (bypasses const-init limits of VecDeque/Vec)
 - [01-03]: Minimum 1 tick delay in timer wheel insert (prevents slot-0 miss)
+- [01-04]: cpu_id-indexed boot stacks for secondary harts (mhartid unavailable in S-mode)
+- [01-04]: Hand-parsed FDT /cpus node (no external crate dependency)
+- [01-04]: needs_reschedule AtomicBool on PerCpu for cooperative preemption
 
 ### Pending Todos
 
@@ -68,5 +71,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Completed 01-03-PLAN.md
+Stopped at: Completed 01-04-PLAN.md (Phase 1 complete)
 Resume file: None

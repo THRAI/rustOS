@@ -32,12 +32,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Timer IRQ fires at configured interval and a sleeping future wakes after its timeout expires
   4. Trap entry/exit correctly saves and restores all 32 GPRs + CSRs (verified by register-clobber test)
   5. `cargo test --lib` passes for all pure MI logic (locks, timer wheel, run queue) including loom tests for lock-free structures
-**Plans**: TBD
+**Plans**: 4 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
-- [ ] 01-03: TBD
+- [ ] 01-01-PLAN.md — Project scaffold + boot to UART + hal-common types
+- [ ] 01-02-PLAN.md — Trap entry/exit asm + dispatch + timer + TLB/cache
+- [ ] 01-03-PLAN.md — Executor core + async-task + timer wheel + host tests
+- [ ] 01-04-PLAN.md — SMP boot + IPI + preemption + integration tests
 
 ### Phase 2: VM Core + PMAP
 **Goal**: Virtual memory subsystem is complete -- page faults resolve, page tables map correctly, ASIDs avoid TLB aliasing, and frame allocation works under both async and sync contexts
@@ -148,7 +149,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Boot + Executor + HAL Foundation | 0/3 | Not started | - |
+| 1. Boot + Executor + HAL Foundation | 0/4 | Not started | - |
 | 2. VM Core + PMAP | 0/3 | Not started | - |
 | 3. Exception Fixup + VFS + Disk + Process | 0/4 | Not started | - |
 | 4. Pipes + Signals + Full Syscalls | 0/3 | Not started | - |

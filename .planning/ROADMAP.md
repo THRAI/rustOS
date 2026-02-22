@@ -50,12 +50,14 @@ Plans:
   3. ASID generation rollover triggers IPI barrier and no stale TLB entries survive (verified by QEMU integration test)
   4. frame_alloc_sync() in trap context returns a frame (or triggers emergency_reclaim_sync) without ever yielding
   5. Iterative VmObject Drop handles a 500-deep shadow chain without stack overflow
-**Plans**: TBD
+**Plans**: 5 plans
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
-- [ ] 02-03: TBD
+- [ ] 02-01-PLAN.md — VmObject with shadow chains, iterative Drop, PageOwnership, VmMap/VmArea with monotonic IDs
+- [ ] 02-02-PLAN.md — Buddy frame allocator + per-CPU magazine + dual alloc API + memory poisoning
+- [ ] 02-03-PLAN.md — PMAP layer with shared const-generic page table walk + pmap_enter/remove/protect/extract
+- [ ] 02-04-PLAN.md — ASID allocator with generation rollover + TLB shootdown + sync_fault_handler
+- [ ] 02-05-PLAN.md — Host unit tests + QEMU integration tests (custom_test_frameworks)
 
 ### Phase 3: Exception Fixup + VFS + Disk + Process
 **Goal**: User/kernel copy is safe (fixup-gated), filesystem reads and writes work through page cache and lwext4, and fork/exec/wait lifecycle is complete -- the kernel can load and run ELF binaries from disk
@@ -150,7 +152,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Boot + Executor + HAL Foundation | 4/4 | Complete | 2026-02-23 |
-| 2. VM Core + PMAP | 0/3 | Not started | - |
+| 2. VM Core + PMAP | 0/5 | Not started | - |
 | 3. Exception Fixup + VFS + Disk + Process | 0/4 | Not started | - |
 | 4. Pipes + Signals + Full Syscalls | 0/3 | Not started | - |
 | 5. Page Reclamation + LA64 Port | 0/3 | Not started | - |

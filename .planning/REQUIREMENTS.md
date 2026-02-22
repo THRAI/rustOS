@@ -21,13 +21,13 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 
 ### HAL (Machine-Dependent)
 
-- [ ] **HAL-01**: Trap entry/exit assembly saves/restores 32 GPRs + CSRs
-- [ ] **HAL-02**: Separate user and kernel trap vectors (stvec switching)
-- [ ] **HAL-03**: Trap dispatch classifies cause (syscall, page fault, timer IRQ, external IRQ)
+- [x] **HAL-01**: Trap entry/exit assembly saves/restores 32 GPRs + CSRs
+- [x] **HAL-02**: Separate user and kernel trap vectors (stvec switching)
+- [x] **HAL-03**: Trap dispatch classifies cause (syscall, page fault, timer IRQ, external IRQ)
 - [x] **HAL-04**: UART driver for console I/O
-- [ ] **HAL-05**: Timer setup (set_oneshot for next timer IRQ)
-- [ ] **HAL-06**: TLB flush operations (flush_addr, flush_asid, flush_all)
-- [ ] **HAL-07**: Cache ops (dcache_wb, dcache_inv) for DMA correctness
+- [x] **HAL-05**: Timer setup (set_oneshot for next timer IRQ)
+- [x] **HAL-06**: TLB flush operations (flush_addr, flush_asid, flush_all)
+- [x] **HAL-07**: Cache ops (dcache_wb, dcache_inv) for DMA correctness
 - [x] **HAL-08**: IRQ enable/disable/scoped_disable
 - [ ] **HAL-09**: Exception fixup: pcb_onfault field on task struct, O(1) check in trap handler
 - [ ] **HAL-10**: #[naked] copy_user_chunk wrapping C memcpy with fixup landing pad (rv64)
@@ -168,13 +168,13 @@ Deferred post-competition.
 | BOOT-07 | Phase 1 | Pending |
 | BOOT-08 | Phase 1 | Pending |
 | BOOT-09 | Phase 1 | Complete |
-| HAL-01 | Phase 1 | Pending |
-| HAL-02 | Phase 1 | Pending |
-| HAL-03 | Phase 1 | Pending |
+| HAL-01 | Phase 1 | Complete |
+| HAL-02 | Phase 1 | Complete |
+| HAL-03 | Phase 1 | Complete |
 | HAL-04 | Phase 1 | Complete |
-| HAL-05 | Phase 1 | Pending |
-| HAL-06 | Phase 1 | Pending |
-| HAL-07 | Phase 1 | Pending |
+| HAL-05 | Phase 1 | Complete |
+| HAL-06 | Phase 1 | Complete |
+| HAL-07 | Phase 1 | Complete |
 | HAL-08 | Phase 1 | Complete |
 | HAL-09 | Phase 3 | Pending |
 | HAL-10 | Phase 3 | Pending |

@@ -4,33 +4,38 @@
 use core::arch::global_asm;
 
 mod hal;
+#[macro_use]
+mod console;
 
 // Include boot assembly
 global_asm!(include_str!("hal/rv64/boot.S"));
 
-/// Minimal UART write for early boot -- QEMU virt UART at 0x1000_0000
-fn uart_putchar(c: u8) {
-    let uart_base = 0x1000_0000 as *mut u8;
-    unsafe {
-        core::ptr::write_volatile(uart_base, c);
-    }
-}
-
-fn uart_puts(s: &str) {
-    for b in s.bytes() {
-        if b == b'\n' {
-            uart_putchar(b'\r');
-        }
-        uart_putchar(b);
-    }
-}
-
 /// Entry point called from boot.S
 /// a0 = hartid, a1 = dtb_ptr
 #[no_mangle]
-pub extern "C" fn rust_main(hartid: usize, _dtb_ptr: usize) -> ! {
+pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     if hartid == 0 {
-        uart_puts("hello world\n");
+        hal::rv64::uart::init();
+        kprintln!("hello world");
+        kprintln!("[kernel] hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
+
+        // Exercise IRQ enable/disable to verify compilation
+        let was_enabled = hal::rv64::irq::is_enabled();
+        kprintln!("[kernel] IRQ enabled before test: {}", was_enabled);
+
+        hal::rv64::irq::enable();
+        let enabled = hal::rv64::irq::is_enabled();
+        kprintln!("[kernel] IRQ enabled after enable(): {}", enabled);
+
+        let saved = hal::rv64::irq::disable_and_save();
+        let disabled = hal::rv64::irq::is_enabled();
+        kprintln!("[kernel] IRQ enabled after disable_and_save(): {}", disabled);
+
+        hal::rv64::irq::restore(saved);
+        let restored = hal::rv64::irq::is_enabled();
+        kprintln!("[kernel] IRQ enabled after restore(): {}", restored);
+
+        kprintln!("[kernel] boot complete, entering wfi loop");
     }
 
     loop {
@@ -41,7 +46,8 @@ pub extern "C" fn rust_main(hartid: usize, _dtb_ptr: usize) -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    kprintln!("[PANIC] {}", info);
     loop {
         unsafe {
             core::arch::asm!("wfi");

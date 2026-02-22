@@ -19,7 +19,11 @@ where
 {
     let schedule_fn = move |runnable: async_task::Runnable| {
         per_cpu::get(target_cpu).run_queue.push(runnable);
-        // TODO: IPI if target_cpu != current_cpu (Plan 04)
+        // Send IPI if scheduling to a different CPU to wake it from wfi
+        let current_cpu = per_cpu::current().cpu_id;
+        if target_cpu != current_cpu {
+            crate::hal::rv64::ipi::send_ipi(target_cpu);
+        }
     };
     let (runnable, task) = async_task::spawn(future, schedule_fn);
     runnable.schedule();

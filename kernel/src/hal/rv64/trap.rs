@@ -22,14 +22,14 @@ extern "C" {
     fn __user_trap();
 }
 
-/// Initialize trap infrastructure: set stvec, enable timer interrupt in sie.
+/// Initialize trap infrastructure: set stvec, enable timer + software interrupts in sie.
 pub fn init() {
     set_kernel_trap_entry();
-    // Enable S-mode timer interrupt (STIE = bit 5 of sie)
+    // Enable S-mode timer interrupt (STIE = bit 5) and software interrupt (SSIE = bit 1)
     unsafe {
-        core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
+        core::arch::asm!("csrs sie, {}", in(reg) (1usize << 5) | (1usize << 1));
     }
-    kprintln!("[trap] stvec set, STIE enabled");
+    kprintln!("[trap] stvec set, STIE+SSIE enabled");
 }
 
 /// Point stvec to __kernel_trap (Direct mode).
@@ -68,7 +68,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                 handle_external_irq();
             }
             IRQ_S_SOFTWARE => {
-                handle_ipi();
+                super::ipi::handle_ipi();
             }
             _ => {
                 panic!(
@@ -109,13 +109,4 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
 /// Stub: external interrupt handler (expanded in later phases).
 fn handle_external_irq() {
     kprintln!("[trap] external IRQ (stub)");
-}
-
-/// Stub: inter-processor interrupt handler.
-fn handle_ipi() {
-    // Clear S-mode software interrupt pending bit
-    unsafe {
-        core::arch::asm!("csrc sip, {}", in(reg) 1usize << 1);
-    }
-    kprintln!("[trap] IPI received (stub)");
 }

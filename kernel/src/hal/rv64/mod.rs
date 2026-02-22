@@ -5,3 +5,7 @@ pub mod trap;
 pub mod timer;
 pub mod tlb;
 pub mod cache;
+pub mod sbi;
+pub mod fdt;
+pub mod ipi;
+pub mod smp;

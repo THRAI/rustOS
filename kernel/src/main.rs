@@ -26,22 +26,37 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         kprintln!("hello world");
         kprintln!("[kernel] hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
 
-        // Initialize trap infrastructure (stvec + STIE)
+        // Initialize trap infrastructure (stvec + STIE + SSIE)
         trap::init();
 
         // Arm the first timer interrupt (10ms interval)
         hal::rv64::timer::init();
 
+        // Parse FDT to discover CPUs
+        let (num_cpus, hartids) = hal::rv64::fdt::parse_cpus(dtb_ptr);
+
         // Initialize per-CPU data for hart 0
-        // Phase 1: hartid == cpu_id for the boot hart
-        executor::init_per_cpu(0, hartid);
-        unsafe { executor::per_cpu::set_tp(0) };
-        kprintln!("[kernel] per-cpu data initialized for hart {}", hartid);
+        let cpu0 = hal::rv64::fdt::hart_to_cpu(hartid).unwrap_or(0);
+        executor::init_per_cpu(cpu0, hartid);
+        unsafe { executor::per_cpu::set_tp(cpu0) };
+        kprintln!("[kernel] per-cpu data initialized for hart {} (cpu {})", hartid, cpu0);
 
         // Spawn a test kernel task to prove the executor path works
         executor::spawn_kernel_task(async {
             kprintln!("hello from async future!");
         }, 0).detach();
+
+        // Boot secondary harts
+        if num_cpus > 1 {
+            hal::rv64::smp::boot_secondary_harts(num_cpus, &hartids, hartid);
+        }
+
+        // Spawn cross-CPU test task (if we have >1 CPU)
+        if num_cpus > 1 {
+            executor::spawn_kernel_task(async {
+                kprintln!("hello from CPU 1");
+            }, 1).detach();
+        }
 
         // Enable global interrupts
         hal::rv64::irq::enable();
@@ -51,7 +66,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         executor::executor_loop();
     }
 
-    // Secondary harts: park until SMP boot (Plan 04)
+    // Secondary harts: park until SBI hart_start wakes them
     loop {
         unsafe {
             core::arch::asm!("wfi");

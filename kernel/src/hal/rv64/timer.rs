@@ -35,7 +35,7 @@ pub fn read_time() -> u64 {
 /// Program next timer IRQ at `current_time + ticks` via SBI set_timer.
 pub fn set_oneshot(ticks: u64) {
     let deadline = read_time() + ticks;
-    sbi_set_timer(deadline);
+    super::sbi::set_timer(deadline);
 }
 
 /// Handle S-mode timer interrupt. Called from trap dispatch.
@@ -53,20 +53,4 @@ pub fn handle_timer_irq() {
 #[inline]
 pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
-}
-
-/// SBI set_timer ecall (Timer extension EID=0x54494D45, FID=0).
-/// Falls back to legacy extension 0x00 if needed.
-fn sbi_set_timer(stime_value: u64) {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("a0") stime_value,
-            in("a1") 0usize,       // unused
-            in("a6") 0usize,       // FID = 0
-            in("a7") 0x54494D45usize, // EID = TIME extension
-            lateout("a0") _,
-            lateout("a1") _,
-        );
-    }
 }

@@ -30,12 +30,17 @@ gdbserver-rv64: kernel-rv64
 	$(QEMU_RV64) $(QEMU_RV64_FLAGS) -s
 
 # QEMU integration test: boot, capture output, check expected strings
+# Uses background QEMU + sleep + kill for macOS compatibility (no coreutils `timeout`)
 qemu-test-rv64: kernel-rv64
 	@echo "=== QEMU integration test (SMP=$(SMP)) ==="
-	@PASS=0; FAIL=0; \
-	OUTPUT=$$(timeout 30 $(QEMU_RV64) $(QEMU_RV64_FLAGS) 2>&1 || true); \
+	@TMPOUT=$$(mktemp); \
+	$(QEMU_RV64) $(QEMU_RV64_FLAGS) > $$TMPOUT 2>&1 & \
+	QPID=$$!; \
+	sleep 15; \
+	kill $$QPID 2>/dev/null; wait $$QPID 2>/dev/null; \
+	PASS=0; FAIL=0; \
 	for pat in "hello from async future" "woke after 100ms" "hello from CPU 1" "register clobber PASS"; do \
-		if echo "$$OUTPUT" | grep -q "$$pat"; then \
+		if grep -q "$$pat" $$TMPOUT; then \
 			echo "  PASS: $$pat"; \
 			PASS=$$((PASS + 1)); \
 		else \
@@ -43,6 +48,7 @@ qemu-test-rv64: kernel-rv64
 			FAIL=$$((FAIL + 1)); \
 		fi; \
 	done; \
+	rm -f $$TMPOUT; \
 	echo "=== $$PASS passed, $$FAIL failed ==="; \
 	[ $$FAIL -eq 0 ]
 

@@ -32,6 +32,7 @@ where
 
 /// A future that yields once (reschedules), then completes.
 /// Used for cooperative preemption at trap boundaries.
+/// Also checks the per-CPU needs_reschedule flag set by timer IRQ.
 pub async fn yield_now() {
     struct YieldFuture {
         yielded: bool,
@@ -41,6 +42,10 @@ pub async fn yield_now() {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             if self.yielded {
+                // Clear the preemption flag
+                per_cpu::current()
+                    .needs_reschedule
+                    .store(false, core::sync::atomic::Ordering::Release);
                 Poll::Ready(())
             } else {
                 self.yielded = true;

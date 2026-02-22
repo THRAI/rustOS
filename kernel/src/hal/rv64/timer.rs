@@ -43,6 +43,14 @@ pub fn handle_timer_irq() {
     let tick = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     // Re-arm timer for next interval
     set_oneshot(DEFAULT_INTERVAL);
+
+    // Tick the per-CPU timer wheel -- wakes expired sleep futures
+    let pc = crate::executor::per_cpu::current();
+    pc.timer_wheel.lock().advance();
+
+    // Set preemption flag -- yield_now checks this
+    pc.needs_reschedule.store(true, Ordering::Release);
+
     // Periodic status (every 100 ticks = ~1 second)
     if tick % 100 == 0 {
         kprintln!("[timer] tick {}", tick);

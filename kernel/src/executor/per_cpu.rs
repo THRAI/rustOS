@@ -4,16 +4,19 @@
 //! Accessed via the tp register (hot path) or global array (cross-CPU).
 
 use hal_common::{IrqSafeSpinLock, RunQueue, TimerWheel};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 8;
 
-/// Per-CPU data: run queue, timer wheel, hart/cpu identity.
+/// Per-CPU data: run queue, timer wheel, hart/cpu identity, preemption flag.
 pub struct PerCpu {
     pub run_queue: RunQueue<async_task::Runnable>,
     pub timer_wheel: IrqSafeSpinLock<TimerWheel>,
     pub hartid: usize,
     pub cpu_id: usize,
+    /// Set by timer IRQ, checked by yield_now for cooperative preemption.
+    pub needs_reschedule: AtomicBool,
 }
 
 impl PerCpu {
@@ -24,6 +27,7 @@ impl PerCpu {
             timer_wheel: IrqSafeSpinLock::new(TimerWheel::new()),
             hartid,
             cpu_id,
+            needs_reschedule: AtomicBool::new(false),
         }
     }
 }

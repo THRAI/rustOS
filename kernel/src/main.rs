@@ -46,6 +46,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             kprintln!("hello from async future!");
         }, 0).detach();
 
+        // Integration test: sleep future (should wake after ~100ms = 10 ticks)
+        executor::spawn_kernel_task(async {
+            executor::sleep(100).await;
+            kprintln!("woke after 100ms!");
+        }, 0).detach();
+
         // Boot secondary harts
         if num_cpus > 1 {
             hal::rv64::smp::boot_secondary_harts(num_cpus, &hartids, hartid);
@@ -57,6 +63,19 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 kprintln!("hello from CPU 1");
             }, 1).detach();
         }
+
+        // Integration test: cross-CPU wake (CPU 0 sleeps, then spawns on CPU 1)
+        if num_cpus > 1 {
+            executor::spawn_kernel_task(async {
+                executor::sleep(50).await;
+                executor::spawn_kernel_task(async {
+                    kprintln!("cross-cpu wake on CPU 1");
+                }, 1).detach();
+            }, 0).detach();
+        }
+
+        // Register clobber test: verify trap save/restore
+        register_clobber_test();
 
         // Enable global interrupts
         hal::rv64::irq::enable();
@@ -71,6 +90,63 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         unsafe {
             core::arch::asm!("wfi");
         }
+    }
+}
+
+/// Register clobber test: write known values to caller-saved registers,
+/// wait for a timer IRQ (which saves/restores via __kernel_trap), then
+/// verify the registers are intact. Tests trap entry/exit correctness.
+fn register_clobber_test() {
+    let ok: usize;
+    unsafe {
+        core::arch::asm!(
+            // Write known values to t0-t6 (caller-saved temporaries)
+            "li t0, 0xDEAD0000",
+            "li t1, 0xDEAD0001",
+            "li t2, 0xDEAD0002",
+            "li t3, 0xDEAD0003",
+            "li t4, 0xDEAD0004",
+            "li t5, 0xDEAD0005",
+            "li t6, 0xDEAD0006",
+            // Enable interrupts and wait for a timer IRQ
+            "csrsi sstatus, 0x2",  // SIE = 1
+            "wfi",                  // wait for timer IRQ
+            "csrci sstatus, 0x2",  // SIE = 0
+            // Now check all values survived the trap
+            "li {tmp}, 0",         // assume pass (0 = ok)
+            "li {exp}, 0xDEAD0000",
+            "bne t0, {exp}, 1f",
+            "li {exp}, 0xDEAD0001",
+            "bne t1, {exp}, 1f",
+            "li {exp}, 0xDEAD0002",
+            "bne t2, {exp}, 1f",
+            "li {exp}, 0xDEAD0003",
+            "bne t3, {exp}, 1f",
+            "li {exp}, 0xDEAD0004",
+            "bne t4, {exp}, 1f",
+            "li {exp}, 0xDEAD0005",
+            "bne t5, {exp}, 1f",
+            "li {exp}, 0xDEAD0006",
+            "bne t6, {exp}, 1f",
+            "j 2f",                // all passed
+            "1:",                  // fail
+            "li {tmp}, 1",
+            "2:",
+            tmp = out(reg) ok,
+            exp = out(reg) _,
+            out("t0") _,
+            out("t1") _,
+            out("t2") _,
+            out("t3") _,
+            out("t4") _,
+            out("t5") _,
+            out("t6") _,
+        );
+    }
+    if ok == 0 {
+        kprintln!("register clobber PASS");
+    } else {
+        kprintln!("register clobber FAIL");
     }
 }
 

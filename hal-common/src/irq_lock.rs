@@ -128,4 +128,136 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<IrqSafeSpinLock<u32>>();
     }
+
+    #[test]
+    fn mutual_exclusion_two_threads() {
+        extern crate std;
+        use std::sync::Arc;
+        use std::thread;
+
+        let lock = Arc::new(IrqSafeSpinLock::new(0u64));
+        let iterations = 1000;
+
+        let l1 = lock.clone();
+        let t1 = thread::spawn(move || {
+            for _ in 0..iterations {
+                let mut g = l1.lock();
+                *g += 1;
+            }
+        });
+
+        let l2 = lock.clone();
+        let t2 = thread::spawn(move || {
+            for _ in 0..iterations {
+                let mut g = l2.lock();
+                *g += 1;
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let g = lock.lock();
+        assert_eq!(*g, 2 * iterations);
+    }
+}
+
+/// Loom-based concurrency tests for IrqSafeSpinLock.
+///
+/// These use loom's AtomicBool/UnsafeCell to explore all thread interleavings.
+/// Run with: `cargo test -p hal-common --features loom -- loom`
+/// or: `RUSTFLAGS="--cfg loom" cargo test -p hal-common`
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::cell::UnsafeCell;
+    use loom::thread;
+
+    /// Minimal loom-compatible spinlock (mirrors IrqSafeSpinLock logic
+    /// but uses loom primitives so loom can explore interleavings).
+    struct LoomSpinLock<T> {
+        locked: AtomicBool,
+        data: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Send for LoomSpinLock<T> {}
+    unsafe impl<T: Send> Sync for LoomSpinLock<T> {}
+
+    impl<T> LoomSpinLock<T> {
+        fn new(data: T) -> Self {
+            Self {
+                locked: AtomicBool::new(false),
+                data: UnsafeCell::new(data),
+            }
+        }
+
+        fn lock<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+            while self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                loom::thread::yield_now();
+            }
+            let ret = self.data.with_mut(|ptr| f(unsafe { &mut *ptr }));
+            self.locked.store(false, Ordering::Release);
+            ret
+        }
+    }
+
+    #[test]
+    fn loom_two_threads_increment() {
+        loom::model(|| {
+            let lock = Arc::new(LoomSpinLock::new(0u32));
+
+            let l1 = lock.clone();
+            let t1 = thread::spawn(move || {
+                l1.lock(|v| *v += 1);
+            });
+
+            let l2 = lock.clone();
+            let t2 = thread::spawn(move || {
+                l2.lock(|v| *v += 1);
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            lock.lock(|v| assert_eq!(*v, 2));
+        });
+    }
+
+    #[test]
+    fn loom_cross_cpu_lock_contention() {
+        // Simulates two CPUs (threads) contending for the same lock.
+        // With IrqSafeSpinLock, IRQs are disabled before lock, so the
+        // "IRQ" thread represents a different CPU, not same-CPU reentrance.
+        loom::model(|| {
+            let lock = Arc::new(LoomSpinLock::new(0u32));
+            let done = Arc::new(AtomicBool::new(false));
+
+            let l1 = lock.clone();
+            let d1 = done.clone();
+            let t1 = thread::spawn(move || {
+                l1.lock(|v| {
+                    *v += 1;
+                });
+                d1.store(true, Ordering::Release);
+            });
+
+            let l2 = lock.clone();
+            let t2 = thread::spawn(move || {
+                l2.lock(|v| {
+                    *v += 1;
+                });
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            lock.lock(|v| assert_eq!(*v, 2));
+            assert!(done.load(Ordering::Acquire));
+        });
+    }
 }

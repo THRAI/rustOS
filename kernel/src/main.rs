@@ -8,6 +8,7 @@ use core::arch::global_asm;
 mod alloc_early;
 mod executor;
 mod hal;
+mod mm;
 #[macro_use]
 mod console;
 mod trap;

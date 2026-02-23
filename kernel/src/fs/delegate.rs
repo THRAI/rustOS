@@ -43,6 +43,26 @@ pub enum FsRequest {
         handle: FsFileHandle,
         reply: ReplySlot<Result<(), i32>>,
     },
+    /// Look up a child entry in a directory by inode + name.
+    /// Returns (child_ino, file_type, file_size).
+    Lookup {
+        parent_ino: u32,
+        name: [u8; 256],
+        name_len: usize,
+        reply: ReplySlot<Result<(u32, u8, u64), i32>>,
+    },
+    /// Stat an inode: returns (size, file_type_u8).
+    Stat {
+        ino: u32,
+        reply: ReplySlot<Result<(u64, u8), i32>>,
+    },
+    /// Read one page of file data at the given byte offset.
+    /// Delegate allocates a frame, reads data into it, returns PhysAddr as usize.
+    ReadPage {
+        ino: u32,
+        offset: u64,
+        reply: ReplySlot<Result<usize, i32>>,
+    },
 }
 
 /// A oneshot reply slot: delegate writes result, wakes the caller.
@@ -115,10 +135,16 @@ macro_rules! define_reply_pool {
 define_reply_pool!(OPEN_REPLIES, Result<FsFileHandle, i32>);
 define_reply_pool!(READ_REPLIES, Result<usize, i32>);
 define_reply_pool!(CLOSE_REPLIES, Result<(), i32>);
+define_reply_pool!(LOOKUP_REPLIES, Result<(u32, u8, u64), i32>);
+define_reply_pool!(STAT_REPLIES, Result<(u64, u8), i32>);
+define_reply_pool!(READPAGE_REPLIES, Result<usize, i32>);
 
 static OPEN_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READ_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static CLOSE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static LOOKUP_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static STAT_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static READPAGE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 
 fn alloc_open_reply() -> &'static ReplyInner<Result<FsFileHandle, i32>> {
     let idx = OPEN_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
@@ -141,6 +167,33 @@ fn alloc_read_reply() -> &'static ReplyInner<Result<usize, i32>> {
 fn alloc_close_reply() -> &'static ReplyInner<Result<(), i32>> {
     let idx = CLOSE_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
     let r = &CLOSE_REPLIES[idx];
+    r.done.store(false, Ordering::Relaxed);
+    *r.waker.lock() = None;
+    *r.value.lock() = None;
+    r
+}
+
+fn alloc_lookup_reply() -> &'static ReplyInner<Result<(u32, u8, u64), i32>> {
+    let idx = LOOKUP_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
+    let r = &LOOKUP_REPLIES[idx];
+    r.done.store(false, Ordering::Relaxed);
+    *r.waker.lock() = None;
+    *r.value.lock() = None;
+    r
+}
+
+fn alloc_stat_reply() -> &'static ReplyInner<Result<(u64, u8), i32>> {
+    let idx = STAT_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
+    let r = &STAT_REPLIES[idx];
+    r.done.store(false, Ordering::Relaxed);
+    *r.waker.lock() = None;
+    *r.value.lock() = None;
+    r
+}
+
+fn alloc_readpage_reply() -> &'static ReplyInner<Result<usize, i32>> {
+    let idx = READPAGE_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
+    let r = &READPAGE_REPLIES[idx];
     r.done.store(false, Ordering::Relaxed);
     *r.waker.lock() = None;
     *r.value.lock() = None;
@@ -259,6 +312,42 @@ async fn delegate_task() {
                 }
                 reply.complete(Ok(()));
             }
+            FsRequest::Lookup { parent_ino, name, name_len, reply } => {
+                let name_str = core::str::from_utf8(&name[..name_len]).unwrap_or("");
+                match fs.lookup_in_dir(parent_ino, name_str) {
+                    Ok((child_ino, file_type, file_size)) => {
+                        reply.complete(Ok((child_ino, file_type, file_size)));
+                    }
+                    Err(_) => reply.complete(Err(-2)), // ENOENT
+                }
+            }
+            FsRequest::Stat { ino, reply } => {
+                match fs.read_inode(ino) {
+                    Ok(inode) => {
+                        let ftype = if inode.is_dir() { 2u8 } else { 1u8 };
+                        reply.complete(Ok((inode.size(), ftype)));
+                    }
+                    Err(_) => reply.complete(Err(-2)), // ENOENT
+                }
+            }
+            FsRequest::ReadPage { ino, offset, reply } => {
+                // Allocate a frame for the page data
+                match crate::mm::allocator::frame_alloc_sync() {
+                    Some(pa) => {
+                        let buf = unsafe {
+                            core::slice::from_raw_parts_mut(pa.as_usize() as *mut u8, 4096)
+                        };
+                        // Zero the buffer first
+                        buf.fill(0);
+                        // Read file data at offset into the frame
+                        match fs.read_file_at(ino, offset, buf) {
+                            Ok(_) => reply.complete(Ok(pa.as_usize())),
+                            Err(_) => reply.complete(Err(-5)), // EIO
+                        }
+                    }
+                    None => reply.complete(Err(-12)), // ENOMEM
+                }
+            }
         }
 
         // Yield to let other tasks run
@@ -331,6 +420,49 @@ pub async fn fs_close(handle: FsFileHandle) -> Result<(), i32> {
 
     send_request(FsRequest::Close {
         handle,
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Look up a child entry in a directory. Returns (child_ino, file_type, file_size).
+pub async fn fs_lookup(parent_ino: u32, name: &str) -> Result<(u32, u8, u64), i32> {
+    let reply_inner = alloc_lookup_reply();
+    let mut name_buf = [0u8; 256];
+    let len = name.len().min(256);
+    name_buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+
+    send_request(FsRequest::Lookup {
+        parent_ino,
+        name: name_buf,
+        name_len: len,
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Stat an inode. Returns (size, file_type_u8).
+pub async fn fs_stat(ino: u32) -> Result<(u64, u8), i32> {
+    let reply_inner = alloc_stat_reply();
+
+    send_request(FsRequest::Stat {
+        ino,
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Read one page of file data at the given byte offset.
+/// Delegate allocates a frame, reads data into it, returns PhysAddr as usize.
+pub async fn fs_read_page(ino: u32, offset: u64) -> Result<usize, i32> {
+    let reply_inner = alloc_readpage_reply();
+
+    send_request(FsRequest::ReadPage {
+        ino,
+        offset,
         reply: ReplySlot::new(reply_inner),
     });
 

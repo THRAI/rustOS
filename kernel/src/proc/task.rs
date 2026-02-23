@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use spin::Mutex;
 
 use crate::mm::vm::vm_map::VmMap;
+use crate::fs::fd_table::FdTable;
 
 use super::pid::alloc_pid;
 
@@ -49,7 +50,7 @@ pub struct Task {
     /// Virtual address space.
     pub vm_map: Mutex<VmMap>,
     /// File descriptor table placeholder (expanded in VFS plan).
-    pub fd_table: Mutex<Vec<()>>,
+    pub fd_table: Mutex<FdTable>,
     /// Current state (Running / Zombie). Stored as AtomicU8 for lock-free access.
     state: AtomicU8,
     /// Exit status, set by sys_exit with Release ordering.
@@ -66,7 +67,7 @@ impl Task {
             parent,
             children: Mutex::new(Vec::new()),
             vm_map: Mutex::new(VmMap::new()),
-            fd_table: Mutex::new(Vec::new()),
+            fd_table: Mutex::new(FdTable::new()),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
             parent_waker: Mutex::new(None),
@@ -80,7 +81,7 @@ impl Task {
             parent: Weak::new(),
             children: Mutex::new(Vec::new()),
             vm_map: Mutex::new(VmMap::new()),
-            fd_table: Mutex::new(Vec::new()),
+            fd_table: Mutex::new(FdTable::new()),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
             parent_waker: Mutex::new(None),

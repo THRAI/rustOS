@@ -16,10 +16,10 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
         *child.vm_map.lock() = child_vm;
     }
 
-    // Copy fd table placeholder
+    // Fork fd table (Arc-shared OpenFile entries per POSIX)
     {
         let parent_fds = parent.fd_table.lock();
-        *child.fd_table.lock() = parent_fds.clone();
+        *child.fd_table.lock() = parent_fds.fork();
     }
 
     // Register child in parent's children list

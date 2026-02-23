@@ -278,4 +278,87 @@ impl Ext4Fs {
     pub fn block_size(&self) -> usize {
         self.block_size
     }
+
+    /// Look up a child entry in a directory by parent inode + name.
+    /// Returns (child_ino, file_type, file_size).
+    pub fn lookup_in_dir(&self, parent_ino: u32, name: &str) -> Result<(u32, u8, u64), &'static str> {
+        let dir_inode = self.read_inode(parent_ino)?;
+        if !dir_inode.is_dir() {
+            return Err("not a directory");
+        }
+        let name_bytes = name.as_bytes();
+        for i in 0..12 {
+            let blk = dir_inode.i_block[i];
+            if blk == 0 {
+                break;
+            }
+            let mut buf = [0u8; 1024];
+            (self.read_block)(blk as u64, &mut buf).map_err(|_| "failed to read dir block")?;
+
+            let mut off = 0usize;
+            while off < self.block_size && off < 1024 {
+                if off + 8 > 1024 {
+                    break;
+                }
+                let de: DirEntry = unsafe {
+                    core::ptr::read_unaligned(buf[off..].as_ptr() as *const DirEntry)
+                };
+                if de.rec_len == 0 {
+                    break;
+                }
+                if de.inode != 0 && de.name_len as usize == name_bytes.len() {
+                    let de_name = &buf[off + 8..off + 8 + de.name_len as usize];
+                    if de_name == name_bytes {
+                        let child_inode = self.read_inode(de.inode)?;
+                        return Ok((de.inode, de.file_type, child_inode.size()));
+                    }
+                }
+                off += de.rec_len as usize;
+            }
+        }
+        Err("file not found")
+    }
+
+    /// Read file data at a byte offset into buf. Returns bytes read.
+    /// Used by the page cache to read individual pages.
+    pub fn read_file_at(&self, ino: u32, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let inode = self.read_inode(ino)?;
+        if !inode.is_file() {
+            return Err("not a regular file");
+        }
+
+        let file_size = inode.size();
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let to_read = buf.len().min((file_size - offset) as usize);
+        let mut total = 0usize;
+
+        // Calculate starting block index and offset within block
+        let start_block_idx = (offset / self.block_size as u64) as usize;
+        let offset_in_block = (offset % self.block_size as u64) as usize;
+
+        // Read direct blocks (i_block[0..11]) starting from the right position
+        for i in start_block_idx..12 {
+            if total >= to_read {
+                break;
+            }
+            let blk = inode.i_block[i];
+            if blk == 0 {
+                break;
+            }
+            let mut block_buf = [0u8; 1024];
+            (self.read_block)(blk as u64, &mut block_buf)
+                .map_err(|_| "failed to read file block")?;
+
+            let skip = if i == start_block_idx { offset_in_block } else { 0 };
+            let avail = self.block_size - skip;
+            let chunk = (to_read - total).min(avail);
+            buf[total..total + chunk].copy_from_slice(&block_buf[skip..skip + chunk]);
+            total += chunk;
+        }
+
+        Ok(total)
+    }
 }

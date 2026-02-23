@@ -6,6 +6,7 @@ extern crate alloc;
 use core::arch::global_asm;
 
 mod alloc_early;
+mod drivers;
 mod executor;
 mod hal;
 mod mm;
@@ -63,11 +64,17 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             mm::allocator::init_frame_allocator(mem_start, mem_end);
         }
 
+        // Initialize VirtIO-blk driver (probes MMIO addresses for block device)
+        drivers::virtio_blk::init();
+
         // Integration test: exception fixup (copy_user_chunk with bad pointers)
         test_fixup();
 
         // Integration test: uiomove short-read with partially-valid user range
         test_uiomove_short_read();
+
+        // Integration test: fork + exit + wait4 lifecycle
+        test_fork_exit_wait4();
 
         // Spawn a test kernel task to prove the executor path works
         executor::spawn_kernel_task(async {
@@ -234,6 +241,80 @@ fn test_uiomove_short_read() {
 }
 
 /// Integration test: copy_user_chunk with bad pointers returns EFAULT via fixup.
+/// Integration test: fork creates COW child, child exits, parent wait4 collects status.
+fn test_fork_exit_wait4() {
+    use alloc::sync::Arc;
+    use proc::task::Task;
+    use proc::fork::fork;
+    use proc::exit_wait::{sys_exit, WaitChildFuture};
+    use proc::syscall_result::SyscallResult;
+
+    // Create init task (pid 1)
+    let init = Task::new_init();
+    let init_pid = init.pid;
+
+    // Fork to create child
+    let child = fork(&init);
+    let child_pid = child.pid;
+
+    // Verify child has different pid
+    assert_ne!(init_pid, child_pid, "child must have different pid");
+
+    // Verify child's parent is init
+    assert_eq!(child.ppid(), init_pid, "child ppid must be parent pid");
+
+    // Verify child is in parent's children list
+    assert_eq!(init.children.lock().len(), 1);
+
+    // Verify COW: child's VmMap was forked (it's a new VmMap instance)
+    // (VmMap::fork creates shadow objects for each VMA — with empty parent, child is also empty)
+
+    // Child exits with code 42
+    let result = sys_exit(&child, 42);
+    match result {
+        SyscallResult::Terminated => {},
+        _ => panic!("sys_exit must return Terminated"),
+    }
+
+    // Verify child is now ZOMBIE
+    assert_eq!(child.state(), proc::task::TaskState::Zombie);
+
+    // Verify exit status
+    assert_eq!(child.exit_status.load(core::sync::atomic::Ordering::Acquire), 42);
+
+    // Test WaitChildFuture synchronously via a manual poll
+    // Since child is already ZOMBIE, the first poll should return Ready
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use core::pin::Pin;
+    use core::future::Future;
+
+    // Create a no-op waker for manual polling
+    fn noop_raw_waker() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = core::task::Context::from_waker(&waker);
+
+    let mut wait_fut = WaitChildFuture::new(Arc::clone(&init));
+    let poll_result = Pin::new(&mut wait_fut).poll(&mut cx);
+
+    match poll_result {
+        core::task::Poll::Ready(Some((pid, status))) => {
+            assert_eq!(pid, child_pid, "wait4 must return child pid");
+            assert_eq!(status, 42, "wait4 must return exit code 42");
+        }
+        other => panic!("wait4 expected Ready(Some), got {:?}", other),
+    }
+
+    // Verify child was reaped from parent's children list
+    assert_eq!(init.children.lock().len(), 0, "zombie must be reaped");
+
+    kprintln!("fork-exit-wait4 PASS");
+}
+
 fn test_fixup() {
     use hal::rv64::copy_user::copy_user_chunk;
     let src_buf = [0xABu8; 16];

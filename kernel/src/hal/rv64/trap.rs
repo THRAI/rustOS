@@ -84,9 +84,11 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
     } else {
         match code {
             EXC_ECALL_U => {
-                // Stub: ecall from U-mode (Phase 3)
-                kprintln!("[trap] ecall from U-mode (stub), sepc={:#x}", frame.pc());
+                // Advance past ecall instruction before dispatch
                 frame.set_pc(frame.pc() + 4);
+                // Syscall dispatch: a7 = syscall number, a0-a5 = args
+                let syscall_num = frame.arg(7);
+                dispatch_syscall(frame, syscall_num);
             }
             EXC_LOAD_ACCESS_FAULT | EXC_STORE_ACCESS_FAULT |
             EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
@@ -123,4 +125,37 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
 /// Stub: external interrupt handler (expanded in later phases).
 fn handle_external_irq() {
     kprintln!("[trap] external IRQ (stub)");
+}
+
+// ---------------------------------------------------------------------------
+// Syscall dispatch (stub — expanded in plan 03-05)
+// ---------------------------------------------------------------------------
+
+// Linux-compatible syscall numbers for rv64
+const SYS_EXIT: usize = 93;
+const SYS_GETPID: usize = 172;
+const SYS_GETPPID: usize = 173;
+
+/// Dispatch ecall from U-mode. a7 = syscall number, a0-a5 = args.
+/// Stub: only getpid/getppid/exit wired. Full dispatch in plan 03-05.
+fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
+    match syscall_num {
+        SYS_GETPID => {
+            // Stub: return 0 until current task tracking is wired
+            frame.set_ret_val(0);
+        }
+        SYS_GETPPID => {
+            frame.set_ret_val(0);
+        }
+        SYS_EXIT => {
+            let _code = frame.arg(0) as i32;
+            // Stub: full exit path wired via SyscallResult in executor
+            kprintln!("[syscall] exit({})", _code);
+        }
+        _ => {
+            kprintln!("[syscall] unimplemented syscall {}", syscall_num);
+            // Return -ENOSYS (38)
+            frame.set_ret_val((-38isize) as usize);
+        }
+    }
 }

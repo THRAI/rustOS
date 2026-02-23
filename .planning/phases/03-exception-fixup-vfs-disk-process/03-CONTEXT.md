@@ -16,6 +16,7 @@ Safe user/kernel copy (fixup-gated), filesystem I/O through page cache + lwext4,
 ### Exception Fixup Mechanism
 - BSD-style `pcb_onfault` dynamic state machine: `tp -> PerCpu -> Task.pcb_onfault`
 - Hand-written assembly for `copy_user_chunk`, no fixup tables, no PC-range checks
+- `sstatus.SUM` bit control: set SUM=1 (bit 18) in prologue before user memory access, clear in both epilogue and landing pad — without SUM, S-mode cannot access U-mode pages
 - `copy_user_chunk` is page-aligned atomic: `Chunk_Size = min(N, 4096 - Δ)`, never crosses a page boundary
 - Assembly ABI: `extern "C" fn copy_user_chunk(dst, src, len) -> usize` — returns 0 on success, EFAULT on trap via landing pad
 - Landing pad clears `pcb_onfault`, sets `a0 = EFAULT`, executes `ret`

@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 3 of 7 (Exception Fixup + VFS + Disk + Process)
-Plan: 1 of 5 in current phase
+Plan: 3 of 5 in current phase
 Status: Executing
-Last activity: 2026-02-23 -- Plan 03-01 complete (HARD GATE 3a passed)
+Last activity: 2026-02-23 -- Plan 03-03 complete (process lifecycle)
 
-Progress: [██░░░░░░░░] 20% (Phase 3)
+Progress: [██████░░░░] 60% (Phase 3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 10
+- Total plans completed: 12
 - Average duration: 6min
-- Total execution time: 1.07 hours
+- Total execution time: 1.17 hours
 
 **By Phase:**
 
@@ -29,10 +29,10 @@ Progress: [██░░░░░░░░] 20% (Phase 3)
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
 | 2 | 5/5 | 24min | 5min |
-| 3 | 1/5 | 10min | 10min |
+| 3 | 3/5 | 26min | 9min |
 
 **Recent Trend:**
-- Last 5 plans: 4min, 8min, 8min, 10min
+- Last 5 plans: 4min, 8min, 10min, 10min, 6min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -76,6 +76,10 @@ Recent decisions affecting current work:
 - [03-01]: global_asm! with const offset_of!(PerCpu, pcb_onfault) — eliminates offset mismatch bugs
 - [03-01]: Trap handler covers access faults (5,7) + page faults (13,15) — QEMU raises access faults for unmapped addresses
 - [03-01]: Pluggable copy_fn in kernel-mm uio for host testability
+- [03-03]: Weak<Task> for child-to-parent link (no circular Arc)
+- [03-03]: AtomicU8 TaskState + AtomicI32 exit_status with Release/Acquire ordering
+- [03-03]: WaitChildFuture registers Waker BEFORE scanning children (no lost wakeup)
+- [03-03]: Linux-compatible syscall numbers for rv64 (SYS_EXIT=93, SYS_GETPID=172, SYS_GETPPID=173)
 
 ### Pending Todos
 
@@ -88,5 +92,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Plan 03-01 complete (HARD GATE 3a passed), ready for plan 03-02
+Stopped at: Plan 03-03 complete (process lifecycle), ready for plan 03-04
 Resume file: None

@@ -9,6 +9,7 @@ mod alloc_early;
 mod executor;
 mod hal;
 mod mm;
+mod proc;
 #[macro_use]
 mod console;
 mod trap;

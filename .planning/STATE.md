@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 2 of 7 (VM Core + PMAP)
-Plan: 3 of 5 in current phase
-Status: In Progress
-Last activity: 2026-02-23 -- Completed 02-03-PLAN.md
+Plan: 5 of 5 in current phase
+Status: Complete
+Last activity: 2026-02-23 -- Completed 02-05-PLAN.md (Phase 2 complete)
 
-Progress: [██████----] 60% (Phase 2)
+Progress: [██████████] 100% (Phase 2)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7
+- Total plans completed: 9
 - Average duration: 6min
-- Total execution time: 0.72 hours
+- Total execution time: 0.90 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
-| 2 | 3/5 | 16min | 5min |
+| 2 | 5/5 | 24min | 5min |
 
 **Recent Trend:**
-- Last 5 plans: 6min, 4min, 4min, 8min
+- Last 5 plans: 4min, 4min, 8min, 8min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -69,6 +69,9 @@ Recent decisions affecting current work:
 - [02-03]: PteFlags bit positions mirror Sv39 hardware for zero-cost conversion
 - [02-03]: Leaked FrameTracker for PT pages (freed on pmap teardown, not RAII per-page)
 - [02-03]: Walk returns raw *mut PteRaw pointer + level for max caller flexibility
+- [02-05]: std::sync::Mutex guard for ASID tests sharing mutable global state (parallel safety)
+- [02-05]: QEMU iterative drop reduced to 200-deep (host covers 500+/1000+, QEMU 15s timeout)
+- [02-05]: VM integration tests at 400ms delay to avoid satp-switch timing conflict
 
 ### Pending Todos
 
@@ -81,5 +84,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Completed 02-03-PLAN.md
+Stopped at: Completed Phase 2 (all 5 plans done)
 Resume file: None

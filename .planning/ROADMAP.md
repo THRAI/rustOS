@@ -13,7 +13,7 @@ Seven phases take this kernel from first UART output to running git/vim/gcc/rust
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Boot + Executor + HAL Foundation** - Kernel boots on rv64 QEMU with async executor, SMP, trap handling, and debug infrastructure (~3K LOC)
-- [ ] **Phase 2: VM Core + PMAP** - Virtual memory subsystem with page tables, ASID management, fault handling, and frame allocation (~6K LOC)
+- [x] **Phase 2: VM Core + PMAP** - Virtual memory subsystem with page tables, ASID management, fault handling, and frame allocation (~6K LOC)
 - [ ] **Phase 3: Exception Fixup + VFS + Disk + Process** - User/kernel copy safety, filesystem, block I/O, and fork/exec/wait (~10K LOC, hard gate on fixup tests at 3a)
 - [ ] **Phase 4: Pipes + Signals + Full Syscalls** - IPC pipes, signal delivery, and remaining syscall surface for test suite compatibility (~4K LOC)
 - [ ] **Phase 5: Page Reclamation + LA64 Port** - Page daemon, writeback daemon, shadow collapse, and full LoongArch64 HAL/PMAP port (~6K LOC)
@@ -53,11 +53,11 @@ Plans:
 **Plans**: 5 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — VmObject with shadow chains, iterative Drop, PageOwnership, VmMap/VmArea with monotonic IDs
-- [ ] 02-02-PLAN.md — Buddy frame allocator + per-CPU magazine + dual alloc API + memory poisoning
-- [ ] 02-03-PLAN.md — PMAP layer with shared const-generic page table walk + pmap_enter/remove/protect/extract
-- [ ] 02-04-PLAN.md — ASID allocator with generation rollover + TLB shootdown + sync_fault_handler
-- [ ] 02-05-PLAN.md — Host unit tests + QEMU integration tests (custom_test_frameworks)
+- [x] 02-01-PLAN.md — VmObject with shadow chains, iterative Drop, PageOwnership, VmMap/VmArea with monotonic IDs
+- [x] 02-02-PLAN.md — Buddy frame allocator + per-CPU magazine + dual alloc API + memory poisoning
+- [x] 02-03-PLAN.md — PMAP layer with shared const-generic page table walk + pmap_enter/remove/protect/extract
+- [x] 02-04-PLAN.md — ASID allocator with generation rollover + TLB shootdown + sync_fault_handler
+- [x] 02-05-PLAN.md — Host unit tests + QEMU integration tests (custom_test_frameworks)
 
 ### Phase 3: Exception Fixup + VFS + Disk + Process
 **Goal**: User/kernel copy is safe (fixup-gated), filesystem reads and writes work through page cache and lwext4, and fork/exec/wait lifecycle is complete -- the kernel can load and run ELF binaries from disk
@@ -152,7 +152,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Boot + Executor + HAL Foundation | 4/4 | Complete | 2026-02-23 |
-| 2. VM Core + PMAP | 0/5 | Not started | - |
+| 2. VM Core + PMAP | 5/5 | Complete | 2026-02-23 |
 | 3. Exception Fixup + VFS + Disk + Process | 0/4 | Not started | - |
 | 4. Pipes + Signals + Full Syscalls | 0/3 | Not started | - |
 | 5. Page Reclamation + LA64 Port | 0/3 | Not started | - |

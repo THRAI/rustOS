@@ -164,10 +164,8 @@ fn handle_anonymous_fault(
         obj.insert_page(offset, OwnedPage::new_anonymous(new_frame));
     }
 
-    // TODO: pmap_enter(fault_va_aligned, new_frame, vma.prot)
-    // The pmap_enter call will be wired when the pmap module is
-    // integrated into the kernel crate. For now, the page is resident
-    // in the VmObject and ready for mapping.
+    // INTEGRATION: wire pmap_enter when pmap_activate is called.
+    // pmap::pmap_enter(pmap, fault_va_aligned, new_frame, vma.prot, false)
 
     FaultResult::Resolved
 }
@@ -185,7 +183,8 @@ fn handle_cow_fault(
     let refcount = Arc::strong_count(&vma.object);
     if refcount == 1 {
         // Sole owner: just upgrade permissions, no copy needed.
-        // TODO: pmap_protect(fault_va_aligned, vma.prot) to add Write
+        // INTEGRATION: wire pmap_protect when pmap_activate is called.
+        // pmap::pmap_protect(pmap, fault_va_aligned, fault_va_aligned + PAGE_SIZE, vma.prot)
         return FaultResult::Resolved;
     }
 
@@ -204,8 +203,8 @@ fn handle_cow_fault(
         obj.insert_page(offset, OwnedPage::new_anonymous(new_frame));
     }
 
-    // TODO: pmap_enter(fault_va_aligned, new_frame, vma.prot | Write)
-    // Will be wired when pmap is integrated into the kernel crate.
+    // INTEGRATION: wire pmap_enter when pmap_activate is called.
+    // pmap::pmap_enter(pmap, fault_va_aligned, new_frame, vma.prot | MapPerm::W, false)
 
     FaultResult::Resolved
 }

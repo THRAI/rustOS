@@ -1,0 +1,128 @@
+//! QEMU integration tests for the pmap layer.
+//!
+//! Tier 2.a: Offline PT walk — create/enter/extract/remove without satp switch.
+//! Tier 2.b: satp switch — identity-map kernel, map high VA, activate, read/write.
+
+use hal_common::{VirtAddr, PAGE_SIZE};
+
+use super::{
+    pmap_create, pmap_destroy, pmap_enter, pmap_enter_range, pmap_extract, pmap_remove,
+    pmap_activate,
+};
+use super::super::vm::vm_map::MapPerm;
+use super::super::allocator::frame_alloc_sync;
+
+/// Tier 2.a: Verify pmap walk logic with real allocated frames.
+/// No satp switch — purely tests the radix tree construction.
+pub fn test_pmap_extract_only() {
+    // 1. Create a fresh pmap (allocates root PT page)
+    let mut pmap = pmap_create();
+
+    // 2. Allocate a backing frame
+    let frame = frame_alloc_sync().expect("OOM in pmap extract test");
+
+    // 3. Enter mapping: VA 0x1_0000_0000 → frame, R|W
+    let va = VirtAddr::new(0x1_0000_0000);
+    pmap_enter(&mut pmap, va, frame, MapPerm::R | MapPerm::W, false)
+        .expect("pmap_enter failed");
+
+    // 4. Extract and verify
+    let extracted = pmap_extract(&pmap, va).expect("pmap_extract returned None");
+    assert_eq!(extracted.as_usize(), frame.as_usize());
+
+    // 5. Second mapping at different VA
+    let va2 = VirtAddr::new(0x1_0000_1000);
+    let frame2 = frame_alloc_sync().expect("OOM");
+    pmap_enter(&mut pmap, va2, frame2, MapPerm::R | MapPerm::X, false).unwrap();
+    assert_eq!(pmap_extract(&pmap, va2).unwrap().as_usize(), frame2.as_usize());
+
+    // 6. Unmapped VA returns None
+    assert!(pmap_extract(&pmap, VirtAddr::new(0x1_0000_2000)).is_none());
+
+    // 7. Remove and verify
+    pmap_remove(&mut pmap, va, VirtAddr::new(va.as_usize() + PAGE_SIZE));
+    assert!(pmap_extract(&pmap, va).is_none());
+
+    // 8. Second mapping still intact
+    assert_eq!(pmap_extract(&pmap, va2).unwrap().as_usize(), frame2.as_usize());
+
+    pmap_destroy(&mut pmap);
+    crate::kprintln!("pmap extract-only PASS");
+}
+
+/// Tier 2.b: Activate pmap with identity-mapped kernel, write through a high VA.
+///
+/// The entire satp-active window is IRQ-locked to prevent preemption.
+pub fn test_pmap_satp_switch() {
+    let mut pmap = pmap_create();
+
+    // 1. Identity-map kernel regions
+    extern "C" {
+        static stext: u8;
+        static etext: u8;
+        static srodata: u8;
+        static erodata: u8;
+        static sdata: u8;
+        static ekernel: u8;
+    }
+    unsafe {
+        let text_s = &stext as *const u8 as usize;
+        let text_e = &etext as *const u8 as usize;
+        let ro_s = &srodata as *const u8 as usize;
+        let ro_e = &erodata as *const u8 as usize;
+        let data_s = &sdata as *const u8 as usize;
+        let _kern_e = &ekernel as *const u8 as usize;
+
+        // .text: R|X
+        pmap_enter_range(&mut pmap, text_s, text_e, MapPerm::R | MapPerm::X);
+        // .rodata: R
+        pmap_enter_range(&mut pmap, ro_s, ro_e, MapPerm::R);
+        // .data + .bss + stacks + allocatable frames: R|W
+        pmap_enter_range(&mut pmap, data_s, 0x8800_0000, MapPerm::R | MapPerm::W);
+        // UART MMIO
+        pmap_enter_range(&mut pmap, 0x1000_0000, 0x1000_1000, MapPerm::R | MapPerm::W);
+        // CLINT MMIO (timer handler)
+        pmap_enter_range(&mut pmap, 0x0200_0000, 0x0201_0000, MapPerm::R | MapPerm::W);
+    }
+
+    // 2. Map a high VA to a fresh frame
+    let test_frame = frame_alloc_sync().expect("OOM in satp test");
+    let test_va = VirtAddr::new(0xDEAD_0000);
+    pmap_enter(&mut pmap, test_va, test_frame, MapPerm::R | MapPerm::W, false).unwrap();
+
+    // === BEGIN IRQ-LOCKED WINDOW ===
+    let saved = hal_common::irq_lock::arch_irq::disable_and_save();
+
+    // 3. Activate pmap (writes satp, sfence.vma)
+    pmap_activate(&mut pmap);
+
+    // 4. Write through the new virtual mapping
+    unsafe {
+        let ptr = test_va.as_usize() as *mut u64;
+        ptr.write_volatile(0xCAFE_BABE);
+        let readback = ptr.read_volatile();
+        assert_eq!(readback, 0xCAFE_BABE);
+    }
+
+    // 5. Verify write landed at the physical frame (identity-mapped)
+    unsafe {
+        let phys_ptr = test_frame.as_usize() as *const u64;
+        assert_eq!(phys_ptr.read_volatile(), 0xCAFE_BABE);
+    }
+
+    // 6. Deactivate: return to bare mode (satp=0)
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, zero",
+            "sfence.vma zero, zero",
+        );
+    }
+
+    // === END IRQ-LOCKED WINDOW ===
+    hal_common::irq_lock::arch_irq::restore(saved);
+
+    // 7. Cleanup
+    pmap_destroy(&mut pmap);
+
+    crate::kprintln!("pmap satp-switch PASS");
+}

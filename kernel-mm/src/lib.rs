@@ -4,3 +4,6 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod vm;
+
+#[cfg(test)]
+mod pmap_tests;

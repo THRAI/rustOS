@@ -16,11 +16,16 @@ pub fn send_ipi(target_cpu: usize) {
 
 /// Handle S-mode software interrupt (IPI received).
 /// Called from trap dispatch on scause interrupt code 1.
-/// Clears sip.SSIP. The IPI's purpose is to break wfi --
-/// the executor loop handles the actual work.
+/// Clears sip.SSIP, then checks for pending TLB shootdown requests.
 pub fn handle_ipi() {
     // Clear S-mode software interrupt pending bit (SSIP = bit 1)
     unsafe {
         core::arch::asm!("csrc sip, {}", in(reg) 1usize << 1);
+    }
+
+    // Check for pending TLB shootdown on this CPU.
+    let cpu_id = crate::executor::per_cpu::current().cpu_id;
+    if crate::mm::pmap::shootdown::has_pending(cpu_id) {
+        crate::mm::pmap::shootdown::handle_shootdown_ipi(cpu_id);
     }
 }

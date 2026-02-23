@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Arch-specific IRQ control.
 /// On host targets (x86_64, aarch64), these are no-ops for testability.
 #[cfg(not(target_arch = "riscv64"))]
-mod arch_irq {
+pub mod arch_irq {
     pub fn disable_and_save() -> usize {
         0
     }
@@ -18,7 +18,7 @@ mod arch_irq {
 }
 
 #[cfg(target_arch = "riscv64")]
-mod arch_irq {
+pub mod arch_irq {
     /// Read sstatus, clear SIE bit, return old sstatus value.
     pub fn disable_and_save() -> usize {
         let saved: usize;

@@ -52,6 +52,16 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         unsafe { executor::per_cpu::set_tp(cpu0) };
         kprintln!("[kernel] per-cpu data initialized for {} harts", num_cpus);
 
+        // Initialize frame allocator with physical memory after kernel image
+        {
+            extern "C" { static ekernel: u8; }
+            let mem_start = hal_common::PhysAddr::new(
+                unsafe { &ekernel as *const u8 as usize }
+            );
+            let mem_end = hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
+            mm::allocator::init_frame_allocator(mem_start, mem_end);
+        }
+
         // Spawn a test kernel task to prove the executor path works
         executor::spawn_kernel_task(async {
             kprintln!("hello from async future!");
@@ -84,6 +94,17 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 }, 1).detach();
             }, 0).detach();
         }
+
+        // Tier 2.a: offline PT walk (no satp switch)
+        executor::spawn_kernel_task(async {
+            mm::pmap::test_integration::test_pmap_extract_only();
+        }, 0).detach();
+
+        // Tier 2.b: satp switch (delay to let 2.a finish first)
+        executor::spawn_kernel_task(async {
+            executor::sleep(200).await;
+            mm::pmap::test_integration::test_pmap_satp_switch();
+        }, 0).detach();
 
         // Register clobber test: verify trap save/restore
         register_clobber_test();

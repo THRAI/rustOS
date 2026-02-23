@@ -154,7 +154,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 |-------|----------------|--------|-----------|
 | 1. Boot + Executor + HAL Foundation | 4/4 | Complete | 2026-02-23 |
 | 2. VM Core + PMAP | 5/5 | Complete | 2026-02-23 |
-| 3. Exception Fixup + VFS + Disk + Process | 4/5 | In progress | - |d | - |
+| 3. Exception Fixup + VFS + Disk + Process | 4/5 | Complete    | 2026-02-23 |d | - |
 | 4. Pipes + Signals + Full Syscalls | 0/3 | Not started | - |
 | 5. Page Reclamation + LA64 Port | 0/3 | Not started | - |
 | 6. Network + Sockets | 0/3 | Not started | - |

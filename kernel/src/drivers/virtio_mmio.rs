@@ -12,9 +12,14 @@ pub const DEVICE_FEATURES: usize = 0x010;
 pub const DEVICE_FEATURES_SEL: usize = 0x014;
 pub const DRIVER_FEATURES: usize = 0x020;
 pub const DRIVER_FEATURES_SEL: usize = 0x024;
+pub const GUEST_PAGE_SIZE: usize = 0x028;
 pub const QUEUE_SEL: usize = 0x030;
 pub const QUEUE_NUM_MAX: usize = 0x034;
 pub const QUEUE_NUM: usize = 0x038;
+/// MMIO v1 (legacy) registers
+pub const QUEUE_ALIGN: usize = 0x03C;
+pub const QUEUE_PFN: usize = 0x040;
+/// MMIO v2 (modern) registers
 pub const QUEUE_READY: usize = 0x044;
 pub const QUEUE_NOTIFY: usize = 0x050;
 pub const INTERRUPT_STATUS: usize = 0x060;

@@ -10,6 +10,11 @@ use crate::mm::allocator::frame_alloc_sync;
 use core::sync::atomic::{fence, Ordering};
 use hal_common::PAGE_SIZE;
 
+/// Align `val` up to `align` (must be power of 2).
+const fn align_up(val: usize, align: usize) -> usize {
+    (val + align - 1) & !(align - 1)
+}
+
 /// Sector size in bytes.
 const SECTOR_SIZE: usize = 512;
 
@@ -147,7 +152,10 @@ impl VirtioBlk {
             return None;
         }
 
-        // 5. Configure virtqueue 0
+        // MMIO v1: set guest page size (required before queue setup)
+        mmio.write(GUEST_PAGE_SIZE, PAGE_SIZE as u32);
+
+        // 5. Configure virtqueue 0 (MMIO v1 legacy layout)
         mmio.write(QUEUE_SEL, 0);
         let max_size = mmio.read(QUEUE_NUM_MAX) as u16;
         if max_size == 0 {
@@ -157,40 +165,44 @@ impl VirtioBlk {
         let queue_size = max_size.min(QUEUE_SIZE_MAX);
         mmio.write(QUEUE_NUM, queue_size as u32);
 
-        // Allocate descriptor table, available ring, used ring
-        // Desc table: 16 bytes * queue_size
-        // Avail ring: 4 + 2*queue_size + 2 (pad)
-        // Used ring: 4 + 8*queue_size + 2 (pad)
-        // We allocate pages for each.
-        let desc_frame = frame_alloc_sync().expect("virtio-blk: desc alloc");
-        let avail_frame = frame_alloc_sync().expect("virtio-blk: avail alloc");
-        let used_frame = frame_alloc_sync().expect("virtio-blk: used alloc");
+        // MMIO v1: virtqueue is a single contiguous region.
+        // Layout:
+        //   desc table:  16 * queue_size bytes at offset 0
+        //   avail ring:  2 + 2 + 2*queue_size + 2 bytes (flags, idx, ring[], used_event)
+        //   [padding to QUEUE_ALIGN boundary]
+        //   used ring:   2 + 2 + 8*queue_size + 2 bytes (flags, idx, ring[], avail_event)
+        let qs = queue_size as usize;
+        let desc_size = 16 * qs;
+        let avail_size = 6 + 2 * qs; // flags(2) + idx(2) + ring(2*qs) + used_event(2)
+        let queue_align = PAGE_SIZE; // QEMU default alignment
+        let used_offset = align_up(desc_size + avail_size, queue_align);
+        let used_size = 6 + 8 * qs;
+        let total_size = used_offset + used_size;
 
-        let desc_pa = desc_frame.as_usize();
-        let avail_pa = avail_frame.as_usize();
-        let used_pa = used_frame.as_usize();
+        // Allocate enough contiguous pages (buddy order)
+        let num_pages = align_up(total_size, PAGE_SIZE) / PAGE_SIZE;
+        let order = num_pages.next_power_of_two().trailing_zeros() as usize;
+        let base_frame = crate::mm::allocator::frame_alloc_contiguous(order)
+            .expect("virtio-blk: queue alloc");
+        let base_pa = base_frame.as_usize();
 
-        // Zero the pages
+        // Zero the entire region
         unsafe {
-            core::ptr::write_bytes(desc_pa as *mut u8, 0, PAGE_SIZE);
-            core::ptr::write_bytes(avail_pa as *mut u8, 0, PAGE_SIZE);
-            core::ptr::write_bytes(used_pa as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(base_pa as *mut u8, 0, (1 << order) * PAGE_SIZE);
         }
 
-        // Write queue addresses to device
-        mmio.write(QUEUE_DESC_LOW, desc_pa as u32);
-        mmio.write(QUEUE_DESC_HIGH, (desc_pa >> 32) as u32);
-        mmio.write(QUEUE_DRIVER_LOW, avail_pa as u32);
-        mmio.write(QUEUE_DRIVER_HIGH, (avail_pa >> 32) as u32);
-        mmio.write(QUEUE_DEVICE_LOW, used_pa as u32);
-        mmio.write(QUEUE_DEVICE_HIGH, (used_pa >> 32) as u32);
+        let desc_pa = base_pa;
+        let avail_pa = base_pa + desc_size;
+        let used_pa = base_pa + used_offset;
 
-        mmio.write(QUEUE_READY, 1);
+        // Tell device: QUEUE_ALIGN and QUEUE_PFN
+        mmio.write(QUEUE_ALIGN, queue_align as u32);
+        mmio.write(QUEUE_PFN, (base_pa / PAGE_SIZE) as u32);
 
         // 6. Driver OK
         mmio.write(STATUS, status | STATUS_DRIVER_OK);
 
-        // Read capacity from device config (offset 0x100 for MMIO v2)
+        // Read capacity from device config (offset 0x100 for MMIO v1)
         let cap_lo = mmio.read(0x100) as u64;
         let cap_hi = mmio.read(0x104) as u64;
         let capacity = cap_lo | (cap_hi << 32);
@@ -309,30 +321,29 @@ impl VirtioBlk {
         // Notify device
         self.mmio.write(QUEUE_NOTIFY, 0);
 
-        // Adaptive polling: spin then WFI
+        // Poll for completion. Enable SIE briefly so timer IRQs cause vCPU exits,
+        // allowing QEMU to process the MMIO notification on the device model thread.
         let used = self.used_pa as *mut VringUsed;
-        let target_idx = self.last_used_idx.wrapping_add(1);
 
-        for _ in 0..SPIN_ITERS {
-            fence(Ordering::SeqCst);
-            let cur = unsafe { core::ptr::read_volatile(&(*used).idx) };
-            if cur != self.last_used_idx {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        // WFI fallback
         loop {
             fence(Ordering::SeqCst);
             let cur = unsafe { core::ptr::read_volatile(&(*used).idx) };
             if cur != self.last_used_idx {
                 break;
             }
-            unsafe { core::arch::asm!("wfi"); }
+            // Brief SIE window: lets pending IRQs fire, which causes a vCPU exit
+            // and gives QEMU's device model a chance to process the virtqueue.
+            unsafe {
+                core::arch::asm!(
+                    "csrsi sstatus, 0x2",
+                    "nop",
+                    "csrci sstatus, 0x2",
+                );
+            }
+            core::hint::spin_loop();
         }
 
-        self.last_used_idx = target_idx;
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
         self.next_desc = (d2 + 1) % self.queue_size;
 
         // Check status

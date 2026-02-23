@@ -8,6 +8,7 @@ use core::arch::global_asm;
 mod alloc_early;
 mod drivers;
 mod executor;
+mod fs;
 mod hal;
 mod mm;
 mod proc;
@@ -66,6 +67,16 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Initialize VirtIO-blk driver (probes MMIO addresses for block device)
         drivers::virtio_blk::init();
+
+        // Initialize filesystem delegate (mounts ext4, spawns delegate task)
+        fs::delegate::init();
+
+        // Integration test: read /hello.txt from ext4 via delegate
+        executor::spawn_kernel_task(async {
+            // Small delay to let delegate mount
+            executor::sleep(200).await;
+            test_delegate_read().await;
+        }, 0).detach();
 
         // Integration test: exception fixup (copy_user_chunk with bad pointers)
         test_fixup();
@@ -313,6 +324,27 @@ fn test_fork_exit_wait4() {
     assert_eq!(init.children.lock().len(), 0, "zombie must be reaped");
 
     kprintln!("fork-exit-wait4 PASS");
+}
+
+async fn test_delegate_read() {
+    match fs::delegate::fs_open("/hello.txt").await {
+        Ok(handle) => {
+            let mut buf = [0u8; 64];
+            match fs::delegate::fs_read(handle, &mut buf).await {
+                Ok(n) => {
+                    let content = core::str::from_utf8(&buf[..n]).unwrap_or("<invalid utf8>");
+                    if content == "hello from ext4" {
+                        kprintln!("delegate read PASS");
+                    } else {
+                        kprintln!("delegate read FAIL (content={:?})", content);
+                    }
+                }
+                Err(e) => kprintln!("delegate read FAIL (read err={})", e),
+            }
+            let _ = fs::delegate::fs_close(handle).await;
+        }
+        Err(e) => kprintln!("delegate read FAIL (open err={})", e),
+    }
 }
 
 fn test_fixup() {

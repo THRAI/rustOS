@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 3 of 7 (Exception Fixup + VFS + Disk + Process)
-Plan: 4 of 5 in current phase
-Status: Executing
-Last activity: 2026-02-23 -- Plan 03-02 complete (VirtIO-blk + ext4 + delegate)
+Plan: 5 of 5 in current phase
+Status: Ready
+Last activity: 2026-02-23 -- Plan 03-04 complete (VFS layer: vnode, page cache, fd table, syscalls, fault_in_page)
 
-Progress: [████████░░] 80% (Phase 3)
+Progress: [█████████░] 90% (Phase 3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 13
-- Average duration: 6min
-- Total execution time: 1.30 hours
+- Total plans completed: 14
+- Average duration: 7min
+- Total execution time: 1.47 hours
 
 **By Phase:**
 
@@ -29,10 +29,10 @@ Progress: [████████░░] 80% (Phase 3)
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
 | 2 | 5/5 | 24min | 5min |
-| 3 | 4/5 | 34min | 9min |
+| 3 | 4/5 | 44min | 11min |
 
 **Recent Trend:**
-- Last 5 plans: 8min, 10min, 10min, 6min, 8min
+- Last 5 plans: 10min, 10min, 6min, 8min, 10min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -86,6 +86,12 @@ Recent decisions affecting current work:
 - [03-02]: ReplySlot with AtomicBool + IrqSafeSpinLock for oneshot wakeup — no alloc per request
 - [03-02]: Python ext4 image builder for macOS compatibility (no mkfs.ext4 needed)
 
+- [03-04]: BTreeMap dentry cache (no eviction, sufficient for competition workloads)
+- [03-04]: 3-state page cache (Absent -> Fetching -> Cached) with lock-based CAS transitions
+- [03-04]: FdTable uses BTreeMap<u32, Arc<OpenFile>> with next_fd starting at 3
+- [03-04]: Boundary page anonymization: fresh frame + memcpy + zero tail, never mutate page cache frames
+- [03-04]: Delegate extended with Lookup/Stat/ReadPage for VFS path walk and page cache
+
 ### Pending Todos
 
 None yet.
@@ -97,5 +103,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Plan 03-02 complete (VirtIO-blk + ext4 + delegate), ready for plan 03-04
+Stopped at: Plan 03-04 complete (VFS layer), ready for plan 03-05 (ELF loading + exec)
 Resume file: None

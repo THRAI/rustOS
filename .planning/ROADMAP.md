@@ -75,7 +75,7 @@ Plans:
 - [x] 03-01-PLAN.md — Exception fixup: pcb_onfault + copy_user_chunk asm + uiomove + trap integration (HARD GATE 3a)
 - [x] 03-02-PLAN.md — VirtIO-blk driver + lwext4 FFI + delegate thread
 - [x] 03-03-PLAN.md — Process lifecycle: Task struct, fork COW, exit/wait4, SyscallResult, PersistentUserTaskFuture
-- [ ] 03-04-PLAN.md — VFS layer: Vnode trait, page cache, dentry cache, fd table, syscalls, file-backed faults
+- [x] 03-04-PLAN.md — VFS layer: Vnode trait, page cache, dentry cache, fd table, syscalls, file-backed faults
 - [ ] 03-05-PLAN.md — ELF loading + exec + syscall dispatch + testsuite integration
 
 ### Phase 4: Pipes + Signals + Full Syscalls

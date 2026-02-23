@@ -54,6 +54,7 @@ qemu-test-rv64: kernel-rv64
 
 test:
 	cargo test --lib -p hal-common --target $(HOST_TARGET)
+	cargo test --lib -p kernel-mm --target $(HOST_TARGET)
 
 test-all: test qemu-test-rv64
 

@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Boot + Executor + HAL Foundation** - Kernel boots on rv64 QEMU with async executor, SMP, trap handling, and debug infrastructure (~3K LOC)
 - [x] **Phase 2: VM Core + PMAP** - Virtual memory subsystem with page tables, ASID management, fault handling, and frame allocation (~6K LOC)
-- [ ] **Phase 3: Exception Fixup + VFS + Disk + Process** - User/kernel copy safety, filesystem, block I/O, and fork/exec/wait (~10K LOC, hard gate on fixup tests at 3a)
+- [x] **Phase 3: Exception Fixup + VFS + Disk + Process** - User/kernel copy safety, filesystem, block I/O, and fork/exec/wait (~10K LOC, hard gate on fixup tests at 3a)
 - [ ] **Phase 4: Pipes + Signals + Full Syscalls** - IPC pipes, signal delivery, and remaining syscall surface for test suite compatibility (~4K LOC)
 - [ ] **Phase 5: Page Reclamation + LA64 Port** - Page daemon, writeback daemon, shadow collapse, and full LoongArch64 HAL/PMAP port (~6K LOC)
 - [ ] **Phase 6: Network + Sockets** - VirtIO-net, smoltcp integration, TCP sockets, kqueue, and LTP test coverage (~8K LOC)
@@ -76,7 +76,7 @@ Plans:
 - [x] 03-02-PLAN.md — VirtIO-blk driver + lwext4 FFI + delegate thread
 - [x] 03-03-PLAN.md — Process lifecycle: Task struct, fork COW, exit/wait4, SyscallResult, PersistentUserTaskFuture
 - [x] 03-04-PLAN.md — VFS layer: Vnode trait, page cache, dentry cache, fd table, syscalls, file-backed faults
-- [ ] 03-05-PLAN.md — ELF loading + exec + syscall dispatch + testsuite integration
+- [x] 03-05-PLAN.md — ELF loading + exec + syscall dispatch + testsuite integration
 
 ### Phase 4: Pipes + Signals + Full Syscalls
 **Goal**: IPC pipes, POSIX signal delivery, and the remaining syscall surface are complete -- the kernel supports the full interface needed by libc-test and shell pipelines

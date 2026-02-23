@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-22)
 
 **Core value:** Boot on rv64 QEMU and run real applications without OOM panic or silent memory corruption under SMP
-**Current focus:** Phase 3: Exception Fixup + VFS + Disk + Process
+**Current focus:** Phase 4: Pipes + Signals + Full Syscalls
 
 ## Current Position
 
-Phase: 3 of 7 (Exception Fixup + VFS + Disk + Process)
-Plan: 5 of 5 in current phase
-Status: Ready
-Last activity: 2026-02-23 -- Plan 03-04 complete (VFS layer: vnode, page cache, fd table, syscalls, fault_in_page)
+Phase: 3 of 7 (Exception Fixup + VFS + Disk + Process) — COMPLETE
+Plan: 5 of 5 in current phase — DONE
+Status: Phase 3 complete, ready for Phase 4
+Last activity: 2026-02-23 -- Plan 03-05 complete (ELF loading + exec + syscall dispatch + fork-exec-wait4)
 
-Progress: [█████████░] 90% (Phase 3)
+Progress: [██████████] 100% (Phase 3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 14
+- Total plans completed: 15
 - Average duration: 7min
-- Total execution time: 1.47 hours
+- Total execution time: 1.58 hours
 
 **By Phase:**
 
@@ -29,10 +29,10 @@ Progress: [█████████░] 90% (Phase 3)
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
 | 2 | 5/5 | 24min | 5min |
-| 3 | 4/5 | 44min | 11min |
+| 3 | 5/5 | 51min | 10min |
 
 **Recent Trend:**
-- Last 5 plans: 10min, 10min, 6min, 8min, 10min
+- Last 5 plans: 10min, 6min, 8min, 10min, 7min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -92,6 +92,11 @@ Recent decisions affecting current work:
 - [03-04]: Boundary page anonymization: fresh frame + memcpy + zero tail, never mutate page cache frames
 - [03-04]: Delegate extended with Lookup/Stat/ReadPage for VFS path walk and page cache
 
+- [03-05]: Hand-rolled ELF64 parser over external crate — fewer dependencies, sufficient for static ELF loading
+- [03-05]: Demand-paged VMAs: zero physical frame allocation at exec time, fault handler resolves
+- [03-05]: Synchronous syscall dispatch for simple syscalls, async escalation for fork/exec/wait4/read/open
+- [03-05]: SYS_WRITE to fd 1/2 writes directly to UART (no VFS path for stdout/stderr)
+
 ### Pending Todos
 
 None yet.
@@ -103,5 +108,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Plan 03-04 complete (VFS layer), ready for plan 03-05 (ELF loading + exec)
+Stopped at: Phase 3 complete (all 5 plans done), ready for Phase 4 planning
 Resume file: None

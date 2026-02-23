@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 3 of 7 (Exception Fixup + VFS + Disk + Process)
-Plan: 0 of 5 in current phase
-Status: Planned
-Last activity: 2026-02-23 -- Phase 3 plans created (5 plans across 4 waves)
+Plan: 1 of 5 in current phase
+Status: Executing
+Last activity: 2026-02-23 -- Plan 03-01 complete (HARD GATE 3a passed)
 
-Progress: [░░░░░░░░░░] 0% (Phase 3)
+Progress: [██░░░░░░░░] 20% (Phase 3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 9
+- Total plans completed: 10
 - Average duration: 6min
-- Total execution time: 0.90 hours
+- Total execution time: 1.07 hours
 
 **By Phase:**
 
@@ -29,9 +29,10 @@ Progress: [░░░░░░░░░░] 0% (Phase 3)
 |-------|-------|-------|----------|
 | 1 | 4/4 | 27min | 7min |
 | 2 | 5/5 | 24min | 5min |
+| 3 | 1/5 | 10min | 10min |
 
 **Recent Trend:**
-- Last 5 plans: 4min, 4min, 8min, 8min
+- Last 5 plans: 4min, 8min, 8min, 10min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -72,6 +73,9 @@ Recent decisions affecting current work:
 - [02-05]: std::sync::Mutex guard for ASID tests sharing mutable global state (parallel safety)
 - [02-05]: QEMU iterative drop reduced to 200-deep (host covers 500+/1000+, QEMU 15s timeout)
 - [02-05]: VM integration tests at 400ms delay to avoid satp-switch timing conflict
+- [03-01]: global_asm! with const offset_of!(PerCpu, pcb_onfault) — eliminates offset mismatch bugs
+- [03-01]: Trap handler covers access faults (5,7) + page faults (13,15) — QEMU raises access faults for unmapped addresses
+- [03-01]: Pluggable copy_fn in kernel-mm uio for host testability
 
 ### Pending Todos
 
@@ -84,5 +88,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-23
-Stopped at: Phase 3 planning complete (5 plans created), ready for execution
+Stopped at: Plan 03-01 complete (HARD GATE 3a passed), ready for plan 03-02
 Resume file: None

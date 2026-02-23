@@ -69,13 +69,14 @@ Plans:
   3. fork() + exec() loads an ELF binary from disk and the child runs to exit with correct exit status collected by wait4
   4. The delegate thread runs lwext4 operations without blocking the async executor (verified by concurrent I/O test)
   5. testsuits-for-oskernel basic suite passes at least 80% (~26/33 tests) on rv64 QEMU
-**Plans**: TBD
+**Plans**: 5 plans
 
 Plans:
-- [ ] 03-01: TBD
-- [ ] 03-02: TBD
-- [ ] 03-03: TBD
-- [ ] 03-04: TBD
+- [ ] 03-01-PLAN.md — Exception fixup: pcb_onfault + copy_user_chunk asm + uiomove + trap integration (HARD GATE 3a)
+- [ ] 03-02-PLAN.md — VirtIO-blk driver + lwext4 FFI + delegate thread
+- [ ] 03-03-PLAN.md — Process lifecycle: Task struct, fork COW, exit/wait4, SyscallResult, PersistentUserTaskFuture
+- [ ] 03-04-PLAN.md — VFS layer: Vnode trait, page cache, dentry cache, fd table, syscalls, file-backed faults
+- [ ] 03-05-PLAN.md — ELF loading + exec + syscall dispatch + testsuite integration
 
 ### Phase 4: Pipes + Signals + Full Syscalls
 **Goal**: IPC pipes, POSIX signal delivery, and the remaining syscall surface are complete -- the kernel supports the full interface needed by libc-test and shell pipelines

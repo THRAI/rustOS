@@ -1,0 +1,9 @@
+[package]
+name = "kernel-mm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hal-common = { path = "../hal-common" }
+spin = "0.9"
+bitflags = { workspace = true }

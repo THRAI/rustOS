@@ -229,3 +229,135 @@ impl VmMap {
         self.areas.values()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::vm_object::VmObject;
+
+    fn make_vma(start: usize, end: usize) -> VmArea {
+        let obj = VmObject::new((end - start) as usize);
+        VmArea::new(
+            VirtAddr::new(start)..VirtAddr::new(end),
+            MapPerm::R | MapPerm::W,
+            obj,
+            0,
+            VmAreaType::Anonymous,
+        )
+    }
+
+    #[test]
+    fn insert_and_find() {
+        let mut map = VmMap::new();
+        let vma = make_vma(0x1000, 0x3000);
+        let id = vma.id;
+        assert!(map.insert(vma).is_ok());
+        let found = map.find_area(VirtAddr::new(0x1500)).unwrap();
+        assert_eq!(found.id, id);
+    }
+
+    #[test]
+    fn find_at_boundaries() {
+        let mut map = VmMap::new();
+        map.insert(make_vma(0x1000, 0x3000)).unwrap();
+        // Start of range
+        assert!(map.find_area(VirtAddr::new(0x1000)).is_some());
+        // Last byte in range
+        assert!(map.find_area(VirtAddr::new(0x2FFF)).is_some());
+        // Just past end (exclusive)
+        assert!(map.find_area(VirtAddr::new(0x3000)).is_none());
+        // Before start
+        assert!(map.find_area(VirtAddr::new(0x0FFF)).is_none());
+    }
+
+    #[test]
+    fn insert_overlap_rejected() {
+        let mut map = VmMap::new();
+        map.insert(make_vma(0x1000, 0x3000)).unwrap();
+        let result = map.insert(make_vma(0x2000, 0x4000));
+        assert_eq!(result, Err(VmError::Overlap));
+    }
+
+    #[test]
+    fn insert_adjacent_ok() {
+        let mut map = VmMap::new();
+        map.insert(make_vma(0x1000, 0x2000)).unwrap();
+        // Adjacent, not overlapping
+        assert!(map.insert(make_vma(0x2000, 0x3000)).is_ok());
+    }
+
+    #[test]
+    fn remove_existing() {
+        let mut map = VmMap::new();
+        map.insert(make_vma(0x1000, 0x3000)).unwrap();
+        assert!(map.remove(VirtAddr::new(0x1000)).is_some());
+        assert!(map.find_area(VirtAddr::new(0x1500)).is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent() {
+        let mut map = VmMap::new();
+        assert!(map.remove(VirtAddr::new(0x1000)).is_none());
+    }
+
+    #[test]
+    fn multiple_vmas() {
+        let mut map = VmMap::new();
+        map.insert(make_vma(0x1000, 0x2000)).unwrap();
+        map.insert(make_vma(0x3000, 0x4000)).unwrap();
+        map.insert(make_vma(0x5000, 0x6000)).unwrap();
+        assert!(map.find_area(VirtAddr::new(0x1500)).is_some());
+        assert!(map.find_area(VirtAddr::new(0x3500)).is_some());
+        assert!(map.find_area(VirtAddr::new(0x5500)).is_some());
+        assert!(map.find_area(VirtAddr::new(0x2500)).is_none()); // gap
+    }
+
+    #[test]
+    fn fork_creates_shadows() {
+        let mut parent_map = VmMap::new();
+        let obj = VmObject::new(4096);
+        {
+            let mut w = obj.write();
+            w.insert_page(0, super::super::vm_object::OwnedPage::new_anonymous(
+                hal_common::PhysAddr::new(0xA000),
+            ));
+        }
+        let vma = VmArea::new(
+            VirtAddr::new(0x1000)..VirtAddr::new(0x2000),
+            MapPerm::R | MapPerm::W,
+            obj,
+            0,
+            VmAreaType::Anonymous,
+        );
+        parent_map.insert(vma).unwrap();
+
+        let child_map = parent_map.fork();
+        // Child should have a VMA at the same address
+        let child_vma = child_map.find_area(VirtAddr::new(0x1000)).unwrap();
+        let parent_vma = parent_map.find_area(VirtAddr::new(0x1000)).unwrap();
+        // Child VMA should have a different ID (monotonic)
+        assert_ne!(child_vma.id, parent_vma.id);
+        // Child's object is a shadow (empty, but backed by parent's object)
+        let child_obj = child_vma.object.read();
+        assert_eq!(child_obj.resident_count(), 0);
+    }
+
+    #[test]
+    fn vma_ids_are_unique() {
+        let v1 = make_vma(0x1000, 0x2000);
+        let v2 = make_vma(0x3000, 0x4000);
+        let v3 = make_vma(0x5000, 0x6000);
+        assert_ne!(v1.id, v2.id);
+        assert_ne!(v2.id, v3.id);
+        assert_ne!(v1.id, v3.id);
+    }
+
+    #[test]
+    fn iter_all_vmas() {
+        let mut map = VmMap::new();
+        map.insert(make_vma(0x1000, 0x2000)).unwrap();
+        map.insert(make_vma(0x3000, 0x4000)).unwrap();
+        let count = map.iter().count();
+        assert_eq!(count, 2);
+    }
+}

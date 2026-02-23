@@ -96,3 +96,89 @@ impl Magazine {
         self.count >= MAGAZINE_CAPACITY
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_magazine_is_empty() {
+        let m = Magazine::new();
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+        assert!(!m.is_full());
+    }
+
+    #[test]
+    fn push_pop_single() {
+        let mut m = Magazine::new();
+        let addr = PhysAddr::new(0x1000);
+        assert!(m.push(addr).is_ok());
+        assert_eq!(m.len(), 1);
+        let popped = m.pop().unwrap();
+        assert_eq!(popped, addr);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn push_pop_lifo_order() {
+        let mut m = Magazine::new();
+        let a1 = PhysAddr::new(0x1000);
+        let a2 = PhysAddr::new(0x2000);
+        let a3 = PhysAddr::new(0x3000);
+        m.push(a1).unwrap();
+        m.push(a2).unwrap();
+        m.push(a3).unwrap();
+        assert_eq!(m.pop().unwrap(), a3);
+        assert_eq!(m.pop().unwrap(), a2);
+        assert_eq!(m.pop().unwrap(), a1);
+    }
+
+    #[test]
+    fn push_full_returns_err() {
+        let mut m = Magazine::new();
+        for i in 0..MAGAZINE_CAPACITY {
+            m.push(PhysAddr::new(i * 0x1000)).unwrap();
+        }
+        assert!(m.is_full());
+        let overflow = PhysAddr::new(0xFFFF_0000);
+        assert_eq!(m.push(overflow), Err(overflow));
+    }
+
+    #[test]
+    fn pop_empty_returns_none() {
+        let mut m = Magazine::new();
+        assert!(m.pop().is_none());
+    }
+
+    #[test]
+    fn refill_from_buddy() {
+        let mut buddy = BuddyAllocator::new();
+        buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+        let mut m = Magazine::new();
+        m.refill(&mut buddy, 8);
+        assert_eq!(m.len(), 8);
+    }
+
+    #[test]
+    fn drain_to_buddy() {
+        let mut buddy = BuddyAllocator::new();
+        buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+        let mut m = Magazine::new();
+        m.refill(&mut buddy, 8);
+        let before = buddy.available_pages();
+        m.drain(&mut buddy);
+        assert!(m.is_empty());
+        assert_eq!(buddy.available_pages(), before + 8);
+    }
+
+    #[test]
+    fn drain_half() {
+        let mut buddy = BuddyAllocator::new();
+        buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+        let mut m = Magazine::new();
+        m.refill(&mut buddy, 10);
+        m.drain_half(&mut buddy);
+        assert_eq!(m.len(), 5);
+    }
+}

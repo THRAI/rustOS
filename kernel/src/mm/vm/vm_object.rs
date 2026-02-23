@@ -192,3 +192,137 @@ impl Drop for VmObject {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_object_is_empty() {
+        let obj = VmObject::new(4096);
+        let r = obj.read();
+        assert_eq!(r.size(), 4096);
+        assert_eq!(r.resident_count(), 0);
+        assert!(r.lookup_page(0).is_none());
+    }
+
+    #[test]
+    fn insert_and_lookup_page() {
+        let obj = VmObject::new(8192);
+        {
+            let mut w = obj.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
+            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0x2000)));
+        }
+        let r = obj.read();
+        assert_eq!(r.resident_count(), 2);
+        assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x1000));
+        assert_eq!(r.lookup_page(1).unwrap(), PhysAddr::new(0x2000));
+        assert!(r.lookup_page(2).is_none());
+    }
+
+    #[test]
+    fn shadow_chain_creation() {
+        let parent = VmObject::new(4096);
+        {
+            let mut w = parent.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
+        }
+        let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
+        // Shadow walks backing chain, so parent's page is visible
+        {
+            let r = shadow.read();
+            assert_eq!(r.resident_count(), 0);
+            assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x1000));
+        }
+        // Parent page still accessible
+        {
+            let r = parent.read();
+            assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x1000));
+        }
+    }
+
+    #[test]
+    fn shadow_chain_lookup_iterative() {
+        let grandparent = VmObject::new(4096);
+        {
+            let mut w = grandparent.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xA000)));
+        }
+        let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
+        {
+            let mut w = parent.write();
+            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xB000)));
+        }
+        let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
+        {
+            let mut w = child.write();
+            w.insert_page(2, OwnedPage::new_anonymous(PhysAddr::new(0xC000)));
+        }
+        // Child has page 2, parent has page 1, grandparent has page 0
+        let r = child.read();
+        assert_eq!(r.lookup_page(2).unwrap(), PhysAddr::new(0xC000));
+        // lookup_page walks backing chain, so grandparent's page 0 is visible
+        assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0xA000));
+    }
+
+    #[test]
+    fn page_ownership_types() {
+        let anon = OwnedPage::new_anonymous(PhysAddr::new(0x1000));
+        assert_eq!(anon.ownership, PageOwnership::Anonymous);
+        let cached = OwnedPage::new_cached(PhysAddr::new(0x2000));
+        assert_eq!(cached.ownership, PageOwnership::Cached);
+    }
+
+    #[test]
+    fn iterative_drop_deep_chain_500() {
+        // Build a 500-deep shadow chain. If Drop were recursive, this
+        // would overflow the stack. Iterative Drop handles it.
+        let mut current = VmObject::new(4096);
+        for i in 0..500 {
+            let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
+            {
+                let mut w = shadow.write();
+                w.insert_page(i as u64, OwnedPage::new_anonymous(PhysAddr::new((i + 1) * 0x1000)));
+            }
+            current = shadow;
+        }
+        // Drop the entire chain — should not stack overflow
+        drop(current);
+    }
+
+    #[test]
+    fn iterative_drop_shared_stops_at_refcount() {
+        let parent = VmObject::new(4096);
+        let shadow1 = VmObject::new_shadow(Arc::clone(&parent), 4096);
+        let shadow2 = VmObject::new_shadow(Arc::clone(&parent), 4096);
+        // Drop shadow1 — parent still has refcount > 1 (shadow2 holds it)
+        drop(shadow1);
+        // Parent should still be alive
+        assert_eq!(Arc::strong_count(&parent), 2); // shadow2 + parent
+        drop(shadow2);
+        assert_eq!(Arc::strong_count(&parent), 1);
+    }
+
+    #[test]
+    fn insert_page_overwrites_existing() {
+        let obj = VmObject::new(4096);
+        {
+            let mut w = obj.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x2000)));
+        }
+        let r = obj.read();
+        assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x2000));
+    }
+
+    #[test]
+    fn iterative_drop_1000_deep() {
+        // Stress test: 1000-deep chain
+        let mut current = VmObject::new(4096);
+        for _ in 0..1000 {
+            current = VmObject::new_shadow(Arc::clone(&current), 4096);
+        }
+        drop(current);
+    }
+}

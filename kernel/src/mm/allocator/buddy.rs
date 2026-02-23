@@ -142,3 +142,98 @@ impl BuddyAllocator {
         self.total_pages
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_buddy(pages: usize) -> BuddyAllocator {
+        let mut b = BuddyAllocator::new();
+        let start = PhysAddr::new(0x8000_0000);
+        let end = PhysAddr::new(0x8000_0000 + pages * PAGE_SIZE);
+        b.init(start, end);
+        b
+    }
+
+    #[test]
+    fn alloc_single_page() {
+        let mut b = make_buddy(16);
+        let addr = b.alloc(0).expect("alloc order-0");
+        assert!(addr.is_page_aligned());
+        assert_eq!(b.available_pages(), 15);
+    }
+
+    #[test]
+    fn alloc_free_roundtrip() {
+        let mut b = make_buddy(16);
+        let addr = b.alloc(0).unwrap();
+        b.free(addr, 0);
+        assert_eq!(b.available_pages(), 16);
+    }
+
+    #[test]
+    fn coalesce_buddies() {
+        let mut b = make_buddy(16);
+        // Alloc two order-0 blocks that are buddies
+        let a1 = b.alloc(0).unwrap();
+        let a2 = b.alloc(0).unwrap();
+        assert_eq!(b.available_pages(), 14);
+        // Free both — they should coalesce
+        b.free(a1, 0);
+        b.free(a2, 0);
+        assert_eq!(b.available_pages(), 16);
+        // Should be able to alloc a larger block now
+        let big = b.alloc(4); // 16 pages
+        assert!(big.is_some());
+    }
+
+    #[test]
+    fn alloc_various_orders() {
+        let mut b = make_buddy(256);
+        let o0 = b.alloc(0).unwrap(); // 1 page
+        let o1 = b.alloc(1).unwrap(); // 2 pages
+        let o2 = b.alloc(2).unwrap(); // 4 pages
+        assert_eq!(b.available_pages(), 256 - 7);
+        b.free(o0, 0);
+        b.free(o1, 1);
+        b.free(o2, 2);
+        assert_eq!(b.available_pages(), 256);
+    }
+
+    #[test]
+    fn exhaust_and_oom() {
+        let mut b = make_buddy(4);
+        let _a = b.alloc(0).unwrap();
+        let _b2 = b.alloc(0).unwrap();
+        let _c = b.alloc(0).unwrap();
+        let _d = b.alloc(0).unwrap();
+        assert_eq!(b.available_pages(), 0);
+        assert!(b.alloc(0).is_none());
+    }
+
+    #[test]
+    fn split_large_block() {
+        let mut b = make_buddy(1024);
+        // Alloc order-0 should split from the largest block
+        let addr = b.alloc(0).unwrap();
+        assert!(addr.as_usize() >= 0x8000_0000);
+        assert_eq!(b.available_pages(), 1023);
+        b.free(addr, 0);
+        assert_eq!(b.available_pages(), 1024);
+    }
+
+    #[test]
+    fn total_pages_tracking() {
+        let b = make_buddy(128);
+        assert_eq!(b.total_pages(), 128);
+        assert_eq!(b.available_pages(), 128);
+    }
+
+    #[test]
+    fn alignment_preserved() {
+        let mut b = make_buddy(64);
+        // Order-3 = 8 pages, should be 8-page aligned
+        let addr = b.alloc(3).unwrap();
+        assert_eq!(addr.as_usize() % (8 * PAGE_SIZE), 0);
+    }
+}

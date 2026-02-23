@@ -6,8 +6,11 @@
 
 pub mod buddy;
 pub mod magazine;
+
+#[cfg(not(test))]
 pub mod frame_allocator;
 
+#[cfg(not(test))]
 pub use frame_allocator::{
     init_frame_allocator,
     frame_alloc,
@@ -19,5 +22,16 @@ pub use frame_allocator::{
     available_pages,
 };
 
+#[cfg(not(test))]
 #[cfg(debug_assertions)]
 pub use frame_allocator::STACK_CANARY;
+
+/// Test-only stub: frame_alloc_sync backed by a simple atomic counter.
+/// Returns fake PhysAddr values for unit testing fault handler logic.
+#[cfg(test)]
+pub fn frame_alloc_sync() -> Option<hal_common::PhysAddr> {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT_FRAME: AtomicUsize = AtomicUsize::new(0x8000_0000);
+    let addr = NEXT_FRAME.fetch_add(hal_common::PAGE_SIZE, Ordering::Relaxed);
+    Some(hal_common::PhysAddr::new(addr))
+}

@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "hal-common"]
+members = ["kernel", "hal-common", "kernel-mm"]
 resolver = "2"
 
 [workspace.dependencies]

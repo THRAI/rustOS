@@ -18,6 +18,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
 
 [[package]]
+name = "bitflags"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
+
+[[package]]
 name = "cc"
 version = "1.2.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -66,6 +72,16 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "async-task",
+ "bitflags",
+ "hal-common",
+ "spin",
+]
+
+[[package]]
+name = "kernel-mm"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
  "hal-common",
  "spin",
 ]

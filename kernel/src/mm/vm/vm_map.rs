@@ -15,6 +15,15 @@ use hal_common::VirtAddr;
 
 use super::vm_object::VmObject;
 
+#[cfg(not(test))]
+use crate::fs::vnode::Vnode;
+
+/// Placeholder trait for test builds where the fs module is not available.
+#[cfg(test)]
+pub trait Vnode: Send + Sync {
+    fn vnode_id(&self) -> u64;
+}
+
 // ---------------------------------------------------------------------------
 // Monotonic VMA ID
 // ---------------------------------------------------------------------------
@@ -88,6 +97,12 @@ pub struct VmArea {
     pub obj_offset: u64,
     /// Type of this VMA.
     pub vma_type: VmAreaType,
+    /// File-backed: vnode reference (None for anonymous).
+    pub vnode: Option<Arc<dyn Vnode>>,
+    /// File offset where this VMA's data starts.
+    pub file_offset: u64,
+    /// Number of bytes of file data in this VMA (rest is zero-fill).
+    pub file_size: u64,
 }
 
 impl VmArea {
@@ -106,6 +121,32 @@ impl VmArea {
             object,
             obj_offset,
             vma_type,
+            vnode: None,
+            file_offset: 0,
+            file_size: 0,
+        }
+    }
+
+    /// Create a file-backed VmArea for demand-paged ELF loading.
+    pub fn new_file_backed(
+        range: Range<VirtAddr>,
+        prot: MapPerm,
+        object: Arc<RwLock<VmObject>>,
+        obj_offset: u64,
+        vnode: Arc<dyn Vnode>,
+        file_offset: u64,
+        file_size: u64,
+    ) -> Self {
+        Self {
+            id: next_vma_id(),
+            range,
+            prot,
+            object,
+            obj_offset,
+            vma_type: VmAreaType::FileBacked,
+            vnode: Some(vnode),
+            file_offset,
+            file_size,
         }
     }
 
@@ -211,13 +252,17 @@ impl VmMap {
                 Arc::clone(&vma.object)
             };
 
-            let child_vma = VmArea::new(
-                vma.range.clone(),
-                vma.prot,
-                child_object,
-                vma.obj_offset,
-                vma.vma_type,
-            );
+            let child_vma = VmArea {
+                id: next_vma_id(),
+                range: vma.range.clone(),
+                prot: vma.prot,
+                object: child_object,
+                obj_offset: vma.obj_offset,
+                vma_type: vma.vma_type,
+                vnode: vma.vnode.clone(),
+                file_offset: vma.file_offset,
+                file_size: vma.file_size,
+            };
             // Safe: child is fresh, no overlaps possible.
             let _ = child.areas.insert(child_vma.range.start, child_vma);
         }

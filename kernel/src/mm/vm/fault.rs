@@ -245,6 +245,113 @@ fn copy_page(src: PhysAddr, dst: PhysAddr) {
 #[cfg(test)]
 fn copy_page(_src: PhysAddr, _dst: PhysAddr) {}
 
+// ---------------------------------------------------------------------------
+// Async file-backed fault handler
+// ---------------------------------------------------------------------------
+
+/// Async fault handler for file-backed pages.
+///
+/// Called when sync_fault_handler returns NeedsAsyncIO. Fetches the page
+/// from the page cache (which may trigger delegate I/O), handles boundary
+/// page anonymization, and inserts the page into the VmObject.
+///
+/// Boundary anonymization: when offset_in_vma + PAGE_SIZE > file_size,
+/// allocate a fresh frame, memcpy the file portion, zero the tail.
+/// Never mutate page cache frames.
+#[cfg(not(test))]
+pub async fn fault_in_page(
+    vm_map: &VmMap,
+    fault_va: VirtAddr,
+) -> FaultResult {
+    let fault_va_aligned = VirtAddr(fault_va.0 & !(PAGE_SIZE - 1));
+
+    let vma = match vm_map.find_area(fault_va) {
+        Some(vma) => vma,
+        None => return FaultResult::Error(FaultError::NotMapped),
+    };
+
+    let vnode = match &vma.vnode {
+        Some(v) => v,
+        None => return FaultResult::Error(FaultError::NotMapped),
+    };
+
+    // Compute offset within the VMA
+    let offset_in_vma = (fault_va_aligned.0 - vma.range.start.0) as u64;
+
+    // If beyond file_size, this is a zero-fill page (BSS)
+    if offset_in_vma >= vma.file_size {
+        // Allocate a zeroed anonymous page
+        let frame = match frame_alloc_sync() {
+            Some(f) => f,
+            None => return FaultResult::Error(FaultError::OutOfMemory),
+        };
+        zero_page(frame);
+
+        let obj_offset = ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64
+            + vma.obj_offset;
+        let mut obj = vma.object.write();
+        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_anonymous(frame));
+        return FaultResult::Resolved;
+    }
+
+    // File-backed page: fetch from page cache
+    let file_byte_offset = vma.file_offset + offset_in_vma;
+    let page_offset = file_byte_offset / PAGE_SIZE as u64;
+    let vnode_id = vnode.vnode_id();
+    let ino = vnode_id as u32;
+
+    // Check page cache first
+    let cached_pa = match crate::fs::page_cache::probe(vnode_id, page_offset) {
+        Some(pa) => pa,
+        None => {
+            // Fetch via delegate
+            let page_byte_offset = page_offset * PAGE_SIZE as u64;
+            match crate::fs::delegate::fs_read_page(ino, page_byte_offset).await {
+                Ok(pa_usize) => {
+                    let pa = PhysAddr::new(pa_usize);
+                    crate::fs::page_cache::complete(vnode_id, page_offset, pa);
+                    pa
+                }
+                Err(_) => return FaultResult::Error(FaultError::OutOfMemory),
+            }
+        }
+    };
+
+    // Check if this is a boundary page (partial file data + zero tail)
+    let bytes_from_file_in_page = if offset_in_vma + PAGE_SIZE as u64 > vma.file_size {
+        (vma.file_size - offset_in_vma) as usize
+    } else {
+        PAGE_SIZE
+    };
+
+    let obj_offset = ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64
+        + vma.obj_offset;
+
+    if bytes_from_file_in_page < PAGE_SIZE {
+        // Boundary page: anonymize — allocate fresh frame, copy file portion, zero tail
+        let frame = match frame_alloc_sync() {
+            Some(f) => f,
+            None => return FaultResult::Error(FaultError::OutOfMemory),
+        };
+        // Copy file portion
+        let src = cached_pa.as_usize() as *const u8;
+        let dst = frame.as_usize() as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dst, bytes_from_file_in_page);
+            // Zero the tail
+            core::ptr::write_bytes(dst.add(bytes_from_file_in_page), 0, PAGE_SIZE - bytes_from_file_in_page);
+        }
+        let mut obj = vma.object.write();
+        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_anonymous(frame));
+    } else {
+        // Full page from cache: map read-only (COW on write fault)
+        let mut obj = vma.object.write();
+        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_cached(cached_pa));
+    }
+
+    FaultResult::Resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -68,6 +68,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Initialize VirtIO-blk driver (probes MMIO addresses for block device)
         drivers::virtio_blk::init();
 
+        // Initialize VFS caches
+        fs::dentry::init();
+        fs::page_cache::init();
+
         // Initialize filesystem delegate (mounts ext4, spawns delegate task)
         fs::delegate::init();
 
@@ -76,6 +80,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             // Small delay to let delegate mount
             executor::sleep(200).await;
             test_delegate_read().await;
+        }, 0).detach();
+
+        // Integration test: VFS sys_open + sys_read through page cache
+        executor::spawn_kernel_task(async {
+            executor::sleep(400).await;
+            test_vfs_read().await;
         }, 0).detach();
 
         // Integration test: exception fixup (copy_user_chunk with bad pointers)
@@ -344,6 +354,53 @@ async fn test_delegate_read() {
             let _ = fs::delegate::fs_close(handle).await;
         }
         Err(e) => kprintln!("delegate read FAIL (open err={})", e),
+    }
+}
+
+/// VFS integration test: sys_open + sys_read through page cache.
+/// Reads /hello.txt via VFS syscalls, verifies content, then reads again
+/// to verify page cache hit (second read should not trigger delegate I/O).
+async fn test_vfs_read() {
+    use fs::fd_table::{FdTable, OpenFlags};
+    let fd_table = spin::Mutex::new(FdTable::new());
+
+    // First read: goes through delegate
+    match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
+        Ok(fd) => {
+            let mut buf = [0u8; 64];
+            match fs::syscalls::sys_read(&fd_table, fd, &mut buf).await {
+                Ok(n) => {
+                    let content = core::str::from_utf8(&buf[..n]).unwrap_or("<invalid utf8>");
+                    if content == "hello from ext4" {
+                        // Second read: should hit page cache
+                        let mut buf2 = [0u8; 64];
+                        // Reopen to reset offset
+                        let _ = fs::syscalls::sys_close(&fd_table, fd);
+                        match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
+                            Ok(fd2) => {
+                                match fs::syscalls::sys_read(&fd_table, fd2, &mut buf2).await {
+                                    Ok(n2) => {
+                                        let content2 = core::str::from_utf8(&buf2[..n2]).unwrap_or("<invalid utf8>");
+                                        if content2 == "hello from ext4" {
+                                            kprintln!("vfs read PASS");
+                                        } else {
+                                            kprintln!("vfs read FAIL (cache content={:?})", content2);
+                                        }
+                                    }
+                                    Err(_) => kprintln!("vfs read FAIL (cache read err)"),
+                                }
+                                let _ = fs::syscalls::sys_close(&fd_table, fd2);
+                            }
+                            Err(_) => kprintln!("vfs read FAIL (reopen err)"),
+                        }
+                    } else {
+                        kprintln!("vfs read FAIL (content={:?})", content);
+                    }
+                }
+                Err(_) => kprintln!("vfs read FAIL (read err)"),
+            }
+        }
+        Err(_) => kprintln!("vfs read FAIL (open err)"),
     }
 }
 

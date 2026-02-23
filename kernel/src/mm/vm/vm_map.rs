@@ -269,6 +269,11 @@ impl VmMap {
         child
     }
 
+    /// Remove all VMAs (used by exec to reset address space).
+    pub fn clear(&mut self) {
+        self.areas.clear();
+    }
+
     /// Iterate all VMAs.
     pub fn iter(&self) -> impl Iterator<Item = &VmArea> {
         self.areas.values()

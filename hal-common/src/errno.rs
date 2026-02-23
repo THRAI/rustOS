@@ -9,4 +9,5 @@ pub enum Errno {
     EAGAIN,
     EPERM,
     ENOSYS,
+    ENOEXEC,
 }

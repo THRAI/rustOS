@@ -106,6 +106,23 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             mm::pmap::test_integration::test_pmap_satp_switch();
         }, 0).detach();
 
+        // Phase 2 VM integration tests (run after satp-switch test completes)
+        executor::spawn_kernel_task(async {
+            executor::sleep(400).await;
+            mm::vm::test_integration::test_anonymous_page_fault();
+            mm::vm::test_integration::test_cow_fault();
+        }, 0).detach();
+
+        executor::spawn_kernel_task(async {
+            executor::sleep(400).await;
+            mm::vm::test_integration::test_frame_alloc_sync_works();
+        }, 0).detach();
+
+        executor::spawn_kernel_task(async {
+            executor::sleep(400).await;
+            mm::vm::test_integration::test_iterative_drop_500();
+        }, 0).detach();
+
         // Register clobber test: verify trap save/restore
         register_clobber_test();
 

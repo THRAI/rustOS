@@ -39,7 +39,7 @@ qemu-test-rv64: kernel-rv64
 	sleep 15; \
 	kill $$QPID 2>/dev/null; wait $$QPID 2>/dev/null; \
 	PASS=0; FAIL=0; \
-	for pat in "hello from async future" "woke after 100ms" "hello from CPU" "register clobber PASS" "buddy initialized" "pmap extract-only PASS" "pmap satp-switch PASS"; do \
+	for pat in "hello from async future" "woke after 100ms" "hello from CPU" "register clobber PASS" "buddy initialized" "pmap extract-only PASS" "pmap satp-switch PASS" "vm anonymous fault PASS" "vm cow fault PASS" "vm iterative drop 500 PASS" "vm frame_alloc_sync PASS"; do \
 		if grep -q "$$pat" $$TMPOUT; then \
 			echo "  PASS: $$pat"; \
 			PASS=$$((PASS + 1)); \

@@ -69,6 +69,11 @@ const MAX_ASID: u16 = 65535;
 
 static TEST_GLOBAL_GEN: AtomicU64 = AtomicU64::new(1);
 
+/// Mutex to serialize ASID tests that share global mutable state.
+/// Without this, parallel test execution causes data races on
+/// TEST_ASID_ALLOC / TEST_GLOBAL_GEN.
+static ASID_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct AsidState {
     next: u16,
     generation: u64,
@@ -206,6 +211,7 @@ mod tests {
 
     #[test]
     fn asid_sequential_allocation() {
+        let _guard = ASID_TEST_LOCK.lock().unwrap();
         reset_asid_state();
         let (a1, g1) = test_alloc_asid();
         let (a2, g2) = test_alloc_asid();
@@ -219,6 +225,7 @@ mod tests {
 
     #[test]
     fn asid_generation_rollover() {
+        let _guard = ASID_TEST_LOCK.lock().unwrap();
         reset_asid_state();
         {
             let mut state = TEST_ASID_ALLOC.lock();
@@ -272,5 +279,53 @@ mod tests {
         assert_eq!(vpn_index::<3>(0, 0), 0);
         assert_eq!(vpn_index::<3>(0, 1), 0);
         assert_eq!(vpn_index::<3>(0, 2), 0);
+    }
+
+    #[test]
+    fn asid_check_stale_after_rollover() {
+        let _guard = ASID_TEST_LOCK.lock().unwrap();
+        // Alloc an ASID in generation 1, force rollover to generation 2,
+        // then verify the old ASID is stale (generation mismatch).
+        reset_asid_state();
+        let (asid, gen) = test_alloc_asid();
+        assert_eq!(gen, 1);
+        // Force rollover
+        {
+            let mut state = TEST_ASID_ALLOC.lock();
+            state.next = MAX_ASID;
+        }
+        let (_new_asid, new_gen) = test_alloc_asid();
+        assert_eq!(new_gen, 2);
+        // The old ASID's generation (1) doesn't match global (2) — it's stale
+        let global_gen = TEST_GLOBAL_GEN.load(Ordering::Acquire);
+        assert_ne!(gen, global_gen);
+        // A fresh alloc should be in the new generation
+        let (fresh_asid, fresh_gen) = test_alloc_asid();
+        assert_eq!(fresh_gen, 2);
+        assert_ne!(fresh_asid, asid); // different ASID in new generation
+    }
+
+    #[test]
+    fn asid_wraps_to_1_not_0() {
+        let _guard = ASID_TEST_LOCK.lock().unwrap();
+        // ASID 0 is reserved for kernel; after rollover, first ASID should be 1
+        reset_asid_state();
+        {
+            let mut state = TEST_ASID_ALLOC.lock();
+            state.next = MAX_ASID;
+        }
+        let (asid, _gen) = test_alloc_asid();
+        assert_eq!(asid, 1); // not 0
+    }
+
+    #[test]
+    fn pte_encode_decode_max_pa() {
+        // Test with maximum physical address that fits in Sv39 PTE PPN field
+        // 44-bit PPN * 4096 = 56-bit PA
+        let pa = 0x00FF_FFFF_FFFF_F000usize;
+        let flags = PteFlags::V | PteFlags::R | PteFlags::W;
+        let raw = encode_pte(pa, flags);
+        assert_eq!(pte_pa(raw), pa);
+        assert_eq!(pte_flags(raw), flags);
     }
 }

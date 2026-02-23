@@ -360,4 +360,63 @@ mod tests {
         let count = map.iter().count();
         assert_eq!(count, 2);
     }
+
+    #[test]
+    fn fork_shadow_has_backing_chain() {
+        // Verify that after fork, child's VmObject has a backing pointer
+        // that ultimately reaches the original parent object.
+        let mut parent_map = VmMap::new();
+        let obj = VmObject::new(8192);
+        {
+            let mut w = obj.write();
+            w.insert_page(0, super::super::vm_object::OwnedPage::new_anonymous(
+                hal_common::PhysAddr::new(0xDEAD_0000),
+            ));
+            w.insert_page(1, super::super::vm_object::OwnedPage::new_anonymous(
+                hal_common::PhysAddr::new(0xBEEF_0000),
+            ));
+        }
+        let vma = VmArea::new(
+            VirtAddr::new(0x1000)..VirtAddr::new(0x3000),
+            MapPerm::R | MapPerm::W,
+            obj,
+            0,
+            VmAreaType::Anonymous,
+        );
+        parent_map.insert(vma).unwrap();
+
+        let child_map = parent_map.fork();
+        let child_vma = child_map.find_area(VirtAddr::new(0x1000)).unwrap();
+        let child_obj = child_vma.object.read();
+        // Shadow depth should be 1 (child shadow -> parent object)
+        assert_eq!(child_obj.shadow_depth(), 1);
+        // Parent's pages visible through shadow chain
+        assert_eq!(child_obj.lookup_page(0).unwrap(), hal_common::PhysAddr::new(0xDEAD_0000));
+        assert_eq!(child_obj.lookup_page(1).unwrap(), hal_common::PhysAddr::new(0xBEEF_0000));
+    }
+
+    #[test]
+    fn fork_preserves_vma_count() {
+        let mut map = VmMap::new();
+        map.insert(make_vma(0x1000, 0x2000)).unwrap();
+        map.insert(make_vma(0x3000, 0x4000)).unwrap();
+        map.insert(make_vma(0x5000, 0x6000)).unwrap();
+        let child = map.fork();
+        assert_eq!(child.iter().count(), 3);
+    }
+
+    #[test]
+    fn insert_invalid_range_rejected() {
+        let mut map = VmMap::new();
+        // start >= end should fail
+        let obj = VmObject::new(4096);
+        let vma = VmArea::new(
+            VirtAddr::new(0x2000)..VirtAddr::new(0x1000),
+            MapPerm::R,
+            obj,
+            0,
+            VmAreaType::Anonymous,
+        );
+        assert!(map.insert(vma).is_err());
+    }
 }

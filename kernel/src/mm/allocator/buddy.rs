@@ -236,4 +236,47 @@ mod tests {
         let addr = b.alloc(3).unwrap();
         assert_eq!(addr.as_usize() % (8 * PAGE_SIZE), 0);
     }
+
+    #[test]
+    fn coalesce_roundtrip_alloc_larger() {
+        // Alloc two adjacent order-0 blocks, free both, then alloc order-1.
+        // This verifies coalescing actually produces a usable larger block.
+        let mut b = make_buddy(2);
+        let a1 = b.alloc(0).unwrap();
+        let a2 = b.alloc(0).unwrap();
+        assert_eq!(b.available_pages(), 0);
+        b.free(a1, 0);
+        b.free(a2, 0);
+        assert_eq!(b.available_pages(), 2);
+        // After coalescing, order-1 (2 pages) should succeed
+        let big = b.alloc(1);
+        assert!(big.is_some());
+        assert_eq!(b.available_pages(), 0);
+    }
+
+    #[test]
+    fn split_from_order10_to_order0() {
+        // Init with 1024 pages (order-10 block), alloc order-0 — must split all the way down
+        let mut b = make_buddy(1024);
+        let addr = b.alloc(0).unwrap();
+        assert!(addr.is_page_aligned());
+        assert_eq!(b.available_pages(), 1023);
+    }
+
+    #[test]
+    fn multiple_init_regions() {
+        // Init with two separate regions, verify total pages accumulate
+        let mut b = BuddyAllocator::new();
+        b.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 16 * PAGE_SIZE));
+        b.init(PhysAddr::new(0x9000_0000), PhysAddr::new(0x9000_0000 + 16 * PAGE_SIZE));
+        assert_eq!(b.total_pages(), 32);
+        assert_eq!(b.available_pages(), 32);
+    }
+
+    #[test]
+    fn alloc_order_too_large_for_pool() {
+        // 4 pages can't satisfy order-3 (8 pages)
+        let mut b = make_buddy(4);
+        assert!(b.alloc(3).is_none());
+    }
 }

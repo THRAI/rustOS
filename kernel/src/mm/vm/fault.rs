@@ -373,4 +373,42 @@ mod tests {
         assert!(!PageFaultAccessType::WRITE.permitted_by(rx));
         assert!(PageFaultAccessType::EXECUTE.permitted_by(rx));
     }
+
+    #[test]
+    fn anonymous_fault_allocates_unique_frames() {
+        // Two anonymous faults on different pages should get different frames
+        let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
+        let r1 = sync_fault_handler(&map, VirtAddr::new(0x1000), PageFaultAccessType::READ);
+        assert!(matches!(r1, FaultResult::Resolved));
+        let r2 = sync_fault_handler(&map, VirtAddr::new(0x2000), PageFaultAccessType::READ);
+        assert!(matches!(r2, FaultResult::Resolved));
+        // Both pages should be resident now
+        let vma = map.find_area(VirtAddr::new(0x1000)).unwrap();
+        let obj = vma.object.read();
+        let p1 = obj.lookup_page(0).unwrap();
+        let p2 = obj.lookup_page(1).unwrap();
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn fault_page_aligned_resolution() {
+        // Fault at non-page-aligned address should still resolve (handler page-aligns)
+        let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
+        let result = sync_fault_handler(&map, VirtAddr::new(0x1ABC), PageFaultAccessType::READ);
+        assert!(matches!(result, FaultResult::Resolved));
+    }
+
+    #[test]
+    fn rwx_permission_combinations() {
+        let all = MapPerm::R | MapPerm::W | MapPerm::X;
+        assert!(PageFaultAccessType::READ.permitted_by(all));
+        assert!(PageFaultAccessType::WRITE.permitted_by(all));
+        assert!(PageFaultAccessType::EXECUTE.permitted_by(all));
+
+        // No permissions at all
+        let none = MapPerm::empty();
+        assert!(!PageFaultAccessType::READ.permitted_by(none));
+        assert!(!PageFaultAccessType::WRITE.permitted_by(none));
+        assert!(!PageFaultAccessType::EXECUTE.permitted_by(none));
+    }
 }

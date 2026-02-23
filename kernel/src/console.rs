@@ -46,6 +46,11 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
+/// Write a single byte to the UART (no locking, for syscall write path).
+pub fn putchar(c: u8) {
+    uart::putchar(c);
+}
+
 #[macro_export]
 macro_rules! kprint {
     ($($arg:tt)*) => {

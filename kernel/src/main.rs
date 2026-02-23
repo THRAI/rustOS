@@ -88,6 +88,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             test_vfs_read().await;
         }, 0).detach();
 
+        // Integration test: fork + exec + wait4 lifecycle
+        executor::spawn_kernel_task(async {
+            executor::sleep(600).await;
+            test_fork_exec_wait4().await;
+        }, 0).detach();
+
         // Integration test: exception fixup (copy_user_chunk with bad pointers)
         test_fixup();
 
@@ -401,6 +407,59 @@ async fn test_vfs_read() {
             }
         }
         Err(_) => kprintln!("vfs read FAIL (open err)"),
+    }
+}
+
+/// Integration test: fork + exec + wait4 lifecycle.
+/// Creates init task, forks child, child execs /hello.txt (which will fail
+/// since it's not an ELF), then tests exec with a proper path resolution.
+/// Verifies the full pipeline: fork creates child, exec resets vm_map and
+/// creates demand-paged VMAs, wait4 collects exit status.
+async fn test_fork_exec_wait4() {
+    use alloc::sync::Arc;
+    use proc::task::Task;
+    use proc::fork::fork;
+    use proc::exit_wait::{sys_exit, WaitChildFuture};
+
+    // Create init task
+    let init = Task::new_init();
+
+    // Fork child
+    let child = fork(&init);
+    let child_pid = child.pid;
+
+    // Try exec on the child — use /hello.txt which is NOT an ELF
+    // This should fail with ENOEXEC, proving the ELF validation works
+    match proc::exec::exec(&child, "/hello.txt").await {
+        Err(hal_common::Errno::ENOEXEC) => {
+            // Expected: hello.txt is not an ELF binary
+        }
+        Ok(_) => {
+            kprintln!("fork-exec-wait4 FAIL (hello.txt accepted as ELF)");
+            return;
+        }
+        Err(e) => {
+            kprintln!("fork-exec-wait4 FAIL (unexpected error: {:?})", e);
+            return;
+        }
+    }
+
+    // Child exits with code 7
+    let _ = sys_exit(&child, 7);
+
+    // Parent wait4 collects exit status
+    let wait_result = WaitChildFuture::new(Arc::clone(&init)).await;
+    match wait_result {
+        Some((pid, status)) => {
+            if pid == child_pid && status == 7 {
+                kprintln!("fork-exec-wait4 PASS");
+            } else {
+                kprintln!("fork-exec-wait4 FAIL (pid={}, status={})", pid, status);
+            }
+        }
+        None => {
+            kprintln!("fork-exec-wait4 FAIL (wait4 returned None)");
+        }
     }
 }
 

@@ -4,12 +4,12 @@
 //! Accessed via the tp register (hot path) or global array (cross-CPU).
 
 use hal_common::{IrqSafeSpinLock, RunQueue, TimerWheel};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 8;
 
-/// Per-CPU data: run queue, timer wheel, hart/cpu identity, preemption flag.
+/// Per-CPU data: run queue, timer wheel, hart/cpu identity, preemption flag, fixup pointer.
 pub struct PerCpu {
     pub run_queue: RunQueue<async_task::Runnable>,
     pub timer_wheel: IrqSafeSpinLock<TimerWheel>,
@@ -17,6 +17,11 @@ pub struct PerCpu {
     pub cpu_id: usize,
     /// Set by timer IRQ, checked by yield_now for cooperative preemption.
     pub needs_reschedule: AtomicBool,
+    /// Exception fixup pointer: when non-zero, the trap handler redirects
+    /// load/store page faults to this address (the copy_user_chunk landing pad)
+    /// instead of panicking. Set by copy_user_chunk prologue, cleared by epilogue
+    /// and landing pad.
+    pub pcb_onfault: AtomicUsize,
 }
 
 impl PerCpu {
@@ -28,6 +33,7 @@ impl PerCpu {
             hartid,
             cpu_id,
             needs_reschedule: AtomicBool::new(false),
+            pcb_onfault: AtomicUsize::new(0),
         }
     }
 }

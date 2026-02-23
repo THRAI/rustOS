@@ -1,6 +1,7 @@
 //! rv64 trap setup and dispatch.
 
 use crate::kprintln;
+use core::sync::atomic::Ordering;
 use hal_common::TrapFrame;
 
 // Interrupt bit in scause (bit 63 on rv64)
@@ -12,6 +13,8 @@ const IRQ_S_TIMER: usize = 5;
 const IRQ_S_EXTERNAL: usize = 9;
 
 // Exception cause codes
+const EXC_LOAD_ACCESS_FAULT: usize = 5;
+const EXC_STORE_ACCESS_FAULT: usize = 7;
 const EXC_ECALL_U: usize = 8;
 const EXC_INST_PAGE_FAULT: usize = 12;
 const EXC_LOAD_PAGE_FAULT: usize = 13;
@@ -85,8 +88,19 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                 kprintln!("[trap] ecall from U-mode (stub), sepc={:#x}", frame.pc());
                 frame.set_pc(frame.pc() + 4);
             }
+            EXC_LOAD_ACCESS_FAULT | EXC_STORE_ACCESS_FAULT |
             EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
-                // Stub: page faults (Phase 2)
+                // Check pcb_onfault for exception fixup (copy_user path)
+                let pc = crate::executor::per_cpu::current();
+                let onfault = pc.pcb_onfault.load(Ordering::Relaxed);
+                if onfault != 0 {
+                    // Redirect to landing pad: set sepc to onfault address
+                    frame.set_pc(onfault);
+                    // Clear onfault (landing pad also clears, but belt-and-suspenders)
+                    pc.pcb_onfault.store(0, Ordering::Relaxed);
+                    return;
+                }
+                // No fixup — real fault, panic
                 panic!(
                     "[trap] page fault: cause={}, stval={:#x}, sepc={:#x}",
                     code,

@@ -62,6 +62,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             mm::allocator::init_frame_allocator(mem_start, mem_end);
         }
 
+        // Integration test: exception fixup (copy_user_chunk with bad pointers)
+        test_fixup();
+
         // Spawn a test kernel task to prove the executor path works
         executor::spawn_kernel_task(async {
             kprintln!("hello from async future!");
@@ -143,6 +146,33 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         unsafe {
             core::arch::asm!("wfi");
         }
+    }
+}
+
+/// Integration test: copy_user_chunk with bad pointers returns EFAULT via fixup.
+fn test_fixup() {
+    use hal::rv64::copy_user::copy_user_chunk;
+    let src_buf = [0xABu8; 16];
+
+    // Test 1: bad destination pointer
+    let ret = unsafe {
+        copy_user_chunk(0xDEAD_0000 as *mut u8, src_buf.as_ptr(), 16)
+    };
+    if ret == 14 {
+        kprintln!("fixup bad-dst PASS");
+    } else {
+        kprintln!("fixup bad-dst FAIL (ret={})", ret);
+    }
+
+    // Test 2: bad source pointer
+    let mut dst_buf = [0u8; 16];
+    let ret = unsafe {
+        copy_user_chunk(dst_buf.as_mut_ptr(), 0xDEAD_0000 as *const u8, 16)
+    };
+    if ret == 14 {
+        kprintln!("fixup bad-src PASS");
+    } else {
+        kprintln!("fixup bad-src FAIL (ret={})", ret);
     }
 }
 

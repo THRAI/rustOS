@@ -9,3 +9,4 @@ pub mod sbi;
 pub mod fdt;
 pub mod ipi;
 pub mod smp;
+pub mod copy_user;

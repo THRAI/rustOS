@@ -9,19 +9,19 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 
 ## Current Position
 
-Phase: 3 of 7 (Exception Fixup + VFS + Disk + Process) — COMPLETE
-Plan: 5 of 5 in current phase — DONE
-Status: Phase 3 complete, ready for Phase 4
-Last activity: 2026-02-23 -- Plan 03-05 complete (ELF loading + exec + syscall dispatch + fork-exec-wait4)
+Phase: 3.1 of 7 (Verification Bookkeeping + User Memory Safety) — COMPLETE
+Plan: 1 of 1 in current phase — DONE
+Status: Phase 3.1 complete, ready for Phase 4
+Last activity: 2026-02-24 -- Plan 03.1-01 complete (audit gap closure: pcb_onfault + fault-safe copyinstr + verification docs)
 
-Progress: [██████████] 100% (Phase 3)
+Progress: [██████████] 100% (Phase 3.1)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 15
+- Total plans completed: 16
 - Average duration: 7min
-- Total execution time: 1.58 hours
+- Total execution time: 1.68 hours
 
 **By Phase:**
 
@@ -30,9 +30,10 @@ Progress: [██████████] 100% (Phase 3)
 | 1 | 4/4 | 27min | 7min |
 | 2 | 5/5 | 24min | 5min |
 | 3 | 5/5 | 51min | 10min |
+| 3.1 | 1/1 | 6min | 6min |
 
 **Recent Trend:**
-- Last 5 plans: 10min, 6min, 8min, 10min, 7min
+- Last 5 plans: 6min, 8min, 10min, 7min, 6min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -97,6 +98,9 @@ Recent decisions affecting current work:
 - [03-05]: Synchronous syscall dispatch for simple syscalls, async escalation for fork/exec/wait4/read/open
 - [03-05]: SYS_WRITE to fd 1/2 writes directly to UART (no VFS path for stdout/stderr)
 
+- [03.1-01]: Access faults (5,7) share same match arm as page faults (12,13,15) — pcb_onfault checked first for all
+- [03.1-01]: Store access fault mapped to WRITE access type for fault resolution fallthrough
+
 ### Pending Todos
 
 None yet.
@@ -107,6 +111,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-23
-Stopped at: Phase 3 complete (all 5 plans done), ready for Phase 4 planning
+Last session: 2026-02-24
+Stopped at: Phase 3.1 complete (1/1 plans done), ready for Phase 4 planning
 Resume file: None

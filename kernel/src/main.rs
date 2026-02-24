@@ -165,6 +165,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 executor::sleep(400).await;
                 mm::vm::test_integration::test_iterative_drop_500();
             }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(500).await;
+                mm::vm::test_integration::test_fork_bomb_stress();
+            }, cpu0).detach();
 
             // Filesystem tests (need delegate mount time)
             executor::spawn_kernel_task(async {

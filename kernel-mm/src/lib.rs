@@ -9,6 +9,13 @@ macro_rules! kprintln {
     ($($arg:tt)*) => {};
 }
 
+/// No-op klog for test builds (the real macro lives in the kernel crate).
+#[cfg(test)]
+#[macro_export]
+macro_rules! klog {
+    ($($arg:tt)*) => {};
+}
+
 pub mod allocator;
 pub mod pmap;
 pub mod uio;

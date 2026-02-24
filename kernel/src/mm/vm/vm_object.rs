@@ -219,18 +219,18 @@ impl VmObject {
         }
 
         // Adopt backing's backing (skip over the now-empty object).
-        // Decrement shadow_count on backing (we're detaching).
+        // Decrement shadow_count on backing (we're detaching from it).
         backing.shadow_count -= 1;
 
+        // Take grandparent from backing. This severs backing→grandparent,
+        // so backing's Drop won't decrement grandparent's shadow_count.
+        // We're transferring that shadow relationship to self, so
+        // grandparent's shadow_count stays unchanged (no increment needed).
         let grandparent = backing.backing.take();
         drop(backing);
-        // backing_arc will be dropped here — if Arc refcount hits 0,
-        // VmObject::drop runs but pages are already drained.
+        // backing_arc may be dropped here — if Arc refcount hits 0,
+        // VmObject::drop runs but pages are already drained and backing is None.
 
-        if let Some(ref gp) = grandparent {
-            let mut gp_w = gp.write();
-            gp_w.shadow_count += 1;
-        }
         self.backing = grandparent;
     }
 
@@ -309,6 +309,8 @@ impl Drop for VmObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
+    use alloc::vec;
 
     #[test]
     fn new_object_is_empty() {
@@ -518,5 +520,362 @@ mod tests {
         let root = VmObject::new(4096);
         let rr = root.read();
         assert!(rr.backing().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // shadow_count tracking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shadow_count_incremented_on_new_shadow() {
+        let parent = VmObject::new(4096);
+        assert_eq!(parent.read().shadow_count(), 0);
+        let s1 = VmObject::new_shadow(Arc::clone(&parent), 4096);
+        assert_eq!(parent.read().shadow_count(), 1);
+        let s2 = VmObject::new_shadow(Arc::clone(&parent), 4096);
+        assert_eq!(parent.read().shadow_count(), 2);
+        drop(s1);
+        assert_eq!(parent.read().shadow_count(), 1);
+        drop(s2);
+        assert_eq!(parent.read().shadow_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collapse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collapse_migrates_pages_from_backing() {
+        // Backing has pages at offsets 0 and 1.
+        let backing = VmObject::new(8192);
+        {
+            let mut w = backing.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xA000)));
+            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xB000)));
+        }
+        // Single shadow — shadow_count == 1, collapse is safe.
+        let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
+        assert_eq!(backing.read().shadow_count(), 1);
+
+        // Collapse: pages should migrate from backing into shadow.
+        {
+            let mut w = shadow.write();
+            w.collapse();
+            assert_eq!(w.resident_count(), 2);
+            assert_eq!(w.lookup_page(0).unwrap(), PhysAddr::new(0xA000));
+            assert_eq!(w.lookup_page(1).unwrap(), PhysAddr::new(0xB000));
+            assert!(w.backing().is_none()); // chain shortened
+        }
+    }
+
+    #[test]
+    fn collapse_frees_phantom_on_conflict() {
+        // Backing has page at offset 0 (the "phantom").
+        let backing = VmObject::new(8192);
+        {
+            let mut w = backing.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xDEAD)));
+            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xBEEF)));
+        }
+        let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
+        // Shadow has its own page at offset 0 (COW copy).
+        {
+            let mut w = shadow.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xC000)));
+        }
+
+        // Collapse: offset 0 conflicts (shadow wins), offset 1 migrates.
+        {
+            let mut w = shadow.write();
+            w.collapse();
+            // Shadow keeps its own page at offset 0.
+            assert_eq!(w.lookup_page(0).unwrap(), PhysAddr::new(0xC000));
+            // Offset 1 migrated from backing.
+            assert_eq!(w.lookup_page(1).unwrap(), PhysAddr::new(0xBEEF));
+            assert_eq!(w.resident_count(), 2);
+            assert!(w.backing().is_none());
+        }
+        // Backing's pages were drained — only the shadow's Arc remains.
+        assert_eq!(backing.read().resident_count(), 0);
+    }
+
+    #[test]
+    fn collapse_refuses_when_shadow_count_gt_1() {
+        let backing = VmObject::new(4096);
+        {
+            let mut w = backing.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
+        }
+        let s1 = VmObject::new_shadow(Arc::clone(&backing), 4096);
+        let _s2 = VmObject::new_shadow(Arc::clone(&backing), 4096);
+        assert_eq!(backing.read().shadow_count(), 2);
+
+        // Collapse should be refused — backing has 2 shadows.
+        {
+            let mut w = s1.write();
+            w.collapse();
+            // Page should still be in backing, not migrated.
+            assert_eq!(w.resident_count(), 0);
+            assert!(w.backing().is_some());
+        }
+    }
+
+    #[test]
+    fn collapse_adopts_grandparent() {
+        // grandparent -> parent -> child
+        let grandparent = VmObject::new(4096);
+        {
+            let mut w = grandparent.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xAAAA)));
+        }
+        let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
+        {
+            let mut w = parent.write();
+            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xBBBB)));
+        }
+        let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
+        assert_eq!(parent.read().shadow_count(), 1);
+        assert_eq!(grandparent.read().shadow_count(), 1);
+
+        // Collapse child <- parent: child absorbs parent's pages,
+        // and now points directly to grandparent.
+        {
+            let mut w = child.write();
+            w.collapse();
+            assert_eq!(w.resident_count(), 1); // page 1 from parent
+            assert_eq!(w.lookup_page(1).unwrap(), PhysAddr::new(0xBBBB));
+            // Page 0 is in grandparent, visible via chain walk.
+            assert_eq!(w.lookup_page(0).unwrap(), PhysAddr::new(0xAAAA));
+            assert_eq!(w.shadow_depth(), 1); // child -> grandparent
+        }
+        // Grandparent's shadow_count: parent decremented (detached),
+        // child incremented (adopted).
+        assert_eq!(grandparent.read().shadow_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phantom page scenario (full end-to-end)
+    // -----------------------------------------------------------------------
+
+    /// Simulates the exact phantom page scenario:
+    ///
+    /// 1. Process P has a heap with pages F0, F1 in a backing object.
+    /// 2. Fork: parent and child each get a shadow -> backing.
+    /// 3. Parent shrinks heap (drops F1 from its shadow — but F1 is in backing).
+    /// 4. Parent exits (its shadow is dropped, backing shadow_count -> 1).
+    /// 5. Child COW-faults on F1's offset — collapse should rename F1 into
+    ///    child's shadow (zero-copy), not copy it.
+    #[test]
+    fn phantom_page_eliminated_by_collapse() {
+        // Step 1: backing with F0 and F1.
+        let backing = VmObject::new(8192);
+        {
+            let mut w = backing.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xF0F0)));
+            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xF1F1)));
+        }
+
+        // Step 2: fork — parent shadow and child shadow.
+        let parent_shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
+        let child_shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
+        assert_eq!(backing.read().shadow_count(), 2);
+
+        // Step 3: parent "shrinks" — conceptually drops interest in offset 1.
+        // (In real kernel: pmap_remove + truncate. Here we just note that
+        // parent_shadow has no page at offset 1 — it's a phantom in backing.)
+
+        // Step 4: parent exits.
+        drop(parent_shadow);
+        assert_eq!(backing.read().shadow_count(), 1);
+
+        // Step 5: child triggers collapse (would happen during COW fault).
+        {
+            let mut w = child_shadow.write();
+            w.collapse();
+
+            // F0 and F1 should both be migrated into child (no conflict).
+            assert_eq!(w.resident_count(), 2);
+            assert_eq!(w.lookup_page(0).unwrap(), PhysAddr::new(0xF0F0));
+            assert_eq!(w.lookup_page(1).unwrap(), PhysAddr::new(0xF1F1));
+
+            // Chain is now flat — no backing.
+            assert!(w.backing().is_none());
+        }
+
+        // Backing should be empty (pages migrated, not leaked).
+        assert_eq!(backing.read().resident_count(), 0);
+    }
+
+    /// Variant: child already COW-copied F0 before collapse.
+    /// F0 in backing becomes a phantom — collapse should free it.
+    #[test]
+    fn phantom_page_freed_when_child_has_cow_copy() {
+        let backing = VmObject::new(8192);
+        {
+            let mut w = backing.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xF0F0)));
+            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xF1F1)));
+        }
+
+        let parent_shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
+        let child_shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
+
+        // Child already did a COW copy of offset 0.
+        {
+            let mut w = child_shadow.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xC09F)));
+        }
+
+        // Parent exits.
+        drop(parent_shadow);
+        assert_eq!(backing.read().shadow_count(), 1);
+
+        // Collapse: offset 0 conflicts (child keeps 0xC000, backing's 0xF0F0
+        // is freed). Offset 1 migrates (0xF1F1 renamed into child).
+        {
+            let mut w = child_shadow.write();
+            w.collapse();
+            assert_eq!(w.lookup_page(0).unwrap(), PhysAddr::new(0xC09F));
+            assert_eq!(w.lookup_page(1).unwrap(), PhysAddr::new(0xF1F1));
+            assert_eq!(w.resident_count(), 2);
+            assert!(w.backing().is_none());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fork bomb stress test
+    // -----------------------------------------------------------------------
+
+    /// Simulates a fork bomb: one backing object with N shadows created
+    /// and destroyed in waves. Verifies shadow_count stays consistent
+    /// and collapse works correctly after mass destruction.
+    #[test]
+    fn fork_bomb_shadow_count_consistency() {
+        let backing = VmObject::new(4096);
+        {
+            let mut w = backing.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xBA5E)));
+        }
+
+        // Wave 1: create 100 shadows (simulates fork bomb).
+        let mut shadows: Vec<Arc<RwLock<VmObject>>> = Vec::new();
+        for _ in 0..100 {
+            shadows.push(VmObject::new_shadow(Arc::clone(&backing), 4096));
+        }
+        assert_eq!(backing.read().shadow_count(), 100);
+
+        // All shadows can see the backing page.
+        for s in &shadows {
+            assert_eq!(s.read().lookup_page(0).unwrap(), PhysAddr::new(0xBA5E));
+        }
+
+        // Kill 99 of them (processes exit).
+        let survivor = shadows.pop().unwrap();
+        drop(shadows);
+        assert_eq!(backing.read().shadow_count(), 1);
+
+        // Survivor collapses — absorbs the page.
+        {
+            let mut w = survivor.write();
+            w.collapse();
+            assert_eq!(w.lookup_page(0).unwrap(), PhysAddr::new(0xBA5E));
+            assert_eq!(w.resident_count(), 1);
+            assert!(w.backing().is_none());
+        }
+        assert_eq!(backing.read().resident_count(), 0);
+    }
+
+    /// Fork bomb with deep chains: each generation forks from the previous.
+    /// Simulates shell script `while true; do $0 & done` creating a deep
+    /// shadow chain. Verifies iterative drop + collapse don't corrupt state.
+    #[test]
+    fn fork_bomb_deep_chain_200() {
+        let root = VmObject::new(4096);
+        {
+            let mut w = root.write();
+            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x2007)));
+        }
+
+        // Build a 200-deep chain: each "child" forks from previous "parent".
+        // Keep all intermediate refs alive (simulates all processes running).
+        let mut all: Vec<Arc<RwLock<VmObject>>> = vec![Arc::clone(&root)];
+        for _ in 0..200 {
+            let parent = all.last().unwrap();
+            let child = VmObject::new_shadow(Arc::clone(parent), 4096);
+            all.push(child);
+        }
+
+        // All 201 objects alive. Deepest can see root's page.
+        assert_eq!(all.last().unwrap().read().lookup_page(0).unwrap(), PhysAddr::new(0x2007));
+        assert_eq!(all.last().unwrap().read().shadow_depth(), 200);
+
+        // Kill all except root and the deepest.
+        let deepest = all.pop().unwrap();
+        let _root_ref = all.remove(0);
+        // Drop the 199 intermediates in reverse order.
+        drop(all);
+
+        // Deepest still sees the page (chain walk through root).
+        assert_eq!(deepest.read().lookup_page(0).unwrap(), PhysAddr::new(0x2007));
+
+        // Shadow counts should be consistent after mass drop.
+        // The chain may have partially collapsed during drops.
+        // The key invariant: no panic, no corruption.
+        drop(deepest);
+        // Root should have shadow_count 0 now.
+        assert_eq!(_root_ref.read().shadow_count(), 0);
+    }
+
+    /// Fork bomb: wide fan (100 shadows) each with their own COW page,
+    /// then mass exit. Verifies no page leaks or double-frees.
+    #[test]
+    fn fork_bomb_wide_fan_with_cow_pages() {
+        let backing = VmObject::new(4096 * 4);
+        {
+            let mut w = backing.write();
+            for i in 0..4u64 {
+                w.insert_page(i, OwnedPage::new_anonymous(PhysAddr::new((0xA000 + i as usize) * 0x1000)));
+            }
+        }
+
+        // 100 shadows, each does a COW write to a different page.
+        let mut shadows: Vec<Arc<RwLock<VmObject>>> = Vec::new();
+        for i in 0..100 {
+            let s = VmObject::new_shadow(Arc::clone(&backing), 4096 * 4);
+            {
+                let mut w = s.write();
+                // Each shadow writes to offset (i % 4).
+                let offset = (i % 4) as u64;
+                w.insert_page(offset, OwnedPage::new_anonymous(
+                    PhysAddr::new(0xC000_0000 + i * 0x1000),
+                ));
+            }
+            shadows.push(s);
+        }
+        assert_eq!(backing.read().shadow_count(), 100);
+
+        // Verify each shadow sees its own COW page.
+        for (i, s) in shadows.iter().enumerate() {
+            let offset = (i % 4) as u64;
+            let r = s.read();
+            assert_eq!(r.lookup_page(offset).unwrap(),
+                PhysAddr::new(0xC000_0000 + i * 0x1000));
+        }
+
+        // Kill all but one.
+        let survivor = shadows.pop().unwrap();
+        drop(shadows);
+        assert_eq!(backing.read().shadow_count(), 1);
+
+        // Collapse survivor.
+        {
+            let mut w = survivor.write();
+            w.collapse();
+            // Survivor had COW page at offset 3 (99 % 4 = 3).
+            // Offsets 0, 1, 2 should be migrated from backing.
+            // Offset 3: conflict — survivor's COW page wins.
+            assert_eq!(w.resident_count(), 4);
+            assert!(w.backing().is_none());
+        }
     }
 }

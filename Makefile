@@ -78,6 +78,7 @@ QEMU_TEST_PATTERNS := \
 	"vm cow fault PASS" \
 	"vm iterative drop 500 PASS" \
 	"vm frame_alloc_sync PASS" \
+	"vm fork bomb PASS" \
 	"delegate read PASS" \
 	"vfs read PASS" \
 	"fork-exec-wait4 PASS"

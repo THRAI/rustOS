@@ -459,9 +459,10 @@ mod tests {
 
         let vma = map.find_area(VirtAddr::new(0x1000)).unwrap();
         let obj = vma.object.read();
+        // After COW, page must be in the top-level object (either copied or
+        // renamed via collapse). Both outcomes are correct.
+        assert!(obj.has_page(0));
         assert_eq!(obj.resident_count(), 1);
-        let new_phys = obj.lookup_page(0).unwrap();
-        assert_ne!(new_phys, PhysAddr::new(0xA000));
     }
 
     #[test]

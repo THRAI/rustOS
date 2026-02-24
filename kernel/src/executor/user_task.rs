@@ -457,6 +457,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::BRK => {
             use crate::mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
             use crate::mm::vm::vm_object::VmObject;
+            use crate::mm::vm::vm_object::PageOwnership;
 
             let current_brk = task.brk.load(core::sync::atomic::Ordering::Relaxed);
             if a0 == 0 {
@@ -466,19 +467,73 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 let new_brk = (a0 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                 let old_brk = current_brk;
                 if new_brk > old_brk {
-                    // Expand: create anonymous VMA for the new region
-                    let pages = (new_brk - old_brk) / PAGE_SIZE;
-                    let obj = VmObject::new(pages);
-                    let vma = VmArea::new(
-                        VirtAddr::new(old_brk)..VirtAddr::new(new_brk),
-                        MapPerm::R | MapPerm::W | MapPerm::U,
-                        obj,
-                        0,
-                        VmAreaType::Heap,
-                    );
+                    // --- Expand ---
                     let mut vm = task.vm_map.lock();
-                    if vm.insert(vma).is_err() {
-                        return set_syscall_ret(task, current_brk);
+                    if let Some(heap_vma) = vm.find_area_ending_at_mut(
+                        VirtAddr::new(old_brk), VmAreaType::Heap,
+                    ) {
+                        // In-place extension: slide end, grow VmObject
+                        heap_vma.range.end = VirtAddr::new(new_brk);
+                        let mut obj = heap_vma.object.write();
+                        obj.set_size(new_brk - heap_vma.range.start.as_usize());
+                    } else {
+                        // First brk or no adjacent heap VMA — create new
+                        let size = new_brk - old_brk;
+                        let obj = VmObject::new(size);
+                        let vma = VmArea::new(
+                            VirtAddr::new(old_brk)..VirtAddr::new(new_brk),
+                            MapPerm::R | MapPerm::W | MapPerm::U,
+                            obj,
+                            0,
+                            VmAreaType::Heap,
+                        );
+                        if vm.insert(vma).is_err() {
+                            return set_syscall_ret(task, current_brk);
+                        }
+                    }
+                } else if new_brk < old_brk {
+                    // --- Shrink ---
+                    // 1. Tear down hardware PTEs + TLB shootdown
+                    {
+                        let mut pmap = task.pmap.lock();
+                        crate::mm::pmap::pmap_remove(
+                            &mut pmap,
+                            VirtAddr::new(new_brk),
+                            VirtAddr::new(old_brk),
+                        );
+                    }
+                    // 2. Truncate VmObject pages and free anonymous frames
+                    let mut vm = task.vm_map.lock();
+                    // Find the heap VMA that contains old_brk - 1
+                    if let Some(heap_vma) = vm.find_area_mut(
+                        VirtAddr::new(old_brk - 1),
+                    ) {
+                        if heap_vma.vma_type == VmAreaType::Heap {
+                            let vma_start = heap_vma.range.start.as_usize();
+                            let from_page = ((new_brk - vma_start) / PAGE_SIZE) as u64;
+                            // Truncate pages from VmObject (top-level only — COW safe)
+                            let freed = {
+                                let mut obj = heap_vma.object.write();
+                                let pages = obj.truncate_pages(from_page);
+                                obj.set_size(new_brk.saturating_sub(vma_start));
+                                pages
+                            };
+                            // Free anonymous frames
+                            for page in freed {
+                                if matches!(page.ownership, PageOwnership::Anonymous) {
+                                    crate::mm::allocator::frame_free(page.phys);
+                                }
+                            }
+                            // Slide VMA end down (or remove if fully shrunk)
+                            if new_brk <= vma_start {
+                                vm.remove(VirtAddr::new(vma_start));
+                            } else {
+                                // Re-lookup since we dropped the borrow for frame_free
+                                if let Some(vma) = vm.find_area_mut(VirtAddr::new(vma_start)) {
+                                    vma.range.end = VirtAddr::new(new_brk);
+                                }
+                            }
+                        }
                     }
                 }
                 task.brk.store(new_brk, core::sync::atomic::Ordering::Relaxed);

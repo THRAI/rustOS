@@ -151,6 +151,25 @@ impl VmObject {
     pub fn backing(&self) -> Option<&Arc<RwLock<VmObject>>> {
         self.backing.as_ref()
     }
+
+    /// Update the object size in bytes.
+    pub fn set_size(&mut self, new_size: usize) {
+        self.size = new_size;
+    }
+
+    /// Remove and return all pages at offsets >= `from_page`.
+    /// Only operates on this object (not the backing chain).
+    pub fn truncate_pages(&mut self, from_page: u64) -> alloc::vec::Vec<OwnedPage> {
+        let keys: alloc::vec::Vec<u64> = self.pages.range(from_page..).map(|(&k, _)| k).collect();
+        let mut removed = alloc::vec::Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(page) = self.pages.remove(&k) {
+                self.resident_count -= 1;
+                removed.push(page);
+            }
+        }
+        removed
+    }
 }
 
 /// Iterative Drop: unwind the shadow chain without recursion.
@@ -165,10 +184,8 @@ impl Drop for VmObject {
         let pages = core::mem::take(&mut self.pages);
         for (_offset, page) in pages {
             if matches!(page.ownership, PageOwnership::Anonymous) {
-                // Frame deallocation will go here once the frame allocator
-                // is implemented (Phase 2 Plan 2). For now, the PhysAddr
-                // is simply dropped.
-                let _ = page.phys;
+                #[cfg(not(test))]
+                crate::mm::allocator::frame_free(page.phys);
             }
         }
 
@@ -178,16 +195,16 @@ impl Drop for VmObject {
             match Arc::try_unwrap(arc) {
                 Ok(rwlock) => {
                     let mut obj = rwlock.into_inner();
-                    // Free anonymous pages in this ancestor.
                     let ancestor_pages = core::mem::take(&mut obj.pages);
                     for (_offset, page) in ancestor_pages {
                         if matches!(page.ownership, PageOwnership::Anonymous) {
-                            let _ = page.phys;
+                            #[cfg(not(test))]
+                            crate::mm::allocator::frame_free(page.phys);
                         }
                     }
                     current = obj.backing.take();
                 }
-                Err(_) => break, // Other references exist; stop unwinding.
+                Err(_) => break,
             }
         }
     }

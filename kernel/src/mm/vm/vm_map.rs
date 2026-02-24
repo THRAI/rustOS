@@ -229,6 +229,17 @@ impl VmMap {
         key.and_then(|k| self.areas.remove(&k))
     }
 
+    /// Find the VMA whose `range.end == va` and matches `vma_type` (mutable).
+    /// Used by brk to locate the current heap VMA for in-place resize.
+    pub fn find_area_ending_at_mut(&mut self, va: VirtAddr, ty: VmAreaType) -> Option<&mut VmArea> {
+        // The VMA ending at `va` has start < va, so search backwards from va.
+        self.areas
+            .range_mut(..va)
+            .next_back()
+            .map(|(_, vma)| vma)
+            .filter(|vma| vma.range.end == va && vma.vma_type == ty)
+    }
+
     /// Fork this address space for COW.
     ///
     /// For each Anonymous VMA, a new shadow VmObject is inserted so that
@@ -240,7 +251,11 @@ impl VmMap {
     pub fn fork(&self) -> VmMap {
         let mut child = VmMap::new();
         for (_, vma) in &self.areas {
-            let child_object = if vma.vma_type == VmAreaType::Anonymous {
+            let needs_shadow = matches!(
+                vma.vma_type,
+                VmAreaType::Anonymous | VmAreaType::Heap | VmAreaType::Stack
+            );
+            let child_object = if needs_shadow {
                 // Create a shadow for the child, pointing to the current object.
                 let size = {
                     let obj = vma.object.read();

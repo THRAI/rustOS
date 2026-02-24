@@ -15,6 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Boot + Executor + HAL Foundation** - Kernel boots on rv64 QEMU with async executor, SMP, trap handling, and debug infrastructure (~3K LOC)
 - [x] **Phase 2: VM Core + PMAP** - Virtual memory subsystem with page tables, ASID management, fault handling, and frame allocation (~6K LOC)
 - [x] **Phase 3: Exception Fixup + VFS + Disk + Process** - User/kernel copy safety, filesystem, block I/O, and fork/exec/wait (~10K LOC, hard gate on fixup tests at 3a)
+- [ ] **Phase 3.1: Verification Bookkeeping + User Memory Safety** - INSERTED: Close audit gaps — pcb_onfault in user trap, fault-safe string copy, verification docs (~200 LOC)
 - [ ] **Phase 4: Pipes + Signals + Full Syscalls** - IPC pipes, signal delivery, and remaining syscall surface for test suite compatibility (~4K LOC)
 - [ ] **Phase 5: Page Reclamation + LA64 Port** - Page daemon, writeback daemon, shadow collapse, and full LoongArch64 HAL/PMAP port (~6K LOC)
 - [ ] **Phase 6: Network + Sockets** - VirtIO-net, smoltcp integration, TCP sockets, kqueue, and LTP test coverage (~8K LOC)
@@ -77,6 +78,22 @@ Plans:
 - [x] 03-03-PLAN.md — Process lifecycle: Task struct, fork COW, exit/wait4, SyscallResult, PersistentUserTaskFuture
 - [x] 03-04-PLAN.md — VFS layer: Vnode trait, page cache, dentry cache, fd table, syscalls, file-backed faults
 - [x] 03-05-PLAN.md — ELF loading + exec + syscall dispatch + testsuite integration
+
+### Phase 3.1: Verification Bookkeeping + User Memory Safety (INSERTED)
+**Goal**: Close all v1.0 audit gaps — add pcb_onfault to user trap handler, fault-protect raw user pointer reads, update verification docs and requirement checkboxes
+**Depends on**: Phase 3
+**Requirements**: HAL-02, VM-09, VM-13, VM-14 (re-verification), HAL-09, HAL-10, VFS-05 (integration fixes)
+**Gap Closure**: Closes gaps from v1.0-MILESTONE-AUDIT.md
+**Success Criteria** (what must be TRUE):
+  1. user_trap_handler checks pcb_onfault on access/page faults (FINDING-01 closed)
+  2. sys_openat and execve copyinstr use fault-safe copy instead of raw pointer dereference (FINDING-03 closed)
+  3. Phase 2 VERIFICATION.md exists with VM-09, VM-13, VM-14 verified
+  4. REQUIREMENTS.md checkboxes updated for all 22 stale entries
+  5. All 20 QEMU integration tests still pass
+**Plans**: 1 plan
+
+Plans:
+- [ ] 03.1-01-PLAN.md — pcb_onfault in user trap + fault-safe string copy + verification docs
 
 ### Phase 4: Pipes + Signals + Full Syscalls
 **Goal**: IPC pipes, POSIX signal delivery, and the remaining syscall surface are complete -- the kernel supports the full interface needed by libc-test and shell pipelines
@@ -154,7 +171,8 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 |-------|----------------|--------|-----------|
 | 1. Boot + Executor + HAL Foundation | 4/4 | Complete | 2026-02-23 |
 | 2. VM Core + PMAP | 5/5 | Complete | 2026-02-23 |
-| 3. Exception Fixup + VFS + Disk + Process | 4/5 | Complete    | 2026-02-23 |d | - |
+| 3. Exception Fixup + VFS + Disk + Process | 5/5 | Complete | 2026-02-23 |
+| 3.1 Verification Bookkeeping + User Memory Safety | 0/1 | Not started | - |
 | 4. Pipes + Signals + Full Syscalls | 0/3 | Not started | - |
 | 5. Page Reclamation + LA64 Port | 0/3 | Not started | - |
 | 6. Network + Sockets | 0/3 | Not started | - |

@@ -29,9 +29,9 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [x] **HAL-06**: TLB flush operations (flush_addr, flush_asid, flush_all)
 - [x] **HAL-07**: Cache ops (dcache_wb, dcache_inv) for DMA correctness
 - [x] **HAL-08**: IRQ enable/disable/scoped_disable
-- [ ] **HAL-09**: Exception fixup: pcb_onfault field on task struct, O(1) check in trap handler
-- [ ] **HAL-10**: #[naked] copy_user_chunk wrapping C memcpy with fixup landing pad (rv64)
-- [ ] **HAL-11**: uiomove: page-at-a-time chunked copy with explicit done counter, trinary return (Ok/Fault/NeedsIO)
+- [x] **HAL-09**: Exception fixup: pcb_onfault field on task struct, O(1) check in trap handler
+- [x] **HAL-10**: #[naked] copy_user_chunk wrapping C memcpy with fixup landing pad (rv64)
+- [x] **HAL-11**: uiomove: page-at-a-time chunked copy with explicit done counter, trinary return (Ok/Fault/NeedsIO)
 
 ### VM & PMAP
 
@@ -43,34 +43,34 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 - [x] **VM-06**: Frame allocator: buddy system + per-CPU magazine
 - [x] **VM-07**: Dual frame_alloc API: frame_alloc() async (can yield) + frame_alloc_sync() (trap context, never yields)
 - [x] **VM-08**: emergency_reclaim_sync() scans inactive queue for clean pages without yielding
-- [ ] **VM-09**: sync_fault_handler resolves anonymous and cached-page faults on trap stack
-- [ ] **VM-10**: fault_in_page().await fetches file-backed pages via page cache asynchronously
+- [x] **VM-09**: sync_fault_handler resolves anonymous and cached-page faults on trap stack
+- [x] **VM-10**: fault_in_page().await fetches file-backed pages via page cache asynchronously
 - [x] **VM-11**: Shared page table walk parameterized by const LEVELS (3 for Sv39)
 - [x] **VM-12**: pmap_enter, pmap_remove, pmap_protect, pmap_extract
-- [ ] **VM-13**: ASID allocator with generation-based rollover + synchronous IPI barrier
-- [ ] **VM-14**: pmap_shootdown via IPI + per-CPU ack
+- [x] **VM-13**: ASID allocator with generation-based rollover + synchronous IPI barrier
+- [x] **VM-14**: pmap_shootdown via IPI + per-CPU ack
 - [ ] **VM-15**: Density-aware tree swap for shadow collapse (min(|C|,|P|) insertions)
 - [ ] **VM-16**: Background collapse daemon: chunked (64 pages), bounded lock hold, yield between chunks
 - [x] **VM-17**: Memory poisoning (debug builds) and trap stack canaries
 
 ### VFS & Disk
 
-- [ ] **VFS-01**: Vnode enum dispatch (Ext4 | Tmpfs | Devfs | Pipe | Socket)
-- [ ] **VFS-02**: FdTable per-process (fd number → FileDesc)
-- [ ] **VFS-03**: Page cache with 3-state CAS (absent → Fetching(WakerList) → Cached(Frame))
-- [ ] **VFS-04**: Dentry cache (parent_vnode, name → vnode)
-- [ ] **VFS-05**: sys_open, sys_read, sys_write, sys_close, sys_stat, sys_readdir
-- [ ] **VFS-06**: Delegate thread runs lwext4 synchronously without blocking executor
-- [ ] **VFS-07**: lwext4 FFI with global blockdev callback for VirtIO adaptive polling
-- [ ] **VFS-08**: VirtIO-blk driver (MMIO transport on rv64)
+- [x] **VFS-01**: Vnode enum dispatch (Ext4 | Tmpfs | Devfs | Pipe | Socket)
+- [x] **VFS-02**: FdTable per-process (fd number → FileDesc)
+- [x] **VFS-03**: Page cache with 3-state CAS (absent → Fetching(WakerList) → Cached(Frame))
+- [x] **VFS-04**: Dentry cache (parent_vnode, name → vnode)
+- [x] **VFS-05**: sys_open, sys_read, sys_write, sys_close, sys_stat, sys_readdir
+- [x] **VFS-06**: Delegate thread runs lwext4 synchronously without blocking executor
+- [x] **VFS-07**: lwext4 FFI with global blockdev callback for VirtIO adaptive polling
+- [x] **VFS-08**: VirtIO-blk driver (MMIO transport on rv64)
 
 ### Process
 
-- [ ] **PROC-01**: fork via COW (vm_object_shadow inserts shadow at chain head)
-- [ ] **PROC-02**: exec loads ELF, resets vm_map
-- [ ] **PROC-03**: wait4 and exit with parent/child lifecycle
-- [ ] **PROC-04**: getpid, getppid
-- [ ] **PROC-05**: Persistent UserTaskFuture wrapping run_tasks loop (no per-syscall spawn)
+- [x] **PROC-01**: fork via COW (vm_object_shadow inserts shadow at chain head)
+- [x] **PROC-02**: exec loads ELF, resets vm_map
+- [x] **PROC-03**: wait4 and exit with parent/child lifecycle
+- [x] **PROC-04**: getpid, getppid
+- [x] **PROC-05**: Persistent UserTaskFuture wrapping run_tasks loop (no per-syscall spawn)
 
 ### Signal
 
@@ -121,8 +121,8 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 
 - [x] **TEST-01**: Tier 1 host unit tests (cargo test --lib) for pure MI logic
 - [x] **TEST-02**: Tier 1.5 host loom tests for lock-free structures and CAS state machines
-- [ ] **TEST-03**: Tier 2 QEMU kernel integration tests (custom_test_frameworks)
-- [ ] **TEST-04**: Tier 3a testsuits-for-oskernel basic (~33 tests) pass >=80%
+- [x] **TEST-03**: Tier 2 QEMU kernel integration tests (custom_test_frameworks)
+- [x] **TEST-04**: Tier 3a testsuits-for-oskernel basic (~33 tests) pass >=80%
 - [ ] **TEST-05**: Tier 3b libc-test (~463 tests) active
 - [ ] **TEST-06**: Tier 3c LTP subset (~366 categories) active
 - [ ] **TEST-07**: App tests: git, vim, gcc, rustc run on QEMU
@@ -176,9 +176,9 @@ Deferred post-competition.
 | HAL-06 | Phase 1 | Complete |
 | HAL-07 | Phase 1 | Complete |
 | HAL-08 | Phase 1 | Complete |
-| HAL-09 | Phase 3 | Pending |
-| HAL-10 | Phase 3 | Pending |
-| HAL-11 | Phase 3 | Pending |
+| HAL-09 | Phase 3 | Complete |
+| HAL-10 | Phase 3 | Complete |
+| HAL-11 | Phase 3 | Complete |
 | VM-01 | Phase 2 | Complete |
 | VM-02 | Phase 2 | Complete |
 | VM-03 | Phase 2 | Complete |
@@ -187,28 +187,28 @@ Deferred post-competition.
 | VM-06 | Phase 2 | Complete |
 | VM-07 | Phase 2 | Complete |
 | VM-08 | Phase 2 | Complete |
-| VM-09 | Phase 2 | Pending |
-| VM-10 | Phase 3 | Pending |
+| VM-09 | Phase 2 | Complete |
+| VM-10 | Phase 3 | Complete |
 | VM-11 | Phase 2 | Complete |
 | VM-12 | Phase 2 | Complete |
-| VM-13 | Phase 2 | Pending |
-| VM-14 | Phase 2 | Pending |
+| VM-13 | Phase 2 | Complete |
+| VM-14 | Phase 2 | Complete |
 | VM-15 | Phase 5 | Pending |
 | VM-16 | Phase 5 | Pending |
 | VM-17 | Phase 2 | Complete |
-| VFS-01 | Phase 3 | Pending |
-| VFS-02 | Phase 3 | Pending |
-| VFS-03 | Phase 3 | Pending |
-| VFS-04 | Phase 3 | Pending |
-| VFS-05 | Phase 3 | Pending |
-| VFS-06 | Phase 3 | Pending |
-| VFS-07 | Phase 3 | Pending |
-| VFS-08 | Phase 3 | Pending |
-| PROC-01 | Phase 3 | Pending |
-| PROC-02 | Phase 3 | Pending |
-| PROC-03 | Phase 3 | Pending |
-| PROC-04 | Phase 3 | Pending |
-| PROC-05 | Phase 3 | Pending |
+| VFS-01 | Phase 3 | Complete |
+| VFS-02 | Phase 3 | Complete |
+| VFS-03 | Phase 3 | Complete |
+| VFS-04 | Phase 3 | Complete |
+| VFS-05 | Phase 3 | Complete |
+| VFS-06 | Phase 3 | Complete |
+| VFS-07 | Phase 3 | Complete |
+| VFS-08 | Phase 3 | Complete |
+| PROC-01 | Phase 3 | Complete |
+| PROC-02 | Phase 3 | Complete |
+| PROC-03 | Phase 3 | Complete |
+| PROC-04 | Phase 3 | Complete |
+| PROC-05 | Phase 3 | Complete |
 | SIG-01 | Phase 4 | Pending |
 | SIG-02 | Phase 4 | Pending |
 | SIG-03 | Phase 4 | Pending |
@@ -238,8 +238,8 @@ Deferred post-competition.
 | SYS-06 | Phase 4 | Pending |
 | TEST-01 | Phase 1 | Complete |
 | TEST-02 | Phase 1 | Complete |
-| TEST-03 | Phase 2 | Pending |
-| TEST-04 | Phase 3 | Pending |
+| TEST-03 | Phase 2 | Complete |
+| TEST-04 | Phase 3 | Complete |
 | TEST-05 | Phase 5 | Pending |
 | TEST-06 | Phase 6 | Pending |
 | TEST-07 | Phase 7 | Pending |
@@ -256,4 +256,4 @@ Deferred post-competition.
 
 ---
 *Requirements defined: 2026-02-22*
-*Last updated: 2026-02-22 after roadmap creation*
+*Last updated: 2026-02-24 after v1.0 milestone audit gap closure*

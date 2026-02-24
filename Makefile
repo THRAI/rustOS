@@ -57,19 +57,15 @@ QEMU_TEST_PATTERNS := \
 	"uiomove short-read PASS" \
 	"fork-exit-wait4 PASS" \
 	"lwext4 mounted at /" \
-	"exec OK"
-
-# These tests depend on executor::sleep waking correctly and are
-# currently broken (timer fires but sleep futures don't wake).
-# Uncomment as they are fixed:
-#	"pmap satp-switch PASS"
-#	"vm anonymous fault PASS"
-#	"vm cow fault PASS"
-#	"vm iterative drop 500 PASS"
-#	"vm frame_alloc_sync PASS"
-#	"delegate read PASS"
-#	"vfs read PASS"
-#	"fork-exec-wait4 PASS"
+	"exec OK" \
+	"pmap satp-switch PASS" \
+	"vm anonymous fault PASS" \
+	"vm cow fault PASS" \
+	"vm iterative drop 500 PASS" \
+	"vm frame_alloc_sync PASS" \
+	"delegate read PASS" \
+	"vfs read PASS" \
+	"fork-exec-wait4 PASS"
 
 qemu-test-rv64: kernel-rv64-test $(DISK_IMG)
 	@echo "=== QEMU integration test (SMP=$(SMP)) ==="

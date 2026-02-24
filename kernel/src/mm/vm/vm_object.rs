@@ -55,11 +55,17 @@ impl OwnedPage {
 
 /// Core VM object: a collection of physical pages indexed by page offset,
 /// with an optional backing (parent) object forming a shadow chain.
+///
+/// `shadow_count` tracks how many shadow objects point to this object as
+/// their backing. Used by `collapse()` to determine when page migration
+/// is safe (BSD vm_object_collapse semantics).
 pub struct VmObject {
     /// Pages owned directly by this object, keyed by page offset (in pages).
     pages: BTreeMap<u64, OwnedPage>,
     /// Parent in the shadow chain (for COW).
     backing: Option<Arc<RwLock<VmObject>>>,
+    /// How many shadow objects use this as their backing.
+    shadow_count: usize,
     /// Object size in bytes.
     size: usize,
     /// Number of pages resident in *this* object (not backing).
@@ -72,6 +78,7 @@ impl VmObject {
         Arc::new(RwLock::new(Self {
             pages: BTreeMap::new(),
             backing: None,
+            shadow_count: 0,
             size,
             resident_count: 0,
         }))
@@ -80,10 +87,16 @@ impl VmObject {
     /// Create a shadow object in front of `parent` (for fork COW).
     ///
     /// The new shadow starts empty; page lookups walk through to the parent.
+    /// Increments parent's `shadow_count`.
     pub fn new_shadow(parent: Arc<RwLock<VmObject>>, size: usize) -> Arc<RwLock<Self>> {
+        {
+            let mut p = parent.write();
+            p.shadow_count += 1;
+        }
         Arc::new(RwLock::new(Self {
             pages: BTreeMap::new(),
             backing: Some(parent),
+            shadow_count: 0,
             size,
             resident_count: 0,
         }))
@@ -152,6 +165,75 @@ impl VmObject {
         self.backing.as_ref()
     }
 
+    /// Get the number of shadows pointing to this object.
+    pub fn shadow_count(&self) -> usize {
+        self.shadow_count
+    }
+
+    /// Check if this object (not backing) has a page at the given offset.
+    pub fn has_page(&self, offset: u64) -> bool {
+        self.pages.contains_key(&offset)
+    }
+
+    /// BSD vm_object_collapse: migrate pages from backing into self.
+    ///
+    /// Precondition: caller holds `&mut self` (write lock on this object),
+    /// and `backing.shadow_count == 1` (we are the sole shadow).
+    ///
+    /// Pages in backing that conflict with pages already in self (COW copies)
+    /// are freed. Non-conflicting pages are renamed (moved) into self.
+    /// After migration, self adopts backing's backing (chain shortening).
+    pub fn collapse(&mut self) {
+        let backing_arc = match self.backing.take() {
+            Some(arc) => arc,
+            None => return,
+        };
+
+        let mut backing = backing_arc.write();
+
+        // Only collapse if we are the sole shadow.
+        if backing.shadow_count != 1 {
+            // Put it back — not safe to collapse.
+            drop(backing);
+            self.backing = Some(backing_arc);
+            return;
+        }
+
+        // Migrate pages from backing into self.
+        let backing_pages = core::mem::take(&mut backing.pages);
+        for (offset, page) in backing_pages {
+            if self.pages.contains_key(&offset) {
+                // Conflict: self already has a COW copy at this offset.
+                // Free the phantom page from backing.
+                backing.resident_count = backing.resident_count.saturating_sub(1);
+                if matches!(page.ownership, PageOwnership::Anonymous) {
+                    #[cfg(not(test))]
+                    crate::mm::allocator::frame_free(page.phys);
+                }
+            } else {
+                // No conflict: rename page from backing to self.
+                backing.resident_count = backing.resident_count.saturating_sub(1);
+                self.pages.insert(offset, page);
+                self.resident_count += 1;
+            }
+        }
+
+        // Adopt backing's backing (skip over the now-empty object).
+        // Decrement shadow_count on backing (we're detaching).
+        backing.shadow_count -= 1;
+
+        let grandparent = backing.backing.take();
+        drop(backing);
+        // backing_arc will be dropped here — if Arc refcount hits 0,
+        // VmObject::drop runs but pages are already drained.
+
+        if let Some(ref gp) = grandparent {
+            let mut gp_w = gp.write();
+            gp_w.shadow_count += 1;
+        }
+        self.backing = grandparent;
+    }
+
     /// Update the object size in bytes.
     pub fn set_size(&mut self, new_size: usize) {
         self.size = new_size;
@@ -189,6 +271,14 @@ impl Drop for VmObject {
             }
         }
 
+        // Decrement backing's shadow_count, then release the lock
+        // before taking the Arc (which may trigger further drops).
+        if let Some(ref backing_arc) = self.backing {
+            let mut backing = backing_arc.write();
+            backing.shadow_count = backing.shadow_count.saturating_sub(1);
+            drop(backing); // release write lock before Arc::try_unwrap
+        }
+
         // Iteratively unwind the backing chain.
         let mut current = self.backing.take();
         while let Some(arc) = current {
@@ -201,6 +291,12 @@ impl Drop for VmObject {
                             #[cfg(not(test))]
                             crate::mm::allocator::frame_free(page.phys);
                         }
+                    }
+                    // Decrement next ancestor's shadow_count.
+                    if let Some(ref next_arc) = obj.backing {
+                        let mut next = next_arc.write();
+                        next.shadow_count = next.shadow_count.saturating_sub(1);
+                        drop(next); // release before taking Arc
                     }
                     current = obj.backing.take();
                 }

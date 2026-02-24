@@ -178,6 +178,11 @@ fn handle_anonymous_fault(
 
 /// Handle a COW fault: copy the page to a new frame in the topmost
 /// VmObject and remap with write permission.
+///
+/// Optimization: if the backing object has shadow_count == 1, we are the
+/// sole shadow. Attempt collapse (migrate pages from backing into self),
+/// then check if the page is now local — if so, promote in-place (O(1)
+/// zero-copy) instead of copying.
 fn handle_cow_fault(
     vma: &VmArea,
     offset: u64,
@@ -185,13 +190,29 @@ fn handle_cow_fault(
     old_phys: PhysAddr,
     pmap: &mut Pmap,
 ) -> FaultResult {
-    // Check if the topmost VmObject is the sole owner (refcount == 1).
-    // If so, we can just upgrade permissions without copying.
+    // Fast path: if Arc refcount == 1, no other VMA references this object.
     let refcount = Arc::strong_count(&vma.object);
     if refcount == 1 {
-        // Sole owner: just upgrade permissions, no copy needed.
         pmap::pmap_protect(pmap, fault_va_aligned, VirtAddr(fault_va_aligned.0 + PAGE_SIZE), vma.prot);
         return FaultResult::Resolved;
+    }
+
+    // Try collapse: if backing has shadow_count == 1, migrate pages.
+    {
+        let mut obj = vma.object.write();
+        let can_collapse = obj.backing()
+            .map(|b| b.read().shadow_count() == 1)
+            .unwrap_or(false);
+        if can_collapse {
+            obj.collapse();
+            // After collapse, check if the page is now in our top-level object.
+            if obj.has_page(offset) {
+                // Page was renamed from backing into self — zero-copy promotion.
+                drop(obj);
+                pmap::pmap_protect(pmap, fault_va_aligned, VirtAddr(fault_va_aligned.0 + PAGE_SIZE), vma.prot);
+                return FaultResult::Resolved;
+            }
+        }
     }
 
     // Shared: need to copy the page.

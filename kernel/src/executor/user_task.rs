@@ -590,24 +590,15 @@ async fn sys_openat_async(
 ) -> Result<u32, Errno> {
     use crate::fs::fd_table::OpenFlags;
 
-    // Read pathname from user memory (simple, up to 256 bytes)
-    let mut path_buf = [0u8; 256];
-    let mut path_len = 0;
-    for i in 0..256 {
-        let byte = unsafe { *((pathname_ptr + i) as *const u8) };
-        if byte == 0 { break; }
-        path_buf[i] = byte;
-        path_len += 1;
-    }
-    let path_str = core::str::from_utf8(&path_buf[..path_len])
-        .map_err(|_| Errno::EINVAL)?;
+    // Read pathname from user memory using fault-safe copyinstr.
+    let path_str = copyinstr(pathname_ptr, 256).ok_or(Errno::EFAULT)?;
 
     let open_flags = OpenFlags {
         read: true,
         write: (flags & 0x1) != 0 || (flags & 0x2) != 0,
     };
 
-    crate::fs::syscalls::sys_open(&task.fd_table, path_str, open_flags).await
+    crate::fs::syscalls::sys_open(&task.fd_table, &path_str, open_flags).await
 }
 
 /// sys_wait4: wait for child process.
@@ -640,15 +631,22 @@ fn copyinstr(user_ptr: usize, max_len: usize) -> Option<String> {
     if user_ptr == 0 {
         return None;
     }
-    let mut buf = alloc::vec::Vec::with_capacity(max_len);
-    for i in 0..max_len {
-        let byte = unsafe { *((user_ptr + i) as *const u8) };
-        if byte == 0 {
-            return Some(unsafe { String::from_utf8_unchecked(buf) });
-        }
-        buf.push(byte);
+    let mut buf = alloc::vec![0u8; max_len];
+    // Copy from user memory using fault-safe copy_user_chunk.
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            buf.as_mut_ptr(),
+            user_ptr as *const u8,
+            max_len,
+        )
+    };
+    if rc != 0 {
+        return None; // EFAULT
     }
-    None // no NUL found within max_len
+    // Find NUL terminator
+    let nul_pos = buf.iter().position(|&b| b == 0)?;
+    buf.truncate(nul_pos);
+    Some(unsafe { String::from_utf8_unchecked(buf) })
 }
 
 /// Read a NULL-terminated array of string pointers from user memory.
@@ -661,8 +659,15 @@ fn copyin_argv(user_argv: usize, max_count: usize, max_total: usize) -> alloc::v
     let mut total = 0usize;
     for i in 0..max_count {
         let ptr_addr = user_argv + i * core::mem::size_of::<usize>();
-        let str_ptr = unsafe { *(ptr_addr as *const usize) };
-        if str_ptr == 0 {
+        let mut str_ptr: usize = 0;
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                &mut str_ptr as *mut usize as *mut u8,
+                ptr_addr as *const u8,
+                core::mem::size_of::<usize>(),
+            )
+        };
+        if rc != 0 || str_ptr == 0 {
             break;
         }
         if let Some(s) = copyinstr(str_ptr, 256) {

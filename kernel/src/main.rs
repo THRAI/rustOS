@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(c_variadic)]
 
 extern crate alloc;
 
@@ -10,6 +11,7 @@ mod drivers;
 mod executor;
 mod fs;
 mod hal;
+mod libc_stubs;
 mod mm;
 mod proc;
 #[macro_use]
@@ -20,6 +22,8 @@ mod trap;
 global_asm!(include_str!("hal/rv64/boot.S"));
 // Include trap assembly
 global_asm!(include_str!("hal/rv64/trap.S"));
+// Include memset/memcpy/memmove assembly (ported from FreeBSD)
+global_asm!(include_str!("hal/rv64/memops.S"));
 
 /// Atomic flag: first hart to reach rust_main claims boot role.
 static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -34,26 +38,37 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         kprintln!("hello world");
         kprintln!("[kernel] hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
 
+        // Ensure SIE=0 and set stvec before anything that uses IrqSafeSpinLock.
+        // OpenSBI may leave SIE=1; IrqSafeSpinLock restore would re-enable it,
+        // causing stray interrupts before per-CPU data is ready.
+        unsafe { core::arch::asm!("csrci sstatus, 0x2"); }
+        hal::rv64::trap::set_kernel_trap_entry();
+
+        // Initialize kernel heap first — everything below may allocate
+        alloc_early::init_heap();
+
+        // Parse FDT to discover CPUs (before trap/timer — no IRQs yet)
+        let (num_cpus, hartids) = hal::rv64::fdt::parse_cpus(dtb_ptr);
+
+        // Pre-initialize PerCpu for ALL discovered harts.
+        // Must happen before trap/timer init because the timer IRQ handler
+        // accesses per-CPU data via tp register.
+        for i in 0..num_cpus {
+            let hid = hartids[i];
+            let cid = hal::rv64::fdt::hart_to_cpu(hid).unwrap_or(i);
+            kprintln!("[boot] init_per_cpu({}, {}) start", cid, hid);
+            executor::init_per_cpu(cid, hid);
+            kprintln!("[boot] init_per_cpu({}, {}) done", cid, hid);
+        }
+        let cpu0 = hal::rv64::fdt::hart_to_cpu(hartid).unwrap_or(0);
+        unsafe { executor::per_cpu::set_tp(cpu0) };
+        kprintln!("[kernel] per-cpu data initialized for {} harts", num_cpus);
+
         // Initialize trap infrastructure (stvec + STIE + SSIE)
         trap::init();
 
         // Arm the first timer interrupt (10ms interval)
         hal::rv64::timer::init();
-
-        // Parse FDT to discover CPUs
-        let (num_cpus, hartids) = hal::rv64::fdt::parse_cpus(dtb_ptr);
-
-        // Pre-initialize PerCpu for ALL discovered harts.
-        // This must happen before spawning any cross-CPU tasks, because
-        // schedule_fn calls PerCpu::get(target_cpu) immediately.
-        for i in 0..num_cpus {
-            let hid = hartids[i];
-            let cid = hal::rv64::fdt::hart_to_cpu(hid).unwrap_or(i);
-            executor::init_per_cpu(cid, hid);
-        }
-        let cpu0 = hal::rv64::fdt::hart_to_cpu(hartid).unwrap_or(0);
-        unsafe { executor::per_cpu::set_tp(cpu0) };
-        kprintln!("[kernel] per-cpu data initialized for {} harts", num_cpus);
 
         // Initialize frame allocator with physical memory after kernel image
         {
@@ -62,110 +77,115 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 unsafe { &ekernel as *const u8 as usize }
             );
             let mem_end = hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
+            kprintln!("[boot] init_frame_allocator({:#x}..{:#x})", mem_start.as_usize(), mem_end.as_usize());
+            // Test heap allocation before buddy init
+            {
+                let v: alloc::vec::Vec<u64> = alloc::vec![1, 2, 3, 4, 5];
+                kprintln!("[boot] test vec alloc OK, len={}", v.len());
+            }
             mm::allocator::init_frame_allocator(mem_start, mem_end);
+            kprintln!("[boot] frame allocator done");
         }
 
         // Initialize VirtIO-blk driver (probes MMIO addresses for block device)
         drivers::virtio_blk::init();
 
         // Initialize VFS caches
+        kprintln!("[boot] dentry::init...");
         fs::dentry::init();
+        kprintln!("[boot] page_cache::init...");
         fs::page_cache::init();
 
+        kprintln!("[boot] delegate::init...");
         // Initialize filesystem delegate (mounts ext4, spawns delegate task)
         fs::delegate::init();
+        kprintln!("[boot] delegate done");
 
-        // Integration test: read /hello.txt from ext4 via delegate
-        executor::spawn_kernel_task(async {
-            // Small delay to let delegate mount
-            executor::sleep(200).await;
-            test_delegate_read().await;
-        }, 0).detach();
-
-        // Integration test: VFS sys_open + sys_read through page cache
-        executor::spawn_kernel_task(async {
-            executor::sleep(400).await;
-            test_vfs_read().await;
-        }, 0).detach();
-
-        // Integration test: fork + exec + wait4 lifecycle
-        executor::spawn_kernel_task(async {
-            executor::sleep(600).await;
-            test_fork_exec_wait4().await;
-        }, 0).detach();
-
-        // Integration test: exception fixup (copy_user_chunk with bad pointers)
-        test_fixup();
-
-        // Integration test: uiomove short-read with partially-valid user range
-        test_uiomove_short_read();
-
-        // Integration test: fork + exit + wait4 lifecycle
-        test_fork_exit_wait4();
-
-        // Spawn a test kernel task to prove the executor path works
-        executor::spawn_kernel_task(async {
-            kprintln!("hello from async future!");
-        }, 0).detach();
-
-        // Integration test: sleep future (should wake after ~100ms = 10 ticks)
-        executor::spawn_kernel_task(async {
-            executor::sleep(100).await;
-            kprintln!("woke after 100ms!");
-        }, 0).detach();
-
-        // Boot secondary harts
+        // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {
             hal::rv64::smp::boot_secondary_harts(num_cpus, &hartids, hartid);
         }
 
-        // Spawn cross-CPU test task (if we have >1 CPU)
-        if num_cpus > 1 {
-            executor::spawn_kernel_task(async {
-                kprintln!("hello from CPU 1");
-            }, 1).detach();
-        }
+        // --- Integration tests: only compiled when `--features qemu-test` ---
+        #[cfg(feature = "qemu-test")]
+        {
+            // Synchronous tests (no executor needed)
+            test_fixup();
+            test_uiomove_short_read();
+            test_fork_exit_wait4();
+            register_clobber_test();
 
-        // Integration test: cross-CPU wake (CPU 0 sleeps, then spawns on CPU 1)
-        if num_cpus > 1 {
+            // Async executor test: prove the path works
             executor::spawn_kernel_task(async {
-                executor::sleep(50).await;
+                kprintln!("hello from async future!");
+            }, cpu0).detach();
+
+            // Sleep future (should wake after ~100ms)
+            executor::spawn_kernel_task(async {
+                executor::sleep(100).await;
+                kprintln!("woke after 100ms!");
+            }, cpu0).detach();
+
+            // Cross-CPU tests (delay to let secondary harts finish per_cpu re-init)
+            if num_cpus > 1 {
                 executor::spawn_kernel_task(async {
-                    kprintln!("cross-cpu wake on CPU 1");
+                    executor::sleep(50).await;
+                    kprintln!("hello from CPU 1");
                 }, 1).detach();
-            }, 0).detach();
+            }
+            if num_cpus > 1 {
+                executor::spawn_kernel_task(async {
+                    executor::sleep(50).await;
+                    executor::spawn_kernel_task(async {
+                        kprintln!("cross-cpu wake on CPU 1");
+                    }, 1).detach();
+                }, cpu0).detach();
+            }
+
+            // Pmap tests
+            executor::spawn_kernel_task(async {
+                mm::pmap::test_integration::test_pmap_extract_only();
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(200).await;
+                mm::pmap::test_integration::test_pmap_satp_switch();
+            }, cpu0).detach();
+
+            // VM tests
+            executor::spawn_kernel_task(async {
+                executor::sleep(400).await;
+                mm::vm::test_integration::test_anonymous_page_fault();
+                mm::vm::test_integration::test_cow_fault();
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(400).await;
+                mm::vm::test_integration::test_frame_alloc_sync_works();
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(400).await;
+                mm::vm::test_integration::test_iterative_drop_500();
+            }, cpu0).detach();
+
+            // Filesystem tests (need delegate mount time)
+            executor::spawn_kernel_task(async {
+                executor::sleep(200).await;
+                test_delegate_read().await;
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(400).await;
+                test_vfs_read().await;
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(600).await;
+                test_fork_exec_wait4().await;
+            }, cpu0).detach();
+
+            // Shutdown after all tests complete (10s generous timeout)
+            executor::spawn_kernel_task(async {
+                executor::sleep(10_000).await;
+                hal::rv64::sbi::shutdown();
+            }, cpu0).detach();
         }
-
-        // Tier 2.a: offline PT walk (no satp switch)
-        executor::spawn_kernel_task(async {
-            mm::pmap::test_integration::test_pmap_extract_only();
-        }, 0).detach();
-
-        // Tier 2.b: satp switch (delay to let 2.a finish first)
-        executor::spawn_kernel_task(async {
-            executor::sleep(200).await;
-            mm::pmap::test_integration::test_pmap_satp_switch();
-        }, 0).detach();
-
-        // Phase 2 VM integration tests (run after satp-switch test completes)
-        executor::spawn_kernel_task(async {
-            executor::sleep(400).await;
-            mm::vm::test_integration::test_anonymous_page_fault();
-            mm::vm::test_integration::test_cow_fault();
-        }, 0).detach();
-
-        executor::spawn_kernel_task(async {
-            executor::sleep(400).await;
-            mm::vm::test_integration::test_frame_alloc_sync_works();
-        }, 0).detach();
-
-        executor::spawn_kernel_task(async {
-            executor::sleep(400).await;
-            mm::vm::test_integration::test_iterative_drop_500();
-        }, 0).detach();
-
-        // Register clobber test: verify trap save/restore
-        register_clobber_test();
 
         // Enable global interrupts
         hal::rv64::irq::enable();
@@ -187,9 +207,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     }
 }
 
-/// Integration test: uiomove with a partially-valid user range.
-/// First page of user buffer is valid kernel memory, second page is unmapped.
-/// uiomove should copy the first chunk and return a short read.
+#[cfg(feature = "qemu-test")]
 fn test_uiomove_short_read() {
     use mm::uio::{uiomove, UioDir};
 
@@ -267,8 +285,7 @@ fn test_uiomove_short_read() {
     kprintln!("uiomove short-read PASS");
 }
 
-/// Integration test: copy_user_chunk with bad pointers returns EFAULT via fixup.
-/// Integration test: fork creates COW child, child exits, parent wait4 collects status.
+#[cfg(feature = "qemu-test")]
 fn test_fork_exit_wait4() {
     use alloc::sync::Arc;
     use proc::task::Task;
@@ -342,6 +359,7 @@ fn test_fork_exit_wait4() {
     kprintln!("fork-exit-wait4 PASS");
 }
 
+#[cfg(feature = "qemu-test")]
 async fn test_delegate_read() {
     match fs::delegate::fs_open("/hello.txt").await {
         Ok(handle) => {
@@ -363,12 +381,10 @@ async fn test_delegate_read() {
     }
 }
 
-/// VFS integration test: sys_open + sys_read through page cache.
-/// Reads /hello.txt via VFS syscalls, verifies content, then reads again
-/// to verify page cache hit (second read should not trigger delegate I/O).
+#[cfg(feature = "qemu-test")]
 async fn test_vfs_read() {
     use fs::fd_table::{FdTable, OpenFlags};
-    let fd_table = spin::Mutex::new(FdTable::new());
+    let fd_table = hal_common::SpinMutex::new(FdTable::new());
 
     // First read: goes through delegate
     match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
@@ -410,11 +426,7 @@ async fn test_vfs_read() {
     }
 }
 
-/// Integration test: fork + exec + wait4 lifecycle.
-/// Creates init task, forks child, child execs /hello.txt (which will fail
-/// since it's not an ELF), then tests exec with a proper path resolution.
-/// Verifies the full pipeline: fork creates child, exec resets vm_map and
-/// creates demand-paged VMAs, wait4 collects exit status.
+#[cfg(feature = "qemu-test")]
 async fn test_fork_exec_wait4() {
     use alloc::sync::Arc;
     use proc::task::Task;
@@ -463,6 +475,7 @@ async fn test_fork_exec_wait4() {
     }
 }
 
+#[cfg(feature = "qemu-test")]
 fn test_fixup() {
     use hal::rv64::copy_user::copy_user_chunk;
     let src_buf = [0xABu8; 16];
@@ -492,6 +505,7 @@ fn test_fixup() {
 /// Register clobber test: write known values to caller-saved registers,
 /// wait for a timer IRQ (which saves/restores via __kernel_trap), then
 /// verify the registers are intact. Tests trap entry/exit correctness.
+#[cfg(feature = "qemu-test")]
 fn register_clobber_test() {
     let ok: usize;
     unsafe {

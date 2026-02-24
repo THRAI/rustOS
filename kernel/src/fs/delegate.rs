@@ -1,11 +1,8 @@
 //! Filesystem delegate: serializes all ext4 operations off the async executor.
 //!
-//! A single async task owns the Ext4Fs handle and processes requests
+//! A single async task owns the lwext4 mount and processes requests
 //! from a bounded channel. Callers use async functions (fs_open, fs_read, etc.)
 //! that send requests and await replies via oneshot channels.
-//!
-//! Design: per CONTEXT.md, only ONE task ever calls ext4 functions (serialization).
-//! The delegate yields between operations so the executor stays responsive.
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,14 +10,16 @@ use core::task::{Poll, Waker};
 use core::pin::Pin;
 use core::future::Future;
 use hal_common::IrqSafeSpinLock;
+use lwext4_rust::Ext4File;
 use crate::kprintln;
-use crate::fs::ext4::Ext4Fs;
+
+// SAFETY: Ext4File contains raw pointers from lwext4 C code.
+// All access is serialized in the single delegate_task — never shared across threads.
+struct SendExt4File(Ext4File);
+unsafe impl Send for SendExt4File {}
 
 /// Maximum pending requests in the channel.
 const CHANNEL_CAPACITY: usize = 256;
-
-/// Sector size for VirtIO-blk.
-const SECTOR_SIZE: usize = 512;
 
 /// File handle (index into delegate's open file table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,11 +30,12 @@ pub enum FsRequest {
     Open {
         path: [u8; 256],
         path_len: usize,
+        flags: u32,
         reply: ReplySlot<Result<FsFileHandle, i32>>,
     },
     Read {
         handle: FsFileHandle,
-        buf_ptr: usize, // physical/virtual address of caller's buffer
+        buf_ptr: usize,
         len: usize,
         reply: ReplySlot<Result<usize, i32>>,
     },
@@ -43,8 +43,8 @@ pub enum FsRequest {
         handle: FsFileHandle,
         reply: ReplySlot<Result<(), i32>>,
     },
-    /// Look up a child entry in a directory by inode + name.
-    /// Returns (child_ino, file_type, file_size).
+    /// Look up a child entry in a directory by parent path + name.
+    /// Returns (child_ino_unused, file_type, file_size).
     Lookup {
         parent_ino: u32,
         name: [u8; 256],
@@ -59,7 +59,8 @@ pub enum FsRequest {
     /// Read one page of file data at the given byte offset.
     /// Delegate allocates a frame, reads data into it, returns PhysAddr as usize.
     ReadPage {
-        ino: u32,
+        path: [u8; 256],
+        path_len: usize,
         offset: u64,
         reply: ReplySlot<Result<usize, i32>>,
     },
@@ -77,12 +78,10 @@ struct ReplyInner<T> {
 }
 
 impl<T: 'static> ReplySlot<T> {
-    /// Create a new reply slot. Caller must ensure the backing storage lives long enough.
     fn new(inner: &'static ReplyInner<T>) -> Self {
         Self { inner }
     }
 
-    /// Set the result and wake the waiter.
     fn complete(&self, val: T) {
         *self.inner.value.lock() = Some(val);
         self.inner.done.store(true, Ordering::Release);
@@ -116,7 +115,6 @@ impl<T: Copy + 'static> Future for ReplyFuture<T> {
 }
 
 /// Allocate a static reply slot. Uses a pool of pre-allocated slots.
-/// For simplicity, we use a small fixed pool with atomic index.
 const REPLY_POOL_SIZE: usize = 64;
 
 macro_rules! define_reply_pool {
@@ -146,59 +144,25 @@ static LOOKUP_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static STAT_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READPAGE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 
-fn alloc_open_reply() -> &'static ReplyInner<Result<FsFileHandle, i32>> {
-    let idx = OPEN_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
-    let r = &OPEN_REPLIES[idx];
-    r.done.store(false, Ordering::Relaxed);
-    *r.waker.lock() = None;
-    *r.value.lock() = None;
-    r
+macro_rules! define_alloc_reply {
+    ($fn_name:ident, $pool:ident, $idx:ident, $T:ty) => {
+        fn $fn_name() -> &'static ReplyInner<$T> {
+            let idx = $idx.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
+            let r = &$pool[idx];
+            r.done.store(false, Ordering::Relaxed);
+            *r.waker.lock() = None;
+            *r.value.lock() = None;
+            r
+        }
+    };
 }
 
-fn alloc_read_reply() -> &'static ReplyInner<Result<usize, i32>> {
-    let idx = READ_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
-    let r = &READ_REPLIES[idx];
-    r.done.store(false, Ordering::Relaxed);
-    *r.waker.lock() = None;
-    *r.value.lock() = None;
-    r
-}
-
-fn alloc_close_reply() -> &'static ReplyInner<Result<(), i32>> {
-    let idx = CLOSE_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
-    let r = &CLOSE_REPLIES[idx];
-    r.done.store(false, Ordering::Relaxed);
-    *r.waker.lock() = None;
-    *r.value.lock() = None;
-    r
-}
-
-fn alloc_lookup_reply() -> &'static ReplyInner<Result<(u32, u8, u64), i32>> {
-    let idx = LOOKUP_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
-    let r = &LOOKUP_REPLIES[idx];
-    r.done.store(false, Ordering::Relaxed);
-    *r.waker.lock() = None;
-    *r.value.lock() = None;
-    r
-}
-
-fn alloc_stat_reply() -> &'static ReplyInner<Result<(u64, u8), i32>> {
-    let idx = STAT_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
-    let r = &STAT_REPLIES[idx];
-    r.done.store(false, Ordering::Relaxed);
-    *r.waker.lock() = None;
-    *r.value.lock() = None;
-    r
-}
-
-fn alloc_readpage_reply() -> &'static ReplyInner<Result<usize, i32>> {
-    let idx = READPAGE_REPLY_IDX.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
-    let r = &READPAGE_REPLIES[idx];
-    r.done.store(false, Ordering::Relaxed);
-    *r.waker.lock() = None;
-    *r.value.lock() = None;
-    r
-}
+define_alloc_reply!(alloc_open_reply, OPEN_REPLIES, OPEN_REPLY_IDX, Result<FsFileHandle, i32>);
+define_alloc_reply!(alloc_read_reply, READ_REPLIES, READ_REPLY_IDX, Result<usize, i32>);
+define_alloc_reply!(alloc_close_reply, CLOSE_REPLIES, CLOSE_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_lookup_reply, LOOKUP_REPLIES, LOOKUP_REPLY_IDX, Result<(u32, u8, u64), i32>);
+define_alloc_reply!(alloc_stat_reply, STAT_REPLIES, STAT_REPLY_IDX, Result<(u64, u8), i32>);
+define_alloc_reply!(alloc_readpage_reply, READPAGE_REPLIES, READPAGE_REPLY_IDX, Result<usize, i32>);
 
 /// Bounded request channel.
 static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>> =
@@ -218,59 +182,30 @@ fn send_request(req: FsRequest) {
     }
 }
 
-/// Block read callback for ext4: reads a filesystem block via VirtIO-blk.
-/// Translates filesystem block numbers to sectors.
-fn block_read(block_no: u64, buf: &mut [u8]) -> Result<(), ()> {
-    let blk = crate::drivers::virtio_blk::get();
-    let sectors_per_block = buf.len() / SECTOR_SIZE;
-    let start_sector = block_no * sectors_per_block as u64;
-
-    for i in 0..sectors_per_block {
-        let sector = start_sector + i as u64;
-        let offset = i * SECTOR_SIZE;
-        let sector_buf: &mut [u8; 512] = (&mut buf[offset..offset + 512]).try_into().unwrap();
-        blk.lock().read_sector(sector, sector_buf)?;
-    }
-    Ok(())
-}
-
-/// Open file table entry in the delegate.
-struct OpenFile {
-    inode_no: u32,
-    offset: usize,
-}
-
 /// Maximum open files.
 const MAX_OPEN_FILES: usize = 64;
 
-/// Delegate task: the single async task that owns the Ext4Fs and processes requests.
+/// Delegate task: the single async task that owns lwext4 and processes requests.
 async fn delegate_task() {
-    // Mount the ext4 filesystem
-    let fs = match Ext4Fs::mount(block_read) {
-        Ok(fs) => {
-            kprintln!("[fs] ext4 mounted, delegate running");
-            fs
-        }
-        Err(e) => {
-            kprintln!("[fs] ext4 mount failed: {}", e);
-            return;
-        }
-    };
+    // Mount the ext4 filesystem via lwext4
+    if let Err(e) = crate::fs::ext4::mount() {
+        kprintln!("[fs] ext4 mount failed: {}", e);
+        return;
+    }
+    kprintln!("[fs] ext4 mounted, delegate running");
 
-    // Open file table
-    let mut open_files: [Option<OpenFile>; MAX_OPEN_FILES] = [const { None }; MAX_OPEN_FILES];
+    // Open file table: each slot holds an Option<SendExt4File>
+    let mut open_files: [Option<SendExt4File>; MAX_OPEN_FILES] = [const { None }; MAX_OPEN_FILES];
 
     // Process requests forever
     loop {
-        // Wait for a request
         let req = DelegateRecvFuture.await;
 
         match req {
-            FsRequest::Open { path, path_len, reply } => {
+            FsRequest::Open { path, path_len, flags, reply } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
-                match fs.lookup(path_str) {
-                    Ok(ino) => {
-                        // Find a free slot
+                match crate::fs::ext4::open(path_str, flags) {
+                    Ok(file) => {
                         let mut slot = None;
                         for (i, f) in open_files.iter().enumerate() {
                             if f.is_none() {
@@ -280,69 +215,77 @@ async fn delegate_task() {
                         }
                         match slot {
                             Some(i) => {
-                                open_files[i] = Some(OpenFile { inode_no: ino, offset: 0 });
+                                open_files[i] = Some(SendExt4File(file));
                                 reply.complete(Ok(FsFileHandle(i as u16)));
                             }
                             None => reply.complete(Err(-24)), // EMFILE
                         }
                     }
-                    Err(_) => reply.complete(Err(-2)), // ENOENT
+                    Err(e) => reply.complete(Err(e)),
                 }
             }
             FsRequest::Read { handle, buf_ptr, len, reply } => {
                 let idx = handle.0 as usize;
                 if idx >= MAX_OPEN_FILES || open_files[idx].is_none() {
                     reply.complete(Err(-9)); // EBADF
+                    crate::executor::yield_now().await;
                     continue;
                 }
-                let of = open_files[idx].as_mut().unwrap();
+                let file = &mut open_files[idx].as_mut().unwrap().0;
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
-                match fs.read_file(of.inode_no, buf) {
-                    Ok(n) => {
-                        of.offset += n;
-                        reply.complete(Ok(n));
-                    }
-                    Err(_) => reply.complete(Err(-5)), // EIO
+                match crate::fs::ext4::read(file, buf) {
+                    Ok(n) => reply.complete(Ok(n)),
+                    Err(e) => reply.complete(Err(e)),
                 }
             }
             FsRequest::Close { handle, reply } => {
                 let idx = handle.0 as usize;
                 if idx < MAX_OPEN_FILES {
+                    if let Some(ref mut wrapper) = open_files[idx] {
+                        let _ = crate::fs::ext4::close(&mut wrapper.0);
+                    }
                     open_files[idx] = None;
                 }
                 reply.complete(Ok(()));
             }
-            FsRequest::Lookup { parent_ino, name, name_len, reply } => {
-                let name_str = core::str::from_utf8(&name[..name_len]).unwrap_or("");
-                match fs.lookup_in_dir(parent_ino, name_str) {
-                    Ok((child_ino, file_type, file_size)) => {
-                        reply.complete(Ok((child_ino, file_type, file_size)));
+            FsRequest::Lookup { parent_ino: _, name, name_len, reply } => {
+                // lwext4 is path-based: prepend "/" for root-level lookups
+                let mut path_buf = [0u8; 258];
+                path_buf[0] = b'/';
+                path_buf[1..1 + name_len].copy_from_slice(&name[..name_len]);
+                let full_path = core::str::from_utf8(&path_buf[..1 + name_len]).unwrap_or("");
+                match crate::fs::ext4::stat(full_path) {
+                    Ok((size, ftype)) => {
+                        // Use 0 as inode number — lwext4 doesn't expose raw inodes
+                        reply.complete(Ok((0, ftype, size)));
                     }
                     Err(_) => reply.complete(Err(-2)), // ENOENT
                 }
             }
-            FsRequest::Stat { ino, reply } => {
-                match fs.read_inode(ino) {
-                    Ok(inode) => {
-                        let ftype = if inode.is_dir() { 2u8 } else { 1u8 };
-                        reply.complete(Ok((inode.size(), ftype)));
-                    }
-                    Err(_) => reply.complete(Err(-2)), // ENOENT
-                }
+            FsRequest::Stat { ino: _, reply } => {
+                // Stat not directly usable without a path in lwext4.
+                // Callers should use Lookup which returns size+type.
+                reply.complete(Err(-38)); // ENOSYS
             }
-            FsRequest::ReadPage { ino, offset, reply } => {
-                // Allocate a frame for the page data
+            FsRequest::ReadPage { path, path_len, offset, reply } => {
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 match crate::mm::allocator::frame_alloc_sync() {
                     Some(pa) => {
                         let buf = unsafe {
                             core::slice::from_raw_parts_mut(pa.as_usize() as *mut u8, 4096)
                         };
-                        // Zero the buffer first
                         buf.fill(0);
-                        // Read file data at offset into the frame
-                        match fs.read_file_at(ino, offset, buf) {
-                            Ok(_) => reply.complete(Ok(pa.as_usize())),
-                            Err(_) => reply.complete(Err(-5)), // EIO
+                        // Open, seek, read, close
+                        match crate::fs::ext4::open(path_str, 0) {
+                            Ok(mut file) => {
+                                let _ = file.file_seek(offset as i64, 0); // SEEK_SET
+                                let _ = crate::fs::ext4::read(&mut file, buf);
+                                let _ = crate::fs::ext4::close(&mut file);
+                                reply.complete(Ok(pa.as_usize()));
+                            }
+                            Err(e) => {
+                                reply.complete(Err(e));
+                            }
                         }
                     }
                     None => reply.complete(Err(-12)), // ENOMEM
@@ -386,6 +329,11 @@ impl Future for DelegateRecvFuture {
 
 /// Open a file by path. Returns a file handle.
 pub async fn fs_open(path: &str) -> Result<FsFileHandle, i32> {
+    fs_open_flags(path, 0).await
+}
+
+/// Open a file by path with flags. Returns a file handle.
+pub async fn fs_open_flags(path: &str, flags: u32) -> Result<FsFileHandle, i32> {
     let reply_inner = alloc_open_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);
@@ -394,6 +342,7 @@ pub async fn fs_open(path: &str) -> Result<FsFileHandle, i32> {
     send_request(FsRequest::Open {
         path: path_buf,
         path_len: len,
+        flags,
         reply: ReplySlot::new(reply_inner),
     });
 
@@ -457,11 +406,15 @@ pub async fn fs_stat(ino: u32) -> Result<(u64, u8), i32> {
 
 /// Read one page of file data at the given byte offset.
 /// Delegate allocates a frame, reads data into it, returns PhysAddr as usize.
-pub async fn fs_read_page(ino: u32, offset: u64) -> Result<usize, i32> {
+pub async fn fs_read_page(path: &str, offset: u64) -> Result<usize, i32> {
     let reply_inner = alloc_readpage_reply();
+    let mut path_buf = [0u8; 256];
+    let len = path.len().min(256);
+    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
 
     send_request(FsRequest::ReadPage {
-        ino,
+        path: path_buf,
+        path_len: len,
         offset,
         reply: ReplySlot::new(reply_inner),
     });
@@ -471,5 +424,6 @@ pub async fn fs_read_page(ino: u32, offset: u64) -> Result<usize, i32> {
 
 /// Initialize the delegate: mount ext4 and spawn the delegate task.
 pub fn init() {
-    crate::executor::spawn_kernel_task(delegate_task(), 0).detach();
+    let cpu = crate::executor::per_cpu::current().cpu_id;
+    crate::executor::spawn_kernel_task(delegate_task(), cpu).detach();
 }

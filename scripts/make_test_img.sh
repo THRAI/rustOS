@@ -25,6 +25,13 @@ if [ -f "$SCRIPT_DIR/init" ]; then
     chmod 755 "$STAGING/bin/init"
 fi
 
+# Add /bin/busybox if the binary exists
+if [ -f "$SCRIPT_DIR/busybox" ]; then
+    mkdir -p "$STAGING/bin"
+    cp "$SCRIPT_DIR/busybox" "$STAGING/bin/busybox"
+    chmod 755 "$STAGING/bin/busybox"
+fi
+
 echo "Creating 32MB ext4 test image..."
 $MKE2FS -t ext2 -b 1024 -d "$STAGING" -L testfs \
     -O filetype,^ext_attr,^resize_inode,^dir_index,^sparse_super \

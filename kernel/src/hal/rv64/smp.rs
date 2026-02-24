@@ -4,7 +4,6 @@
 //! then calls secondary_rust_main which initializes PerCpu, trap vectors,
 //! timer, and enters the executor loop.
 
-use crate::kprintln;
 use super::sbi;
 use super::fdt;
 
@@ -16,7 +15,7 @@ pub fn boot_secondary_harts(num_cpus: usize, hartids: &[usize], boot_hartid: usi
             continue; // skip boot hart
         }
         let cpu_id = fdt::hart_to_cpu(hartid).unwrap();
-        kprintln!("[smp] starting hart {} (cpu {})", hartid, cpu_id);
+        klog!(smp, info, "starting hart {} (cpu {})", hartid, cpu_id);
 
         let ret = sbi::hart_start(
             hartid,
@@ -24,7 +23,7 @@ pub fn boot_secondary_harts(num_cpus: usize, hartids: &[usize], boot_hartid: usi
             cpu_id, // passed as a0 (opaque) to the entry point
         );
         if ret.error != 0 {
-            kprintln!("[smp] WARNING: hart_start for hart {} failed: error={}", hartid, ret.error);
+            klog!(smp, error, "hart_start for hart {} failed: error={}", hartid, ret.error);
         }
     }
 }
@@ -36,10 +35,10 @@ pub fn boot_secondary_harts(num_cpus: usize, hartids: &[usize], boot_hartid: usi
 unsafe extern "C" fn secondary_entry() -> ! {
     core::arch::naked_asm!(
         // a0 = cpu_id (opaque from hart_start)
-        // sp = boot_stack_top - cpu_id * 16384
+        // sp = boot_stack_top - cpu_id * 65536
         "mv     t0, a0",           // t0 = cpu_id
         "la     sp, boot_stack_top",
-        "slli   t1, t0, 14",       // t1 = cpu_id * 16384
+        "slli   t1, t0, 16",       // t1 = cpu_id * 65536
         "sub    sp, sp, t1",
         // sscratch = 0 (kernel mode indicator)
         "csrw   sscratch, zero",
@@ -59,7 +58,7 @@ unsafe extern "C" fn secondary_entry() -> ! {
 extern "C" fn secondary_rust_main(cpu_id: usize) -> ! {
     // Look up physical hartid from cpu_id
     let hartid = fdt::cpu_to_hart(cpu_id);
-    kprintln!("[smp] hart {} (cpu {}) starting", hartid, cpu_id);
+    klog!(smp, info, "hart {} (cpu {}) starting", hartid, cpu_id);
 
     // Initialize PerCpu for this CPU
     crate::executor::init_per_cpu(cpu_id, hartid);
@@ -79,7 +78,7 @@ extern "C" fn secondary_rust_main(cpu_id: usize) -> ! {
     // Enable global interrupts
     super::irq::enable();
 
-    kprintln!("[smp] hart {} (cpu {}) entering executor loop", hartid, cpu_id);
+    klog!(smp, info, "hart {} (cpu {}) entering executor loop", hartid, cpu_id);
 
     // Enter the executor loop (never returns)
     crate::executor::executor_loop()

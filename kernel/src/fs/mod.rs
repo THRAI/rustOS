@@ -1,6 +1,7 @@
 //! Filesystem subsystem.
 
 pub mod ext4;
+pub mod lwext4_disk;
 pub mod delegate;
 pub mod vnode;
 pub mod dentry;

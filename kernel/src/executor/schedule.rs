@@ -76,6 +76,7 @@ pub async fn sleep(ms: u64) {
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             if let Some(_id) = self.timer_id {
                 // We were woken -- timer expired
+                crate::klog!(sched, debug, "sleep woke id={} ms={}", _id, self.ms);
                 Poll::Ready(())
             } else {
                 // First poll: register in timer wheel
@@ -83,6 +84,7 @@ pub async fn sleep(ms: u64) {
                 let mut tw = pc.timer_wheel.lock();
                 let id = tw.insert(self.ms, cx.waker().clone());
                 self.timer_id = Some(id);
+                crate::klog!(sched, debug, "sleep reg id={} ms={} tick={} cpu={}", id, self.ms, tw.current_tick(), pc.cpu_id);
                 Poll::Pending
             }
         }

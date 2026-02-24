@@ -57,9 +57,9 @@ _start:
 .setup_stack:
     # Compute per-hart stack pointer:
     # sp = boot_stack_top - (hartid * STACK_SIZE)
-    # STACK_SIZE = 16384 (16KB)
+    # STACK_SIZE = 65536 (64KB)
     la      sp, boot_stack_top
-    slli    t1, a0, 14
+    slli    t1, a0, 16
     sub     sp, sp, t1
 
     # Write 0 to sscratch -- critical: prevents corrupted sp on first trap

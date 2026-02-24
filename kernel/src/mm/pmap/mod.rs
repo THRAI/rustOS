@@ -55,6 +55,20 @@ pub struct Pmap {
 unsafe impl Send for Pmap {}
 
 impl Pmap {
+    /// Create a dummy Pmap for unit tests (no real page table).
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        const ATOMIC_FALSE: AtomicBool = AtomicBool::new(false);
+        Pmap {
+            root: PhysAddr::new(0),
+            asid: 0,
+            generation: 0,
+            active: [ATOMIC_FALSE; MAX_CPUS],
+            pt_pages: Vec::new(),
+            stats: PmapStats::default(),
+        }
+    }
+
     /// Allocate a page table page via `frame_alloc_sync` and track it.
     fn alloc_pt_page(&mut self) -> Option<usize> {
         #[cfg(target_arch = "riscv64")]
@@ -79,14 +93,49 @@ impl Pmap {
 /// Create a new address space with an empty root page table.
 pub fn pmap_create() -> Pmap {
     #[cfg(target_arch = "riscv64")]
-    let root = {
+    let (root, extra_pt) = {
         let frame = super::allocator::frame_alloc_sync()
             .expect("pmap_create: out of memory for root PT");
         pmap_zero_page(frame);
-        frame
+
+        // Identity-map kernel RAM as a 1GB Sv39 gigapage at root entry 2.
+        // Covers 0x8000_0000..0xC000_0000 which includes all kernel text,
+        // data, stacks, and the frame allocator region.
+        // Without this, switching satp to a user pmap unmaps the kernel.
+        let root_ptr = frame.as_usize() as *mut u64;
+        let kernel_giga_pte = pte::encode_pte(
+            0x8000_0000,
+            pte::PteFlags::V | pte::PteFlags::R | pte::PteFlags::W | pte::PteFlags::X
+                | pte::PteFlags::A | pte::PteFlags::D | pte::PteFlags::G,
+        );
+        // Root entry index 2 covers VA 0x8000_0000..0xBFFF_FFFF
+        unsafe { root_ptr.add(2).write(kernel_giga_pte); }
+
+        // Map MMIO region (UART 0x1000_0000, virtio 0x1000_8000) via a
+        // level-1 page table under root entry 0 (VA 0..0x3FFF_FFFF).
+        // Use 2MB megapages for the 0x1000_0000..0x1020_0000 range.
+        let l1_frame = super::allocator::frame_alloc_sync()
+            .expect("pmap_create: out of memory for MMIO L1 PT");
+        pmap_zero_page(l1_frame);
+        let l1_ptr = l1_frame.as_usize() as *mut u64;
+
+        // Root entry 0: non-leaf PTE pointing to L1 table
+        let root0_pte = pte::encode_pte(l1_frame.as_usize(), pte::PteFlags::V);
+        unsafe { root_ptr.add(0).write(root0_pte); }
+
+        // L1 entry 128: 2MB megapage at 0x1000_0000 (UART + virtio-blk)
+        // index = 0x1000_0000 >> 21 = 0x80 = 128
+        let mmio_mega_pte = pte::encode_pte(
+            0x1000_0000,
+            pte::PteFlags::V | pte::PteFlags::R | pte::PteFlags::W
+                | pte::PteFlags::A | pte::PteFlags::D | pte::PteFlags::G,
+        );
+        unsafe { l1_ptr.add(128).write(mmio_mega_pte); }
+
+        (frame, l1_frame)
     };
     #[cfg(not(target_arch = "riscv64"))]
-    let root = PhysAddr::new(0);
+    let (root, extra_pt) = (PhysAddr::new(0), PhysAddr::new(0));
 
     let (asid, generation) = asid::alloc_asid();
 
@@ -100,7 +149,10 @@ pub fn pmap_create() -> Pmap {
         pt_pages: {
             let mut v = Vec::new();
             #[cfg(target_arch = "riscv64")]
-            v.push(root);
+            {
+                v.push(root);
+                v.push(extra_pt);
+            }
             v
         },
         stats: PmapStats::default(),

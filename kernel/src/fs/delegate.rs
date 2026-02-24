@@ -8,10 +8,20 @@ use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use core::pin::Pin;
+
+/// FNV-1a hash of a path string, used as synthetic inode number.
+fn path_hash(path: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in path.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    // Avoid 0 (invalid inode)
+    if h == 0 { 1 } else { h }
+}
 use core::future::Future;
 use hal_common::IrqSafeSpinLock;
 use lwext4_rust::Ext4File;
-use crate::kprintln;
 
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
 // All access is serialized in the single delegate_task — never shared across threads.
@@ -189,10 +199,10 @@ const MAX_OPEN_FILES: usize = 64;
 async fn delegate_task() {
     // Mount the ext4 filesystem via lwext4
     if let Err(e) = crate::fs::ext4::mount() {
-        kprintln!("[fs] ext4 mount failed: {}", e);
+        klog!(fs, error, "ext4 mount failed: {}", e);
         return;
     }
-    kprintln!("[fs] ext4 mounted, delegate running");
+    klog!(fs, info, "ext4 mounted, delegate running");
 
     // SAFETY: We are the single delegate task — the only holder of this token.
     let mut tok = unsafe { crate::fs::ext4::DelegateToken::new() };
@@ -254,11 +264,12 @@ async fn delegate_task() {
             FsRequest::Lookup { parent_ino: _, name, name_len, reply } => {
                 // name is already a full path (e.g. "/bin/init")
                 let full_path = core::str::from_utf8(&name[..name_len]).unwrap_or("");
-                kprintln!("[delegate] lookup: {:?}", full_path);
+                klog!(fs, debug, "lookup: {:?}", full_path);
                 match crate::fs::ext4::stat(&mut tok, full_path) {
                     Ok((size, ftype)) => {
-                        // Use 0 as inode number — lwext4 doesn't expose raw inodes
-                        reply.complete(Ok((0, ftype, size)));
+                        // lwext4 doesn't expose raw inodes; use path hash as synthetic ino.
+                        let ino = path_hash(full_path);
+                        reply.complete(Ok((ino, ftype, size)));
                     }
                     Err(_) => reply.complete(Err(-2)), // ENOENT
                 }

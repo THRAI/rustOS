@@ -1,0 +1,14 @@
+/target/
+kernel-rv64.bin
+freebsd-src/
+chronix/
+delonix/
+log.txt
+log2.txt
+.claude/
+.concept-dev/
+.planning/
+ai/
+concept_docs/
+reports/
+resources.md

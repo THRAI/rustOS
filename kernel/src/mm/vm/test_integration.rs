@@ -12,6 +12,7 @@ use super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
 use super::vm_object::{OwnedPage, VmObject};
 use super::fault::{sync_fault_handler, FaultResult, PageFaultAccessType};
 use super::super::allocator::{frame_alloc_sync, frame_free};
+use super::super::pmap;
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
 pub fn test_anonymous_page_fault() {
@@ -26,7 +27,8 @@ pub fn test_anonymous_page_fault() {
     let mut map = VmMap::new();
     map.insert(vma).unwrap();
 
-    let result = sync_fault_handler(&map, VirtAddr::new(0x1000_0000), PageFaultAccessType::READ);
+    let mut test_pmap = pmap::pmap_create();
+    let result = sync_fault_handler(&map, &mut test_pmap, VirtAddr::new(0x1000_0000), PageFaultAccessType::READ);
     match result {
         FaultResult::Resolved => {
             // Verify a page was inserted into the VmObject
@@ -72,7 +74,8 @@ pub fn test_cow_fault() {
     let mut map = VmMap::new();
     map.insert(vma).unwrap();
 
-    let result = sync_fault_handler(&map, VirtAddr::new(0x2000_0000), PageFaultAccessType::WRITE);
+    let mut test_pmap = pmap::pmap_create();
+    let result = sync_fault_handler(&map, &mut test_pmap, VirtAddr::new(0x2000_0000), PageFaultAccessType::WRITE);
     match result {
         FaultResult::Resolved => {
             let vma = map.find_area(VirtAddr::new(0x2000_0000)).unwrap();

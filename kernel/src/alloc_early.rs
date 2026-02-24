@@ -1,48 +1,41 @@
-//! Minimal bump allocator for early boot.
+//! Kernel heap allocator backed by a static .bss buffer.
 //!
-//! Provides a #[global_allocator] so hal-common's alloc-using modules link.
-//! Will be replaced by a proper allocator when VM is available (Phase 2).
+//! Uses linked_list_allocator::Heap wrapped in our IrqSafeSpinLock.
+//! Must be initialized (init_heap) before any allocation — call right after UART.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicUsize, Ordering};
-use core::cell::UnsafeCell;
+use linked_list_allocator::Heap;
+use hal_common::IrqSafeSpinLock;
 
-/// 64KB static heap for early boot allocations.
-const HEAP_SIZE: usize = 64 * 1024;
+const HEAP_SIZE: usize = 512 * 1024; // 512KB
+static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
-#[repr(align(16))]
-struct AlignedHeap(UnsafeCell<[u8; HEAP_SIZE]>);
+static HEAP: IrqSafeSpinLock<Heap> = IrqSafeSpinLock::new(Heap::empty());
 
-// SAFETY: Access is serialized via atomic HEAP_POS compare-exchange.
-unsafe impl Sync for AlignedHeap {}
+struct KernelAllocator;
 
-static HEAP: AlignedHeap = AlignedHeap(UnsafeCell::new([0; HEAP_SIZE]));
-static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
-
-struct BumpAllocator;
-
-unsafe impl GlobalAlloc for BumpAllocator {
+unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        loop {
-            let pos = HEAP_POS.load(Ordering::Relaxed);
-            let aligned = (pos + layout.align() - 1) & !(layout.align() - 1);
-            let new_pos = aligned + layout.size();
-            if new_pos > HEAP_SIZE {
-                return core::ptr::null_mut();
-            }
-            if HEAP_POS
-                .compare_exchange_weak(pos, new_pos, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return unsafe { (*HEAP.0.get()).as_mut_ptr().add(aligned) };
-            }
-        }
+        HEAP.lock()
+            .allocate_first_fit(layout)
+            .ok()
+            .map_or(core::ptr::null_mut(), |nn| nn.as_ptr())
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator never frees -- acceptable for early boot
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        HEAP.lock()
+            .deallocate(core::ptr::NonNull::new_unchecked(ptr), layout);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator;
+static ALLOCATOR: KernelAllocator = KernelAllocator;
+
+/// Initialize the kernel heap from a static buffer.
+/// Must be called before anything that allocates (buddy init, per-CPU, etc.).
+pub fn init_heap() {
+    unsafe {
+        HEAP.lock().init(HEAP_SPACE.as_mut_ptr(), HEAP_SIZE);
+    }
+    crate::klog!(boot, info, "heap initialized {} KB (static)", HEAP_SIZE / 1024);
+}

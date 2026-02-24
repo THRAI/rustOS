@@ -3,7 +3,6 @@
 //! Uses SBI set_timer ecall to program stimecmp for next timer IRQ.
 //! QEMU virt provides a 10 MHz timebase.
 
-use crate::kprintln;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// QEMU virt timebase: 10 MHz
@@ -19,7 +18,7 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Initialize timer: arm the first timer interrupt.
 pub fn init() {
     set_oneshot(DEFAULT_INTERVAL);
-    kprintln!("[timer] init: {}Hz timebase, {}ms interval", TICK_HZ, DEFAULT_INTERVAL / TICK_MS);
+    klog!(sched, info, "init: {}Hz timebase, {}ms interval", TICK_HZ, DEFAULT_INTERVAL / TICK_MS);
 }
 
 /// Read the `time` CSR (cycle counter at timebase frequency).
@@ -46,14 +45,20 @@ pub fn handle_timer_irq() {
 
     // Tick the per-CPU timer wheel -- wakes expired sleep futures
     let pc = crate::executor::per_cpu::current();
+    let wt = pc.timer_wheel.lock().current_tick();
     pc.timer_wheel.lock().advance();
+
+    // Log every tick for first 60 wheel ticks on any CPU
+    if wt < 60 {
+        klog!(sched, debug, "cpu={} wheel={} global={}", pc.cpu_id, wt, tick);
+    }
 
     // Set preemption flag -- yield_now checks this
     pc.needs_reschedule.store(true, Ordering::Release);
 
     // Periodic status (every 100 ticks = ~1 second)
     if tick % 100 == 0 {
-        kprintln!("[timer] tick {}", tick);
+        klog!(sched, debug, "tick {} cpu={} wheel={}", tick, pc.cpu_id, pc.timer_wheel.lock().current_tick());
     }
 }
 

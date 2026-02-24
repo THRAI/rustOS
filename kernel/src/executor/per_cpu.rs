@@ -4,7 +4,10 @@
 //! Accessed via the tp register (hot path) or global array (cross-CPU).
 
 use hal_common::{IrqSafeSpinLock, RunQueue, TimerWheel};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+
+extern crate alloc;
+use alloc::boxed::Box;
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 8;
@@ -15,67 +18,66 @@ pub struct PerCpu {
     pub timer_wheel: IrqSafeSpinLock<TimerWheel>,
     pub hartid: usize,
     pub cpu_id: usize,
-    /// Set by timer IRQ, checked by yield_now for cooperative preemption.
     pub needs_reschedule: AtomicBool,
-    /// Exception fixup pointer: when non-zero, the trap handler redirects
-    /// load/store page faults to this address (the copy_user_chunk landing pad)
-    /// instead of panicking. Set by copy_user_chunk prologue, cleared by epilogue
-    /// and landing pad.
     pub pcb_onfault: AtomicUsize,
 }
 
-impl PerCpu {
-    /// Create a new PerCpu for the given CPU.
-    pub fn new(cpu_id: usize, hartid: usize) -> Self {
-        Self {
-            run_queue: RunQueue::new(),
-            timer_wheel: IrqSafeSpinLock::new(TimerWheel::new()),
-            hartid,
-            cpu_id,
-            needs_reschedule: AtomicBool::new(false),
-            pcb_onfault: AtomicUsize::new(0),
-        }
-    }
-}
-
-/// Global per-CPU data array. Each element is initialized via spin::Once
-/// to bypass const-initialization limits of VecDeque/Vec inside RunQueue/TimerWheel.
-static PER_CPU_DATA: [spin::Once<PerCpu>; MAX_CPUS] = [
-    spin::Once::new(), spin::Once::new(), spin::Once::new(), spin::Once::new(),
-    spin::Once::new(), spin::Once::new(), spin::Once::new(), spin::Once::new(),
+/// Global per-CPU pointers. Null = not initialized.
+static PER_CPU_PTRS: [AtomicPtr<PerCpu>; MAX_CPUS] = [
+    AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()),
 ];
 
 /// Initialize PerCpu for a given CPU. Called once per CPU during boot.
+/// Heap-allocates to avoid stack overflow from large struct move.
 pub fn init_per_cpu(cpu_id: usize, hartid: usize) {
-    PER_CPU_DATA[cpu_id].call_once(|| PerCpu::new(cpu_id, hartid));
+    crate::klog!(sched, debug, "per_cpu init cpu {} hart {}", cpu_id, hartid);
+
+    // Build fields individually to minimize stack usage
+    crate::klog!(sched, debug, "per_cpu   RunQueue::new()");
+    let rq = RunQueue::new();
+    crate::klog!(sched, debug, "per_cpu   TimerWheel::new()");
+    let tw = TimerWheel::new();
+    crate::klog!(sched, debug, "per_cpu   Box::new(PerCpu)");
+
+    let pc = Box::new(PerCpu {
+        run_queue: rq,
+        timer_wheel: IrqSafeSpinLock::new(tw),
+        hartid,
+        cpu_id,
+        needs_reschedule: AtomicBool::new(false),
+        pcb_onfault: AtomicUsize::new(0),
+    });
+    let ptr = Box::into_raw(pc);
+    PER_CPU_PTRS[cpu_id].store(ptr, Ordering::Release);
+    crate::klog!(sched, debug, "per_cpu   done, ptr={:p}", ptr);
 }
 
 /// Get PerCpu for a specific CPU by logical ID.
-/// Panics if accessed before init -- correct behavior for a pre-boot access bug.
 pub fn get(cpu_id: usize) -> &'static PerCpu {
-    PER_CPU_DATA[cpu_id]
-        .get()
-        .expect("PerCpu not initialized")
+    let ptr = PER_CPU_PTRS[cpu_id].load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "PerCpu not initialized for cpu {}", cpu_id);
+    unsafe { &*ptr }
 }
 
 /// Get PerCpu for the current CPU via tp register.
-///
-/// In Phase 1, tp is set in rust_main after PerCpu init.
-/// For Phase 1 (single hart), this reads the tp register which points
-/// to the PerCpu struct.
 #[inline]
 pub fn current() -> &'static PerCpu {
     let tp: usize;
     unsafe {
         core::arch::asm!("mv {}, tp", out(reg) tp);
     }
-    // tp points directly to the PerCpu struct
     assert!(tp != 0, "tp register not initialized (PerCpu not set up)");
     unsafe { &*(tp as *const PerCpu) }
 }
 
 /// Set the tp register to point to the PerCpu for the given CPU.
-/// Called once per CPU during boot after init_per_cpu.
 pub unsafe fn set_tp(cpu_id: usize) {
     let per_cpu = get(cpu_id) as *const PerCpu as usize;
     core::arch::asm!("mv tp, {}", in(reg) per_cpu);

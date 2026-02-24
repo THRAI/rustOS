@@ -15,7 +15,6 @@ use hal_common::{Errno, VirtAddr, PAGE_SIZE};
 use crate::proc::task::Task;
 use crate::hal::rv64::user_trap::trap_return;
 use crate::mm::vm::fault::{sync_fault_handler, FaultResult, FaultError, PageFaultAccessType};
-use crate::kprintln;
 
 use super::schedule::{spawn_kernel_task, yield_now};
 
@@ -36,43 +35,100 @@ const EXC_STORE_ACCESS_FAULT: usize = 7;
 const EXC_STORE_PAGE_FAULT: usize = 15;
 
 // Linux-compatible rv64 syscall numbers
-const SYS_GETCWD: usize = 17;
-const SYS_DUP: usize = 23;
-const SYS_DUP3: usize = 24;
-const SYS_IOCTL: usize = 29;
-const SYS_OPENAT: usize = 56;
-const SYS_CLOSE: usize = 57;
-const SYS_GETDENTS64: usize = 61;
-const SYS_LSEEK: usize = 62;
-const SYS_READ: usize = 63;
-const SYS_WRITE: usize = 64;
-const SYS_WRITEV: usize = 66;
-const SYS_FSTAT: usize = 80;
-const SYS_FSTATAT: usize = 79;
-const SYS_EXIT: usize = 93;
-const SYS_EXIT_GROUP: usize = 94;
-const SYS_SET_TID_ADDRESS: usize = 96;
-const SYS_CLOCK_GETTIME: usize = 113;
-const SYS_SCHED_YIELD: usize = 124;
-const SYS_SIGACTION: usize = 134;
-const SYS_SIGPROCMASK: usize = 135;
-const SYS_SIGRETURN: usize = 139;
-const SYS_TIMES: usize = 153;
-const SYS_UNAME: usize = 160;
-const SYS_GETPID: usize = 172;
-const SYS_GETPPID: usize = 173;
-const SYS_GETUID: usize = 174;
-const SYS_GETEUID: usize = 175;
-const SYS_GETGID: usize = 176;
-const SYS_GETEGID: usize = 177;
-const SYS_GETTID: usize = 178;
-const SYS_BRK: usize = 214;
-const SYS_MUNMAP: usize = 215;
-const SYS_CLONE: usize = 220;
-const SYS_EXECVE: usize = 221;
-const SYS_MMAP: usize = 222;
-const SYS_MPROTECT: usize = 226;
-const SYS_WAIT4: usize = 260;
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SyscallId(usize);
+
+impl SyscallId {
+    const GETCWD: Self = Self(17);
+    const DUP: Self = Self(23);
+    const DUP3: Self = Self(24);
+    const IOCTL: Self = Self(29);
+    const OPENAT: Self = Self(56);
+    const CLOSE: Self = Self(57);
+    const GETDENTS64: Self = Self(61);
+    const LSEEK: Self = Self(62);
+    const READ: Self = Self(63);
+    const WRITE: Self = Self(64);
+    const WRITEV: Self = Self(66);
+    const FSTATAT: Self = Self(79);
+    const FSTAT: Self = Self(80);
+    const EXIT: Self = Self(93);
+    const EXIT_GROUP: Self = Self(94);
+    const SET_TID_ADDRESS: Self = Self(96);
+    const CLOCK_GETTIME: Self = Self(113);
+    const SCHED_YIELD: Self = Self(124);
+    const SIGACTION: Self = Self(134);
+    const SIGPROCMASK: Self = Self(135);
+    const SIGRETURN: Self = Self(139);
+    const TIMES: Self = Self(153);
+    const UNAME: Self = Self(160);
+    const GETPID: Self = Self(172);
+    const GETPPID: Self = Self(173);
+    const GETUID: Self = Self(174);
+    const GETEUID: Self = Self(175);
+    const GETGID: Self = Self(176);
+    const GETEGID: Self = Self(177);
+    const GETTID: Self = Self(178);
+    const BRK: Self = Self(214);
+    const MUNMAP: Self = Self(215);
+    const CLONE: Self = Self(220);
+    const EXECVE: Self = Self(221);
+    const MMAP: Self = Self(222);
+    const MPROTECT: Self = Self(226);
+    const WAIT4: Self = Self(260);
+}
+
+impl core::fmt::Display for SyscallId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match *self {
+            Self::GETCWD => "getcwd",
+            Self::DUP => "dup",
+            Self::DUP3 => "dup3",
+            Self::IOCTL => "ioctl",
+            Self::OPENAT => "openat",
+            Self::CLOSE => "close",
+            Self::GETDENTS64 => "getdents64",
+            Self::LSEEK => "lseek",
+            Self::READ => "read",
+            Self::WRITE => "write",
+            Self::WRITEV => "writev",
+            Self::FSTATAT => "fstatat",
+            Self::FSTAT => "fstat",
+            Self::EXIT => "exit",
+            Self::EXIT_GROUP => "exit_group",
+            Self::SET_TID_ADDRESS => "set_tid_address",
+            Self::CLOCK_GETTIME => "clock_gettime",
+            Self::SCHED_YIELD => "sched_yield",
+            Self::SIGACTION => "sigaction",
+            Self::SIGPROCMASK => "sigprocmask",
+            Self::SIGRETURN => "sigreturn",
+            Self::TIMES => "times",
+            Self::UNAME => "uname",
+            Self::GETPID => "getpid",
+            Self::GETPPID => "getppid",
+            Self::GETUID => "getuid",
+            Self::GETEUID => "geteuid",
+            Self::GETGID => "getgid",
+            Self::GETEGID => "getegid",
+            Self::GETTID => "gettid",
+            Self::BRK => "brk",
+            Self::MUNMAP => "munmap",
+            Self::CLONE => "clone",
+            Self::EXECVE => "execve",
+            Self::MMAP => "mmap",
+            Self::MPROTECT => "mprotect",
+            Self::WAIT4 => "wait4",
+            _ => return write!(f, "unknown({})", self.0),
+        };
+        write!(f, "{}", name)
+    }
+}
+
+impl core::fmt::Debug for SyscallId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}({})", self, self.0)
+    }
+}
 
 /// Result of handling a user trap.
 enum TrapResult {
@@ -84,7 +140,7 @@ enum TrapResult {
 
 /// The persistent trap loop for a user process.
 async fn run_tasks(task: Arc<Task>) {
-    kprintln!("[run_tasks] starting pid={}", task.pid);
+    klog!(sched, debug, "run_tasks: starting pid={}", task.pid);
     loop {
         // Activate per-process page table before returning to user mode.
         {
@@ -92,21 +148,22 @@ async fn run_tasks(task: Arc<Task>) {
             crate::mm::pmap::pmap_activate(&mut pmap);
         }
 
-        kprintln!("[run_tasks] calling trap_return pid={}", task.pid);
+        klog!(sched, debug, "run_tasks: calling trap_return pid={}", task.pid);
 
         // Return to userspace. Blocks until user traps back.
         trap_return(&task);
 
-        kprintln!("[run_tasks] returned from trap_return pid={}", task.pid);
+        klog!(sched, debug, "run_tasks: returned from trap_return pid={}", task.pid);
+
+        // Dispatch based on scause in the trap frame.
+        // Keep user pmap active — syscall handlers need it for copy_user / fault resolution.
+        let result = user_trap_handler(&task).await;
 
         // Deactivate pmap (back in kernel context).
         {
             let mut pmap = task.pmap.lock();
             crate::mm::pmap::pmap_deactivate(&mut pmap);
         }
-
-        // Dispatch based on scause in the trap frame.
-        let result = user_trap_handler(&task).await;
 
         match result {
             TrapResult::Continue => {}
@@ -131,22 +188,9 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
     let is_interrupt = scause & SCAUSE_INTERRUPT != 0;
     let code = scause & !SCAUSE_INTERRUPT;
 
-    {
-        static TRAP_LOG_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        let c = TRAP_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if c < 10 {
-            kprintln!("[user_trap] scause={:#x} is_int={} code={} cpu={}", scause, is_interrupt, code, crate::executor::per_cpu::current().cpu_id);
-        }
-    }
-
     if is_interrupt {
         match code {
             IRQ_S_TIMER => {
-                static USER_TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-                let c = USER_TIMER_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if c < 5 {
-                    kprintln!("[user_trap] timer IRQ on cpu={}", crate::executor::per_cpu::current().cpu_id);
-                }
                 crate::hal::rv64::timer::handle_timer_irq();
             }
             IRQ_S_SOFTWARE => {
@@ -156,7 +200,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                 // External IRQ handling
             }
             _ => {
-                kprintln!("[user_trap] unhandled interrupt: code={}", code);
+                klog!(trap, debug, "unhandled interrupt: code={}", code);
             }
         }
         return TrapResult::Continue;
@@ -195,9 +239,10 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
             };
 
             if let Err(e) = resolve_user_fault(task, fault_va, access_type).await {
-                kprintln!(
-                    "[user_trap] fatal fault: pid={} va={:#x} code={} err={:?}",
-                    task.pid, stval, code, e
+                let pc = task.trap_frame.lock().sepc;
+                klog!(trap, error,
+                    "fatal fault: pid={} va={:#x} pc={:#x} code={} err={:?}",
+                    task.pid, stval, pc, code, e
                 );
                 // TODO(Phase 4): deliver SIGSEGV. For now, kill process.
                 do_exit(task, -11); // SIGSEGV = 11
@@ -206,8 +251,8 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
             TrapResult::Continue
         }
         _ => {
-            kprintln!(
-                "[user_trap] unhandled exception: code={} sepc={:#x} stval={:#x}",
+            klog!(trap, error,
+                "unhandled exception: code={} sepc={:#x} stval={:#x}",
                 code,
                 { task.trap_frame.lock().sepc },
                 stval
@@ -259,18 +304,51 @@ async fn fault_in_page_async(
     fault_va: VirtAddr,
 ) -> Result<(), FaultError> {
     // Time-of-check: snapshot VMA state under lock
-    let (vnode_id, vnode_path, file_offset) = {
+    let (vnode_id, vnode_path, file_offset, file_size, _vma_file_offset, vma_start) = {
         let map = task.vm_map.lock();
         let vma = map.find_area(fault_va).ok_or(FaultError::NotMapped)?;
         let vnode = vma.vnode.as_ref()
             .ok_or(FaultError::InvalidAccess)?;
         let page_idx = (fault_va.as_usize() - vma.range.start.as_usize()) / PAGE_SIZE;
         let file_offset = vma.file_offset + (page_idx * PAGE_SIZE) as u64;
-        (vnode.vnode_id(), String::from(vnode.path()), file_offset)
+        (
+            vnode.vnode_id(),
+            String::from(vnode.path()),
+            file_offset,
+            vma.file_size,
+            vma.file_offset,
+            vma.range.start.as_usize(),
+        )
     }; // lock dropped before .await
 
-    // Fetch page through page cache (may await delegate I/O)
-    let pa = page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset).await?;
+    // Compute how far into the VMA this page starts (in bytes)
+    let fault_va_aligned = fault_va.as_usize() & !(PAGE_SIZE - 1);
+    let vma_page_byte_offset = (fault_va_aligned - vma_start) as u64;
+
+    let pa = if vma_page_byte_offset >= file_size {
+        // Entirely beyond file data — pure BSS zero page
+        let frame = crate::mm::allocator::frame_alloc_sync()
+            .ok_or(FaultError::OutOfMemory)?;
+        unsafe { core::ptr::write_bytes(frame.as_usize() as *mut u8, 0, PAGE_SIZE); }
+        frame
+    } else if vma_page_byte_offset + PAGE_SIZE as u64 > file_size {
+        // Partial page: file data + zero fill for the rest
+        let fetched = page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset).await?;
+        // Copy file portion to a new frame and zero the tail
+        let frame = crate::mm::allocator::frame_alloc_sync()
+            .ok_or(FaultError::OutOfMemory)?;
+        let file_bytes = (file_size - vma_page_byte_offset) as usize;
+        unsafe {
+            let src = fetched.as_usize() as *const u8;
+            let dst = frame.as_usize() as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, file_bytes);
+            core::ptr::write_bytes(dst.add(file_bytes), 0, PAGE_SIZE - file_bytes);
+        }
+        frame
+    } else {
+        // Fully within file data — use page cache directly
+        page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset).await?
+    };
 
     // Time-of-use: re-validate VMA under lock before mapping
     {
@@ -358,52 +436,112 @@ fn noop_waker() -> core::task::Waker {
 
 /// Async syscall dispatch.
 async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
-    let (syscall_num, a0, a1, a2, _a3, _a4, _a5) = {
+    let (id, a0, a1, a2, _a3, _a4, _a5) = {
         let tf = task.trap_frame.lock();
-        (tf.x[17], tf.x[10], tf.x[11], tf.x[12], tf.x[13], tf.x[14], tf.x[15])
+        (SyscallId(tf.x[17]), tf.x[10], tf.x[11], tf.x[12], tf.x[13], tf.x[14], tf.x[15])
     };
 
-    let ret: usize = match syscall_num {
+    klog!(syscall, debug, "pid={} {} a0={:#x} a1={:#x} a2={:#x}", task.pid, id, a0, a1, a2);
+
+    let ret: usize = match id {
         // --- Fast-path synchronous syscalls ---
-        SYS_GETPID => task.pid as usize,
-        SYS_GETPPID => task.ppid() as usize,
-        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 0,
-        SYS_GETTID => task.pid as usize,
-        SYS_SET_TID_ADDRESS => task.pid as usize,
-        SYS_SCHED_YIELD => {
+        SyscallId::GETPID => task.pid as usize,
+        SyscallId::GETPPID => task.ppid() as usize,
+        SyscallId::GETUID | SyscallId::GETEUID | SyscallId::GETGID | SyscallId::GETEGID => 0,
+        SyscallId::GETTID => task.pid as usize,
+        SyscallId::SET_TID_ADDRESS => task.pid as usize,
+        SyscallId::SCHED_YIELD => {
             yield_now().await;
             0
         }
-        SYS_BRK => {
-            // Stub: return current brk (0 = let libc use mmap)
-            0
+        SyscallId::BRK => {
+            use crate::mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
+            use crate::mm::vm::vm_object::VmObject;
+
+            let current_brk = task.brk.load(core::sync::atomic::Ordering::Relaxed);
+            if a0 == 0 {
+                // Query current brk
+                current_brk
+            } else {
+                let new_brk = (a0 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let old_brk = current_brk;
+                if new_brk > old_brk {
+                    // Expand: create anonymous VMA for the new region
+                    let pages = (new_brk - old_brk) / PAGE_SIZE;
+                    let obj = VmObject::new(pages);
+                    let vma = VmArea::new(
+                        VirtAddr::new(old_brk)..VirtAddr::new(new_brk),
+                        MapPerm::R | MapPerm::W | MapPerm::U,
+                        obj,
+                        0,
+                        VmAreaType::Heap,
+                    );
+                    let mut vm = task.vm_map.lock();
+                    if vm.insert(vma).is_err() {
+                        return set_syscall_ret(task, current_brk);
+                    }
+                }
+                task.brk.store(new_brk, core::sync::atomic::Ordering::Relaxed);
+                new_brk
+            }
         }
-        SYS_MMAP => {
-            // Stub: anonymous mmap bump allocator
+        SyscallId::MMAP => {
+            // Anonymous mmap: create a real VMA so page faults resolve
+            let addr = a0;
             let len = a1;
+            let prot_bits = a2;
             if len == 0 {
                 (-22isize) as usize // EINVAL
             } else {
+                use crate::mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
+                use crate::mm::vm::vm_object::VmObject;
+
+                let aligned_len = (len + 0xFFF) & !0xFFF;
+                let pages = aligned_len / PAGE_SIZE;
+
+                // Bump allocator for mmap base address
                 static MMAP_NEXT: core::sync::atomic::AtomicUsize =
                     core::sync::atomic::AtomicUsize::new(0x0000_0020_0000_0000);
-                MMAP_NEXT.fetch_add(
-                    (len + 0xFFF) & !0xFFF,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
+                let base = if addr != 0 {
+                    // MAP_FIXED hint — use requested address
+                    addr & !0xFFF
+                } else {
+                    MMAP_NEXT.fetch_add(aligned_len, core::sync::atomic::Ordering::Relaxed)
+                };
+
+                let mut perm = MapPerm::U;
+                if prot_bits & 0x1 != 0 { perm |= MapPerm::R; }
+                if prot_bits & 0x2 != 0 { perm |= MapPerm::W; }
+                if prot_bits & 0x4 != 0 { perm |= MapPerm::X; }
+
+                let obj = VmObject::new(pages);
+                let vma = VmArea::new(
+                    VirtAddr::new(base)..VirtAddr::new(base + aligned_len),
+                    perm,
+                    obj,
+                    0,
+                    VmAreaType::Anonymous,
+                );
+
+                let mut vm = task.vm_map.lock();
+                match vm.insert(vma) {
+                    Ok(()) => base,
+                    Err(_) => (-12isize) as usize, // ENOMEM
+                }
             }
         }
-        SYS_MPROTECT | SYS_MUNMAP => 0, // stub success
-        SYS_SIGACTION | SYS_SIGPROCMASK | SYS_SIGRETURN => 0, // stub
-        SYS_CLOCK_GETTIME => 0, // stub
-        SYS_TIMES => 0, // stub
-        SYS_UNAME => {
+        SyscallId::MPROTECT | SyscallId::MUNMAP => 0, // stub success
+        SyscallId::SIGACTION | SyscallId::SIGPROCMASK | SyscallId::SIGRETURN => 0, // stub
+        SyscallId::CLOCK_GETTIME => 0, // stub
+        SyscallId::TIMES => 0, // stub
+        SyscallId::UNAME => {
             // TODO: write utsname to user memory
             0
         }
-        SYS_IOCTL => 0, // stub
+        SyscallId::IOCTL => 0, // stub
 
         // --- Async syscalls ---
-        SYS_WRITE => {
+        SyscallId::WRITE => {
             // a0=fd, a1=buf, a2=len
             if (a0 == 1 || a0 == 2) && a2 > 0 {
                 // stdout/stderr → UART
@@ -429,28 +567,28 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 (-1isize) as usize // EPERM
             }
         }
-        SYS_READ => {
+        SyscallId::READ => {
             // a0=fd, a1=user_buf, a2=len
             match sys_read_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => n,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
-        SYS_OPENAT => {
+        SyscallId::OPENAT => {
             // a0=dirfd, a1=pathname, a2=flags, a3=mode
             match sys_openat_async(task, a1, a2).await {
                 Ok(fd) => fd as usize,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
-        SYS_CLOSE => {
+        SyscallId::CLOSE => {
             let fd = a0 as u32;
             match crate::fs::syscalls::sys_close(&task.fd_table, fd) {
                 Ok(()) => 0,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
-        SYS_FSTAT => {
+        SyscallId::FSTAT => {
             match crate::fs::syscalls::sys_stat(&task.fd_table, a0 as u32) {
                 Ok((_size, _vtype)) => {
                     // TODO: write stat struct to user memory at a1
@@ -459,11 +597,11 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
-        SYS_EXIT | SYS_EXIT_GROUP => {
+        SyscallId::EXIT | SyscallId::EXIT_GROUP => {
             do_exit(task, a0 as i32);
             return TrapResult::Exit;
         }
-        SYS_CLONE => {
+        SyscallId::CLONE => {
             // Basic fork (flags ignored for now)
             let child = crate::proc::fork::fork(task);
             let child_pid = child.pid;
@@ -474,7 +612,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             spawn_user_task(child, cpu);
             parent_ret
         }
-        SYS_EXECVE => {
+        SyscallId::EXECVE => {
             // a0=pathname, a1=argv, a2=envp
             // Read pathname from user memory
             let path = match copyinstr(a0, 256) {
@@ -500,14 +638,14 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
-        SYS_WAIT4 => {
+        SyscallId::WAIT4 => {
             match sys_wait4_async(task, a0 as isize, a1).await {
                 Ok(pid) => pid as usize,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
         _ => {
-            kprintln!("[syscall] unimplemented syscall {}", syscall_num);
+            klog!(syscall, info, "unimplemented {}", id);
             (-38isize) as usize // ENOSYS
         }
     };

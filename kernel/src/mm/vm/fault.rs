@@ -19,6 +19,7 @@ use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 use super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
 use super::vm_object::{OwnedPage, VmObject};
 use super::super::allocator::frame_alloc_sync;
+use super::super::pmap::{self, Pmap};
 
 /// Result of a synchronous page fault resolution attempt.
 #[derive(Debug)]
@@ -40,6 +41,8 @@ pub enum FaultError {
     InvalidAccess,
     /// No VMA covers the faulting address.
     NotMapped,
+    /// I/O error during async page fetch.
+    IoError,
 }
 
 /// Access type that caused the page fault.
@@ -74,6 +77,7 @@ impl PageFaultAccessType {
 /// Uses `frame_alloc_sync()` exclusively for all allocations.
 pub fn sync_fault_handler(
     vm_map: &VmMap,
+    pmap: &mut Pmap,
     fault_va: VirtAddr,
     access_type: PageFaultAccessType,
 ) -> FaultResult {
@@ -102,7 +106,7 @@ pub fn sync_fault_handler(
         + vma.obj_offset;
 
     // 4. Classify and handle the fault.
-    classify_and_handle(vma, offset, fault_va_aligned, access_type)
+    classify_and_handle(vma, offset, fault_va_aligned, access_type, pmap)
 }
 
 /// Classify the fault and handle it.
@@ -111,6 +115,7 @@ fn classify_and_handle(
     offset: u64,
     fault_va_aligned: VirtAddr,
     access_type: PageFaultAccessType,
+    pmap: &mut Pmap,
 ) -> FaultResult {
     // Check if the VMA is file-backed (Cached type).
     if vma.vma_type == VmAreaType::FileBacked || vma.vma_type == VmAreaType::Device {
@@ -127,11 +132,11 @@ fn classify_and_handle(
     match existing_page {
         None => {
             // (a) Anonymous fault: page not in any VmObject in chain.
-            handle_anonymous_fault(vma, offset, fault_va_aligned)
+            handle_anonymous_fault(vma, offset, fault_va_aligned, pmap)
         }
         Some(_old_phys) if access_type.write && vma.prot.contains(MapPerm::W) => {
             // (b) COW fault: write to read-only page in a writable VMA.
-            handle_cow_fault(vma, offset, fault_va_aligned, _old_phys)
+            handle_cow_fault(vma, offset, fault_va_aligned, _old_phys, pmap)
         }
         Some(_) => {
             // Page exists and access is not a write-to-COW.
@@ -147,7 +152,8 @@ fn classify_and_handle(
 fn handle_anonymous_fault(
     vma: &VmArea,
     offset: u64,
-    _fault_va_aligned: VirtAddr,
+    fault_va_aligned: VirtAddr,
+    pmap: &mut Pmap,
 ) -> FaultResult {
     // Allocate a frame synchronously (never yields).
     let new_frame = match frame_alloc_sync() {
@@ -164,8 +170,8 @@ fn handle_anonymous_fault(
         obj.insert_page(offset, OwnedPage::new_anonymous(new_frame));
     }
 
-    // INTEGRATION: wire pmap_enter when pmap_activate is called.
-    // pmap::pmap_enter(pmap, fault_va_aligned, new_frame, vma.prot, false)
+    // Map the page in the hardware page table.
+    let _ = pmap::pmap_enter(pmap, fault_va_aligned, new_frame, vma.prot, false);
 
     FaultResult::Resolved
 }
@@ -175,16 +181,16 @@ fn handle_anonymous_fault(
 fn handle_cow_fault(
     vma: &VmArea,
     offset: u64,
-    _fault_va_aligned: VirtAddr,
+    fault_va_aligned: VirtAddr,
     old_phys: PhysAddr,
+    pmap: &mut Pmap,
 ) -> FaultResult {
     // Check if the topmost VmObject is the sole owner (refcount == 1).
     // If so, we can just upgrade permissions without copying.
     let refcount = Arc::strong_count(&vma.object);
     if refcount == 1 {
         // Sole owner: just upgrade permissions, no copy needed.
-        // INTEGRATION: wire pmap_protect when pmap_activate is called.
-        // pmap::pmap_protect(pmap, fault_va_aligned, fault_va_aligned + PAGE_SIZE, vma.prot)
+        pmap::pmap_protect(pmap, fault_va_aligned, VirtAddr(fault_va_aligned.0 + PAGE_SIZE), vma.prot);
         return FaultResult::Resolved;
     }
 
@@ -203,8 +209,8 @@ fn handle_cow_fault(
         obj.insert_page(offset, OwnedPage::new_anonymous(new_frame));
     }
 
-    // INTEGRATION: wire pmap_enter when pmap_activate is called.
-    // pmap::pmap_enter(pmap, fault_va_aligned, new_frame, vma.prot | MapPerm::W, false)
+    // Map the new frame with full write permission.
+    let _ = pmap::pmap_enter(pmap, fault_va_aligned, new_frame, vma.prot, false);
 
     FaultResult::Resolved
 }
@@ -298,7 +304,6 @@ pub async fn fault_in_page(
     let file_byte_offset = vma.file_offset + offset_in_vma;
     let page_offset = file_byte_offset / PAGE_SIZE as u64;
     let vnode_id = vnode.vnode_id();
-    let ino = vnode_id as u32;
 
     // Check page cache first
     let cached_pa = match crate::fs::page_cache::probe(vnode_id, page_offset) {
@@ -306,7 +311,7 @@ pub async fn fault_in_page(
         None => {
             // Fetch via delegate
             let page_byte_offset = page_offset * PAGE_SIZE as u64;
-            match crate::fs::delegate::fs_read_page(ino, page_byte_offset).await {
+            match crate::fs::delegate::fs_read_page(vnode.path(), page_byte_offset).await {
                 Ok(pa_usize) => {
                     let pa = PhysAddr::new(pa_usize);
                     crate::fs::page_cache::complete(vnode_id, page_offset, pa);
@@ -357,6 +362,7 @@ mod tests {
     use super::*;
     use super::super::vm_map::{VmArea, VmAreaType, VmMap, MapPerm};
     use super::super::vm_object::{OwnedPage, VmObject};
+    use super::super::super::pmap::Pmap;
 
     fn make_anon_map(start: usize, end: usize, prot: MapPerm) -> VmMap {
         let obj = VmObject::new(end - start);
@@ -375,9 +381,9 @@ mod tests {
     #[test]
     fn anonymous_fault_resolves() {
         let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
-        let result = sync_fault_handler(&map, VirtAddr::new(0x1500), PageFaultAccessType::READ);
+        let mut pmap = Pmap::dummy();
+        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1500), PageFaultAccessType::READ);
         assert!(matches!(result, FaultResult::Resolved));
-        // Page should now be in the VmObject
         let vma = map.find_area(VirtAddr::new(0x1500)).unwrap();
         let obj = vma.object.read();
         assert_eq!(obj.resident_count(), 1);
@@ -386,47 +392,35 @@ mod tests {
     #[test]
     fn fault_not_mapped() {
         let map = VmMap::new();
-        let result = sync_fault_handler(&map, VirtAddr::new(0x5000), PageFaultAccessType::READ);
+        let mut pmap = Pmap::dummy();
+        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x5000), PageFaultAccessType::READ);
         assert!(matches!(result, FaultResult::Error(FaultError::NotMapped)));
     }
 
     #[test]
     fn fault_invalid_access_write_to_readonly() {
         let map = make_anon_map(0x1000, 0x2000, MapPerm::R);
-        let result = sync_fault_handler(&map, VirtAddr::new(0x1000), PageFaultAccessType::WRITE);
-        // Write to R-only VMA: permitted_by fails, but special case checks
-        // if VMA is readable for COW. VMA is R but not W, so it goes through
-        // to classify_and_handle which finds no page -> anonymous fault.
-        // Actually, the permission check: write && prot.contains(R) is true,
-        // so it passes. Then classify_and_handle: no page -> anonymous fault.
-        // But wait, the VMA doesn't have W permission, so this is a write
-        // fault to a read-only VMA. Let me re-read the logic...
-        // The special case allows it through if vma.prot.contains(R).
-        // Then in classify_and_handle, existing_page is None -> anonymous fault.
-        // This is actually correct for COW setup where the VMA is RW but
-        // the PTE is R-only. But here the VMA itself is R-only.
-        // The fault handler resolves it as anonymous. This is a known
-        // simplification — full permission enforcement happens at PTE level.
+        let mut pmap = Pmap::dummy();
+        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::WRITE);
         assert!(matches!(result, FaultResult::Resolved) || matches!(result, FaultResult::Error(FaultError::InvalidAccess)));
     }
 
     #[test]
     fn fault_execute_on_non_exec() {
         let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
-        let result = sync_fault_handler(&map, VirtAddr::new(0x1000), PageFaultAccessType::EXECUTE);
+        let mut pmap = Pmap::dummy();
+        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::EXECUTE);
         assert!(matches!(result, FaultResult::Error(FaultError::InvalidAccess)));
     }
 
     #[test]
     fn cow_fault_copies_page() {
-        // Set up a VMA with a shared VmObject (simulating post-fork)
         let parent_obj = VmObject::new(4096);
         {
             let mut w = parent_obj.write();
             w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xA000)));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent_obj), 4096);
-        // Hold a second reference to simulate fork sharing (refcount > 1).
         let _sibling_ref = Arc::clone(&shadow);
         let vma = VmArea::new(
             VirtAddr::new(0x1000)..VirtAddr::new(0x2000),
@@ -438,16 +432,13 @@ mod tests {
         let mut map = VmMap::new();
         map.insert(vma).unwrap();
 
-        // The shadow has a page at offset 0 via its backing (parent_obj).
-        // A write fault should trigger COW (refcount > 1 forces copy).
-        let result = sync_fault_handler(&map, VirtAddr::new(0x1000), PageFaultAccessType::WRITE);
+        let mut pmap = Pmap::dummy();
+        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::WRITE);
         assert!(matches!(result, FaultResult::Resolved));
 
-        // The shadow should now have its own page at offset 0
         let vma = map.find_area(VirtAddr::new(0x1000)).unwrap();
         let obj = vma.object.read();
         assert_eq!(obj.resident_count(), 1);
-        // The new page should be different from the parent's
         let new_phys = obj.lookup_page(0).unwrap();
         assert_ne!(new_phys, PhysAddr::new(0xA000));
     }
@@ -464,7 +455,8 @@ mod tests {
         );
         let mut map = VmMap::new();
         map.insert(vma).unwrap();
-        let result = sync_fault_handler(&map, VirtAddr::new(0x1000), PageFaultAccessType::READ);
+        let mut pmap = Pmap::dummy();
+        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::READ);
         assert!(matches!(result, FaultResult::NeedsAsyncIO));
     }
 
@@ -483,13 +475,12 @@ mod tests {
 
     #[test]
     fn anonymous_fault_allocates_unique_frames() {
-        // Two anonymous faults on different pages should get different frames
         let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
-        let r1 = sync_fault_handler(&map, VirtAddr::new(0x1000), PageFaultAccessType::READ);
+        let mut pmap = Pmap::dummy();
+        let r1 = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::READ);
         assert!(matches!(r1, FaultResult::Resolved));
-        let r2 = sync_fault_handler(&map, VirtAddr::new(0x2000), PageFaultAccessType::READ);
+        let r2 = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x2000), PageFaultAccessType::READ);
         assert!(matches!(r2, FaultResult::Resolved));
-        // Both pages should be resident now
         let vma = map.find_area(VirtAddr::new(0x1000)).unwrap();
         let obj = vma.object.read();
         let p1 = obj.lookup_page(0).unwrap();
@@ -499,9 +490,9 @@ mod tests {
 
     #[test]
     fn fault_page_aligned_resolution() {
-        // Fault at non-page-aligned address should still resolve (handler page-aligns)
         let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
-        let result = sync_fault_handler(&map, VirtAddr::new(0x1ABC), PageFaultAccessType::READ);
+        let mut pmap = Pmap::dummy();
+        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1ABC), PageFaultAccessType::READ);
         assert!(matches!(result, FaultResult::Resolved));
     }
 
@@ -512,7 +503,6 @@ mod tests {
         assert!(PageFaultAccessType::WRITE.permitted_by(all));
         assert!(PageFaultAccessType::EXECUTE.permitted_by(all));
 
-        // No permissions at all
         let none = MapPerm::empty();
         assert!(!PageFaultAccessType::READ.permitted_by(none));
         assert!(!PageFaultAccessType::WRITE.permitted_by(none));

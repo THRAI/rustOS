@@ -6,7 +6,7 @@
 use hal_common::{VirtAddr, PAGE_SIZE};
 
 use super::{
-    pmap_create, pmap_destroy, pmap_enter, pmap_enter_range, pmap_extract, pmap_remove,
+    pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove,
     pmap_activate,
 };
 use super::super::vm::vm_map::MapPerm;
@@ -56,34 +56,8 @@ pub fn test_pmap_extract_only() {
 pub fn test_pmap_satp_switch() {
     let mut pmap = pmap_create();
 
-    // 1. Identity-map kernel regions
-    extern "C" {
-        static stext: u8;
-        static etext: u8;
-        static srodata: u8;
-        static erodata: u8;
-        static sdata: u8;
-        static ekernel: u8;
-    }
-    unsafe {
-        let text_s = &stext as *const u8 as usize;
-        let text_e = &etext as *const u8 as usize;
-        let ro_s = &srodata as *const u8 as usize;
-        let ro_e = &erodata as *const u8 as usize;
-        let data_s = &sdata as *const u8 as usize;
-        let _kern_e = &ekernel as *const u8 as usize;
-
-        // .text: R|X
-        pmap_enter_range(&mut pmap, text_s, text_e, MapPerm::R | MapPerm::X);
-        // .rodata: R
-        pmap_enter_range(&mut pmap, ro_s, ro_e, MapPerm::R);
-        // .data + .bss + stacks + allocatable frames: R|W
-        pmap_enter_range(&mut pmap, data_s, 0x8800_0000, MapPerm::R | MapPerm::W);
-        // UART MMIO
-        pmap_enter_range(&mut pmap, 0x1000_0000, 0x1000_1000, MapPerm::R | MapPerm::W);
-        // CLINT MMIO (timer handler)
-        pmap_enter_range(&mut pmap, 0x0200_0000, 0x0201_0000, MapPerm::R | MapPerm::W);
-    }
+    // pmap_create() now includes kernel identity mappings (1GB gigapage at
+    // root entry 2) and MMIO megapage, so no manual kernel mapping needed.
 
     // 2. Map a high VA to a fresh frame
     let test_frame = frame_alloc_sync().expect("OOM in satp test");

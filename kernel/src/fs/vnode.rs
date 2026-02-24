@@ -41,13 +41,15 @@ pub trait Vnode: Send + Sync {
     fn vnode_id(&self) -> VnodeId;
     fn vtype(&self) -> VnodeType;
     fn size(&self) -> u64;
+    fn path(&self) -> &str;
 }
 
-/// Ext4 vnode: holds inode number, file type, and cached size.
+/// Ext4 vnode: holds inode number, file type, cached size, and path.
 pub struct Ext4Vnode {
     pub ino: u32,
     pub vtype: VnodeType,
     pub file_size: AtomicU64,
+    pub path: String,
 }
 
 impl Ext4Vnode {
@@ -56,6 +58,16 @@ impl Ext4Vnode {
             ino,
             vtype,
             file_size: AtomicU64::new(size),
+            path: String::new(),
+        })
+    }
+
+    pub fn new_with_path(ino: u32, vtype: VnodeType, size: u64, path: String) -> Arc<Self> {
+        Arc::new(Self {
+            ino,
+            vtype,
+            file_size: AtomicU64::new(size),
+            path,
         })
     }
 }
@@ -71,5 +83,9 @@ impl Vnode for Ext4Vnode {
 
     fn size(&self) -> u64 {
         self.file_size.load(Ordering::Relaxed)
+    }
+
+    fn path(&self) -> &str {
+        &self.path
     }
 }

@@ -14,14 +14,29 @@ QEMU_RV64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_R
 
 OBJCOPY := rust-objcopy
 
+# Kernel log control: LOG=all | LOG=boot,fs,driver | (empty = quiet)
+# Available modules: boot syscall trap vm sched fs driver smp
+comma := ,
+space := $(subst ,, )
+LOG ?=
+ifdef LOG
+  ifeq ($(LOG),all)
+    _LOG_FEATURES := log-all
+  else
+    _LOG_FEATURES := $(patsubst %,log-%,$(subst $(comma), ,$(LOG)))
+  endif
+endif
+_CARGO_LOG = $(if $(_LOG_FEATURES),--features $(subst $(space),$(comma),$(_LOG_FEATURES)))
+_TEST_FEATURES = qemu-test$(if $(_LOG_FEATURES),$(comma)$(subst $(space),$(comma),$(_LOG_FEATURES)))
+
 .PHONY: kernel-rv64 kernel-rv64-test run-rv64 debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
 
 kernel-rv64:
-	cargo build --release -p kernel --target $(TARGET_RV64)
+	cargo build --release -p kernel --target $(TARGET_RV64) $(_CARGO_LOG)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
 
 kernel-rv64-test:
-	cargo build --release -p kernel --target $(TARGET_RV64) --features qemu-test
+	cargo build --release -p kernel --target $(TARGET_RV64) --features $(_TEST_FEATURES)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
 
 $(DISK_IMG): scripts/make_test_img.sh $(wildcard scripts/init)

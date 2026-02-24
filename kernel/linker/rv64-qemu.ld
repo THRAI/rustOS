@@ -6,7 +6,7 @@ ENTRY(_start)
 
 BASE_ADDRESS = 0x80200000;
 MAX_CPUS = 8;
-STACK_SIZE = 16384;  /* 16KB per hart */
+STACK_SIZE = 65536;  /* 64KB per hart */
 
 SECTIONS
 {

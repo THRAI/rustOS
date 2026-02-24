@@ -65,3 +65,32 @@ macro_rules! kprintln {
         $crate::console::_print(format_args!("{}\n", format_args!($($arg)*)))
     };
 }
+
+/// Structured kernel log macro.
+///
+/// `klog!(module, level, "fmt", args...)`
+///
+/// - `error`: always compiled in
+/// - `info` / `debug`: only compiled when the module's `log-<module>` feature is enabled
+#[macro_export]
+macro_rules! klog {
+    ($mod:ident, error, $($arg:tt)*) => {
+        $crate::kprintln!(concat!("[", stringify!($mod), "] {}"), format_args!($($arg)*))
+    };
+    ($mod:ident, $lvl:ident, $($arg:tt)*) => {
+        $crate::_klog_if!($mod, $($arg)*)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! _klog_if {
+    (boot,    $($arg:tt)*) => { #[cfg(feature = "log-boot")]    { $crate::kprintln!(concat!("[boot] {}"),    format_args!($($arg)*)); } };
+    (syscall, $($arg:tt)*) => { #[cfg(feature = "log-syscall")] { $crate::kprintln!(concat!("[syscall] {}"), format_args!($($arg)*)); } };
+    (trap,    $($arg:tt)*) => { #[cfg(feature = "log-trap")]    { $crate::kprintln!(concat!("[trap] {}"),    format_args!($($arg)*)); } };
+    (vm,      $($arg:tt)*) => { #[cfg(feature = "log-vm")]      { $crate::kprintln!(concat!("[vm] {}"),      format_args!($($arg)*)); } };
+    (sched,   $($arg:tt)*) => { #[cfg(feature = "log-sched")]   { $crate::kprintln!(concat!("[sched] {}"),   format_args!($($arg)*)); } };
+    (fs,      $($arg:tt)*) => { #[cfg(feature = "log-fs")]      { $crate::kprintln!(concat!("[fs] {}"),      format_args!($($arg)*)); } };
+    (driver,  $($arg:tt)*) => { #[cfg(feature = "log-driver")]  { $crate::kprintln!(concat!("[driver] {}"),  format_args!($($arg)*)); } };
+    (smp,     $($arg:tt)*) => { #[cfg(feature = "log-smp")]     { $crate::kprintln!(concat!("[smp] {}"),     format_args!($($arg)*)); } };
+}

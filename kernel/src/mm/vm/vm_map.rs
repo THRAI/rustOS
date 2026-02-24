@@ -22,6 +22,7 @@ use crate::fs::vnode::Vnode;
 #[cfg(test)]
 pub trait Vnode: Send + Sync {
     fn vnode_id(&self) -> u64;
+    fn path(&self) -> &str;
 }
 
 // ---------------------------------------------------------------------------

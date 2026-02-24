@@ -46,17 +46,23 @@ impl BuddyAllocator {
         assert!(end.is_page_aligned(), "buddy init: end not page-aligned");
         assert!(start.as_usize() < end.as_usize(), "buddy init: empty range");
 
+        // Pre-allocate Vec capacity to avoid realloc during the loop.
+        // For 128MB, order-11 (8MB blocks) needs ~16 slots; smaller orders need fewer.
+        for i in 0..=MAX_ORDER {
+            if self.free_lists[i].capacity() == 0 {
+                self.free_lists[i].reserve(16);
+            }
+        }
+        crate::klog!(boot, info, "buddy vecs pre-allocated");
+
         let mut addr = start.as_usize();
         let end_addr = end.as_usize();
         let total = (end_addr - addr) / PAGE_SIZE;
         self.total_pages += total;
 
-        // Greedily insert largest possible blocks.
+        let mut count = 0usize;
         while addr < end_addr {
             let pages_left = (end_addr - addr) / PAGE_SIZE;
-            // Find the largest order that:
-            // 1. fits in remaining space
-            // 2. is naturally aligned (addr is aligned to 2^order pages)
             let mut order = MAX_ORDER;
             while order > 0 {
                 let block_pages = 1 << order;
@@ -70,7 +76,9 @@ impl BuddyAllocator {
             self.free_lists[order].push(PhysAddr::new(addr));
             self.free_pages += 1 << order;
             addr += (1 << order) * PAGE_SIZE;
+            count += 1;
         }
+        crate::klog!(boot, info, "buddy init done: {} blocks inserted", count);
     }
 
     /// Allocate a block of 2^order contiguous pages.

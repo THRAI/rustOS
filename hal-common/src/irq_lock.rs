@@ -5,7 +5,7 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Arch-specific IRQ control.
 /// On host targets (x86_64, aarch64), these are no-ops for testability.
@@ -48,7 +48,7 @@ pub mod arch_irq {
 /// (run queues, timer wheel, etc). Using a bare spinlock on IRQ-shared
 /// data is a latent deadlock.
 pub struct IrqSafeSpinLock<T> {
-    locked: AtomicBool,
+    locked: AtomicUsize,
     data: UnsafeCell<T>,
 }
 
@@ -59,7 +59,7 @@ unsafe impl<T: Send> Sync for IrqSafeSpinLock<T> {}
 impl<T> IrqSafeSpinLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            locked: AtomicUsize::new(0),
             data: UnsafeCell::new(data),
         }
     }
@@ -68,7 +68,7 @@ impl<T> IrqSafeSpinLock<T> {
         let saved = arch_irq::disable_and_save();
         while self
             .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             // Spin with a hint to reduce bus contention
@@ -102,7 +102,7 @@ impl<T> DerefMut for IrqSafeGuard<'_, T> {
 
 impl<T> Drop for IrqSafeGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
+        self.lock.locked.store(0, Ordering::Release);
         arch_irq::restore(self.saved);
     }
 }

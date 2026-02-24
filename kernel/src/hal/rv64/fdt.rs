@@ -2,8 +2,6 @@
 //!
 //! Parses the /cpus node to discover hart IDs. Hand-parses the FDT
 //! header and structure block -- no external crate needed.
-
-use crate::kprintln;
 use super::super::super::executor::per_cpu::MAX_CPUS;
 
 /// Maximum physical harts we track (for hartid -> cpu_id mapping).
@@ -24,7 +22,7 @@ pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
     let mut hartids = [0usize; MAX_CPUS];
 
     if dtb_ptr == 0 {
-        kprintln!("[fdt] WARNING: dtb_ptr is null, assuming 1 CPU (hart 0)");
+        klog!(smp, error, "dtb_ptr is null, assuming 1 CPU (hart 0)");
         hartids[0] = 0;
         unsafe {
             HART_TO_CPU[0] = Some(0);
@@ -36,7 +34,7 @@ pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
     // Validate FDT magic
     let magic = read_be32(dtb_ptr);
     if magic != 0xd00dfeed {
-        kprintln!("[fdt] WARNING: bad magic {:#x}, assuming 1 CPU", magic);
+        klog!(smp, error, "bad magic {:#x}, assuming 1 CPU", magic);
         hartids[0] = 0;
         unsafe {
             HART_TO_CPU[0] = Some(0);
@@ -126,7 +124,7 @@ pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
     }
 
     if num_cpus == 0 {
-        kprintln!("[fdt] WARNING: no CPUs found, assuming 1 CPU (hart 0)");
+        klog!(smp, error, "no CPUs found, assuming 1 CPU (hart 0)");
         hartids[0] = 0;
         num_cpus = 1;
         unsafe {
@@ -135,7 +133,7 @@ pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
         }
     }
 
-    kprintln!("[fdt] discovered {} CPUs", num_cpus);
+    klog!(smp, info, "discovered {} CPUs", num_cpus);
     (num_cpus, hartids)
 }
 

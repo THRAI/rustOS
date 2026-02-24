@@ -1,6 +1,5 @@
 //! rv64 trap setup and dispatch.
 
-use crate::kprintln;
 use core::sync::atomic::Ordering;
 use hal_common::TrapFrame;
 
@@ -32,7 +31,7 @@ pub fn init() {
     unsafe {
         core::arch::asm!("csrs sie, {}", in(reg) (1usize << 5) | (1usize << 1));
     }
-    kprintln!("[trap] stvec set, STIE+SSIE enabled");
+    klog!(trap, info, "stvec set, STIE+SSIE enabled");
 }
 
 /// Point stvec to __kernel_trap (Direct mode).
@@ -124,7 +123,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
 
 /// Stub: external interrupt handler (expanded in later phases).
 fn handle_external_irq() {
-    kprintln!("[trap] external IRQ (stub)");
+    klog!(trap, debug, "external IRQ (stub)");
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +217,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
             // here we just record the syscall args and return -EAGAIN
             // to signal the executor to handle it asynchronously.
             // For synchronous stub: return fd 3+ or error
-            kprintln!("[syscall] openat(dirfd={}, path={:#x}, flags={:#x})", a0 as isize, a1, a2);
+            klog!(syscall, debug, "openat(dirfd={}, path={:#x}, flags={:#x})", a0 as isize, a1, a2);
             (-38isize) as usize // handled async by executor
         }
         SYS_CLOSE => {
@@ -236,7 +235,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
         }
         SYS_READ => {
             // a0=fd, a1=buf, a2=count — async, handled by executor
-            kprintln!("[syscall] read(fd={}, buf={:#x}, count={})", a0, a1, a2);
+            klog!(syscall, debug, "read(fd={}, buf={:#x}, count={})", a0, a1, a2);
             (-38isize) as usize // handled async by executor
         }
         SYS_WRITE => {
@@ -288,7 +287,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             let code = a0 as i32;
-            kprintln!("[syscall] exit({})", code);
+            klog!(syscall, debug, "exit({})", code);
             // Signal executor via special return value
             // The executor checks for this and handles task termination
             frame.set_ret_val(code as usize);
@@ -364,12 +363,12 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
         SYS_MUNMAP => 0,    // stub success
         SYS_CLONE => {
             // Stub: return 0 (child) — real fork handled by executor
-            kprintln!("[syscall] clone(flags={:#x})", a0);
+            klog!(syscall, debug, "clone(flags={:#x})", a0);
             (-38isize) as usize // handled async by executor
         }
         SYS_EXECVE => {
             // a0=pathname, a1=argv, a2=envp — async, handled by executor
-            kprintln!("[syscall] execve(path={:#x})", a0);
+            klog!(syscall, debug, "execve(path={:#x})", a0);
             (-38isize) as usize // handled async by executor
         }
         SYS_MMAP => {
@@ -392,11 +391,11 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
         SYS_MPROTECT => 0,  // stub success
         SYS_WAIT4 => {
             // a0=pid, a1=wstatus, a2=options — async, handled by executor
-            kprintln!("[syscall] wait4(pid={})", a0 as isize);
+            klog!(syscall, debug, "wait4(pid={})", a0 as isize);
             (-38isize) as usize // handled async by executor
         }
         _ => {
-            kprintln!("[syscall] unimplemented syscall {}", syscall_num);
+            klog!(syscall, info, "unimplemented syscall {}", syscall_num);
             (-38isize) as usize // ENOSYS
         }
     };

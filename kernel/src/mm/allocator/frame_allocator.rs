@@ -39,17 +39,29 @@ static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine>; per_cpu::MAX_CPUS] = [
 /// Initialize the buddy allocator with the given physical memory range.
 /// Called once during boot after the early bump allocator has reserved its region.
 pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
-    let mut buddy = GLOBAL_BUDDY.lock();
+    crate::klog!(boot, info, "frame: Box::new(BuddyAllocator::new())...");
+    let mut buddy = alloc::boxed::Box::new(BuddyAllocator::new());
+    crate::klog!(boot, info, "frame: box created, calling init...");
     buddy.init(start, end);
-    let total = buddy.total_pages();
-    let free = buddy.available_pages();
-    drop(buddy);
-    crate::kprintln!(
-        "[frame] buddy initialized: {} total pages, {} free ({} MB)",
-        total,
-        free,
-        free * PAGE_SIZE / (1024 * 1024)
-    );
+    crate::klog!(boot, info, "frame: init done, total={} free={}", buddy.total_pages(), buddy.available_pages());
+    crate::klog!(boot, info, "frame: swapping into global...");
+    // Single-threaded at boot — use lock normally
+    {
+        let mut guard = GLOBAL_BUDDY.lock();
+        crate::klog!(boot, info, "frame: lock acquired, doing swap...");
+        core::mem::swap(&mut *guard, &mut *buddy);
+        crate::klog!(boot, info, "frame: swap done, dropping guard...");
+    }
+    crate::klog!(boot, info, "frame: guard dropped");
+    {
+        let guard = GLOBAL_BUDDY.lock();
+        crate::klog!(
+            boot, info, "frame: buddy initialized: {} total pages, {} free ({} MB)",
+            guard.total_pages(),
+            guard.available_pages(),
+            guard.available_pages() * PAGE_SIZE / (1024 * 1024)
+        );
+    }
 }
 
 /// Get the current CPU's magazine index.

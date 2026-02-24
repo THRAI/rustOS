@@ -5,3 +5,4 @@ resolver = "2"
 [workspace.dependencies]
 bitflags = "2"
 log = "0.4"
+lwext4_rust = { git = "https://github.com/PACTHEMAN123/ext4fs.git", default-features = false, branch = "main" }

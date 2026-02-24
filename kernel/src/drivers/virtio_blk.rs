@@ -5,7 +5,6 @@
 //! synchronous read_sector/write_sector with adaptive polling.
 
 use crate::drivers::virtio_mmio::*;
-use crate::kprintln;
 use crate::mm::allocator::frame_alloc_sync;
 use core::sync::atomic::{fence, Ordering};
 use hal_common::PAGE_SIZE;
@@ -103,7 +102,7 @@ pub struct VirtioBlk {
 }
 
 /// Global driver instance.
-static VIRTIO_BLK: spin::Once<spin::Mutex<VirtioBlk>> = spin::Once::new();
+static VIRTIO_BLK: hal_common::Once<hal_common::SpinMutex<VirtioBlk>> = hal_common::Once::new();
 
 impl VirtioBlk {
     /// Probe MMIO addresses and initialize the first block device found.
@@ -118,7 +117,7 @@ impl VirtioBlk {
             if dev_id != DEVICE_TYPE_BLOCK {
                 continue;
             }
-            kprintln!("[virtio-blk] found block device at {:#x}", base);
+            klog!(driver, info, "found block device at {:#x}", base);
             return Self::init_device(mmio);
         }
         None
@@ -147,7 +146,7 @@ impl VirtioBlk {
         mmio.write(STATUS, status);
         let readback = mmio.read(STATUS);
         if readback & STATUS_FEATURES_OK == 0 {
-            kprintln!("[virtio-blk] FEATURES_OK not set, aborting");
+            klog!(driver, error, "FEATURES_OK not set, aborting");
             mmio.write(STATUS, STATUS_FAILED);
             return None;
         }
@@ -159,33 +158,27 @@ impl VirtioBlk {
         mmio.write(QUEUE_SEL, 0);
         let max_size = mmio.read(QUEUE_NUM_MAX) as u16;
         if max_size == 0 {
-            kprintln!("[virtio-blk] queue 0 not available");
+            klog!(driver, error, "queue 0 not available");
             return None;
         }
         let queue_size = max_size.min(QUEUE_SIZE_MAX);
         mmio.write(QUEUE_NUM, queue_size as u32);
 
-        // MMIO v1: virtqueue is a single contiguous region.
-        // Layout:
-        //   desc table:  16 * queue_size bytes at offset 0
-        //   avail ring:  2 + 2 + 2*queue_size + 2 bytes (flags, idx, ring[], used_event)
-        //   [padding to QUEUE_ALIGN boundary]
-        //   used ring:   2 + 2 + 8*queue_size + 2 bytes (flags, idx, ring[], avail_event)
         let qs = queue_size as usize;
         let desc_size = 16 * qs;
-        let avail_size = 6 + 2 * qs; // flags(2) + idx(2) + ring(2*qs) + used_event(2)
-        let queue_align = PAGE_SIZE; // QEMU default alignment
+        let avail_size = 6 + 2 * qs;
+        let queue_align = PAGE_SIZE;
         let used_offset = align_up(desc_size + avail_size, queue_align);
         let used_size = 6 + 8 * qs;
         let total_size = used_offset + used_size;
 
-        // Allocate enough contiguous pages (buddy order)
         let num_pages = align_up(total_size, PAGE_SIZE) / PAGE_SIZE;
         let order = num_pages.next_power_of_two().trailing_zeros() as usize;
         let base_frame = crate::mm::allocator::frame_alloc_contiguous(order)
             .expect("virtio-blk: queue alloc");
         let base_pa = base_frame.as_usize();
 
+        // Zero the entire region
         // Zero the entire region
         unsafe {
             core::ptr::write_bytes(base_pa as *mut u8, 0, (1 << order) * PAGE_SIZE);
@@ -365,12 +358,12 @@ impl VirtioBlk {
 pub fn init() {
     VIRTIO_BLK.call_once(|| {
         let blk = VirtioBlk::probe_and_init().expect("virtio-blk: no block device found");
-        kprintln!("[virtio-blk] initialized, capacity = {} sectors", blk.capacity());
-        spin::Mutex::new(blk)
+        klog!(driver, info, "initialized, capacity = {} sectors", blk.capacity());
+        hal_common::SpinMutex::new(blk)
     });
 }
 
 /// Get a reference to the global VirtIO-blk driver.
-pub fn get() -> &'static spin::Mutex<VirtioBlk> {
+pub fn get() -> &'static hal_common::SpinMutex<VirtioBlk> {
     VIRTIO_BLK.get().expect("virtio-blk not initialized")
 }

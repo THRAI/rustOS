@@ -9,6 +9,15 @@ path = "src/main.rs"
 
 [features]
 qemu-test = []
+log-boot    = []
+log-syscall = []
+log-trap    = []
+log-vm      = []
+log-sched   = []
+log-fs      = []
+log-driver  = []
+log-smp     = []
+log-all     = ["log-boot", "log-syscall", "log-trap", "log-vm", "log-sched", "log-fs", "log-driver", "log-smp"]
 
 [dependencies]
 hal-common = { path = "../hal-common" }

@@ -10,7 +10,6 @@ use lwext4_rust::bindings::{
 };
 use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
 use super::lwext4_disk::Disk;
-use crate::kprintln;
 
 // SAFETY: All lwext4 access is serialized through the delegate task.
 unsafe impl Send for Disk {}
@@ -70,11 +69,11 @@ pub fn mount() -> Result<(), i32> {
     let disk = Disk::new();
     let bw = Ext4BlockWrapper::<Disk>::new(disk, "/", "ext4_fs")
         .map_err(|e| {
-            kprintln!("[ext4] mount failed: {}", e);
+            klog!(fs, error, "ext4 mount failed: {}", e);
             -5
         })?;
     EXT4_BW.call_once(|| hal_common::SpinMutex::new(SendSyncBW(bw)));
-    kprintln!("[ext4] lwext4 mounted at /");
+    klog!(fs, info, "lwext4 mounted at /");
     Ok(())
 }
 

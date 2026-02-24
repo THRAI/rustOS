@@ -3,16 +3,27 @@
 //! Each Task holds its PID, parent link (Weak to avoid circular Arc),
 //! children list, VmMap, state, exit status, and a parent waker for
 //! wait4 notification.
+//!
+//! Per-task TrapFrame persists across .await points (not on kernel stack).
+//! Per-task kernel stack (8KB, 2 pages from frame allocator) is used by
+//! __user_trap / trap_return for the setjmp/longjmp trap mechanism.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
-use spin::Mutex;
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
+use hal_common::{PhysAddr, TrapFrame, PAGE_SIZE};
+use hal_common::SpinMutex as Mutex;
 
 use crate::mm::vm::vm_map::VmMap;
+use crate::mm::allocator::{frame_alloc_contiguous, frame_free_contiguous};
+use crate::mm::pmap::{self, Pmap};
 use crate::fs::fd_table::FdTable;
 
 use super::pid::alloc_pid;
+
+/// Kernel stack size: 2 pages (8KB).
+const KSTACK_ORDER: usize = 1; // 2^1 = 2 pages
+const KSTACK_SIZE: usize = PAGE_SIZE * (1 << KSTACK_ORDER);
 
 // ---------------------------------------------------------------------------
 // TaskState
@@ -57,11 +68,30 @@ pub struct Task {
     pub exit_status: AtomicI32,
     /// Waker for parent's WaitChildFuture. Set by wait4 before scanning.
     pub parent_waker: Mutex<Option<core::task::Waker>>,
+    /// User-mode register state. Persists across .await points (not on kernel stack).
+    pub trap_frame: Mutex<TrapFrame>,
+    /// Per-process page table (Sv39).
+    pub pmap: Mutex<Pmap>,
+    /// Kernel stack base (2 pages from frame allocator, page-aligned).
+    kstack_base: PhysAddr,
+    /// Kernel stack pointer (top of kstack, used by trap_return / __user_trap).
+    pub kernel_sp: usize,
+    /// Program break (brk). Page-aligned end of heap.
+    pub brk: AtomicUsize,
+}
+
+/// Allocate a kernel stack (2 pages) and return (base, sp_top).
+fn alloc_kstack() -> (PhysAddr, usize) {
+    let base = frame_alloc_contiguous(KSTACK_ORDER)
+        .expect("failed to allocate kernel stack");
+    let sp = base.as_usize() + KSTACK_SIZE;
+    (base, sp)
 }
 
 impl Task {
     /// Create a new task with the given parent.
     pub fn new(parent: Weak<Task>) -> Arc<Self> {
+        let (kstack_base, kernel_sp) = alloc_kstack();
         Arc::new(Self {
             pid: alloc_pid(),
             parent,
@@ -71,11 +101,17 @@ impl Task {
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
             parent_waker: Mutex::new(None),
+            trap_frame: Mutex::new(TrapFrame::zero()),
+            pmap: Mutex::new(pmap::pmap_create()),
+            kstack_base,
+            kernel_sp,
+            brk: AtomicUsize::new(0),
         })
     }
 
     /// Create init (pid 1) with no parent.
     pub fn new_init() -> Arc<Self> {
+        let (kstack_base, kernel_sp) = alloc_kstack();
         Arc::new(Self {
             pid: alloc_pid(),
             parent: Weak::new(),
@@ -85,6 +121,11 @@ impl Task {
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
             parent_waker: Mutex::new(None),
+            trap_frame: Mutex::new(TrapFrame::zero()),
+            pmap: Mutex::new(pmap::pmap_create()),
+            kstack_base,
+            kernel_sp,
+            brk: AtomicUsize::new(0),
         })
     }
 
@@ -104,5 +145,14 @@ impl Task {
             Some(p) => p.pid,
             None => 0,
         }
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // Free page table pages.
+        pmap::pmap_destroy(&mut self.pmap.lock());
+        // Free the per-task kernel stack back to the buddy allocator.
+        frame_free_contiguous(self.kstack_base, KSTACK_ORDER);
     }
 }

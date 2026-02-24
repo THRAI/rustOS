@@ -65,3 +65,14 @@ pub fn hart_status(hartid: usize) -> usize {
 pub fn hart_stop() -> SbiRet {
     sbi_call(EID_HSM, 1, [0, 0, 0])
 }
+
+const EID_SRST: usize = 0x53525354; // System Reset extension
+
+/// Shutdown the system (power off).
+/// EID=SRST, FID=0, reset_type=0 (shutdown), reset_reason=0 (no reason).
+pub fn shutdown() -> ! {
+    sbi_call(EID_SRST, 0, [0, 0, 0]);
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}

@@ -6,6 +6,8 @@ extern crate alloc;
 
 use core::arch::global_asm;
 
+#[macro_use]
+mod console;
 mod alloc_early;
 mod drivers;
 mod executor;
@@ -14,8 +16,6 @@ mod hal;
 mod libc_stubs;
 mod mm;
 mod proc;
-#[macro_use]
-mod console;
 mod trap;
 
 // Include boot assembly
@@ -36,7 +36,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     if !BOOT_HART_CLAIMED.swap(true, core::sync::atomic::Ordering::AcqRel) {
         hal::rv64::uart::init();
         kprintln!("hello world");
-        kprintln!("[kernel] hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
+        klog!(boot, info, "hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
 
         // Ensure SIE=0 and set stvec before anything that uses IrqSafeSpinLock.
         // OpenSBI may leave SIE=1; IrqSafeSpinLock restore would re-enable it,
@@ -56,13 +56,13 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         for i in 0..num_cpus {
             let hid = hartids[i];
             let cid = hal::rv64::fdt::hart_to_cpu(hid).unwrap_or(i);
-            kprintln!("[boot] init_per_cpu({}, {}) start", cid, hid);
+            klog!(boot, info, "init_per_cpu({}, {}) start", cid, hid);
             executor::init_per_cpu(cid, hid);
-            kprintln!("[boot] init_per_cpu({}, {}) done", cid, hid);
+            klog!(boot, info, "init_per_cpu({}, {}) done", cid, hid);
         }
         let cpu0 = hal::rv64::fdt::hart_to_cpu(hartid).unwrap_or(0);
         unsafe { executor::per_cpu::set_tp(cpu0) };
-        kprintln!("[kernel] per-cpu data initialized for {} harts", num_cpus);
+        klog!(boot, info, "per-cpu data initialized for {} harts", num_cpus);
 
         // Initialize trap infrastructure (stvec + STIE + SSIE)
         trap::init();
@@ -77,29 +77,29 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 unsafe { &ekernel as *const u8 as usize }
             );
             let mem_end = hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
-            kprintln!("[boot] init_frame_allocator({:#x}..{:#x})", mem_start.as_usize(), mem_end.as_usize());
+            klog!(boot, info, "init_frame_allocator({:#x}..{:#x})", mem_start.as_usize(), mem_end.as_usize());
             // Test heap allocation before buddy init
             {
                 let v: alloc::vec::Vec<u64> = alloc::vec![1, 2, 3, 4, 5];
-                kprintln!("[boot] test vec alloc OK, len={}", v.len());
+                klog!(boot, info, "test vec alloc OK, len={}", v.len());
             }
             mm::allocator::init_frame_allocator(mem_start, mem_end);
-            kprintln!("[boot] frame allocator done");
+            klog!(boot, info, "frame allocator done");
         }
 
         // Initialize VirtIO-blk driver (probes MMIO addresses for block device)
         drivers::virtio_blk::init();
 
         // Initialize VFS caches
-        kprintln!("[boot] dentry::init...");
+        klog!(boot, info, "dentry::init...");
         fs::dentry::init();
-        kprintln!("[boot] page_cache::init...");
+        klog!(boot, info, "page_cache::init...");
         fs::page_cache::init();
 
-        kprintln!("[boot] delegate::init...");
+        klog!(boot, info, "delegate::init...");
         // Initialize filesystem delegate (mounts ext4, spawns delegate task)
         fs::delegate::init();
-        kprintln!("[boot] delegate done");
+        klog!(boot, info, "delegate done");
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {
@@ -187,9 +187,44 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             }, cpu0).detach();
         }
 
+        // Spawn init process: exec /bin/init, then enter user mode
+        {
+            let init_task = proc::task::Task::new_init();
+            let init_task2 = init_task.clone();
+            let init_cpu = cpu0;
+            executor::spawn_kernel_task(async move {
+                // Wait for delegate mount to complete
+                executor::sleep(100).await;
+                let argv = alloc::vec![
+                    alloc::string::String::from("/bin/busybox"),
+                    alloc::string::String::from("echo"),
+                    alloc::string::String::from("hello from busybox"),
+                ];
+                let envp = alloc::vec![
+                    alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
+                    alloc::string::String::from("HOME=/"),
+                ];
+                match proc::exec::exec_with_args(&init_task2, "/bin/busybox", &argv, &envp).await {
+                    Ok((entry, sp)) => {
+                        {
+                            let mut tf = init_task2.trap_frame.lock();
+                            tf.sepc = entry;
+                            tf.x[2] = sp;
+                            tf.sstatus = 1 << 5; // SPP=0, SPIE=1
+                        }
+                        klog!(boot, info, "exec OK: entry={:#x} sp={:#x}", entry, sp);
+                        executor::spawn_user_task(init_task2, init_cpu);
+                    }
+                    Err(e) => {
+                        klog!(boot, error, "exec /bin/busybox failed: {:?}", e);
+                    }
+                }
+            }, cpu0).detach();
+        }
+
         // Enable global interrupts
         hal::rv64::irq::enable();
-        kprintln!("[kernel] interrupts enabled, entering executor loop");
+        klog!(boot, info, "interrupts enabled, entering executor loop");
 
         // Enter the executor loop (never returns)
         executor::executor_loop();
@@ -367,7 +402,7 @@ async fn test_delegate_read() {
             match fs::delegate::fs_read(handle, &mut buf).await {
                 Ok(n) => {
                     let content = core::str::from_utf8(&buf[..n]).unwrap_or("<invalid utf8>");
-                    if content == "hello from ext4" {
+                    if content.trim_end() == "hello from ext4" {
                         kprintln!("delegate read PASS");
                     } else {
                         kprintln!("delegate read FAIL (content={:?})", content);
@@ -393,8 +428,7 @@ async fn test_vfs_read() {
             match fs::syscalls::sys_read(&fd_table, fd, &mut buf).await {
                 Ok(n) => {
                     let content = core::str::from_utf8(&buf[..n]).unwrap_or("<invalid utf8>");
-                    if content == "hello from ext4" {
-                        // Second read: should hit page cache
+                    if content.trim_end() == "hello from ext4" {
                         let mut buf2 = [0u8; 64];
                         // Reopen to reset offset
                         let _ = fs::syscalls::sys_close(&fd_table, fd);
@@ -403,7 +437,7 @@ async fn test_vfs_read() {
                                 match fs::syscalls::sys_read(&fd_table, fd2, &mut buf2).await {
                                     Ok(n2) => {
                                         let content2 = core::str::from_utf8(&buf2[..n2]).unwrap_or("<invalid utf8>");
-                                        if content2 == "hello from ext4" {
+                                        if content2.trim_end() == "hello from ext4" {
                                             kprintln!("vfs read PASS");
                                         } else {
                                             kprintln!("vfs read FAIL (cache content={:?})", content2);

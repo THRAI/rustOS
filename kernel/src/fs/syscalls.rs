@@ -15,7 +15,7 @@ use super::path;
 use super::vnode::{Vnode, VnodeType};
 
 /// sys_open: resolve path, create OpenFile, insert into fd table.
-pub async fn sys_open(fd_table: &spin::Mutex<FdTable>, path_str: &str, flags: OpenFlags) -> Result<u32, Errno> {
+pub async fn sys_open(fd_table: &hal_common::SpinMutex<FdTable>, path_str: &str, flags: OpenFlags) -> Result<u32, Errno> {
     let vnode = path::resolve(path_str).await?;
     let file = OpenFile::new(vnode, flags);
     let fd = fd_table.lock().insert(file);
@@ -23,7 +23,7 @@ pub async fn sys_open(fd_table: &spin::Mutex<FdTable>, path_str: &str, flags: Op
 }
 
 /// sys_read: read from fd into buffer, going through page cache.
-pub async fn sys_read(fd_table: &spin::Mutex<FdTable>, fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
+pub async fn sys_read(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
     let (vnode, offset, file) = {
         let table = fd_table.lock();
         let f = table.get(fd).ok_or(Errno::EBADF)?;
@@ -51,9 +51,8 @@ pub async fn sys_read(fd_table: &spin::Mutex<FdTable>, fd: u32, buf: &mut [u8]) 
             Some(pa) => pa,
             None => {
                 // Fetch via delegate
-                let ino = vnode.vnode_id() as u32;
                 let page_byte_offset = page_offset * PAGE_SIZE as u64;
-                match delegate::fs_read_page(ino, page_byte_offset).await {
+                match delegate::fs_read_page(vnode.path(), page_byte_offset).await {
                     Ok(pa_usize) => {
                         let pa = PhysAddr::new(pa_usize);
                         page_cache::complete(vnode.vnode_id(), page_offset, pa);
@@ -83,18 +82,18 @@ pub async fn sys_read(fd_table: &spin::Mutex<FdTable>, fd: u32, buf: &mut [u8]) 
 }
 
 /// sys_write: stub for Phase 3 (read-only filesystem).
-pub async fn sys_write(_fd_table: &spin::Mutex<FdTable>, _fd: u32, _buf: &[u8]) -> Result<usize, Errno> {
+pub async fn sys_write(_fd_table: &hal_common::SpinMutex<FdTable>, _fd: u32, _buf: &[u8]) -> Result<usize, Errno> {
     Err(Errno::EPERM) // Read-only filesystem in Phase 3
 }
 
 /// sys_close: remove fd from table.
-pub fn sys_close(fd_table: &spin::Mutex<FdTable>, fd: u32) -> Result<(), Errno> {
+pub fn sys_close(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(), Errno> {
     fd_table.lock().remove(fd).ok_or(Errno::EBADF)?;
     Ok(())
 }
 
 /// sys_stat: get file metadata by fd.
-pub fn sys_stat(fd_table: &spin::Mutex<FdTable>, fd: u32) -> Result<(u64, u8), Errno> {
+pub fn sys_stat(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(u64, u8), Errno> {
     let table = fd_table.lock();
     let f = table.get(fd).ok_or(Errno::EBADF)?;
     let size = f.vnode.size();

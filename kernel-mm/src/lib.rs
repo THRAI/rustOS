@@ -2,7 +2,15 @@
 
 extern crate alloc;
 
+/// No-op kprintln for test builds (the real macro lives in the kernel crate).
+#[cfg(test)]
+#[macro_export]
+macro_rules! kprintln {
+    ($($arg:tt)*) => {};
+}
+
 pub mod allocator;
+pub mod pmap;
 pub mod uio;
 pub mod vm;
 

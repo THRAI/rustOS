@@ -1,364 +1,205 @@
-//! Minimal read-only ext4 filesystem parser.
+//! lwext4-backed ext4 filesystem driver.
 //!
-//! Reads superblock, group descriptors, inodes, and directory entries
-//! to support open + read of files. Uses a block read callback to
-//! access the underlying block device.
+//! All public I/O functions require `&mut DelegateToken`, enforcing at
+//! compile time that only the single delegate task can call into lwext4.
+//! Metadata queries (`stat`, `exists`) use the native C APIs
+//! (`ext4_raw_inode_fill`, `ext4_inode_exist`) instead of file-open hacks.
 
-/// ext4 superblock magic.
-const EXT4_SUPER_MAGIC: u16 = 0xEF53;
+use lwext4_rust::bindings::{
+    self, ext4_dir, ext4_direntry, ext4_inode, EOK, ENOENT,
+};
+use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
+use super::lwext4_disk::Disk;
+use crate::kprintln;
 
-/// Inode number for root directory.
-const EXT4_ROOT_INO: u32 = 2;
+// SAFETY: All lwext4 access is serialized through the delegate task.
+unsafe impl Send for Disk {}
+unsafe impl Sync for Disk {}
 
-/// File type in directory entry: regular file.
-const EXT4_FT_REG_FILE: u8 = 1;
-/// File type in directory entry: directory.
-const EXT4_FT_DIR: u8 = 2;
+struct SendSyncBW(Ext4BlockWrapper<Disk>);
+unsafe impl Send for SendSyncBW {}
+unsafe impl Sync for SendSyncBW {}
 
-/// On-disk superblock (partial — fields we need).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Superblock {
-    pub s_inodes_count: u32,
-    pub s_blocks_count_lo: u32,
-    pub s_r_blocks_count_lo: u32,
-    pub s_free_blocks_count_lo: u32,
-    pub s_free_inodes_count: u32,
-    pub s_first_data_block: u32,
-    pub s_log_block_size: u32,
-    pub s_log_cluster_size: u32,
-    pub s_blocks_per_group: u32,
-    pub s_clusters_per_group: u32,
-    pub s_inodes_per_group: u32,
-    pub s_mtime: u32,
-    pub s_wtime: u32,
-    pub s_mnt_count: u16,
-    pub s_max_mnt_count: u16,
-    pub s_magic: u16,
-}
+static EXT4_BW: hal_common::Once<hal_common::SpinMutex<SendSyncBW>> = hal_common::Once::new();
 
-impl Superblock {
-    pub fn block_size(&self) -> usize {
-        1024 << self.s_log_block_size
+// ── DelegateToken (Phase 2) ─────────────────────────────────────────
+
+/// Proof that the caller is running inside the delegate task.
+/// Only one instance exists, created in `delegate_task()`.
+pub struct DelegateToken(());
+
+impl DelegateToken {
+    /// # Safety
+    /// Must only be called once, inside the delegate task.
+    pub(crate) unsafe fn new() -> Self {
+        Self(())
     }
 }
 
-/// On-disk group descriptor (32 bytes, no 64-bit extensions).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct GroupDesc {
-    pub bg_block_bitmap_lo: u32,
-    pub bg_inode_bitmap_lo: u32,
-    pub bg_inode_table_lo: u32,
-    pub bg_free_blocks_count_lo: u16,
-    pub bg_free_inodes_count_lo: u16,
-    pub bg_used_dirs_count_lo: u16,
-    pub bg_flags: u16,
-    pub bg_exclude_bitmap_lo: u32,
-    pub bg_block_bitmap_csum_lo: u16,
-    pub bg_inode_bitmap_csum_lo: u16,
-    pub bg_itable_unused_lo: u16,
-    pub bg_checksum: u16,
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// Convert a `&str` path to a stack-allocated null-terminated buffer.
+/// Returns `(buf, len_with_nul)`. Panics if path >= 256 bytes.
+fn path_to_cstr(path: &str) -> [u8; 257] {
+    let bytes = path.as_bytes();
+    assert!(bytes.len() < 257, "path too long for ext4 cstr buffer");
+    let mut buf = [0u8; 257];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    // buf[bytes.len()] is already 0 (null terminator)
+    buf
 }
 
-/// On-disk inode (128 bytes minimum).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Inode {
-    pub i_mode: u16,
-    pub i_uid: u16,
-    pub i_size_lo: u32,
-    pub i_atime: u32,
-    pub i_ctime: u32,
-    pub i_mtime: u32,
-    pub i_dtime: u32,
-    pub i_gid: u16,
-    pub i_links_count: u16,
-    pub i_blocks_lo: u32,
-    pub i_flags: u32,
-    pub i_osd1: u32,
-    pub i_block: [u32; 15],
-    pub i_generation: u32,
-    pub i_file_acl_lo: u32,
-    pub i_size_high: u32,
-    pub i_obso_faddr: u32,
-    pub i_osd2: [u8; 12],
+// ── VFS Flags (Phase 3) ─────────────────────────────────────────────
+
+/// Standard POSIX-style open flags used by the VFS layer.
+/// Eliminates magic numbers like `0x0010_0000`.
+pub mod flags {
+    pub const O_RDONLY: u32 = 0;
+    pub const O_WRONLY: u32 = 1;
+    pub const O_RDWR: u32 = 2;
+    pub const O_CREAT: u32 = 0x0000_0040;
+    pub const O_TRUNC: u32 = 0x0000_0200;
+    pub const O_APPEND: u32 = 0x0000_0400;
+    pub const O_DIRECTORY: u32 = 0x0010_0000;
 }
 
-impl Inode {
-    pub fn size(&self) -> u64 {
-        self.i_size_lo as u64 | ((self.i_size_high as u64) << 32)
-    }
+// ── Mount ───────────────────────────────────────────────────────────
 
-    /// Check if this inode is a directory.
-    pub fn is_dir(&self) -> bool {
-        (self.i_mode & 0xF000) == 0x4000
-    }
-
-    /// Check if this inode is a regular file.
-    pub fn is_file(&self) -> bool {
-        (self.i_mode & 0xF000) == 0x8000
-    }
+/// Mount the ext4 filesystem from VirtIO-blk.
+pub fn mount() -> Result<(), i32> {
+    let disk = Disk::new();
+    let bw = Ext4BlockWrapper::<Disk>::new(disk, "/", "ext4_fs")
+        .map_err(|e| {
+            kprintln!("[ext4] mount failed: {}", e);
+            -5
+        })?;
+    EXT4_BW.call_once(|| hal_common::SpinMutex::new(SendSyncBW(bw)));
+    kprintln!("[ext4] lwext4 mounted at /");
+    Ok(())
 }
 
-/// On-disk directory entry (variable length).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DirEntry {
-    pub inode: u32,
-    pub rec_len: u16,
-    pub name_len: u8,
-    pub file_type: u8,
-    // name bytes follow (up to 255)
+// ── File I/O (require DelegateToken) ────────────────────────────────
+
+/// Open a file. Returns an Ext4File handle.
+pub fn open(_tok: &mut DelegateToken, path: &str, open_flags: u32) -> Result<Ext4File, i32> {
+    let ftype = if open_flags & flags::O_DIRECTORY != 0 {
+        InodeTypes::EXT4_DE_DIR
+    } else {
+        InodeTypes::EXT4_DE_REG_FILE
+    };
+    let mut file = Ext4File::new(path, ftype);
+    file.file_open(path, open_flags)?;
+    Ok(file)
 }
 
-/// Block read function type: reads `block_no` into `buf`.
-/// `buf` is guaranteed to be at least `block_size` bytes.
-pub type BlockReadFn = fn(block_no: u64, buf: &mut [u8]) -> Result<(), ()>;
-
-/// Ext4 filesystem handle.
-pub struct Ext4Fs {
-    sb: Superblock,
-    gd: GroupDesc,
-    block_size: usize,
-    inode_size: usize,
-    read_block: BlockReadFn,
+/// Read from an open file into buf. Returns bytes read.
+pub fn read(_tok: &mut DelegateToken, file: &mut Ext4File, buf: &mut [u8]) -> Result<usize, i32> {
+    file.file_read(buf)
 }
 
-impl Ext4Fs {
-    /// Mount an ext4 filesystem using the given block read function.
-    /// Reads superblock from block 1 (offset 1024) and group descriptor.
-    pub fn mount(read_block: BlockReadFn) -> Result<Self, &'static str> {
-        // Read superblock: always at byte offset 1024
-        let mut buf = [0u8; 1024];
-        // For 1024-byte blocks, superblock is in block 1.
-        // For larger blocks, it's at offset 1024 within block 0.
-        // Read block 0 first to check, then block 1.
-        read_block(1, &mut buf).map_err(|_| "failed to read superblock block")?;
+/// Write to an open file. Returns bytes written.
+pub fn write(_tok: &mut DelegateToken, file: &mut Ext4File, buf: &[u8]) -> Result<usize, i32> {
+    file.file_write(buf)
+}
 
-        let sb: Superblock = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const Superblock) };
+/// Close an open file.
+pub fn close(_tok: &mut DelegateToken, file: &mut Ext4File) -> Result<(), i32> {
+    file.file_close()?;
+    Ok(())
+}
 
-        if sb.s_magic != EXT4_SUPER_MAGIC {
-            // Maybe block size > 1024, superblock at offset 1024 in block 0
-            read_block(0, &mut buf).map_err(|_| "failed to read block 0")?;
-            // Can't handle >1024 block size with 1024-byte buffer for mount
-            return Err("bad superblock magic");
-        }
+// ── Native stat via ext4_raw_inode_fill (Phase 1) ───────────────────
 
-        let block_size = sb.block_size();
-        // Read inode size from superblock (at offset 88 in the raw superblock)
-        // We already have the raw bytes in buf
-        let inode_size = u16::from_le_bytes([buf[88], buf[89]]) as usize;
-        let inode_size = if inode_size == 0 { 128 } else { inode_size };
+/// Stat a path: returns `(file_size, file_type_u8)`.
+/// file_type: 1=regular, 2=directory.
+///
+/// Uses the native `ext4_raw_inode_fill` C API — no file_open needed.
+pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u64, u8), i32> {
+    let cpath = path_to_cstr(path);
+    let mut ino: u32 = 0;
+    let mut inode: ext4_inode = unsafe { core::mem::zeroed() };
 
-        // Read group descriptor table (block after superblock)
-        let gd_block = sb.s_first_data_block + 1;
-        let mut gd_buf = [0u8; 1024];
-        read_block(gd_block as u64, &mut gd_buf).map_err(|_| "failed to read GDT")?;
+    let rc = unsafe {
+        bindings::ext4_raw_inode_fill(
+            cpath.as_ptr() as *const core::ffi::c_char,
+            &mut ino,
+            &mut inode,
+        )
+    };
 
-        let gd: GroupDesc = unsafe { core::ptr::read_unaligned(gd_buf.as_ptr() as *const GroupDesc) };
-
-        Ok(Ext4Fs {
-            sb,
-            gd,
-            block_size,
-            inode_size,
-            read_block,
-        })
+    if rc != EOK as i32 {
+        return Err(-(rc.abs()));
     }
 
-    /// Read an inode by number (1-based).
-    pub fn read_inode(&self, ino: u32) -> Result<Inode, &'static str> {
-        let idx = (ino - 1) as usize;
-        let inodes_per_block = self.block_size / self.inode_size;
-        let block_offset = idx / inodes_per_block;
-        let offset_in_block = (idx % inodes_per_block) * self.inode_size;
+    let mode = inode.mode;
+    let ftype = if (mode & 0xF000) == 0x4000 { 2u8 } else { 1u8 };
+    let size = (inode.size_hi as u64) << 32 | (inode.size_lo as u64);
+    Ok((size, ftype))
+}
 
-        let table_block = self.gd.bg_inode_table_lo as u64 + block_offset as u64;
-        let mut buf = [0u8; 1024];
-        (self.read_block)(table_block, &mut buf).map_err(|_| "failed to read inode block")?;
-
-        let inode: Inode = unsafe {
-            core::ptr::read_unaligned(buf[offset_in_block..].as_ptr() as *const Inode)
-        };
-        Ok(inode)
+/// Check if an inode exists at the given path.
+pub fn exists(_tok: &mut DelegateToken, path: &str) -> bool {
+    let cpath = path_to_cstr(path);
+    let ptr = cpath.as_ptr() as *const core::ffi::c_char;
+    let rc = unsafe { bindings::ext4_inode_exist(ptr, 1) }; // EXT4_DE_REG_FILE
+    if rc == EOK as i32 {
+        return true;
     }
+    let rc = unsafe { bindings::ext4_inode_exist(ptr, 2) }; // EXT4_DE_DIR
+    rc == EOK as i32
+}
 
-    /// Look up a file by path (e.g., "/hello.txt"). Returns inode number.
-    pub fn lookup(&self, path: &str) -> Result<u32, &'static str> {
-        let path = path.trim_start_matches('/');
-        if path.is_empty() {
-            return Ok(EXT4_ROOT_INO);
-        }
+// ── Directory iteration (native C API) ──────────────────────────────
 
-        let mut current_ino = EXT4_ROOT_INO;
-
-        for component in path.split('/') {
-            if component.is_empty() {
-                continue;
-            }
-            let inode = self.read_inode(current_ino)?;
-            if !inode.is_dir() {
-                return Err("not a directory");
-            }
-            current_ino = self.find_in_dir(&inode, component)?;
-        }
-
-        Ok(current_ino)
+/// Open a directory for iteration. Returns an opaque `ext4_dir` handle.
+pub fn dir_open(_tok: &mut DelegateToken, path: &str) -> Result<ext4_dir, i32> {
+    let cpath = path_to_cstr(path);
+    let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
+    let rc = unsafe {
+        bindings::ext4_dir_open(
+            &mut dir,
+            cpath.as_ptr() as *const core::ffi::c_char,
+        )
+    };
+    if rc != EOK as i32 {
+        return Err(-(rc.abs()));
     }
+    Ok(dir)
+}
 
-    /// Find a name in a directory inode. Returns the inode number.
-    fn find_in_dir(&self, dir_inode: &Inode, name: &str) -> Result<u32, &'static str> {
-        let name_bytes = name.as_bytes();
-        // Walk direct blocks (i_block[0..11])
-        for i in 0..12 {
-            let blk = dir_inode.i_block[i];
-            if blk == 0 {
-                break;
-            }
-            let mut buf = [0u8; 1024];
-            (self.read_block)(blk as u64, &mut buf).map_err(|_| "failed to read dir block")?;
-
-            let mut off = 0usize;
-            while off < self.block_size && off < 1024 {
-                if off + 8 > 1024 {
-                    break;
-                }
-                let de: DirEntry = unsafe {
-                    core::ptr::read_unaligned(buf[off..].as_ptr() as *const DirEntry)
-                };
-                if de.rec_len == 0 {
-                    break;
-                }
-                if de.inode != 0 && de.name_len as usize == name_bytes.len() {
-                    let de_name = &buf[off + 8..off + 8 + de.name_len as usize];
-                    if de_name == name_bytes {
-                        return Ok(de.inode);
-                    }
-                }
-                off += de.rec_len as usize;
-            }
-        }
-        Err("file not found")
+/// Read the next directory entry. Returns `None` when exhausted.
+/// Yields `(name_bytes, name_len, inode_type, inode_number)`.
+pub fn dir_next(_tok: &mut DelegateToken, dir: &mut ext4_dir) -> Option<([u8; 255], u8, u8, u32)> {
+    let de_ptr = unsafe { bindings::ext4_dir_entry_next(dir) };
+    if de_ptr.is_null() {
+        return None;
     }
-
-    /// Read file contents into `buf`. Returns bytes read.
-    pub fn read_file(&self, ino: u32, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let inode = self.read_inode(ino)?;
-        if !inode.is_file() {
-            return Err("not a regular file");
-        }
-
-        let file_size = inode.size() as usize;
-        let to_read = buf.len().min(file_size);
-        let mut total = 0usize;
-
-        // Read direct blocks (i_block[0..11])
-        for i in 0..12 {
-            if total >= to_read {
-                break;
-            }
-            let blk = inode.i_block[i];
-            if blk == 0 {
-                break;
-            }
-            let mut block_buf = [0u8; 1024];
-            (self.read_block)(blk as u64, &mut block_buf)
-                .map_err(|_| "failed to read file block")?;
-
-            let chunk = (to_read - total).min(self.block_size);
-            buf[total..total + chunk].copy_from_slice(&block_buf[..chunk]);
-            total += chunk;
-        }
-
-        Ok(total)
+    let de: &ext4_direntry = unsafe { &*de_ptr };
+    if de.name_length == 0 {
+        return None;
     }
+    Some((de.name, de.name_length, de.inode_type, de.inode))
+}
 
-    /// Block size of this filesystem.
-    pub fn block_size(&self) -> usize {
-        self.block_size
+/// Close a directory handle.
+pub fn dir_close(_tok: &mut DelegateToken, dir: &mut ext4_dir) -> Result<(), i32> {
+    let rc = unsafe { bindings::ext4_dir_close(dir) };
+    if rc != EOK as i32 {
+        return Err(-(rc.abs()));
     }
+    Ok(())
+}
 
-    /// Look up a child entry in a directory by parent inode + name.
-    /// Returns (child_ino, file_type, file_size).
-    pub fn lookup_in_dir(&self, parent_ino: u32, name: &str) -> Result<(u32, u8, u64), &'static str> {
-        let dir_inode = self.read_inode(parent_ino)?;
-        if !dir_inode.is_dir() {
-            return Err("not a directory");
-        }
-        let name_bytes = name.as_bytes();
-        for i in 0..12 {
-            let blk = dir_inode.i_block[i];
-            if blk == 0 {
-                break;
-            }
-            let mut buf = [0u8; 1024];
-            (self.read_block)(blk as u64, &mut buf).map_err(|_| "failed to read dir block")?;
+/// Create a directory.
+pub fn mkdir(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
+    let mut file = Ext4File::new(path, InodeTypes::EXT4_DE_DIR);
+    file.dir_mk(path)?;
+    Ok(())
+}
 
-            let mut off = 0usize;
-            while off < self.block_size && off < 1024 {
-                if off + 8 > 1024 {
-                    break;
-                }
-                let de: DirEntry = unsafe {
-                    core::ptr::read_unaligned(buf[off..].as_ptr() as *const DirEntry)
-                };
-                if de.rec_len == 0 {
-                    break;
-                }
-                if de.inode != 0 && de.name_len as usize == name_bytes.len() {
-                    let de_name = &buf[off + 8..off + 8 + de.name_len as usize];
-                    if de_name == name_bytes {
-                        let child_inode = self.read_inode(de.inode)?;
-                        return Ok((de.inode, de.file_type, child_inode.size()));
-                    }
-                }
-                off += de.rec_len as usize;
-            }
-        }
-        Err("file not found")
-    }
-
-    /// Read file data at a byte offset into buf. Returns bytes read.
-    /// Used by the page cache to read individual pages.
-    pub fn read_file_at(&self, ino: u32, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let inode = self.read_inode(ino)?;
-        if !inode.is_file() {
-            return Err("not a regular file");
-        }
-
-        let file_size = inode.size();
-        if offset >= file_size {
-            return Ok(0);
-        }
-
-        let to_read = buf.len().min((file_size - offset) as usize);
-        let mut total = 0usize;
-
-        // Calculate starting block index and offset within block
-        let start_block_idx = (offset / self.block_size as u64) as usize;
-        let offset_in_block = (offset % self.block_size as u64) as usize;
-
-        // Read direct blocks (i_block[0..11]) starting from the right position
-        for i in start_block_idx..12 {
-            if total >= to_read {
-                break;
-            }
-            let blk = inode.i_block[i];
-            if blk == 0 {
-                break;
-            }
-            let mut block_buf = [0u8; 1024];
-            (self.read_block)(blk as u64, &mut block_buf)
-                .map_err(|_| "failed to read file block")?;
-
-            let skip = if i == start_block_idx { offset_in_block } else { 0 };
-            let avail = self.block_size - skip;
-            let chunk = (to_read - total).min(avail);
-            buf[total..total + chunk].copy_from_slice(&block_buf[skip..skip + chunk]);
-            total += chunk;
-        }
-
-        Ok(total)
-    }
+/// Remove a file.
+pub fn unlink(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
+    let mut file = Ext4File::new(path, InodeTypes::EXT4_DE_REG_FILE);
+    file.file_remove(path)?;
+    Ok(())
 }

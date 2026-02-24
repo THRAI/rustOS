@@ -194,6 +194,9 @@ async fn delegate_task() {
     }
     kprintln!("[fs] ext4 mounted, delegate running");
 
+    // SAFETY: We are the single delegate task — the only holder of this token.
+    let mut tok = unsafe { crate::fs::ext4::DelegateToken::new() };
+
     // Open file table: each slot holds an Option<SendExt4File>
     let mut open_files: [Option<SendExt4File>; MAX_OPEN_FILES] = [const { None }; MAX_OPEN_FILES];
 
@@ -204,7 +207,7 @@ async fn delegate_task() {
         match req {
             FsRequest::Open { path, path_len, flags, reply } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
-                match crate::fs::ext4::open(path_str, flags) {
+                match crate::fs::ext4::open(&mut tok, path_str, flags) {
                     Ok(file) => {
                         let mut slot = None;
                         for (i, f) in open_files.iter().enumerate() {
@@ -233,7 +236,7 @@ async fn delegate_task() {
                 }
                 let file = &mut open_files[idx].as_mut().unwrap().0;
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
-                match crate::fs::ext4::read(file, buf) {
+                match crate::fs::ext4::read(&mut tok, file, buf) {
                     Ok(n) => reply.complete(Ok(n)),
                     Err(e) => reply.complete(Err(e)),
                 }
@@ -242,19 +245,17 @@ async fn delegate_task() {
                 let idx = handle.0 as usize;
                 if idx < MAX_OPEN_FILES {
                     if let Some(ref mut wrapper) = open_files[idx] {
-                        let _ = crate::fs::ext4::close(&mut wrapper.0);
+                        let _ = crate::fs::ext4::close(&mut tok, &mut wrapper.0);
                     }
                     open_files[idx] = None;
                 }
                 reply.complete(Ok(()));
             }
             FsRequest::Lookup { parent_ino: _, name, name_len, reply } => {
-                // lwext4 is path-based: prepend "/" for root-level lookups
-                let mut path_buf = [0u8; 258];
-                path_buf[0] = b'/';
-                path_buf[1..1 + name_len].copy_from_slice(&name[..name_len]);
-                let full_path = core::str::from_utf8(&path_buf[..1 + name_len]).unwrap_or("");
-                match crate::fs::ext4::stat(full_path) {
+                // name is already a full path (e.g. "/bin/init")
+                let full_path = core::str::from_utf8(&name[..name_len]).unwrap_or("");
+                kprintln!("[delegate] lookup: {:?}", full_path);
+                match crate::fs::ext4::stat(&mut tok, full_path) {
                     Ok((size, ftype)) => {
                         // Use 0 as inode number — lwext4 doesn't expose raw inodes
                         reply.complete(Ok((0, ftype, size)));
@@ -276,11 +277,11 @@ async fn delegate_task() {
                         };
                         buf.fill(0);
                         // Open, seek, read, close
-                        match crate::fs::ext4::open(path_str, 0) {
+                        match crate::fs::ext4::open(&mut tok, path_str, 0) {
                             Ok(mut file) => {
                                 let _ = file.file_seek(offset as i64, 0); // SEEK_SET
-                                let _ = crate::fs::ext4::read(&mut file, buf);
-                                let _ = crate::fs::ext4::close(&mut file);
+                                let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
+                                let _ = crate::fs::ext4::close(&mut tok, &mut file);
                                 reply.complete(Ok(pa.as_usize()));
                             }
                             Err(e) => {

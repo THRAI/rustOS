@@ -59,6 +59,11 @@ impl Future for WaitChildFuture {
     type Output = Option<(u32, i32)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // EINTR guard: check for pending signals before blocking
+        if self.parent.signals.has_unmasked_pending() {
+            return Poll::Ready(None);
+        }
+
         // Step 1: Register waker FIRST (before scanning) to prevent lost wakeups
         {
             let mut waker_slot = self.parent.parent_waker.lock();

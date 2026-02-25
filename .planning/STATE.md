@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — IN PROGRESS
-Plan: 3 of 4 in current phase — 04-03 complete
-Status: Real mmap/munmap/mprotect + lseek/fstat/clock_gettime/nanosleep/futex implemented
-Last activity: 2026-02-25 -- Plan 04-03 complete (~8min)
+Plan: 3 of 4 in current phase — 04-02 complete
+Status: Full POSIX signal delivery (sigaction/sigprocmask/kill/sendsig/sigreturn), process groups, SIGPIPE/SIGCHLD/SIGSEGV
+Last activity: 2026-02-25 -- Plan 04-02 complete (~8min)
 
-Progress: [██████░░░░] 50% (Phase 4)
+Progress: [████████░░] 75% (Phase 4)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 18
+- Total plans completed: 19
 - Average duration: 7min
-- Total execution time: 1.94 hours
+- Total execution time: 2.07 hours
 
 **By Phase:**
 
@@ -31,10 +31,10 @@ Progress: [██████░░░░] 50% (Phase 4)
 | 2 | 5/5 | 24min | 5min |
 | 3 | 5/5 | 51min | 10min |
 | 3.1 | 1/1 | 6min | 6min |
-| 4 | 2/4 | 16min | 8min |
+| 4 | 3/4 | 24min | 8min |
 
 **Recent Trend:**
-- Last 5 plans: 10min, 7min, 6min, 8min, 8min
+- Last 5 plans: 7min, 6min, 8min, 8min, 8min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -115,6 +115,13 @@ Recent decisions affecting current work:
 - [04-03]: clock_gettime reads rdtime CSR, QEMU virt 10MHz timer frequency
 - [04-03]: nanosleep delegates to executor timer wheel sleep(ms)
 
+- [04-02]: u64 atomic bitmaps for pending/blocked signals (lock-free post_signal via fetch_or)
+- [04-02]: SIGCODE_VA at 0x3FFFFF000, mapped RO+X+U in every process at exec
+- [04-02]: Global TASK_REGISTRY (SpinMutex<Vec<Arc<Task>>>) for kill/getpgid iteration
+- [04-02]: SignalWakeHelper future captures top_level_waker on first poll for async signal injection
+- [04-02]: sendsig builds SigFrame in kernel, copyout to user stack via copy_user_chunk
+- [04-02]: sigreturn sanitizes sstatus (SPP cleared, SPIE set), bounds-checks sepc < USER_MAX_VA
+
 ### Pending Todos
 
 None yet.
@@ -126,5 +133,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-25
-Stopped at: Plan 04-03 complete, ready for 04-02 (signals) or 04-04 (integration)
+Stopped at: Plan 04-02 complete, ready for 04-04 (integration/remaining syscalls)
 Resume file: None

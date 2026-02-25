@@ -45,6 +45,12 @@ fn sig_bit(sig: u8) -> u64 {
     1u64 << (sig - 1)
 }
 
+/// Public version of sig_bit for cross-module use.
+#[inline]
+pub fn sig_bit_pub(sig: u8) -> u64 {
+    sig_bit(sig)
+}
+
 // ---------------------------------------------------------------------------
 // Default signal dispositions
 // ---------------------------------------------------------------------------
@@ -140,6 +146,15 @@ impl SignalState {
         // SIGKILL and SIGSTOP cannot be blocked
         let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
         (pending & (!blocked | unblockable)) != 0
+    }
+
+    /// Check if the given signal's action has SA_RESTART set.
+    pub fn is_restart(&self, sig: u8) -> bool {
+        if sig < 1 || sig > MAX_SIG {
+            return false;
+        }
+        let actions = self.actions.lock();
+        actions[(sig - 1) as usize].flags & SA_RESTART != 0
     }
 
     /// Dequeue the highest-priority unmasked pending signal. Returns None if none.

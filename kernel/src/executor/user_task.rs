@@ -684,6 +684,10 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             // a0=fd, a1=buf, a2=len
             match sys_write_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => n,
+                Err(Errno::EINTR) => {
+                    maybe_restart_syscall(task);
+                    (-(Errno::EINTR.as_i32() as isize)) as usize
+                }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
@@ -691,6 +695,10 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             // a0=fd, a1=user_buf, a2=len
             match sys_read_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => n,
+                Err(Errno::EINTR) => {
+                    maybe_restart_syscall(task);
+                    (-(Errno::EINTR.as_i32() as isize)) as usize
+                }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
@@ -766,6 +774,10 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::WAIT4 => {
             match sys_wait4_async(task, a0 as isize, a1).await {
                 Ok(pid) => pid as usize,
+                Err(Errno::EINTR) => {
+                    maybe_restart_syscall(task);
+                    (-(Errno::EINTR.as_i32() as isize)) as usize
+                }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
@@ -1096,7 +1108,6 @@ async fn sys_nanosleep_async(
     req_ptr: usize,
     rem_ptr: usize,
 ) -> Result<(), Errno> {
-    let _ = task;
     if req_ptr == 0 {
         return Err(Errno::EFAULT);
     }
@@ -1112,16 +1123,49 @@ async fn sys_nanosleep_async(
     }
     let secs = ts[0];
     let nsecs = ts[1];
-    let ms = secs * 1000 + nsecs / 1_000_000;
+    let total_ms = secs * 1000 + nsecs / 1_000_000;
 
-    if ms == 0 {
+    if total_ms == 0 {
         // Zero sleep: just yield
         yield_now().await;
         return Ok(());
     }
 
-    // Sleep via executor timer wheel
-    super::schedule::sleep(ms).await;
+    // Interruptible sleep: poll in 10ms increments to check signals
+    let start = crate::hal::rv64::timer::read_time_ms();
+    let deadline = start + total_ms;
+
+    loop {
+        // Check for pending signals
+        if task.signals.has_unmasked_pending() {
+            // Write remaining time to rem pointer
+            if rem_ptr != 0 {
+                let now = crate::hal::rv64::timer::read_time_ms();
+                let remaining_ms = deadline.saturating_sub(now);
+                let rem_secs = remaining_ms / 1000;
+                let rem_nsecs = (remaining_ms % 1000) * 1_000_000;
+                let rem_ts = [rem_secs, rem_nsecs];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        rem_ts.as_ptr() as *const u8,
+                        rem_ptr as *mut u8,
+                        16,
+                    );
+                }
+            }
+            return Err(Errno::EINTR);
+        }
+
+        let now = crate::hal::rv64::timer::read_time_ms();
+        if now >= deadline {
+            break;
+        }
+
+        // Sleep in small increments (max 10ms) to stay responsive to signals
+        let remaining = deadline - now;
+        let chunk = core::cmp::min(remaining, 10);
+        super::schedule::sleep(chunk).await;
+    }
 
     // On normal completion, write zero remaining time
     if rem_ptr != 0 {
@@ -1165,7 +1209,7 @@ async fn sys_futex_async(
             };
             let pa_key = hal_common::PhysAddr::new(pa.as_usize() + (uaddr & 0xFFF));
             // Park on the futex
-            crate::ipc::futex::futex_wait(pa_key).await;
+            crate::ipc::futex::futex_wait(pa_key, task).await?;
             Ok(0)
         }
         FUTEX_WAKE => {
@@ -1304,6 +1348,10 @@ impl<'a> core::future::Future for PipeReadFuture<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        // EINTR guard: check for pending signals before blocking
+        if this.task.signals.has_unmasked_pending() {
+            return Poll::Ready(Err(Errno::EINTR));
+        }
         let mut kbuf = alloc::vec![0u8; this.len];
         match this.pipe.read(&mut kbuf) {
             Ok(0) => Poll::Ready(Ok(0)), // EOF
@@ -1394,7 +1442,7 @@ async fn sys_write_async(
             if rc != 0 {
                 return Err(Errno::EFAULT);
             }
-            let result = PipeWriteFuture { pipe, data: kbuf, written: 0 }.await;
+            let result = PipeWriteFuture { pipe, task, data: kbuf, written: 0 }.await;
             // Post SIGPIPE on broken pipe
             if let Err(Errno::EPIPE) = &result {
                 task.signals.post_signal(crate::proc::signal::SIGPIPE);
@@ -1405,17 +1453,26 @@ async fn sys_write_async(
 }
 
 /// Future for async pipe write.
-struct PipeWriteFuture {
+struct PipeWriteFuture<'a> {
     pipe: alloc::sync::Arc<crate::fs::pipe::Pipe>,
+    task: &'a Arc<Task>,
     data: alloc::vec::Vec<u8>,
     written: usize,
 }
 
-impl core::future::Future for PipeWriteFuture {
+impl<'a> core::future::Future for PipeWriteFuture<'a> {
     type Output = Result<usize, Errno>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        // EINTR guard: check for pending signals before blocking
+        if this.task.signals.has_unmasked_pending() {
+            // Return partial write if any, else EINTR
+            if this.written > 0 {
+                return Poll::Ready(Ok(this.written));
+            }
+            return Poll::Ready(Err(Errno::EINTR));
+        }
         loop {
             if this.written >= this.data.len() {
                 return Poll::Ready(Ok(this.written));
@@ -1586,7 +1643,7 @@ async fn sys_wait4_async(
     use crate::proc::exit_wait::WaitChildFuture;
 
     // WaitChildFuture returns Option<(child_pid, exit_status)>.
-    // None means no children exist.
+    // None means either no children exist or interrupted by signal.
     let result = WaitChildFuture::new(Arc::clone(task)).await;
 
     match result {
@@ -1598,7 +1655,14 @@ async fn sys_wait4_async(
             }
             Ok(child_pid)
         }
-        None => Err(Errno::ECHILD),
+        None => {
+            // Distinguish EINTR from ECHILD
+            if task.signals.has_unmasked_pending() {
+                Err(Errno::EINTR)
+            } else {
+                Err(Errno::ECHILD)
+            }
+        }
     }
 }
 
@@ -1665,6 +1729,25 @@ fn set_syscall_ret(task: &Arc<Task>, val: usize) -> TrapResult {
     TrapResult::Continue
 }
 
+/// SA_RESTART: if the pending signal has SA_RESTART, rewind sepc by 4
+/// so the ecall instruction re-executes after signal delivery.
+fn maybe_restart_syscall(task: &Arc<Task>) {
+    // Peek at the lowest pending unmasked signal to check SA_RESTART
+    let pending = task.signals.pending.load(core::sync::atomic::Ordering::Acquire);
+    let blocked = task.signals.blocked.load(core::sync::atomic::Ordering::Relaxed);
+    let unblockable = crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGKILL)
+        | crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGSTOP);
+    let deliverable = pending & (!blocked | unblockable);
+    if deliverable != 0 {
+        let bit = deliverable.trailing_zeros() as u8;
+        let sig = bit + 1;
+        if task.signals.is_restart(sig) {
+            // Rewind sepc past the ecall (dispatch_syscall already advanced by 4)
+            task.trap_frame.lock().sepc -= 4;
+        }
+    }
+}
+
 /// Mark process as zombie and wake parent.
 fn do_exit(task: &Arc<Task>, status: i32) {
     task.exit_status.store(status, core::sync::atomic::Ordering::Release);
@@ -1676,6 +1759,15 @@ fn do_exit(task: &Arc<Task>, status: i32) {
     // Post SIGCHLD to parent
     if let Some(parent) = task.parent.upgrade() {
         parent.signals.post_signal(crate::proc::signal::SIGCHLD);
+
+        // SA_NOCLDWAIT: auto-reap child (remove from parent's children list)
+        let sigchld_action = {
+            let actions = parent.signals.actions.lock();
+            actions[(crate::proc::signal::SIGCHLD - 1) as usize]
+        };
+        if sigchld_action.flags & crate::proc::signal::SA_NOCLDWAIT != 0 {
+            parent.children.lock().retain(|c| c.pid != task.pid);
+        }
 
         // Wake parent's WaitChildFuture
         if let Some(waker) = parent.parent_waker.lock().take() {

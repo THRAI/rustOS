@@ -31,6 +31,12 @@ pub fn read_time() -> u64 {
     val
 }
 
+/// Read current time in milliseconds.
+#[inline]
+pub fn read_time_ms() -> u64 {
+    read_time() / TICK_MS
+}
+
 /// Program next timer IRQ at `current_time + ticks` via SBI set_timer.
 pub fn set_oneshot(ticks: u64) {
     let deadline = read_time() + ticks;

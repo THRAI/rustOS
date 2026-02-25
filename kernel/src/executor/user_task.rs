@@ -77,6 +77,8 @@ impl SyscallId {
     const MPROTECT: Self = Self(226);
     const WAIT4: Self = Self(260);
     const PIPE2: Self = Self(59);
+    const NANOSLEEP: Self = Self(101);
+    const FUTEX: Self = Self(98);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -120,6 +122,8 @@ impl core::fmt::Display for SyscallId {
             Self::MPROTECT => "mprotect",
             Self::WAIT4 => "wait4",
             Self::PIPE2 => "pipe2",
+            Self::NANOSLEEP => "nanosleep",
+            Self::FUTEX => "futex",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -573,7 +577,20 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             sys_mprotect(task, a0, a1, a2)
         }
         SyscallId::SIGACTION | SyscallId::SIGPROCMASK | SyscallId::SIGRETURN => 0, // stub
-        SyscallId::CLOCK_GETTIME => 0, // stub
+        SyscallId::CLOCK_GETTIME => {
+            // a0=clockid, a1=timespec pointer
+            match sys_clock_gettime(task, a0 as u32, a1) {
+                Ok(()) => 0,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::NANOSLEEP => {
+            // a0=req timespec, a1=rem timespec (may be null)
+            match sys_nanosleep_async(task, a0, a1).await {
+                Ok(()) => 0,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
         SyscallId::TIMES => 0, // stub
         SyscallId::UNAME => {
             // TODO: write utsname to user memory
@@ -617,11 +634,16 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             }
         }
         SyscallId::FSTAT => {
-            match crate::fs::syscalls::sys_stat(&task.fd_table, a0 as u32) {
-                Ok((_size, _vtype)) => {
-                    // TODO: write stat struct to user memory at a1
-                    0
-                }
+            // a0=fd, a1=statbuf
+            match sys_fstat(task, a0 as u32, a1) {
+                Ok(()) => 0,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::LSEEK => {
+            // a0=fd, a1=offset, a2=whence
+            match sys_lseek(task, a0 as u32, a1 as i64, a2 as u32) {
+                Ok(off) => off as usize,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
@@ -669,6 +691,13 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::WAIT4 => {
             match sys_wait4_async(task, a0 as isize, a1).await {
                 Ok(pid) => pid as usize,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::FUTEX => {
+            // a0=uaddr, a1=op, a2=val, a3=timeout/val2, a4=uaddr2, a5=val3
+            match sys_futex_async(task, a0, a1 as u32, a2 as u32).await {
+                Ok(v) => v as usize,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
@@ -816,6 +845,270 @@ fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize) -> 
     }
     0
 }
+
+// ---------------------------------------------------------------------------
+// lseek / fstat / clock_gettime / nanosleep / futex
+// ---------------------------------------------------------------------------
+
+/// sys_lseek: move file offset. ESPIPE on pipes.
+fn sys_lseek(
+    task: &Arc<Task>,
+    fd: u32,
+    offset: i64,
+    whence: u32,
+) -> Result<u64, Errno> {
+    use crate::fs::fd_table::FileObject;
+    use core::sync::atomic::Ordering;
+
+    const SEEK_SET: u32 = 0;
+    const SEEK_CUR: u32 = 1;
+    const SEEK_END: u32 = 2;
+
+    let tab = task.fd_table.lock();
+    let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+
+    // Pipes and devices are not seekable
+    match &desc.object {
+        FileObject::PipeRead(_) | FileObject::PipeWrite(_) => return Err(Errno::ESPIPE),
+        FileObject::Device(_) => return Err(Errno::ESPIPE),
+        FileObject::Vnode(_) => {}
+    }
+
+    let size = match &desc.object {
+        FileObject::Vnode(v) => v.size(),
+        _ => 0,
+    };
+
+    let cur = desc.offset.load(Ordering::Relaxed) as i64;
+    let new_off = match whence {
+        SEEK_SET => offset,
+        SEEK_CUR => cur + offset,
+        SEEK_END => size as i64 + offset,
+        _ => return Err(Errno::EINVAL),
+    };
+
+    if new_off < 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    desc.offset.store(new_off as u64, Ordering::Relaxed);
+    Ok(new_off as u64)
+}
+
+/// Linux struct stat for rv64 (128 bytes).
+#[repr(C)]
+struct LinuxStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    __pad1: u64,
+    st_size: i64,
+    st_blksize: i32,
+    __pad2: i32,
+    st_blocks: i64,
+    st_atime: i64,
+    st_atime_nsec: i64,
+    st_mtime: i64,
+    st_mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
+    __unused: [i32; 2],
+}
+
+/// sys_fstat: write stat struct to user memory.
+fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
+    use crate::fs::fd_table::FileObject;
+
+    if statbuf == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let tab = task.fd_table.lock();
+    let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+
+    let mut st = LinuxStat {
+        st_dev: 0, st_ino: 0, st_mode: 0, st_nlink: 1,
+        st_uid: 0, st_gid: 0, st_rdev: 0, __pad1: 0,
+        st_size: 0, st_blksize: 4096, __pad2: 0, st_blocks: 0,
+        st_atime: 0, st_atime_nsec: 0,
+        st_mtime: 0, st_mtime_nsec: 0,
+        st_ctime: 0, st_ctime_nsec: 0,
+        __unused: [0; 2],
+    };
+
+    match &desc.object {
+        FileObject::Vnode(v) => {
+            let size = v.size();
+            st.st_size = size as i64;
+            st.st_blocks = ((size + 511) / 512) as i64;
+            st.st_ino = v.vnode_id();
+            // S_IFREG=0o100000 or S_IFDIR=0o040000
+            use crate::fs::vnode::VnodeType;
+            st.st_mode = match v.vtype() {
+                VnodeType::Regular => 0o100644,
+                VnodeType::Directory => 0o040755,
+            };
+        }
+        FileObject::PipeRead(_) | FileObject::PipeWrite(_) => {
+            st.st_mode = 0o010600; // S_IFIFO | rw
+        }
+        FileObject::Device(dk) => {
+            use crate::fs::fd_table::DeviceKind;
+            st.st_mode = 0o020666; // S_IFCHR | rw
+            st.st_rdev = match dk {
+                DeviceKind::Null => 0x0103,    // 1:3
+                DeviceKind::Zero => 0x0105,    // 1:5
+                DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite => 0x0501, // 5:1
+            };
+        }
+    }
+
+    // Copy stat struct to user memory
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &st as *const LinuxStat as *const u8,
+            statbuf as *mut u8,
+            core::mem::size_of::<LinuxStat>(),
+        );
+    }
+    Ok(())
+}
+
+/// Read rdtime CSR (RISC-V cycle counter used as time source).
+fn read_rdtime() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("rdtime {}", out(reg) val); }
+    val
+}
+
+/// Timer frequency: QEMU virt = 10 MHz.
+const TIMER_FREQ: u64 = 10_000_000;
+
+/// sys_clock_gettime: read hardware time via rdtime CSR.
+fn sys_clock_gettime(
+    task: &Arc<Task>,
+    _clockid: u32,
+    tp: usize,
+) -> Result<(), Errno> {
+    let _ = task; // used for user memory access context
+    if tp == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let ticks = read_rdtime();
+    let secs = ticks / TIMER_FREQ;
+    let nsecs = (ticks % TIMER_FREQ) * (1_000_000_000 / TIMER_FREQ);
+
+    // struct timespec { time_t tv_sec; long tv_nsec; } — 16 bytes on rv64
+    let ts: [u64; 2] = [secs, nsecs];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            ts.as_ptr() as *const u8,
+            tp as *mut u8,
+            16,
+        );
+    }
+    Ok(())
+}
+
+/// sys_nanosleep: async sleep via timer wheel.
+async fn sys_nanosleep_async(
+    task: &Arc<Task>,
+    req_ptr: usize,
+    rem_ptr: usize,
+) -> Result<(), Errno> {
+    let _ = task;
+    if req_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    // Read struct timespec from user memory
+    let mut ts = [0u64; 2];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            req_ptr as *const u8,
+            ts.as_mut_ptr() as *mut u8,
+            16,
+        );
+    }
+    let secs = ts[0];
+    let nsecs = ts[1];
+    let ms = secs * 1000 + nsecs / 1_000_000;
+
+    if ms == 0 {
+        // Zero sleep: just yield
+        yield_now().await;
+        return Ok(());
+    }
+
+    // Sleep via executor timer wheel
+    super::schedule::sleep(ms).await;
+
+    // On normal completion, write zero remaining time
+    if rem_ptr != 0 {
+        let zero_ts = [0u64; 2];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                zero_ts.as_ptr() as *const u8,
+                rem_ptr as *mut u8,
+                16,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// sys_futex: FUTEX_WAIT and FUTEX_WAKE.
+async fn sys_futex_async(
+    task: &Arc<Task>,
+    uaddr: usize,
+    op: u32,
+    val: u32,
+) -> Result<usize, Errno> {
+    const FUTEX_WAIT: u32 = 0;
+    const FUTEX_WAKE: u32 = 1;
+    // Mask out FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256)
+    let cmd = op & 0x7f;
+
+    match cmd {
+        FUTEX_WAIT => {
+            // Read current value at uaddr
+            let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+            if current != val {
+                // Value changed — don't sleep
+                return Err(Errno::EAGAIN);
+            }
+            // Resolve physical address for futex key
+            let pa = {
+                let pmap = task.pmap.lock();
+                crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
+                    .ok_or(Errno::EFAULT)?
+            };
+            let pa_key = hal_common::PhysAddr::new(pa.as_usize() + (uaddr & 0xFFF));
+            // Park on the futex
+            crate::ipc::futex::futex_wait(pa_key).await;
+            Ok(0)
+        }
+        FUTEX_WAKE => {
+            // Resolve physical address for futex key
+            let pa = {
+                let pmap = task.pmap.lock();
+                crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
+                    .ok_or(Errno::EFAULT)?
+            };
+            let pa_key = hal_common::PhysAddr::new(pa.as_usize() + (uaddr & 0xFFF));
+            let woken = crate::ipc::futex::futex_wake(pa_key, val as usize);
+            Ok(woken)
+        }
+        _ => Err(Errno::ENOSYS),
+    }
+}
+
+/// sys_read through the three-layer FD model.
 async fn sys_read_async(
     task: &Arc<Task>,
     fd: u32,

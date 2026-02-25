@@ -13,6 +13,7 @@ mod drivers;
 mod executor;
 mod fs;
 mod hal;
+mod ipc;
 mod libc_stubs;
 mod mm;
 mod proc;

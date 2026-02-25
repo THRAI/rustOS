@@ -16,6 +16,9 @@ pub enum Errno {
     ENOTTY,
     EMFILE,
     EEXIST,
+    ESPIPE,
+    EINTR,
+    ETIMEDOUT,
 }
 
 impl Errno {
@@ -37,6 +40,9 @@ impl Errno {
             Errno::ENOSYS => 38,
             Errno::ENOEXEC => 8,
             Errno::ENOTTY => 25,
+            Errno::ESPIPE => 29,
+            Errno::EINTR => 4,
+            Errno::ETIMEDOUT => 110,
         }
     }
 }

@@ -129,13 +129,18 @@ impl Pipe {
         }
         let (n, wake_reader) = {
             let mut buf = self.buf.lock();
-            if buf.is_full() {
+            let avail = buf.available_write();
+            if avail == 0 {
                 if self.reader_closed.load(Ordering::Acquire) {
                     return Err(Errno::EPIPE);
                 }
                 return Err(Errno::EAGAIN);
             }
-            let to_write = data.len().min(buf.available_write());
+            // PIPE_BUF atomicity: writes <= PIPE_BUF are all-or-nothing
+            if data.len() <= PIPE_BUF && avail < data.len() {
+                return Err(Errno::EAGAIN);
+            }
+            let to_write = data.len().min(avail);
             for i in 0..to_write {
                 let idx = buf.tail;
                 buf.data[idx] = data[i];

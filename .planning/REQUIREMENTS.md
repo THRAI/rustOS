@@ -74,16 +74,16 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 
 ### Signal
 
-- [ ] **SIG-01**: sigaction registers signal handlers
-- [ ] **SIG-02**: sigprocmask manages blocked signal set
-- [ ] **SIG-03**: kill posts signal to target process
-- [ ] **SIG-04**: check_pending_signals at userret modifies trap frame for delivery
-- [ ] **SIG-05**: sigreturn restores original frame after signal handler
+- [x] **SIG-01**: sigaction registers signal handlers
+- [x] **SIG-02**: sigprocmask manages blocked signal set
+- [x] **SIG-03**: kill posts signal to target process
+- [x] **SIG-04**: check_pending_signals at userret modifies trap frame for delivery
+- [x] **SIG-05**: sigreturn restores original frame after signal handler
 
 ### IPC
 
-- [ ] **IPC-01**: Pipe with ring buffer + waker per end
-- [ ] **IPC-02**: Futex wait (atomic compare + park) and wake
+- [x] **IPC-01**: Pipe with ring buffer + waker per end
+- [x] **IPC-02**: Futex wait (atomic compare + park) and wake
 - [ ] **IPC-03**: TCP sockets wrapping smoltcp (connect, recv, send, accept)
 - [ ] **IPC-04**: kqueue with EVFILT_READ, EVFILT_WRITE (waker slot evolves to WakerList)
 
@@ -110,12 +110,12 @@ Requirements for competition submission. Each maps to roadmap phases per BLACKBO
 
 ### Syscalls (Remaining)
 
-- [ ] **SYS-01**: dup, dup2, dup3
-- [ ] **SYS-02**: lseek, fstat
-- [ ] **SYS-03**: mmap, munmap, mprotect, brk
-- [ ] **SYS-04**: clock_gettime, nanosleep
-- [ ] **SYS-05**: ioctl (terminal basics)
-- [ ] **SYS-06**: /dev/null, /dev/zero, /dev/console (devfs)
+- [x] **SYS-01**: dup, dup2, dup3
+- [x] **SYS-02**: lseek, fstat
+- [x] **SYS-03**: mmap, munmap, mprotect, brk
+- [x] **SYS-04**: clock_gettime, nanosleep
+- [x] **SYS-05**: ioctl (terminal basics)
+- [x] **SYS-06**: /dev/null, /dev/zero, /dev/console (devfs)
 
 ### Testing
 
@@ -209,13 +209,13 @@ Deferred post-competition.
 | PROC-03 | Phase 3 | Complete |
 | PROC-04 | Phase 3 | Complete |
 | PROC-05 | Phase 3 | Complete |
-| SIG-01 | Phase 4 | Pending |
-| SIG-02 | Phase 4 | Pending |
-| SIG-03 | Phase 4 | Pending |
-| SIG-04 | Phase 4 | Pending |
-| SIG-05 | Phase 4 | Pending |
-| IPC-01 | Phase 4 | Pending |
-| IPC-02 | Phase 4 | Pending |
+| SIG-01 | Phase 4 | Complete |
+| SIG-02 | Phase 4 | Complete |
+| SIG-03 | Phase 4 | Complete |
+| SIG-04 | Phase 4 | Complete |
+| SIG-05 | Phase 4 | Complete |
+| IPC-01 | Phase 4 | Complete |
+| IPC-02 | Phase 4 | Complete |
 | IPC-03 | Phase 6 | Pending |
 | IPC-04 | Phase 6 | Pending |
 | DMN-01 | Phase 5 | Pending |
@@ -230,12 +230,12 @@ Deferred post-competition.
 | LA64-04 | Phase 5 | Pending |
 | LA64-05 | Phase 5 | Pending |
 | LA64-06 | Phase 5 | Pending |
-| SYS-01 | Phase 4 | Pending |
-| SYS-02 | Phase 4 | Pending |
-| SYS-03 | Phase 4 | Pending |
-| SYS-04 | Phase 4 | Pending |
-| SYS-05 | Phase 4 | Pending |
-| SYS-06 | Phase 4 | Pending |
+| SYS-01 | Phase 4 | Complete |
+| SYS-02 | Phase 4 | Complete |
+| SYS-03 | Phase 4 | Complete |
+| SYS-04 | Phase 4 | Complete |
+| SYS-05 | Phase 4 | Complete |
+| SYS-06 | Phase 4 | Complete |
 | TEST-01 | Phase 1 | Complete |
 | TEST-02 | Phase 1 | Complete |
 | TEST-03 | Phase 2 | Complete |

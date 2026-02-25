@@ -252,6 +252,11 @@ impl VmObject {
         }
         removed
     }
+
+    /// Iterate over all pages directly owned by this object (not backing).
+    pub fn pages_iter(&self) -> impl Iterator<Item = &OwnedPage> {
+        self.pages.values()
+    }
 }
 
 /// Iterative Drop: unwind the shadow chain without recursion.

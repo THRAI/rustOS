@@ -133,7 +133,7 @@ make qemu-test-rv64 LOG=all
   BEFORE FORK                        AFTER FORK (COW)
   ──────────                         ────────────────
 
-  ┌──────────┐                  ┌──────────┐   ┌──────────┐
+  ┌─────-─────┐                  ┌──────────┐   ┌──────────┐
   │ Process P │                  │ Parent   │   │ Child    │
   │   VmArea  │                  │  shadow  │   │  shadow  │
   └─────┬─────┘                  └────┬─────┘   └────┬─────┘
@@ -154,8 +154,8 @@ make qemu-test-rv64 LOG=all
                                       └──────────┘
 
 
-  PARENT WRITES TO F0 (COW)          PARENT EXITS
-  ─────────────────────────          ─────────────
+  PARENT WRITES TO F0 (COW)               PARENT EXITS
+  ─────────────────────────              ─────────────
 
   ┌──────────┐   ┌──────────┐            ┌──────────┐
   │ Parent   │   │ Child    │            │ Child    │

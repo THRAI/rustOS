@@ -564,51 +564,14 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             }
         }
         SyscallId::MMAP => {
-            // Anonymous mmap: create a real VMA so page faults resolve
-            let addr = a0;
-            let len = a1;
-            let prot_bits = a2;
-            if len == 0 {
-                (-22isize) as usize // EINVAL
-            } else {
-                use crate::mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
-                use crate::mm::vm::vm_object::VmObject;
-
-                let aligned_len = (len + 0xFFF) & !0xFFF;
-                let pages = aligned_len / PAGE_SIZE;
-
-                // Bump allocator for mmap base address
-                static MMAP_NEXT: core::sync::atomic::AtomicUsize =
-                    core::sync::atomic::AtomicUsize::new(0x0000_0020_0000_0000);
-                let base = if addr != 0 {
-                    // MAP_FIXED hint — use requested address
-                    addr & !0xFFF
-                } else {
-                    MMAP_NEXT.fetch_add(aligned_len, core::sync::atomic::Ordering::Relaxed)
-                };
-
-                let mut perm = MapPerm::U;
-                if prot_bits & 0x1 != 0 { perm |= MapPerm::R; }
-                if prot_bits & 0x2 != 0 { perm |= MapPerm::W; }
-                if prot_bits & 0x4 != 0 { perm |= MapPerm::X; }
-
-                let obj = VmObject::new(pages);
-                let vma = VmArea::new(
-                    VirtAddr::new(base)..VirtAddr::new(base + aligned_len),
-                    perm,
-                    obj,
-                    0,
-                    VmAreaType::Anonymous,
-                );
-
-                let mut vm = task.vm_map.lock();
-                match vm.insert(vma) {
-                    Ok(()) => base,
-                    Err(_) => (-12isize) as usize, // ENOMEM
-                }
-            }
+            sys_mmap(task, a0, a1, a2, _a3, _a4 as u32, _a5 as u64)
         }
-        SyscallId::MPROTECT | SyscallId::MUNMAP => 0, // stub success
+        SyscallId::MUNMAP => {
+            sys_munmap(task, a0, a1)
+        }
+        SyscallId::MPROTECT => {
+            sys_mprotect(task, a0, a1, a2)
+        }
         SyscallId::SIGACTION | SyscallId::SIGPROCMASK | SyscallId::SIGRETURN => 0, // stub
         SyscallId::CLOCK_GETTIME => 0, // stub
         SyscallId::TIMES => 0, // stub
@@ -719,7 +682,140 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
     TrapResult::Continue
 }
 
-/// sys_read through the three-layer FD model.
+// ---------------------------------------------------------------------------
+// mmap / munmap / mprotect
+// ---------------------------------------------------------------------------
+
+/// Free anonymous frames from removed VMAs.
+fn free_removed_frames(removed: alloc::vec::Vec<crate::mm::vm::vm_map::VmArea>) {
+    use crate::mm::vm::vm_object::PageOwnership;
+    for vma in removed {
+        let obj = vma.object.read();
+        for page in obj.pages_iter() {
+            if matches!(page.ownership, PageOwnership::Anonymous) {
+                crate::mm::allocator::frame_free(page.phys);
+            }
+        }
+    }
+}
+
+/// sys_mmap: real mmap with top-down allocation and MAP_FIXED.
+fn sys_mmap(
+    task: &Arc<Task>,
+    addr: usize,
+    len: usize,
+    prot_bits: usize,
+    flags: usize,
+    _fd: u32,
+    _offset: u64,
+) -> usize {
+    use crate::mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
+    use crate::mm::vm::vm_object::VmObject;
+
+    let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if aligned_len == 0 {
+        return (-(Errno::EINVAL.as_i32() as isize)) as usize;
+    }
+
+    let map_fixed = flags & 0x10 != 0;   // MAP_FIXED
+    let _map_anon = flags & 0x20 != 0;   // MAP_ANONYMOUS
+    let _map_private = flags & 0x02 != 0; // MAP_PRIVATE
+
+    let mut vm = task.vm_map.lock();
+
+    let base = if map_fixed {
+        let start = VirtAddr::new(addr & !0xFFF);
+        let end = VirtAddr::new(start.as_usize() + aligned_len);
+        // MAP_FIXED: delete existing mappings in range first
+        let removed = vm.remove_range(start, end);
+        // Tear down PTEs for removed range
+        {
+            let mut pmap = task.pmap.lock();
+            crate::mm::pmap::pmap_remove(&mut pmap, start, end);
+        }
+        // Free anonymous frames from removed VMAs
+        free_removed_frames(removed);
+        start.as_usize()
+    } else if addr != 0 {
+        // Hint address: try it, fall back to top-down
+        let hint = VirtAddr::new(addr & !0xFFF);
+        let hint_end = VirtAddr::new(hint.as_usize() + aligned_len);
+        // Check if hint range is free
+        let hint_ok = vm.find_area(hint).is_none()
+            && vm.find_area(VirtAddr::new(hint_end.as_usize().saturating_sub(1))).is_none();
+        if hint_ok {
+            hint.as_usize()
+        } else {
+            match vm.find_free_area_topdown(aligned_len) {
+                Some(va) => va.as_usize(),
+                None => return (-(Errno::ENOMEM.as_i32() as isize)) as usize,
+            }
+        }
+    } else {
+        // Top-down allocation
+        match vm.find_free_area_topdown(aligned_len) {
+            Some(va) => va.as_usize(),
+            None => return (-(Errno::ENOMEM.as_i32() as isize)) as usize,
+        }
+    };
+
+    // Build VMA
+    let mut perm = MapPerm::U;
+    if prot_bits & 1 != 0 { perm |= MapPerm::R; }
+    if prot_bits & 2 != 0 { perm |= MapPerm::W; }
+    if prot_bits & 4 != 0 { perm |= MapPerm::X; }
+
+    let obj = VmObject::new(aligned_len / PAGE_SIZE);
+    let vma = VmArea::new(
+        VirtAddr::new(base)..VirtAddr::new(base + aligned_len),
+        perm, obj, 0, VmAreaType::Anonymous,
+    );
+    match vm.insert(vma) {
+        Ok(()) => base,
+        Err(_) => (-(Errno::ENOMEM.as_i32() as isize)) as usize,
+    }
+}
+
+/// sys_munmap: tear down PTEs + TLB + remove/split VMAs.
+fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> usize {
+    let aligned_start = VirtAddr::new(addr & !0xFFF);
+    let aligned_end = VirtAddr::new((addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+    if aligned_start >= aligned_end {
+        return (-(Errno::EINVAL.as_i32() as isize)) as usize;
+    }
+    let mut vm = task.vm_map.lock();
+    let removed = vm.remove_range(aligned_start, aligned_end);
+    {
+        let mut pmap = task.pmap.lock();
+        crate::mm::pmap::pmap_remove(&mut pmap, aligned_start, aligned_end);
+    }
+    free_removed_frames(removed);
+    0
+}
+
+/// sys_mprotect: change VMA permissions + update PTEs.
+fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize) -> usize {
+    use crate::mm::vm::vm_map::MapPerm;
+
+    let start = VirtAddr::new(addr & !0xFFF);
+    let end = VirtAddr::new((addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+    if start >= end {
+        return (-(Errno::EINVAL.as_i32() as isize)) as usize;
+    }
+
+    let mut perm = MapPerm::U;
+    if prot_bits & 1 != 0 { perm |= MapPerm::R; }
+    if prot_bits & 2 != 0 { perm |= MapPerm::W; }
+    if prot_bits & 4 != 0 { perm |= MapPerm::X; }
+
+    let mut vm = task.vm_map.lock();
+    vm.protect_range(start, end, perm);
+    {
+        let mut pmap = task.pmap.lock();
+        crate::mm::pmap::pmap_protect(&mut pmap, start, end, perm);
+    }
+    0
+}
 async fn sys_read_async(
     task: &Arc<Task>,
     fd: u32,

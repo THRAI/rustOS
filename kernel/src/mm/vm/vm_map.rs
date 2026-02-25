@@ -285,6 +285,289 @@ impl VmMap {
         child
     }
 
+    /// MMAP region: top-down allocation below stack.
+    const MMAP_BASE: usize = 0x0000_003F_FFF0_0000; // just below USER_STACK_TOP
+    const MMAP_MIN: usize  = 0x0000_0020_0000_0000; // floor
+
+    /// Find a free region of `size` bytes, searching top-down from MMAP_BASE.
+    /// Returns the start address of the free region.
+    pub fn find_free_area_topdown(&self, size: usize) -> Option<VirtAddr> {
+        let aligned_size = (size + 0xFFF) & !0xFFF;
+        if aligned_size == 0 {
+            return None;
+        }
+
+        // Collect VMAs in the mmap region, sorted by start address
+        let mmap_vmas: Vec<(usize, usize)> = self.areas.values()
+            .filter(|vma| vma.range.end.as_usize() > Self::MMAP_MIN
+                       && vma.range.start.as_usize() < Self::MMAP_BASE)
+            .map(|vma| (vma.range.start.as_usize(), vma.range.end.as_usize()))
+            .collect();
+
+        // Try gap between MMAP_BASE and highest VMA
+        let mut ceiling = Self::MMAP_BASE;
+        // Walk VMAs from highest to lowest
+        for &(start, end) in mmap_vmas.iter().rev() {
+            let gap_top = ceiling;
+            let gap_bottom = end;
+            if gap_top >= gap_bottom + aligned_size {
+                let base = gap_top - aligned_size;
+                if base >= Self::MMAP_MIN {
+                    return Some(VirtAddr::new(base));
+                }
+            }
+            ceiling = start;
+        }
+
+        // Try gap between lowest VMA and MMAP_MIN
+        if ceiling >= Self::MMAP_MIN + aligned_size {
+            let base = ceiling - aligned_size;
+            if base >= Self::MMAP_MIN {
+                return Some(VirtAddr::new(base));
+            }
+        }
+
+        None
+    }
+
+    /// Remove all VMAs overlapping [start, end). Split VMAs that partially overlap.
+    /// Returns Vec of removed VmAreas for frame cleanup.
+    pub fn remove_range(&mut self, start: VirtAddr, end: VirtAddr) -> Vec<VmArea> {
+        if start >= end {
+            return Vec::new();
+        }
+
+        // Collect keys of all VMAs that overlap [start, end)
+        let overlapping: Vec<VirtAddr> = self.areas.range(..end)
+            .filter(|(_, vma)| vma.range.end > start)
+            .map(|(&k, _)| k)
+            .collect();
+
+        let mut removed = Vec::new();
+
+        for key in overlapping {
+            let vma = self.areas.remove(&key).unwrap();
+
+            let vma_start = vma.range.start;
+            let vma_end = vma.range.end;
+
+            if vma_start >= start && vma_end <= end {
+                // Fully contained: remove entirely
+                removed.push(vma);
+            } else if vma_start < start && vma_end > end {
+                // Spans both sides: split into left + right, remove middle
+                let left_size = start.as_usize() - vma_start.as_usize();
+                let right_start = end;
+
+                // Left portion
+                let left_obj = VmObject::new(left_size);
+                let left_vma = VmArea {
+                    id: next_vma_id(),
+                    range: vma_start..start,
+                    prot: vma.prot,
+                    object: left_obj,
+                    obj_offset: vma.obj_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset,
+                    file_size: if vma.file_size > left_size as u64 { left_size as u64 } else { vma.file_size },
+                };
+                self.areas.insert(vma_start, left_vma);
+
+                // Right portion
+                let right_size = vma_end.as_usize() - right_start.as_usize();
+                let right_obj = VmObject::new(right_size);
+                let right_offset_delta = (right_start.as_usize() - vma_start.as_usize()) as u64;
+                let right_vma = VmArea {
+                    id: next_vma_id(),
+                    range: right_start..vma_end,
+                    prot: vma.prot,
+                    object: right_obj,
+                    obj_offset: vma.obj_offset + right_offset_delta,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset + right_offset_delta,
+                    file_size: vma.file_size.saturating_sub(right_offset_delta),
+                };
+                self.areas.insert(right_start, right_vma);
+
+                // The middle portion is "removed"
+                removed.push(vma);
+            } else if vma_start < start {
+                // Partial overlap at end: truncate VMA to end at `start`
+                let keep_size = start.as_usize() - vma_start.as_usize();
+                let truncated_obj = VmObject::new(keep_size);
+                let kept = VmArea {
+                    id: next_vma_id(),
+                    range: vma_start..start,
+                    prot: vma.prot,
+                    object: truncated_obj,
+                    obj_offset: vma.obj_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset,
+                    file_size: if vma.file_size > keep_size as u64 { keep_size as u64 } else { vma.file_size },
+                };
+                self.areas.insert(vma_start, kept);
+                removed.push(vma);
+            } else {
+                // Partial overlap at start: truncate VMA to start at `end`
+                let new_start = end;
+                let new_size = vma_end.as_usize() - new_start.as_usize();
+                let truncated_obj = VmObject::new(new_size);
+                let offset_delta = (new_start.as_usize() - vma_start.as_usize()) as u64;
+                let kept = VmArea {
+                    id: next_vma_id(),
+                    range: new_start..vma_end,
+                    prot: vma.prot,
+                    object: truncated_obj,
+                    obj_offset: vma.obj_offset + offset_delta,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset + offset_delta,
+                    file_size: vma.file_size.saturating_sub(offset_delta),
+                };
+                self.areas.insert(new_start, kept);
+                removed.push(vma);
+            }
+        }
+
+        removed
+    }
+
+    /// Change permissions on all VMAs overlapping [start, end).
+    /// Splits VMAs at boundaries if the range doesn't align.
+    pub fn protect_range(&mut self, start: VirtAddr, end: VirtAddr, new_prot: MapPerm) {
+        if start >= end {
+            return;
+        }
+
+        // Collect keys of overlapping VMAs
+        let overlapping: Vec<VirtAddr> = self.areas.range(..end)
+            .filter(|(_, vma)| vma.range.end > start)
+            .map(|(&k, _)| k)
+            .collect();
+
+        for key in overlapping {
+            let vma = self.areas.remove(&key).unwrap();
+            let vma_start = vma.range.start;
+            let vma_end = vma.range.end;
+
+            if vma_start >= start && vma_end <= end {
+                // Fully contained: just update prot
+                let mut updated = vma;
+                updated.prot = new_prot;
+                self.areas.insert(vma_start, updated);
+            } else if vma_start < start && vma_end > end {
+                // Spans both sides: split into 3 (left unchanged, middle new prot, right unchanged)
+                let left_size = start.as_usize() - vma_start.as_usize();
+                let left = VmArea {
+                    id: next_vma_id(),
+                    range: vma_start..start,
+                    prot: vma.prot,
+                    object: VmObject::new(left_size),
+                    obj_offset: vma.obj_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset,
+                    file_size: core::cmp::min(vma.file_size, left_size as u64),
+                };
+                self.areas.insert(vma_start, left);
+
+                let mid_size = end.as_usize() - start.as_usize();
+                let mid_offset = (start.as_usize() - vma_start.as_usize()) as u64;
+                let mid = VmArea {
+                    id: next_vma_id(),
+                    range: start..end,
+                    prot: new_prot,
+                    object: VmObject::new(mid_size),
+                    obj_offset: vma.obj_offset + mid_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset + mid_offset,
+                    file_size: vma.file_size.saturating_sub(mid_offset).min(mid_size as u64),
+                };
+                self.areas.insert(start, mid);
+
+                let right_start = end;
+                let right_size = vma_end.as_usize() - right_start.as_usize();
+                let right_offset = (right_start.as_usize() - vma_start.as_usize()) as u64;
+                let right = VmArea {
+                    id: next_vma_id(),
+                    range: right_start..vma_end,
+                    prot: vma.prot,
+                    object: VmObject::new(right_size),
+                    obj_offset: vma.obj_offset + right_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset + right_offset,
+                    file_size: vma.file_size.saturating_sub(right_offset),
+                };
+                self.areas.insert(right_start, right);
+            } else if vma_start < start {
+                // Partial overlap at end: split at `start`
+                let left_size = start.as_usize() - vma_start.as_usize();
+                let left = VmArea {
+                    id: next_vma_id(),
+                    range: vma_start..start,
+                    prot: vma.prot,
+                    object: VmObject::new(left_size),
+                    obj_offset: vma.obj_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset,
+                    file_size: core::cmp::min(vma.file_size, left_size as u64),
+                };
+                self.areas.insert(vma_start, left);
+
+                let right_offset = (start.as_usize() - vma_start.as_usize()) as u64;
+                let right_size = vma_end.as_usize() - start.as_usize();
+                let right = VmArea {
+                    id: next_vma_id(),
+                    range: start..vma_end,
+                    prot: new_prot,
+                    object: VmObject::new(right_size),
+                    obj_offset: vma.obj_offset + right_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset + right_offset,
+                    file_size: vma.file_size.saturating_sub(right_offset),
+                };
+                self.areas.insert(start, right);
+            } else {
+                // Partial overlap at start: split at `end`
+                let left_size = end.as_usize() - vma_start.as_usize();
+                let left = VmArea {
+                    id: next_vma_id(),
+                    range: vma_start..end,
+                    prot: new_prot,
+                    object: VmObject::new(left_size),
+                    obj_offset: vma.obj_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset,
+                    file_size: core::cmp::min(vma.file_size, left_size as u64),
+                };
+                self.areas.insert(vma_start, left);
+
+                let right_offset = (end.as_usize() - vma_start.as_usize()) as u64;
+                let right_size = vma_end.as_usize() - end.as_usize();
+                let right = VmArea {
+                    id: next_vma_id(),
+                    range: end..vma_end,
+                    prot: vma.prot,
+                    object: VmObject::new(right_size),
+                    obj_offset: vma.obj_offset + right_offset,
+                    vma_type: vma.vma_type,
+                    vnode: vma.vnode.clone(),
+                    file_offset: vma.file_offset + right_offset,
+                    file_size: vma.file_size.saturating_sub(right_offset),
+                };
+                self.areas.insert(end, right);
+            }
+        }
+    }
+
     /// Remove all VMAs (used by exec to reset address space).
     pub fn clear(&mut self) {
         self.areas.clear();

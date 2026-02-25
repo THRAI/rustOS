@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Create a minimal ext4 filesystem image with /hello.txt.
+"""Create a minimal ext4 filesystem image with /hello.txt and /bin/init.
 
 Works on macOS without mkfs.ext4 or Docker. Writes raw ext4 structures
 directly: superblock, group descriptors, bitmaps, inode table, root
-directory, and a single file with known content.
+directory, /bin directory, and files.
 
 Usage: python3 make_ext4_img.py [output_path]
 """
@@ -13,6 +13,7 @@ import sys
 import os
 import time
 import uuid
+import math
 
 OUTPUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "test.img")
 IMG_SIZE = 32 * 1024 * 1024  # 32 MB
@@ -23,6 +24,15 @@ INODES_PER_GROUP = INODES_COUNT
 BLOCKS_PER_GROUP = BLOCKS_COUNT  # single block group
 INODE_SIZE = 128
 FILE_CONTENT = b"hello from ext4"
+
+# Read init binary if it exists next to this script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INIT_PATH = os.path.join(SCRIPT_DIR, "init")
+if os.path.exists(INIT_PATH):
+    with open(INIT_PATH, 'rb') as f:
+        INIT_CONTENT = f.read()
+else:
+    INIT_CONTENT = None
 
 # ext4 superblock constants
 EXT4_SUPER_MAGIC = 0xEF53
@@ -60,14 +70,26 @@ def main():
     # Root dir inode = 2, hello.txt inode = 12 (first non-reserved)
     ROOT_INO = 2
     FILE_INO = 12
+    BIN_DIR_INO = 13
+    INIT_INO = 14
     root_dir_block = first_data_block
     file_data_block = first_data_block + 1
+    bin_dir_block = first_data_block + 2
 
-    # Number of used blocks: boot + super + gdt + bbitmap + ibitmap + inode_table + root_dir + file_data
-    used_blocks = file_data_block + 1
+    # /bin/init data blocks (contiguous)
+    init_data_blocks = []
+    next_block = first_data_block + 3
+    if INIT_CONTENT:
+        n_init_blocks = math.ceil(len(INIT_CONTENT) / BLOCK_SIZE)
+        for _ in range(n_init_blocks):
+            init_data_blocks.append(next_block)
+            next_block += 1
+
+    # Number of used blocks
+    used_blocks = next_block
     free_blocks = BLOCKS_COUNT - used_blocks
-    # Used inodes: 1..11 reserved + inode 12 (hello.txt) = 12 used
-    used_inodes = FILE_INO
+    # Used inodes: 1..11 reserved + hello(12) + bin_dir(13) + init(14)
+    used_inodes = INIT_INO if INIT_CONTENT else FILE_INO
     free_inodes = INODES_COUNT - used_inodes
 
     # ---- Superblock (offset 1024, block 1) ----

@@ -81,7 +81,12 @@ QEMU_TEST_PATTERNS := \
 	"vm fork bomb PASS" \
 	"delegate read PASS" \
 	"vfs read PASS" \
-	"fork-exec-wait4 PASS"
+	"fork-exec-wait4 PASS" \
+	"pipe data transfer PASS" \
+	"signal pending delivery PASS" \
+	"mmap munmap PASS" \
+	"device nodes PASS" \
+	"futex wake PASS"
 
 qemu-test-rv64: kernel-rv64-test $(DISK_IMG)
 	@echo "=== QEMU integration test (SMP=$(SMP)) ==="

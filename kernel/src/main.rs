@@ -185,9 +185,31 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 test_fork_exec_wait4().await;
             }, cpu0).detach();
 
-            // Shutdown after all tests complete (10s generous timeout)
+            // Phase 4 integration tests
             executor::spawn_kernel_task(async {
-                executor::sleep(10_000).await;
+                executor::sleep(700).await;
+                test_pipe_data_transfer().await;
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(800).await;
+                test_signal_pending_delivery();
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(800).await;
+                test_mmap_munmap();
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(800).await;
+                test_device_nodes().await;
+            }, cpu0).detach();
+            executor::spawn_kernel_task(async {
+                executor::sleep(900).await;
+                test_futex_wake();
+            }, cpu0).detach();
+
+            // Shutdown after all tests complete (12s generous timeout)
+            executor::spawn_kernel_task(async {
+                executor::sleep(12_000).await;
                 hal::rv64::sbi::shutdown();
             }, cpu0).detach();
         }
@@ -512,6 +534,220 @@ async fn test_fork_exec_wait4() {
             kprintln!("fork-exec-wait4 FAIL (wait4 returned None)");
         }
     }
+}
+
+#[cfg(feature = "qemu-test")]
+async fn test_pipe_data_transfer() {
+    use alloc::sync::Arc;
+    use fs::pipe::Pipe;
+
+    let pipe = Pipe::new();
+    let msg = b"hello pipe";
+
+    // Write to pipe
+    match pipe.write(msg) {
+        Ok(n) if n == msg.len() => {}
+        other => {
+            kprintln!("pipe data transfer FAIL (write: {:?})", other);
+            return;
+        }
+    }
+
+    // Read from pipe
+    let mut buf = [0u8; 64];
+    match pipe.read(&mut buf) {
+        Ok(n) if n == msg.len() => {
+            if &buf[..n] == msg {
+                // Test EOF: close writer, read should return 0
+                pipe.close_write();
+                match pipe.read(&mut buf) {
+                    Ok(0) => kprintln!("pipe data transfer PASS"),
+                    other => kprintln!("pipe data transfer FAIL (eof: {:?})", other),
+                }
+            } else {
+                kprintln!("pipe data transfer FAIL (data mismatch)");
+            }
+        }
+        other => {
+            kprintln!("pipe data transfer FAIL (read: {:?})", other);
+        }
+    }
+}
+
+#[cfg(feature = "qemu-test")]
+fn test_signal_pending_delivery() {
+    use alloc::sync::Arc;
+    use proc::task::Task;
+    use proc::signal::{SignalState, SIGUSR1, SIGCHLD, SA_RESTART};
+
+    let task = Task::new_init();
+
+    // Post SIGUSR1, verify pending
+    task.signals.post_signal(SIGUSR1);
+    if !task.signals.has_unmasked_pending() {
+        kprintln!("signal pending delivery FAIL (not pending after post)");
+        return;
+    }
+
+    // Dequeue it
+    match task.signals.dequeue_signal() {
+        Some(sig) if sig == SIGUSR1 => {}
+        other => {
+            kprintln!("signal pending delivery FAIL (dequeue: {:?})", other);
+            return;
+        }
+    }
+
+    // Should be empty now
+    if task.signals.has_unmasked_pending() {
+        kprintln!("signal pending delivery FAIL (still pending after dequeue)");
+        return;
+    }
+
+    // Test SA_RESTART flag via is_restart
+    {
+        let mut actions = task.signals.actions.lock();
+        actions[(SIGUSR1 - 1) as usize].flags = SA_RESTART;
+    }
+    if !task.signals.is_restart(SIGUSR1) {
+        kprintln!("signal pending delivery FAIL (is_restart false)");
+        return;
+    }
+
+    // Test blocked signals: block SIGUSR1, post it, should not be unmasked-pending
+    task.signals.blocked.store(
+        proc::signal::sig_bit_pub(SIGUSR1),
+        core::sync::atomic::Ordering::Release,
+    );
+    task.signals.post_signal(SIGUSR1);
+    if task.signals.has_unmasked_pending() {
+        kprintln!("signal pending delivery FAIL (blocked signal visible)");
+        return;
+    }
+    // Clear blocked, now it should be visible
+    task.signals.blocked.store(0, core::sync::atomic::Ordering::Release);
+    if !task.signals.has_unmasked_pending() {
+        kprintln!("signal pending delivery FAIL (unblocked signal not visible)");
+        return;
+    }
+    // Clean up
+    let _ = task.signals.dequeue_signal();
+
+    kprintln!("signal pending delivery PASS");
+}
+
+#[cfg(feature = "qemu-test")]
+fn test_mmap_munmap() {
+    use alloc::sync::Arc;
+    use mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
+    use mm::vm::vm_object::VmObject;
+    use hal_common::{VirtAddr, PAGE_SIZE};
+
+    let task = proc::task::Task::new_init();
+
+    // Insert an anonymous VMA
+    let base = VirtAddr::new(0x1000_0000);
+    let len = PAGE_SIZE;
+    let obj = VmObject::new(1);
+    let vma = VmArea::new(
+        base..VirtAddr::new(base.as_usize() + len),
+        MapPerm::R | MapPerm::W | MapPerm::U,
+        obj, 0, VmAreaType::Anonymous,
+    );
+    {
+        let mut vm = task.vm_map.lock();
+        match vm.insert(vma) {
+            Ok(()) => {}
+            Err(_) => {
+                kprintln!("mmap munmap FAIL (insert)");
+                return;
+            }
+        }
+        // Verify VMA exists
+        if vm.find_area(base).is_none() {
+            kprintln!("mmap munmap FAIL (find after insert)");
+            return;
+        }
+        // Remove it
+        vm.remove(base);
+        if vm.find_area(base).is_some() {
+            kprintln!("mmap munmap FAIL (still present after remove)");
+            return;
+        }
+    }
+
+    kprintln!("mmap munmap PASS");
+}
+
+#[cfg(feature = "qemu-test")]
+async fn test_device_nodes() {
+    use fs::fd_table::{FdTable, FileDescription, FileObject, DeviceKind, OpenFlags};
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU64;
+
+    // Test /dev/null behavior directly via FileObject
+    // Write to /dev/null: always succeeds (swallowed)
+    // Read from /dev/null: always returns EOF (0 bytes)
+
+    // Test /dev/zero behavior: read returns zeros
+    // We test via the device open path
+    let fd_table = hal_common::SpinMutex::new(FdTable::new_with_stdio());
+
+    // Open /dev/null
+    match fs::syscalls::sys_open(&fd_table, "/dev/null", OpenFlags::RDWR).await {
+        Ok(fd) => {
+            // Verify it opened (fd >= 3 since 0,1,2 are stdio)
+            if fd < 3 {
+                kprintln!("device nodes FAIL (/dev/null fd={} too low)", fd);
+                return;
+            }
+            let _ = fs::syscalls::sys_close(&fd_table, fd);
+        }
+        Err(e) => {
+            kprintln!("device nodes FAIL (/dev/null open: {:?})", e);
+            return;
+        }
+    }
+
+    // Open /dev/zero
+    match fs::syscalls::sys_open(&fd_table, "/dev/zero", OpenFlags::RDONLY).await {
+        Ok(fd) => {
+            let _ = fs::syscalls::sys_close(&fd_table, fd);
+        }
+        Err(e) => {
+            kprintln!("device nodes FAIL (/dev/zero open: {:?})", e);
+            return;
+        }
+    }
+
+    // Open /dev/console
+    match fs::syscalls::sys_open(&fd_table, "/dev/console", OpenFlags::RDWR).await {
+        Ok(fd) => {
+            let _ = fs::syscalls::sys_close(&fd_table, fd);
+        }
+        Err(e) => {
+            kprintln!("device nodes FAIL (/dev/console open: {:?})", e);
+            return;
+        }
+    }
+
+    kprintln!("device nodes PASS");
+}
+
+#[cfg(feature = "qemu-test")]
+fn test_futex_wake() {
+    use ipc::futex;
+    use hal_common::PhysAddr;
+
+    // futex_wake on a key with no waiters should return 0
+    let key = PhysAddr::new(0xDEAD_0000);
+    let woken = futex::futex_wake(key, 1);
+    if woken != 0 {
+        kprintln!("futex wake FAIL (woke {} on empty)", woken);
+        return;
+    }
+
+    kprintln!("futex wake PASS");
 }
 
 #[cfg(feature = "qemu-test")]

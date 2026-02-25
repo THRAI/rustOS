@@ -139,13 +139,43 @@ impl SignalState {
         self.pending.fetch_or(sig_bit(sig), Ordering::Release);
     }
 
-    /// Check if there are unmasked pending signals.
+    /// Check if there are unmasked pending signals (raw bitmap check).
     pub fn has_unmasked_pending(&self) -> bool {
         let pending = self.pending.load(Ordering::Acquire);
         let blocked = self.blocked.load(Ordering::Relaxed);
-        // SIGKILL and SIGSTOP cannot be blocked
         let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
         (pending & (!blocked | unblockable)) != 0
+    }
+
+    /// Check if there are unmasked pending signals that would actually
+    /// interrupt (not default-ignored like SIGCHLD with SIG_DFL).
+    pub fn has_actionable_pending(&self) -> bool {
+        let pending = self.pending.load(Ordering::Acquire);
+        let blocked = self.blocked.load(Ordering::Relaxed);
+        let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+        let deliverable = pending & (!blocked | unblockable);
+        if deliverable == 0 {
+            return false;
+        }
+        // Check each deliverable signal: skip those with default-ignore disposition
+        let actions = self.actions.lock();
+        let mut bits = deliverable;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as u8;
+            let sig = bit + 1;
+            let action = &actions[bit as usize];
+            match action.handler {
+                SIG_DFL => {
+                    if default_action(sig) != SigDefault::Ignore {
+                        return true; // Would terminate/stop
+                    }
+                }
+                SIG_IGN => {} // Explicitly ignored
+                _ => return true, // User handler installed
+            }
+            bits &= !(1u64 << bit);
+        }
+        false
     }
 
     /// Check if the given signal's action has SA_RESTART set.

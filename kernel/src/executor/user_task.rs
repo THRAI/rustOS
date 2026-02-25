@@ -1137,7 +1137,7 @@ async fn sys_nanosleep_async(
 
     loop {
         // Check for pending signals
-        if task.signals.has_unmasked_pending() {
+        if task.signals.has_actionable_pending() {
             // Write remaining time to rem pointer
             if rem_ptr != 0 {
                 let now = crate::hal::rv64::timer::read_time_ms();
@@ -1349,7 +1349,7 @@ impl<'a> core::future::Future for PipeReadFuture<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         // EINTR guard: check for pending signals before blocking
-        if this.task.signals.has_unmasked_pending() {
+        if this.task.signals.has_actionable_pending() {
             return Poll::Ready(Err(Errno::EINTR));
         }
         let mut kbuf = alloc::vec![0u8; this.len];
@@ -1466,7 +1466,7 @@ impl<'a> core::future::Future for PipeWriteFuture<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         // EINTR guard: check for pending signals before blocking
-        if this.task.signals.has_unmasked_pending() {
+        if this.task.signals.has_actionable_pending() {
             // Return partial write if any, else EINTR
             if this.written > 0 {
                 return Poll::Ready(Ok(this.written));
@@ -1657,7 +1657,7 @@ async fn sys_wait4_async(
         }
         None => {
             // Distinguish EINTR from ECHILD
-            if task.signals.has_unmasked_pending() {
+            if task.signals.has_actionable_pending() {
                 Err(Errno::EINTR)
             } else {
                 Err(Errno::ECHILD)

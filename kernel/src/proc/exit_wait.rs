@@ -59,18 +59,13 @@ impl Future for WaitChildFuture {
     type Output = Option<(u32, i32)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // EINTR guard: check for pending signals before blocking
-        if self.parent.signals.has_unmasked_pending() {
-            return Poll::Ready(None);
-        }
-
         // Step 1: Register waker FIRST (before scanning) to prevent lost wakeups
         {
             let mut waker_slot = self.parent.parent_waker.lock();
             *waker_slot = Some(cx.waker().clone());
         }
 
-        // Step 2: Scan children for any ZOMBIE
+        // Step 2: Scan children for any ZOMBIE (check zombies BEFORE signal guard)
         let children = self.parent.children.lock();
         for child in children.iter() {
             if child.state() == TaskState::Zombie {
@@ -86,6 +81,13 @@ impl Future for WaitChildFuture {
 
                 return Poll::Ready(Some((pid, status)));
             }
+        }
+        drop(children);
+
+        // Step 3: EINTR guard — only after confirming no zombie is ready
+        if self.parent.signals.has_actionable_pending() {
+            *self.parent.parent_waker.lock() = None;
+            return Poll::Ready(None);
         }
 
         // No zombie children yet — waker is already registered, suspend

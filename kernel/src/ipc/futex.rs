@@ -65,7 +65,7 @@ impl<'a> Future for FutexWaitFuture<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // EINTR guard: check for pending signals before blocking
-        if self.task.signals.has_unmasked_pending() {
+        if self.task.signals.has_actionable_pending() {
             return Poll::Ready(Err(Errno::EINTR));
         }
         if self.registered {

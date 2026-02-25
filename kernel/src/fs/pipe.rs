@@ -1,0 +1,173 @@
+//! Pipe: 4KB ring buffer with async waker integration.
+//!
+//! Created by pipe2 syscall. Read/write ends share an Arc<Pipe>.
+//! Full implementation in Task 2.
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::Waker;
+use hal_common::{Errno, SpinMutex};
+
+/// Pipe buffer size (also PIPE_BUF for atomic write guarantee).
+const PIPE_BUF: usize = 4096;
+
+/// A unidirectional pipe with a fixed ring buffer.
+pub struct Pipe {
+    buf: SpinMutex<PipeBuffer>,
+    /// True when the read end has been closed.
+    reader_closed: AtomicBool,
+    /// True when the write end has been closed.
+    writer_closed: AtomicBool,
+}
+
+struct PipeBuffer {
+    data: [u8; PIPE_BUF],
+    head: usize,
+    tail: usize,
+    len: usize,
+    reader_waker: Option<Waker>,
+    writer_waker: Option<Waker>,
+}
+
+impl PipeBuffer {
+    fn new() -> Self {
+        Self {
+            data: [0u8; PIPE_BUF],
+            head: 0,
+            tail: 0,
+            len: 0,
+            reader_waker: None,
+            writer_waker: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == PIPE_BUF
+    }
+
+    fn available_read(&self) -> usize {
+        self.len
+    }
+
+    fn available_write(&self) -> usize {
+        PIPE_BUF - self.len
+    }
+}
+
+impl Pipe {
+    /// Create a new pipe. Returns the shared Arc.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            buf: SpinMutex::new(PipeBuffer::new()),
+            reader_closed: AtomicBool::new(false),
+            writer_closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Close the read end.
+    pub fn close_read(&self) {
+        self.reader_closed.store(true, Ordering::Release);
+        // Wake writer so it gets EPIPE
+        let waker = {
+            let mut buf = self.buf.lock();
+            buf.writer_waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Close the write end.
+    pub fn close_write(&self) {
+        self.writer_closed.store(true, Ordering::Release);
+        // Wake reader so it gets EOF
+        let waker = {
+            let mut buf = self.buf.lock();
+            buf.reader_waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Read from pipe. Returns Ok(0) on EOF (writer closed + empty).
+    /// Returns Err(EAGAIN) if empty and writer alive (caller should register waker and retry).
+    pub fn read(&self, out: &mut [u8]) -> Result<usize, Errno> {
+        let (n, wake_writer) = {
+            let mut buf = self.buf.lock();
+            if buf.is_empty() {
+                if self.writer_closed.load(Ordering::Acquire) {
+                    return Ok(0); // EOF
+                }
+                return Err(Errno::EAGAIN);
+            }
+            let to_read = out.len().min(buf.available_read());
+            for i in 0..to_read {
+                let idx = buf.head;
+                out[i] = buf.data[idx];
+                buf.head = (idx + 1) % PIPE_BUF;
+            }
+            buf.len -= to_read;
+            let wake = buf.writer_waker.take();
+            (to_read, wake)
+        };
+        if let Some(w) = wake_writer {
+            w.wake();
+        }
+        Ok(n)
+    }
+
+    /// Write to pipe. Returns Err(EPIPE) if reader closed.
+    /// Returns Err(EAGAIN) if full and reader alive.
+    pub fn write(&self, data: &[u8]) -> Result<usize, Errno> {
+        if self.reader_closed.load(Ordering::Acquire) {
+            return Err(Errno::EPIPE);
+        }
+        let (n, wake_reader) = {
+            let mut buf = self.buf.lock();
+            if buf.is_full() {
+                if self.reader_closed.load(Ordering::Acquire) {
+                    return Err(Errno::EPIPE);
+                }
+                return Err(Errno::EAGAIN);
+            }
+            let to_write = data.len().min(buf.available_write());
+            for i in 0..to_write {
+                let idx = buf.tail;
+                buf.data[idx] = data[i];
+                buf.tail = (idx + 1) % PIPE_BUF;
+            }
+            buf.len += to_write;
+            let wake = buf.reader_waker.take();
+            (to_write, wake)
+        };
+        if let Some(w) = wake_reader {
+            w.wake();
+        }
+        Ok(n)
+    }
+
+    /// Register a waker for the read end (called when read returns EAGAIN).
+    pub fn register_reader_waker(&self, waker: &Waker) {
+        let mut buf = self.buf.lock();
+        buf.reader_waker = Some(waker.clone());
+    }
+
+    /// Register a waker for the write end (called when write returns EAGAIN).
+    pub fn register_writer_waker(&self, waker: &Waker) {
+        let mut buf = self.buf.lock();
+        buf.writer_waker = Some(waker.clone());
+    }
+
+    pub fn is_reader_closed(&self) -> bool {
+        self.reader_closed.load(Ordering::Acquire)
+    }
+
+    pub fn is_writer_closed(&self) -> bool {
+        self.writer_closed.load(Ordering::Acquire)
+    }
+}

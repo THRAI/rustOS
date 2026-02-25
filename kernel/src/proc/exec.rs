@@ -233,8 +233,8 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         }
     }
 
-    // 6. Reset fd table: keep stdin/stdout/stderr (0,1,2), close rest
-    // For now, just leave fd table as-is (exec preserves fds per POSIX)
+    // 6. Strip CLOEXEC fds (point of no return — exec will succeed)
+    task.fd_table.lock().strip_cloexec();
 
     Ok((entry, USER_STACK_TOP))
 }

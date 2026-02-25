@@ -12,6 +12,10 @@ pub enum Errno {
     ENOEXEC,
     ECHILD,
     EIO,
+    EPIPE,
+    ENOTTY,
+    EMFILE,
+    EEXIST,
 }
 
 impl Errno {
@@ -21,14 +25,18 @@ impl Errno {
             Errno::EPERM => 1,
             Errno::ENOENT => 2,
             Errno::EIO => 5,
+            Errno::EBADF => 9,
+            Errno::ECHILD => 10,
             Errno::EAGAIN => 11,
             Errno::ENOMEM => 12,
             Errno::EFAULT => 14,
+            Errno::EEXIST => 17,
             Errno::EINVAL => 22,
-            Errno::EBADF => 9,
+            Errno::EMFILE => 24,
+            Errno::EPIPE => 32,
             Errno::ENOSYS => 38,
             Errno::ENOEXEC => 8,
-            Errno::ECHILD => 10,
+            Errno::ENOTTY => 25,
         }
     }
 }

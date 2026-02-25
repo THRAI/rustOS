@@ -109,7 +109,7 @@ impl Task {
         })
     }
 
-    /// Create init (pid 1) with no parent.
+    /// Create init (pid 1) with no parent. Stdio fds pre-populated.
     pub fn new_init() -> Arc<Self> {
         let (kstack_base, kernel_sp) = alloc_kstack();
         Arc::new(Self {
@@ -117,7 +117,7 @@ impl Task {
             parent: Weak::new(),
             children: Mutex::new(Vec::new()),
             vm_map: Mutex::new(VmMap::new()),
-            fd_table: Mutex::new(FdTable::new()),
+            fd_table: Mutex::new(FdTable::new_with_stdio()),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
             parent_waker: Mutex::new(None),

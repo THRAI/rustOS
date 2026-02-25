@@ -76,6 +76,7 @@ impl SyscallId {
     const MMAP: Self = Self(222);
     const MPROTECT: Self = Self(226);
     const WAIT4: Self = Self(260);
+    const PIPE2: Self = Self(59);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -118,6 +119,7 @@ impl core::fmt::Display for SyscallId {
             Self::MMAP => "mmap",
             Self::MPROTECT => "mprotect",
             Self::WAIT4 => "wait4",
+            Self::PIPE2 => "pipe2",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -450,6 +452,27 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::GETUID | SyscallId::GETEUID | SyscallId::GETGID | SyscallId::GETEGID => 0,
         SyscallId::GETTID => task.pid as usize,
         SyscallId::SET_TID_ADDRESS => task.pid as usize,
+        SyscallId::DUP => {
+            match task.fd_table.lock().dup(a0 as u32) {
+                Ok(fd) => fd as usize,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::DUP3 => {
+            // a0=oldfd, a1=newfd, a2=flags
+            let cloexec = (a2 & 0o2000000) != 0;
+            match task.fd_table.lock().dup3(a0 as u32, a1 as u32, cloexec) {
+                Ok(fd) => fd as usize,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::PIPE2 => {
+            // a0=pipefd[2] user pointer, a1=flags
+            match sys_pipe2(task, a0, a1) {
+                Ok(()) => 0,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
         SyscallId::SCHED_YIELD => {
             yield_now().await;
             0
@@ -593,33 +616,20 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             // TODO: write utsname to user memory
             0
         }
-        SyscallId::IOCTL => 0, // stub
+        SyscallId::IOCTL => {
+            // a0=fd, a1=request, a2=argp
+            match sys_ioctl(task, a0 as u32, a1, a2) {
+                Ok(v) => v as usize,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
 
         // --- Async syscalls ---
         SyscallId::WRITE => {
             // a0=fd, a1=buf, a2=len
-            if (a0 == 1 || a0 == 2) && a2 > 0 {
-                // stdout/stderr → UART
-                // Fault in user pages covering the buffer, then copy with SUM.
-                fault_in_user_buffer(task, a1, a2, PageFaultAccessType::READ).await;
-                let mut kbuf = alloc::vec![0u8; a2];
-                let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
-                        kbuf.as_mut_ptr(), a1 as *const u8, a2,
-                    )
-                };
-                if rc != 0 {
-                    (-14isize) as usize // EFAULT
-                } else {
-                    for &b in &kbuf {
-                        crate::console::putchar(b);
-                    }
-                    a2
-                }
-            } else if a0 == 1 || a0 == 2 {
-                0 // zero-length write
-            } else {
-                (-1isize) as usize // EPERM
+            match sys_write_async(task, a0 as u32, a1, a2).await {
+                Ok(n) => n,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
         SyscallId::READ => {
@@ -709,70 +719,374 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
     TrapResult::Continue
 }
 
-/// sys_read through page cache with uiomove to user addresses.
+/// sys_read through the three-layer FD model.
 async fn sys_read_async(
     task: &Arc<Task>,
     fd: u32,
     user_buf: usize,
     len: usize,
 ) -> Result<usize, Errno> {
+    use crate::fs::fd_table::{FileObject, DeviceKind};
     use crate::mm::uio::{uiomove, UioDir};
 
-    let (vnode_id, vnode_path, file_size, mut offset) = {
-        let tab = task.fd_table.lock();
-        let file = tab.get(fd).ok_or(Errno::EBADF)?;
-        let offset = file.offset.load(core::sync::atomic::Ordering::Relaxed);
-        let vnode = &file.vnode;
-        (vnode.vnode_id(), String::from(vnode.path()), vnode.size(), offset)
-    };
-
-    if offset >= file_size {
+    if len == 0 {
         return Ok(0);
     }
-    let to_read = core::cmp::min(len, (file_size - offset) as usize);
-    let mut total = 0usize;
 
-    while total < to_read {
-        let page_offset = offset / PAGE_SIZE as u64;
-        let offset_in_page = (offset % PAGE_SIZE as u64) as usize;
-        let chunk = core::cmp::min(PAGE_SIZE - offset_in_page, to_read - total);
-
-        // Ensure page is in cache
-        let pa = page_cache_fetch_by_id(vnode_id, &vnode_path, page_offset * PAGE_SIZE as u64).await
-            .map_err(|_| Errno::EIO)?;
-
-        // Copy from page cache to user buffer via uiomove
-        // uiomove(kern, user, len, dir): CopyOut copies kern→user
-        let kern = (pa.as_usize() + offset_in_page) as *mut u8;
-        let user = (user_buf + total) as *mut u8;
-
-        match uiomove(kern, user, chunk, UioDir::CopyOut) {
-            Ok(result) => {
-                total += result.done;
-                offset += result.done as u64;
-            }
-            Err(Errno::EFAULT) => {
-                // User buffer page not present — resolve fault and retry
-                resolve_user_fault(
-                    task,
-                    VirtAddr::new(user_buf + total),
-                    PageFaultAccessType::WRITE,
-                ).await.map_err(|_| Errno::EFAULT)?;
-                continue; // retry, don't advance
-            }
-            Err(e) => return Err(e),
-        }
+    // Snapshot what we need from the fd table
+    enum ReadSource {
+        Vnode { id: u64, path: String, size: u64, offset: u64 },
+        PipeRead(alloc::sync::Arc<crate::fs::pipe::Pipe>),
+        DevNull,
+        DevZero,
+        DevConsole,
     }
 
-    // Update file offset
-    {
+    let (source, desc) = {
         let tab = task.fd_table.lock();
-        if let Some(file) = tab.get(fd) {
-            file.offset.store(offset, core::sync::atomic::Ordering::Relaxed);
+        let d = tab.get(fd).ok_or(Errno::EBADF)?;
+        if !d.flags.read {
+            return Err(Errno::EPERM);
+        }
+        let src = match &d.object {
+            FileObject::Vnode(v) => ReadSource::Vnode {
+                id: v.vnode_id(),
+                path: String::from(v.path()),
+                size: v.size(),
+                offset: d.offset.load(core::sync::atomic::Ordering::Relaxed),
+            },
+            FileObject::PipeRead(p) => ReadSource::PipeRead(Arc::clone(p)),
+            FileObject::PipeWrite(_) => return Err(Errno::EBADF),
+            FileObject::Device(DeviceKind::Null) => ReadSource::DevNull,
+            FileObject::Device(DeviceKind::Zero) => ReadSource::DevZero,
+            FileObject::Device(DeviceKind::ConsoleRead) => ReadSource::DevConsole,
+            FileObject::Device(DeviceKind::ConsoleWrite) => return Err(Errno::EBADF),
+        };
+        (src, Arc::clone(d))
+    };
+
+    match source {
+        ReadSource::DevNull => Ok(0), // EOF
+        ReadSource::DevZero => {
+            // Fill user buffer with zeros
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::WRITE).await;
+            let zeros = alloc::vec![0u8; len];
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    user_buf as *mut u8, zeros.as_ptr(), len,
+                )
+            };
+            if rc != 0 { Err(Errno::EFAULT) } else { Ok(len) }
+        }
+        ReadSource::DevConsole => {
+            // Console read: return 0 for now (no input buffer yet)
+            Ok(0)
+        }
+        ReadSource::PipeRead(pipe) => {
+            // Async pipe read: loop until data available or EOF
+            PipeReadFuture { pipe, task, user_buf, len }.await
+        }
+        ReadSource::Vnode { id, path, size, mut offset } => {
+            if offset >= size {
+                return Ok(0);
+            }
+            let to_read = core::cmp::min(len, (size - offset) as usize);
+            let mut total = 0usize;
+
+            while total < to_read {
+                let page_offset = offset / PAGE_SIZE as u64;
+                let offset_in_page = (offset % PAGE_SIZE as u64) as usize;
+                let chunk = core::cmp::min(PAGE_SIZE - offset_in_page, to_read - total);
+
+                let pa = page_cache_fetch_by_id(id, &path, page_offset * PAGE_SIZE as u64).await
+                    .map_err(|_| Errno::EIO)?;
+
+                let kern = (pa.as_usize() + offset_in_page) as *mut u8;
+                let user = (user_buf + total) as *mut u8;
+
+                match uiomove(kern, user, chunk, UioDir::CopyOut) {
+                    Ok(result) => {
+                        total += result.done;
+                        offset += result.done as u64;
+                    }
+                    Err(Errno::EFAULT) => {
+                        resolve_user_fault(
+                            task,
+                            VirtAddr::new(user_buf + total),
+                            PageFaultAccessType::WRITE,
+                        ).await.map_err(|_| Errno::EFAULT)?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            desc.offset.store(offset, core::sync::atomic::Ordering::Relaxed);
+            Ok(total)
+        }
+    }
+}
+
+/// Future for async pipe read.
+struct PipeReadFuture<'a> {
+    pipe: alloc::sync::Arc<crate::fs::pipe::Pipe>,
+    task: &'a Arc<Task>,
+    user_buf: usize,
+    len: usize,
+}
+
+impl<'a> core::future::Future for PipeReadFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut kbuf = alloc::vec![0u8; this.len];
+        match this.pipe.read(&mut kbuf) {
+            Ok(0) => Poll::Ready(Ok(0)), // EOF
+            Ok(n) => {
+                // Copy to user buffer (best-effort, fault in pages first would be ideal)
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        this.user_buf as *mut u8, kbuf.as_ptr(), n,
+                    )
+                };
+                if rc != 0 {
+                    Poll::Ready(Err(Errno::EFAULT))
+                } else {
+                    Poll::Ready(Ok(n))
+                }
+            }
+            Err(Errno::EAGAIN) => {
+                this.pipe.register_reader_waker(cx.waker());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+/// sys_write through the three-layer FD model.
+async fn sys_write_async(
+    task: &Arc<Task>,
+    fd: u32,
+    user_buf: usize,
+    len: usize,
+) -> Result<usize, Errno> {
+    use crate::fs::fd_table::{FileObject, DeviceKind};
+
+    if len == 0 {
+        return Ok(0);
+    }
+
+    enum WriteTarget {
+        DevNull,
+        DevConsole,
+        PipeWrite(alloc::sync::Arc<crate::fs::pipe::Pipe>),
+    }
+
+    let target = {
+        let tab = task.fd_table.lock();
+        let d = tab.get(fd).ok_or(Errno::EBADF)?;
+        if !d.flags.write {
+            return Err(Errno::EPERM);
+        }
+        match &d.object {
+            FileObject::Device(DeviceKind::Null) => WriteTarget::DevNull,
+            FileObject::Device(DeviceKind::Zero) => WriteTarget::DevNull,
+            FileObject::Device(DeviceKind::ConsoleWrite) | FileObject::Device(DeviceKind::ConsoleRead) => WriteTarget::DevConsole,
+            FileObject::PipeWrite(p) => WriteTarget::PipeWrite(Arc::clone(p)),
+            FileObject::PipeRead(_) => return Err(Errno::EBADF),
+            FileObject::Vnode(_) => return Err(Errno::EPERM), // read-only fs
+        }
+    };
+
+    match target {
+        WriteTarget::DevNull => Ok(len),
+        WriteTarget::DevConsole => {
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
+            let mut kbuf = alloc::vec![0u8; len];
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    kbuf.as_mut_ptr(), user_buf as *const u8, len,
+                )
+            };
+            if rc != 0 {
+                return Err(Errno::EFAULT);
+            }
+            for &b in &kbuf {
+                crate::console::putchar(b);
+            }
+            Ok(len)
+        }
+        WriteTarget::PipeWrite(pipe) => {
+            // Copy user data to kernel buffer first
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
+            let mut kbuf = alloc::vec![0u8; len];
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    kbuf.as_mut_ptr(), user_buf as *const u8, len,
+                )
+            };
+            if rc != 0 {
+                return Err(Errno::EFAULT);
+            }
+            PipeWriteFuture { pipe, data: kbuf, written: 0 }.await
+        }
+    }
+}
+
+/// Future for async pipe write.
+struct PipeWriteFuture {
+    pipe: alloc::sync::Arc<crate::fs::pipe::Pipe>,
+    data: alloc::vec::Vec<u8>,
+    written: usize,
+}
+
+impl core::future::Future for PipeWriteFuture {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        loop {
+            if this.written >= this.data.len() {
+                return Poll::Ready(Ok(this.written));
+            }
+            match this.pipe.write(&this.data[this.written..]) {
+                Ok(n) => {
+                    this.written += n;
+                    if this.written >= this.data.len() {
+                        return Poll::Ready(Ok(this.written));
+                    }
+                    // Partial write — register waker and wait for space
+                    this.pipe.register_writer_waker(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(Errno::EAGAIN) => {
+                    this.pipe.register_writer_waker(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+/// sys_ioctl: handle terminal ioctls for isatty() support.
+fn sys_ioctl(
+    task: &Arc<Task>,
+    fd: u32,
+    request: usize,
+    argp: usize,
+) -> Result<i32, Errno> {
+    use crate::fs::fd_table::{FileObject, DeviceKind};
+
+    let tab = task.fd_table.lock();
+    let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+
+    // Only console devices support ioctls
+    let is_console = matches!(
+        &desc.object,
+        FileObject::Device(DeviceKind::ConsoleRead) | FileObject::Device(DeviceKind::ConsoleWrite)
+    );
+    if !is_console {
+        return Err(Errno::ENOTTY);
+    }
+
+    const TCGETS: usize = 0x5401;
+    const TCSETS: usize = 0x5402;
+    const TCSETSW: usize = 0x5403;
+    const TCSETSF: usize = 0x5404;
+    const TIOCGWINSZ: usize = 0x5413;
+    const FIONBIO: usize = 0x5421;
+
+    match request {
+        TCGETS => {
+            // Write a basic Termios struct: ICANON|ECHO, B38400
+            // Linux struct termios is 60 bytes (on most arches)
+            if argp != 0 {
+                let mut termios = [0u32; 15]; // 60 bytes
+                termios[0] = 0; // c_iflag
+                termios[1] = 0; // c_oflag
+                termios[2] = 0o000017; // c_cflag: CS8 | B38400
+                termios[3] = 0o000012; // c_lflag: ICANON | ECHO
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        termios.as_ptr() as *const u8,
+                        argp as *mut u8,
+                        60,
+                    );
+                }
+            }
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            // struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
+            if argp != 0 {
+                let winsize: [u16; 4] = [24, 80, 0, 0];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        winsize.as_ptr() as *const u8,
+                        argp as *mut u8,
+                        8,
+                    );
+                }
+            }
+            Ok(0)
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            // Accept silently (no hardware effect)
+            Ok(0)
+        }
+        FIONBIO => {
+            // Accept silently
+            Ok(0)
+        }
+        _ => Err(Errno::ENOTTY),
+    }
+}
+
+/// sys_pipe2: create a pipe and return two fds.
+fn sys_pipe2(
+    task: &Arc<Task>,
+    pipefd_ptr: usize,
+    flags: usize,
+) -> Result<(), Errno> {
+    use crate::fs::fd_table::{FdFlags, FileDescription, FileObject, OpenFlags};
+    use crate::fs::pipe::Pipe;
+
+    let pipe = Pipe::new();
+    let cloexec = (flags & 0o2000000) != 0;
+    let fd_flags = if cloexec { FdFlags::CLOEXEC } else { FdFlags::empty() };
+
+    let read_desc = FileDescription::new(FileObject::PipeRead(Arc::clone(&pipe)), OpenFlags::RDONLY);
+    let write_desc = FileDescription::new(FileObject::PipeWrite(pipe), OpenFlags::WRONLY);
+
+    let (read_fd, write_fd) = {
+        let mut tab = task.fd_table.lock();
+        let rfd = tab.insert(read_desc, fd_flags)?;
+        let wfd = match tab.insert(write_desc, fd_flags) {
+            Ok(fd) => fd,
+            Err(e) => {
+                tab.remove(rfd); // rollback
+                return Err(e);
+            }
+        };
+        (rfd, wfd)
+    };
+
+    // Write [read_fd, write_fd] to user memory
+    if pipefd_ptr != 0 {
+        let fds: [i32; 2] = [read_fd as i32, write_fd as i32];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                fds.as_ptr() as *const u8,
+                pipefd_ptr as *mut u8,
+                8,
+            );
         }
     }
 
-    Ok(total)
+    Ok(())
 }
 
 /// sys_openat: resolve path and open file.

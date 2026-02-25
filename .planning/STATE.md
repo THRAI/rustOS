@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 
 ## Current Position
 
-Phase: 3.1 of 7 (Verification Bookkeeping + User Memory Safety) — COMPLETE
-Plan: 1 of 1 in current phase — DONE
-Status: Phase 3.1 complete, ready for Phase 4
-Last activity: 2026-02-24 -- Plan 03.1-01 complete (audit gap closure: pcb_onfault + fault-safe copyinstr + verification docs)
+Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — PLANNED
+Plan: 0 of 4 in current phase — ready for execution
+Status: Phase 4 plans created, ready for `/gsd:execute-phase 4`
+Last activity: 2026-02-25 -- Phase 4 planning complete (4 plans across 3 waves)
 
-Progress: [██████████] 100% (Phase 3.1)
+Progress: [░░░░░░░░░░] 0% (Phase 4)
 
 ## Performance Metrics
 
@@ -111,6 +111,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-24
-Stopped at: Phase 3.1 complete (1/1 plans done), ready for Phase 4 planning
+Last session: 2026-02-25
+Stopped at: Phase 4 planning complete (4 plans, 3 waves), ready for `/gsd:execute-phase 4`
 Resume file: None

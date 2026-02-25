@@ -105,12 +105,13 @@ Plans:
   3. mmap/munmap/mprotect/brk work correctly (verified by a malloc-heavy test that exercises brk growth and mmap fallback)
   4. /dev/null, /dev/zero, /dev/console are functional and ioctl returns plausible terminal info for isatty() checks
   5. futex wait/wake correctly synchronizes two threads (atomic compare + park, wake unblocks waiter)
-**Plans**: TBD
+**Plans**: 4 plans
 
 Plans:
-- [ ] 04-01: TBD
-- [ ] 04-02: TBD
-- [ ] 04-03: TBD
+- [ ] 04-01-PLAN.md — Three-layer FD model + pipes + device nodes + dup/dup2/dup3 (wave 1)
+- [ ] 04-02-PLAN.md — Signal delivery + sigreturn + process groups (wave 2)
+- [ ] 04-03-PLAN.md — Remaining syscalls: mmap/munmap/mprotect + lseek/fstat + clock_gettime/nanosleep + futex (wave 2)
+- [ ] 04-04-PLAN.md — Signal-syscall integration + EINTR wiring + QEMU tests (wave 3)
 
 ### Phase 5: Page Reclamation + LA64 Port
 **Goal**: The kernel survives memory pressure via page daemon reclamation and shadow collapse, and the full LA64 architecture port boots and passes tests -- dual-arch scoring is unlocked

@@ -79,6 +79,10 @@ impl SyscallId {
     const PIPE2: Self = Self(59);
     const NANOSLEEP: Self = Self(101);
     const FUTEX: Self = Self(98);
+    const KILL: Self = Self(129);
+    const SETPGID: Self = Self(154);
+    const GETPGID: Self = Self(155);
+    const SIGALTSTACK: Self = Self(132);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -124,6 +128,10 @@ impl core::fmt::Display for SyscallId {
             Self::PIPE2 => "pipe2",
             Self::NANOSLEEP => "nanosleep",
             Self::FUTEX => "futex",
+            Self::KILL => "kill",
+            Self::SETPGID => "setpgid",
+            Self::GETPGID => "getpgid",
+            Self::SIGALTSTACK => "sigaltstack",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -147,7 +155,20 @@ enum TrapResult {
 /// The persistent trap loop for a user process.
 async fn run_tasks(task: Arc<Task>) {
     klog!(sched, debug, "run_tasks: starting pid={}", task.pid);
+
+    // Capture top-level waker for async signal injection.
+    SignalWakeHelper(&task).await;
+
     loop {
+        // Check for pending signals before returning to user mode.
+        match crate::proc::signal::check_pending_signals(&task) {
+            Ok(_) => {}       // signal delivered (or none pending), continue
+            Err(_sig) => {    // fatal signal (SIGKILL or unhandled)
+                do_exit(&task, -9); // killed by signal
+                break;
+            }
+        }
+
         // Activate per-process page table before returning to user mode.
         {
             let mut pmap = task.pmap.lock();
@@ -178,6 +199,18 @@ async fn run_tasks(task: Arc<Task>) {
 
         // Cooperative preemption point.
         yield_now().await;
+    }
+}
+
+/// Helper future that captures the executor waker into task.top_level_waker
+/// on first poll, then immediately returns Ready.
+struct SignalWakeHelper<'a>(&'a Task);
+
+impl<'a> Future for SignalWakeHelper<'a> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        *self.0.top_level_waker.lock() = Some(cx.waker().clone());
+        Poll::Ready(())
     }
 }
 
@@ -250,9 +283,8 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                     "fatal fault: pid={} va={:#x} pc={:#x} code={} err={:?}",
                     task.pid, stval, pc, code, e
                 );
-                // TODO(Phase 4): deliver SIGSEGV. For now, kill process.
-                do_exit(task, -11); // SIGSEGV = 11
-                return TrapResult::Exit;
+                // Deliver SIGSEGV. If no handler, check_pending_signals will kill.
+                task.signals.post_signal(crate::proc::signal::SIGSEGV);
             }
             TrapResult::Continue
         }
@@ -576,7 +608,50 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::MPROTECT => {
             sys_mprotect(task, a0, a1, a2)
         }
-        SyscallId::SIGACTION | SyscallId::SIGPROCMASK | SyscallId::SIGRETURN => 0, // stub
+        SyscallId::SIGACTION => {
+            // a0=signum, a1=act, a2=oldact
+            match crate::proc::signal::sys_sigaction(task, a0, a1, a2) {
+                Ok(v) => v,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::SIGPROCMASK => {
+            // a0=how, a1=set, a2=oldset, a3=sigsetsize
+            match crate::proc::signal::sys_sigprocmask(task, a0, a1, a2) {
+                Ok(v) => v,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::SIGRETURN => {
+            let _ = crate::proc::signal::sys_sigreturn(task);
+            // sigreturn sets sepc/sstatus directly; don't overwrite a0
+            return TrapResult::Continue;
+        }
+        SyscallId::KILL => {
+            // a0=pid (or -pgid), a1=sig
+            match crate::proc::signal::sys_kill(task, a0 as isize, a1 as u8) {
+                Ok(v) => v,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::SETPGID => {
+            // a0=pid, a1=pgid
+            match crate::proc::signal::sys_setpgid(task, a0 as u32, a1 as u32) {
+                Ok(v) => v,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::GETPGID => {
+            // a0=pid (0 = self)
+            match crate::proc::signal::sys_getpgid(task, a0 as u32) {
+                Ok(v) => v,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::SIGALTSTACK => {
+            // a0=ss, a1=old_ss — stub for now (accept silently)
+            0
+        }
         SyscallId::CLOCK_GETTIME => {
             // a0=clockid, a1=timespec pointer
             match sys_clock_gettime(task, a0 as u32, a1) {
@@ -1319,7 +1394,12 @@ async fn sys_write_async(
             if rc != 0 {
                 return Err(Errno::EFAULT);
             }
-            PipeWriteFuture { pipe, data: kbuf, written: 0 }.await
+            let result = PipeWriteFuture { pipe, data: kbuf, written: 0 }.await;
+            // Post SIGPIPE on broken pipe
+            if let Err(Errno::EPIPE) = &result {
+                task.signals.post_signal(crate::proc::signal::SIGPIPE);
+            }
+            result
         }
     }
 }
@@ -1590,9 +1670,19 @@ fn do_exit(task: &Arc<Task>, status: i32) {
     task.exit_status.store(status, core::sync::atomic::Ordering::Release);
     task.set_zombie();
 
-    // Wake parent's WaitChildFuture
+    // Unregister from global task registry
+    crate::proc::signal::unregister_task(task.pid);
+
+    // Post SIGCHLD to parent
     if let Some(parent) = task.parent.upgrade() {
+        parent.signals.post_signal(crate::proc::signal::SIGCHLD);
+
+        // Wake parent's WaitChildFuture
         if let Some(waker) = parent.parent_waker.lock().take() {
+            waker.wake();
+        }
+        // Wake parent's top-level waker for signal delivery
+        if let Some(waker) = parent.top_level_waker.lock().take() {
             waker.wake();
         }
     }
@@ -1600,6 +1690,8 @@ fn do_exit(task: &Arc<Task>, status: i32) {
 
 /// Spawn a user task on the given CPU.
 pub fn spawn_user_task(task: Arc<Task>, cpu: usize) {
+    // Register in global task registry for kill/getpgid lookups
+    crate::proc::signal::register_task(&task);
     let handle = spawn_kernel_task(run_tasks(task), cpu);
     handle.detach();
 }

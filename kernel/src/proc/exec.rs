@@ -236,6 +236,26 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     // 6. Strip CLOEXEC fds (point of no return — exec will succeed)
     task.fd_table.lock().strip_cloexec();
 
+    // 7. Map sigcode trampoline page for signal delivery
+    {
+        let mut pmap = task.pmap.lock();
+        super::signal::map_sigcode_page(&mut pmap);
+    }
+
+    // 8. Reset signal dispositions: handlers reset to SIG_DFL on exec (POSIX)
+    {
+        let mut actions = task.signals.actions.lock();
+        for act in actions.iter_mut() {
+            if act.handler != super::signal::SIG_DFL && act.handler != super::signal::SIG_IGN {
+                act.handler = super::signal::SIG_DFL;
+                act.flags = 0;
+                act.mask = 0;
+            }
+        }
+    }
+    // Clear pending signals on exec
+    task.signals.pending.store(0, core::sync::atomic::Ordering::Relaxed);
+
     Ok((entry, USER_STACK_TOP))
 }
 

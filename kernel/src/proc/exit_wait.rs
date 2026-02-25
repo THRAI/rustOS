@@ -16,10 +16,21 @@ pub fn sys_exit(task: &Arc<Task>, code: i32) -> SyscallResult {
     // Transition to ZOMBIE with Release ordering
     task.set_zombie();
 
-    // Wake parent's WaitChildFuture if registered
+    // Unregister from global task registry
+    super::signal::unregister_task(task.pid);
+
+    // Wake parent's WaitChildFuture if registered, and post SIGCHLD
     if let Some(parent) = task.parent.upgrade() {
+        // Post SIGCHLD to parent
+        parent.signals.post_signal(super::signal::SIGCHLD);
+
         let waker = parent.parent_waker.lock().take();
         if let Some(w) = waker {
+            w.wake();
+        }
+        // Also wake parent's top-level waker for signal delivery
+        let tlw = parent.top_level_waker.lock().take();
+        if let Some(w) = tlw {
             w.wake();
         }
     }

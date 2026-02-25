@@ -10,7 +10,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use hal_common::{PhysAddr, TrapFrame, PAGE_SIZE};
 use hal_common::SpinMutex as Mutex;
 
@@ -20,6 +20,7 @@ use crate::mm::pmap::{self, Pmap};
 use crate::fs::fd_table::FdTable;
 
 use super::pid::alloc_pid;
+use super::signal::SignalState;
 
 /// Kernel stack size: 2 pages (8KB).
 const KSTACK_ORDER: usize = 1; // 2^1 = 2 pages
@@ -78,6 +79,12 @@ pub struct Task {
     pub kernel_sp: usize,
     /// Program break (brk). Page-aligned end of heap.
     pub brk: AtomicUsize,
+    /// Signal state (actions, pending, blocked, altstack).
+    pub signals: SignalState,
+    /// Process group ID.
+    pub pgid: AtomicU32,
+    /// Top-level waker for async signal injection (wake from kill).
+    pub top_level_waker: Mutex<Option<core::task::Waker>>,
 }
 
 /// Allocate a kernel stack (2 pages) and return (base, sp_top).
@@ -92,8 +99,11 @@ impl Task {
     /// Create a new task with the given parent.
     pub fn new(parent: Weak<Task>) -> Arc<Self> {
         let (kstack_base, kernel_sp) = alloc_kstack();
+        // Inherit pgid from parent if available, else use own pid
+        let pid = alloc_pid();
+        let pgid = parent.upgrade().map_or(pid, |p| p.pgid.load(Ordering::Relaxed));
         Arc::new(Self {
-            pid: alloc_pid(),
+            pid,
             parent,
             children: Mutex::new(Vec::new()),
             vm_map: Mutex::new(VmMap::new()),
@@ -106,14 +116,18 @@ impl Task {
             kstack_base,
             kernel_sp,
             brk: AtomicUsize::new(0),
+            signals: SignalState::new(),
+            pgid: AtomicU32::new(pgid),
+            top_level_waker: Mutex::new(None),
         })
     }
 
     /// Create init (pid 1) with no parent. Stdio fds pre-populated.
     pub fn new_init() -> Arc<Self> {
         let (kstack_base, kernel_sp) = alloc_kstack();
+        let pid = alloc_pid();
         Arc::new(Self {
-            pid: alloc_pid(),
+            pid,
             parent: Weak::new(),
             children: Mutex::new(Vec::new()),
             vm_map: Mutex::new(VmMap::new()),
@@ -126,6 +140,9 @@ impl Task {
             kstack_base,
             kernel_sp,
             brk: AtomicUsize::new(0),
+            signals: SignalState::new(),
+            pgid: AtomicU32::new(pid),
+            top_level_waker: Mutex::new(None),
         })
     }
 

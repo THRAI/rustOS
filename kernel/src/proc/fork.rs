@@ -56,6 +56,20 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
         core::sync::atomic::Ordering::Relaxed,
     );
 
+    // Inherit pgid from parent (already done in Task::new via parent Weak).
+    // Clear pending signals in child (POSIX: pending signals not inherited).
+    child.signals.pending.store(0, core::sync::atomic::Ordering::Relaxed);
+    // Copy signal actions from parent.
+    {
+        let parent_actions = parent.signals.actions.lock();
+        *child.signals.actions.lock() = *parent_actions;
+    }
+    // Copy blocked mask from parent.
+    child.signals.blocked.store(
+        parent.signals.blocked.load(core::sync::atomic::Ordering::Relaxed),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
     // Register child in parent's children list
     parent.children.lock().push(Arc::clone(&child));
 

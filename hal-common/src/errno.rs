@@ -19,6 +19,7 @@ pub enum Errno {
     ESPIPE,
     EINTR,
     ETIMEDOUT,
+    ESRCH,
 }
 
 impl Errno {
@@ -43,6 +44,7 @@ impl Errno {
             Errno::ESPIPE => 29,
             Errno::EINTR => 4,
             Errno::ETIMEDOUT => 110,
+            Errno::ESRCH => 3,
         }
     }
 }

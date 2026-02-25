@@ -9,19 +9,19 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 
 ## Current Position
 
-Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — PLANNED
-Plan: 0 of 4 in current phase — ready for execution
-Status: Phase 4 plans created, ready for `/gsd:execute-phase 4`
-Last activity: 2026-02-25 -- Phase 4 planning complete (4 plans across 3 waves)
+Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — IN PROGRESS
+Plan: 1 of 4 in current phase — 04-01 complete
+Status: Three-layer FD model + pipes + device nodes + dup/dup2/dup3 implemented
+Last activity: 2026-02-25 -- Plan 04-01 complete (8min)
 
-Progress: [░░░░░░░░░░] 0% (Phase 4)
+Progress: [██░░░░░░░░] 25% (Phase 4)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 16
+- Total plans completed: 17
 - Average duration: 7min
-- Total execution time: 1.68 hours
+- Total execution time: 1.81 hours
 
 **By Phase:**
 
@@ -31,9 +31,10 @@ Progress: [░░░░░░░░░░] 0% (Phase 4)
 | 2 | 5/5 | 24min | 5min |
 | 3 | 5/5 | 51min | 10min |
 | 3.1 | 1/1 | 6min | 6min |
+| 4 | 1/4 | 8min | 8min |
 
 **Recent Trend:**
-- Last 5 plans: 6min, 8min, 10min, 7min, 6min
+- Last 5 plans: 8min, 10min, 7min, 6min, 8min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -101,6 +102,12 @@ Recent decisions affecting current work:
 - [03.1-01]: Access faults (5,7) share same match arm as page faults (12,13,15) — pcb_onfault checked first for all
 - [03.1-01]: Store access fault mapped to WRITE access type for fault resolution fallthrough
 
+- [04-01]: Three-layer FD model: FdTable(Vec) -> FileDescription(Arc, shared) -> FileObject(enum Vnode|Pipe|Device)
+- [04-01]: PipeReadFuture/PipeWriteFuture as explicit Future impls for waker registration
+- [04-01]: Console read returns EOF (no input buffer until signal infrastructure)
+- [04-01]: ioctl writes directly to user memory via ptr::copy_nonoverlapping (console fds only)
+- [04-01]: Stdio pre-populated in new_with_stdio: fd 0=ConsoleRead, fd 1/2=ConsoleWrite
+
 ### Pending Todos
 
 None yet.
@@ -112,5 +119,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-25
-Stopped at: Phase 4 planning complete (4 plans, 3 waves), ready for `/gsd:execute-phase 4`
+Stopped at: Plan 04-01 complete, ready for 04-02
 Resume file: None

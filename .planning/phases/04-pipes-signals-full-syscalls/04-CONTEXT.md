@@ -25,6 +25,29 @@ IPC pipes, POSIX signal delivery, device nodes (/dev/null, /dev/zero, /dev/conso
   2. **PC bounds check**: `sepc < USER_MAX_VA` — reject kernel-space return addresses with SIGSEGV.
   3. **CSR immunity**: Only restore GPRs (a0-a7, t0-t6, s0-s11) and sanitized sstatus/sepc from ucontext. Never restore satp, sscratch, or any privileged CSR from user-provided data.
 
+### Syscall Restart & EINTR Policy
+- **Two equivalence classes**: Blocking syscalls split into idempotent state-driven (restartable) vs time/sync-driven (always EINTR).
+- **Restart whitelist** (SA_RESTART → `sepc -= 4`): read, write, wait4. These are idempotent — retrying doesn't corrupt state.
+- **Always EINTR**: nanosleep (must write remaining time to `rem` pointer — time is irreversible), futex_wait (user-space atomic may have mutated during handler — must re-evaluate CAS).
+- **Restart mechanism**: Syscall dispatcher checks if signal was just delivered + SA_RESTART set + syscall in whitelist → `trap_frame.sepc -= 4` (rewind to ecall instruction), clear return value. On sret, CPU re-executes ecall as if freshly issued by userspace.
+- **Non-restart path**: Preserve `a0 = -EINTR`, return to userspace.
+
+### Async Signal Injection (Cooperative Cancellation)
+- **Injection (O(1))**: `sys_kill` does `target.pending_signals.fetch_or(signal_bit)` + `target.top_level_waker.wake()`. Two atomic ops, no lock.
+- **Top-level Waker**: Task struct holds a persistent waker that always re-enqueues to runqueue, orthogonal to whatever subsystem wait queue (pipe, timer, futex) holds a copy.
+- **Guard clause**: Every blocking `poll` method checks `current_task().has_unmasked_pending_signals()` at entry. If set → `Poll::Ready(Err(EINTR))`. No destructive cancellation — task wakes, re-enters poll, hits guard, exits cleanly.
+
+### Process Groups (Minimal pgrp)
+- **pgid field**: `pgid: u32` in Task struct. Inherited from parent on fork.
+- **Syscalls**: `setpgid(pid, pgid)` and `getpgid(pid)`. busybox sh uses these to group pipeline members.
+- **Broadcast kill**: `kill(-pgrp, sig)` iterates global task list, applies cooperative signal injection to all tasks matching pgid.
+- **No sessions**: No `setsid`, no `tcsetpgrp`, no SIGTTIN/SIGTTOU, no controlling terminal concept. Full job control deferred.
+
+### wait4 / Zombie Lifecycle
+- **Parent waiter_waker**: Stored in parent's Task struct. `sys_wait4` registers waker and returns `Poll::Pending`.
+- **Child exit sequence**: Close all FDs (triggers pipe death) → clear VmMap (release physical memory) → zombie state (retain Task struct + exit code) → wake parent's `waiter_waker`.
+- **Reap**: Parent wakes from wait4, finds zombie in child list, extracts exit code, drops Task struct completely.
+
 ### Pipe & Futex Design
 - **Fixed 4KB ring buffer**: No dynamic resizing. Writer returns `Poll::Pending` when full, reader returns `Poll::Pending` when empty. `IrqSafeSpinLock` protects `PipeInner`.
 - **Waker storage**: `Option<Waker>` per end (not `Vec<Waker>`). Unconditional overwrite on each poll — zero leak, zero `will_wake` scan. Sufficient for 1:1 shell pipe topology. **Tech debt**: M:N multi-reader pipes need upgrade to dedup wait queue in future phase.
@@ -33,22 +56,53 @@ IPC pipes, POSIX signal delivery, device nodes (/dev/null, /dev/zero, /dev/conso
 - **SIGPIPE death detection**: Reader Drop sets `reader_closed = true` + wakes all sleeping writers. Writer poll sees `reader_closed` → returns `EPIPE` → syscall layer posts SIGPIPE to calling task → delivered at userret.
 - **Futex**: Process-private only. Keyed by **physical address** (walk page table on trap entry to get PA). Global `HashMap<PhysAddr, Vec<Waker>>`. FUTEX_WAIT: atomic compare + park. FUTEX_WAKE: wake N waiters.
 
-### Three-Layer FD Model (BSD-style)
-- **Layer 1 — FdTable** (per-process): `SpinMutex<Vec<Option<(Arc<FileDescription>, FdFlags)>>>`. Index = fd number. `FdFlags` is per-slot (contains FD_CLOEXEC). Never shared across fork — each process gets its own FdFlags copy.
-- **Layer 2 — FileDescription** (shared via Arc on dup/fork): Contains `FileObject` + `SpinMutex<u32>` (file status flags: O_NONBLOCK, O_APPEND) + `SpinMutex<u64>` (offset, only meaningful for vnodes).
-- **Layer 3 — FileObject** (enum): `Vnode(Arc<dyn Vnode>)`, `Pipe(Arc<PipeEnd>)`, `Device(DeviceType)`. `match desc.object` routes read/write/ioctl.
-- **POSIX flag separation**: File Status Flags (O_NONBLOCK, O_APPEND) → `FileDescription::flags` (shared). File Descriptor Flags (FD_CLOEXEC) → `FdTable` slot-local (per-process, never shared). Critical for fork safety.
-- **dup/dup2/dup3**: `Arc::clone(entries[old])` into new slot. dup2 atomically replaces target slot under single SpinMutex. Old FileDescription dropped outside lock — actual close runs when last Arc ref drops.
-- **O_CLOEXEC sweep in exec**: After point-of-no-return (old VmMap destroyed), iterate FdTable entries, `.take()` any slot with `FdFlags::CLOEXEC` set.
+### mmap / brk Behavior
+- **MAP_FIXED**: Silently overwrite existing mappings in the range (BSD behavior — `vm_map_delete` before insert).
+- **Address space layout (BSD)**: Stack at top of user VA, mmap region allocated top-down (searching downward from below stack), brk grows upward from .bss end. Maximum separation between zones.
+- **brk region**: Single accordion VmArea extending from page-aligned .bss end. `brk_current` pointer slides monotonically within this region. In-place expand/shrink as designed in Phase 3.
+- **mmap region**: Fragmented playground of discrete VMAs with varying permissions and backing. `find_free_area` searches downward from mmap base, never crosses into brk growth path.
+- **mmap scope**: Anonymous (MAP_ANONYMOUS + MAP_PRIVATE) and private file-backed (MAP_PRIVATE with file). No MAP_SHARED — avoids writeback state machine entirely.
+  - **Anonymous**: Zero-page on demand. Satisfies musl malloc.
+  - **Private file-backed**: Read → page cache RO mapping. Write fault → COW to anonymous page (allocate new frame, copy file data, map R|W). Modifications never pollute page cache, no disk writeback. Reuses Phase 3's `fault_in_page` logic.
 
-### Syscall Surface & mmap
-- **Full mmap** (anonymous + file-backed):
-  - `sys_mmap` is pure metadata — parse FD, validate alignment, insert VMA into VmMap, return VA. Zero I/O, zero physical allocation. Demand paging handles the rest.
-  - **MAP_SHARED**: pmap_enter directly maps Page Cache physical frame to user PTE with R|W. Dirty bit tracked by hardware. Writeback via lwext4 on msync/munmap. Cache coherence is free — sys_read's uiomove reads from the same Page Cache frame.
-  - **MAP_PRIVATE**: Read fault maps Page Cache frame as read-only. Write fault triggers COW — allocate anonymous page, copy data, map R|W, attach to shadow object. Write never modifies underlying file.
-- **munmap/mprotect/brk**: Complete implementation for malloc-heavy workloads.
-- **clock_gettime**: `rdtime` CSR direct (RISC-V cycle counter, S-mode accessible). Convert to nanoseconds via `timebase-frequency` from FDT. No SBI ecall overhead.
-- **nanosleep**: Async sleep via executor timer wheel. Tick-granularity resolution (bounded by timer IRQ period). Interruptible by signals (returns EINTR with remaining time). Tech debt: upgrade to one-shot timer for sub-tick precision if needed later.
+### FetchGuard Abort Safety (Page Cache)
+- **RAII FetchGuard**: Wraps the alpha wolf's I/O fetch. Holds reference to the CacheEntry in Fetching state.
+- **Drop rollback**: On unexpected drop (SIGKILL, timeout), Guard's `Drop` impl rolls back `Fetching → Absent`, extracts and wakes all queued wakers. Next woken thread re-claims alpha wolf role and re-initiates I/O from scratch.
+- **Zero-fill tail**: Mandatory `memset(0)` of `(PAGE_SIZE - bytes_read)` on partial-page file reads (e.g., 5000-byte file, second page gets 904 bytes of data + 3192 bytes zeroed) before promoting to Ready. Non-negotiable security contract — prevents stale frame data leaking to userspace.
+
+### Three-Layer FD Model (BSD-style)
+- **Layer 1 — FdTable** (per-process): `SpinMutex<Vec<Option<(Arc<FileDescription>, FdFlags)>>>`. Index = fd number. FdFlags (bitflags) stored per-slot, not per-file.
+- **Layer 2 — FileDescription** (shared across dup/fork): `Arc<FileDescription>` with `offset: AtomicU64`, `flags: AtomicU32`, `file_object: FileObject`. Shared between parent/child after fork, between original/dup'd fds.
+- **Layer 3 — FileObject** (the backing resource): `enum FileObject { Vnode(Arc<Vnode>), Pipe(Arc<PipeEnd>), Device(DeviceNode) }`. Devices are peers of Vnode and Pipe, not subtypes.
+
+### Close-on-exec & FD Inheritance
+- **FdFlags**: `bitflags! { CLOEXEC = 0o2000000 }` per fd slot in FdTable.
+- **dup/dup2**: Clone `Arc<FileDescription>`, clear CLOEXEC on new fd (POSIX requirement).
+- **dup3**: Clone Arc, set CLOEXEC if O_CLOEXEC passed.
+- **pipe2(O_CLOEXEC)**: Both read and write fds get CLOEXEC set.
+- **fork**: Clone all entries — `Arc::clone` + copy FdFlags to child's FdTable.
+- **exec**: Past point-of-no-return, iterate entries, `.take()` all slots with CLOEXEC set. Drop triggers resource cleanup.
+
+### execve User Stack ABI (RISC-V Sv39)
+- **Byte-level layout** (high address → low address):
+  1. String payloads (envp strings, argv strings, null-terminated)
+  2. Padding (0–15 bytes to ensure final sp is 16-byte aligned)
+  3. Auxiliary vectors (`{u64 a_type, u64 a_val}` pairs: AT_PAGESZ, AT_RANDOM, terminated by AT_NULL)
+  4. envp pointer array (terminated by NULL)
+  5. argv pointer array (terminated by NULL)
+  6. argc (u64)
+- **sp**: Points to argc. Must be 16-byte aligned. Computed by subtracting total payload size from stack top and rounding down to 16.
+- **Register contract**: `a0 = 0` (no dynamic linker cleanup function). All startup data delivered via sp-pointed memory.
+- **Alignment failure = instant death**: musl `_start` asm triggers alignment fault or segfault if sp is not 16-byte aligned.
+
+### Syscall Surface
+- **mmap/munmap/mprotect**: As described above. MAP_ANONYMOUS, MAP_PRIVATE, MAP_FIXED.
+- **brk**: In-place VmArea expand/shrink.
+- **dup/dup2/dup3**: With CLOEXEC semantics as described.
+- **lseek**: Adjust FileDescription offset. SEEK_SET, SEEK_CUR, SEEK_END.
+- **fstat**: Return stat struct from vnode metadata.
+- **clock_gettime**: CLOCK_MONOTONIC and CLOCK_REALTIME via rdtime CSR.
+- **nanosleep**: Async sleep via executor timer wheel. Interruptible by signals (returns EINTR with remaining time in `rem`).
 
 ### Devfs & Device Nodes
 - **Static device table**: No full devfs filesystem. Static table of DeviceNode entries with name + enum dispatch. VFS lookup for `/dev/*` paths hits this table. Devices: null, zero, console.
@@ -68,8 +122,9 @@ IPC pipes, POSIX signal delivery, device nodes (/dev/null, /dev/zero, /dev/conso
 - Exact ring buffer implementation details (head/tail pointers vs index arithmetic)
 - Signal pending set data structure (bitmap vs bitflags)
 - Futex hash table sizing
-- Auxiliary vector entries beyond AT_PAGESZ in exec
+- Auxiliary vector entries beyond AT_PAGESZ/AT_RANDOM in exec
 - Exact timer wheel tick period (10ms suggested, tunable)
+- pgrp index structure (linear scan vs HashMap<pgid, Vec<TaskRef>>)
 
 </decisions>
 
@@ -80,8 +135,12 @@ IPC pipes, POSIX signal delivery, device nodes (/dev/null, /dev/zero, /dev/conso
 - FreeBSD's `pipe_write()` verified for PIPE_BUF atomicity (`sys/kern/sys_pipe.c:1261-1263`)
 - FreeBSD's `struct file` with `f_type`/`f_ops`/`f_data` verified as reference for three-layer fd model (`sys/sys/file.h`)
 - FreeBSD's `/dev/null` implementation verified (`sys/dev/null/null.c`) — `null_write` sets `uio_resid = 0`, `zero_read` uses `uiomove` from `zero_region`
+- FreeBSD's `vm_mmap_object()` → `vm_map_fixed()` → `vm_map_delete()` verified for MAP_FIXED overwrite behavior
+- FreeBSD address space layout: stack at top, mmap top-down, brk up from .bss — verified as reference for VA zone separation
 - musl `isatty()` uses `ioctl(TIOCGWINSZ)`, NOT `tcgetattr`/`TCGETS` — verified via Linux kernel changelog. Both TIOCGWINSZ and TCGETS needed for musl + busybox compatibility.
 - Console read future must use timer wheel as pseudo-IRQ to avoid waker starvation in async executor
+- RISC-V ecall is fixed 4 bytes — restart via `sepc -= 4` is the hardware-level PC rewind, not a kernel-side retry loop
+- nanosleep EINTR must write remaining time to user `rem` pointer — POSIX strict requirement, never auto-restart
 
 </specifics>
 
@@ -92,6 +151,8 @@ IPC pipes, POSIX signal delivery, device nodes (/dev/null, /dev/zero, /dev/conso
 - **VirtIO console driver**: Replace SBI polling with interrupt-driven I/O for proper async console.
 - **One-shot timer precision**: Upgrade timer wheel to support hardware timer reprogramming for sub-tick nanosleep accuracy.
 - **Full termios state machine**: Real echo, line buffering, signal character processing (Ctrl+C → SIGINT). Current stub just stores/returns the struct.
+- **MAP_SHARED**: Requires writeback state machine and page cache dirty tracking. Deferred to avoid complexity.
+- **Full job control**: Sessions (`setsid`), controlling terminal (`tcsetpgrp`), SIGTTIN/SIGTTOU for background process TTY access. Requires TTY line discipline rewrite.
 
 </deferred>
 

@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — IN PROGRESS
-Plan: 1 of 4 in current phase — 04-01 complete
-Status: Three-layer FD model + pipes + device nodes + dup/dup2/dup3 implemented
-Last activity: 2026-02-25 -- Plan 04-01 complete (8min)
+Plan: 3 of 4 in current phase — 04-03 complete
+Status: Real mmap/munmap/mprotect + lseek/fstat/clock_gettime/nanosleep/futex implemented
+Last activity: 2026-02-25 -- Plan 04-03 complete (~8min)
 
-Progress: [██░░░░░░░░] 25% (Phase 4)
+Progress: [██████░░░░] 50% (Phase 4)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 17
+- Total plans completed: 18
 - Average duration: 7min
-- Total execution time: 1.81 hours
+- Total execution time: 1.94 hours
 
 **By Phase:**
 
@@ -31,10 +31,10 @@ Progress: [██░░░░░░░░] 25% (Phase 4)
 | 2 | 5/5 | 24min | 5min |
 | 3 | 5/5 | 51min | 10min |
 | 3.1 | 1/1 | 6min | 6min |
-| 4 | 1/4 | 8min | 8min |
+| 4 | 2/4 | 16min | 8min |
 
 **Recent Trend:**
-- Last 5 plans: 8min, 10min, 7min, 6min, 8min
+- Last 5 plans: 10min, 7min, 6min, 8min, 8min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -108,6 +108,13 @@ Recent decisions affecting current work:
 - [04-01]: ioctl writes directly to user memory via ptr::copy_nonoverlapping (console fds only)
 - [04-01]: Stdio pre-populated in new_with_stdio: fd 0=ConsoleRead, fd 1/2=ConsoleWrite
 
+- [04-03]: Top-down mmap allocation below USER_STACK_TOP with MMAP_MIN floor
+- [04-03]: MAP_FIXED silently overwrites via remove_range + pmap_remove before insert
+- [04-03]: VMA split on partial munmap/mprotect creates fresh VmObjects (demand-paged)
+- [04-03]: Futex keyed by physical address via pmap_extract, global BTreeMap<usize, Vec<Waker>>
+- [04-03]: clock_gettime reads rdtime CSR, QEMU virt 10MHz timer frequency
+- [04-03]: nanosleep delegates to executor timer wheel sleep(ms)
+
 ### Pending Todos
 
 None yet.
@@ -119,5 +126,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-25
-Stopped at: Plan 04-01 complete, ready for 04-02
+Stopped at: Plan 04-03 complete, ready for 04-02 (signals) or 04-04 (integration)
 Resume file: None

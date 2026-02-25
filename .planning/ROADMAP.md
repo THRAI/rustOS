@@ -110,7 +110,7 @@ Plans:
 Plans:
 - [x] 04-01-PLAN.md — Three-layer FD model + pipes + device nodes + dup/dup2/dup3 (wave 1)
 - [ ] 04-02-PLAN.md — Signal delivery + sigreturn + process groups (wave 2)
-- [ ] 04-03-PLAN.md — Remaining syscalls: mmap/munmap/mprotect + lseek/fstat + clock_gettime/nanosleep + futex (wave 2)
+- [x] 04-03-PLAN.md — Remaining syscalls: mmap/munmap/mprotect + lseek/fstat + clock_gettime/nanosleep + futex (wave 2)
 - [ ] 04-04-PLAN.md — Signal-syscall integration + EINTR wiring + QEMU tests (wave 3)
 
 ### Phase 5: Page Reclamation + LA64 Port

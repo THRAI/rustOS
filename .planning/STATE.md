@@ -135,6 +135,7 @@ Recent decisions affecting current work:
 - [04-02]: sendsig builds SigFrame in kernel, copyout to user stack via copy_user_chunk
 - [04-02]: sigreturn sanitizes sstatus (SPP cleared, SPIE set), bounds-checks sepc < USER_MAX_VA
 - [Phase quick-1]: Replaced hardcoded kprintln in fault.rs with klog!(vm,...) for consistency
+- [Phase quick-2]: Display newtype pattern for klog — Signal(u8) wraps at call site, constants stay u8
 
 ### Pending Todos
 
@@ -149,9 +150,10 @@ None yet.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 1 | Add klog tracks (signal, exec, pipe, proc) + replenish existing modules | 2026-02-26 | b39fe04 | [1-add-debugger-log-to-each-module-followin](./quick/1-add-debugger-log-to-each-module-followin/) |
+| 2 | Display impls for Signal and PageFaultAccessType in klog output | 2026-02-26 | 9920f31 | [2-add-debug-trait-for-klog-arguments-follo](./quick/2-add-debug-trait-for-klog-arguments-follo/) |
 
 ## Session Continuity
 
-Last activity: 2026-02-26 - Completed quick task 1: Add klog tracks
+Last activity: 2026-02-26 - Completed quick task 2: Display impls for klog arguments
 Stopped at: Plan 04-02 complete, ready for 04-04 (integration/remaining syscalls)
 Resume file: None

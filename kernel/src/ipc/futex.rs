@@ -23,6 +23,7 @@ static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<usize, Vec<Waker>>> =
 /// Park the current task on a futex key (physical address).
 /// Returns a future that completes when woken by futex_wake or interrupted by signal.
 pub async fn futex_wait(pa_key: PhysAddr, task: &Arc<Task>) -> Result<(), Errno> {
+    klog!(proc, debug, "futex_wait pid={} key={:#x}", task.pid, pa_key.as_usize());
     FutexWaitFuture { pa_key: pa_key.as_usize(), registered: false, task }.await
 }
 
@@ -50,6 +51,7 @@ pub fn futex_wake(pa_key: PhysAddr, count: usize) -> usize {
         table.remove(&key);
     }
 
+    klog!(proc, debug, "futex_wake key={:#x} woken={}", key, woken);
     woken
 }
 

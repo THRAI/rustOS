@@ -11,6 +11,7 @@ use super::syscall_result::SyscallResult;
 
 /// Exit the current process: store exit status, transition to ZOMBIE, wake parent.
 pub fn sys_exit(task: &Arc<Task>, code: i32) -> SyscallResult {
+    klog!(proc, debug, "exit pid={} code={}", task.pid, code);
     // Store exit status with Release ordering
     task.exit_status.store(code, Ordering::Release);
     // Transition to ZOMBIE with Release ordering
@@ -65,8 +66,14 @@ impl Future for WaitChildFuture {
             *waker_slot = Some(cx.waker().clone());
         }
 
-        // Step 2: Scan children for any ZOMBIE (check zombies BEFORE signal guard)
+        // Step 2: If no children at all, return None (ECHILD)
         let children = self.parent.children.lock();
+        if children.is_empty() {
+            *self.parent.parent_waker.lock() = None;
+            return Poll::Ready(None);
+        }
+
+        // Step 3: Scan children for any ZOMBIE
         for child in children.iter() {
             if child.state() == TaskState::Zombie {
                 let pid = child.pid;
@@ -75,6 +82,8 @@ impl Future for WaitChildFuture {
 
                 // Remove the zombie child from parent's children list
                 self.parent.children.lock().retain(|c| c.pid != pid);
+
+                klog!(proc, debug, "wait4 reaped pid={} status={}", pid, status);
 
                 // Clear waker since we're done
                 *self.parent.parent_waker.lock() = None;

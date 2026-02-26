@@ -87,16 +87,23 @@ pub fn sync_fault_handler(
     // 1. Find the VMA containing the faulting address.
     let vma = match vm_map.find_area(fault_va) {
         Some(vma) => vma,
-        None => return FaultResult::Error(FaultError::NotMapped),
+        None => {
+            klog!(vm, debug, "fault NOT_MAPPED va={:#x}", fault_va.0);
+            return FaultResult::Error(FaultError::NotMapped);
+        }
     };
+
+    klog!(vm, debug, "fault ENTER va={:#x} aligned={:#x} type={:?} prot={:?} range=[{:#x}..{:#x})",
+        fault_va.0, fault_va_aligned.0, vma.vma_type, vma.prot,
+        vma.range.start.0, vma.range.end.0);
 
     // 2. Check permissions.
     if !access_type.permitted_by(vma.prot) {
-        // Special case: write to a readable VMA might be COW.
-        // COW is detected below when we find a read-only mapping
-        // in a writable VMA. If the VMA itself doesn't allow write,
-        // it's truly invalid.
         if !(access_type.write && vma.prot.contains(MapPerm::R)) {
+            klog!(vm, debug, "fault PERM_DENIED va={:#x} type={:?} prot={:?} w={} r={} x={}",
+                fault_va.0, vma.vma_type, vma.prot,
+                access_type.write, access_type.read, access_type.execute
+            );
             return FaultResult::Error(FaultError::InvalidAccess);
         }
     }
@@ -106,7 +113,9 @@ pub fn sync_fault_handler(
         + vma.obj_offset;
 
     // 4. Classify and handle the fault.
-    classify_and_handle(vma, offset, fault_va_aligned, access_type, pmap)
+    let result = classify_and_handle(vma, offset, fault_va_aligned, access_type, pmap);
+    klog!(vm, debug, "fault RESULT va={:#x} => {:?}", fault_va.0, result);
+    result
 }
 
 /// Classify the fault and handle it.
@@ -117,19 +126,21 @@ fn classify_and_handle(
     access_type: PageFaultAccessType,
     pmap: &mut Pmap,
 ) -> FaultResult {
-    // Check if the VMA is file-backed (Cached type).
-    if vma.vma_type == VmAreaType::FileBacked || vma.vma_type == VmAreaType::Device {
-        // File-backed faults need async I/O -- deferred to Phase 3.
-        return FaultResult::NeedsAsyncIO;
-    }
-
-    // Look up the page in the shadow chain.
+    // Look up the page in the VmObject shadow chain FIRST — even for
+    // file-backed VMAs. After fork, the child's shadow object may already
+    // contain the page (COW from parent). Only fall through to async I/O
+    // if the page is truly absent.
     let existing_page = {
         let obj = vma.object.read();
         obj.lookup_page(offset)
     };
 
     match existing_page {
+        None if vma.vma_type == VmAreaType::FileBacked || vma.vma_type == VmAreaType::Device => {
+            // Page not in VmObject and VMA is file-backed — need async I/O.
+            klog!(vm, debug, "fault NeedsAsyncIO va={:#x}", fault_va_aligned.0);
+            FaultResult::NeedsAsyncIO
+        }
         None => {
             // (a) Anonymous fault: page not in any VmObject in chain.
             handle_anonymous_fault(vma, offset, fault_va_aligned, pmap)
@@ -138,11 +149,10 @@ fn classify_and_handle(
             // (b) COW fault: write to read-only page in a writable VMA.
             handle_cow_fault(vma, offset, fault_va_aligned, _old_phys, pmap)
         }
-        Some(_) => {
-            // Page exists and access is not a write-to-COW.
-            // This shouldn't normally happen (page is mapped but we faulted).
-            // Could be a race or a permission issue already checked above.
-            FaultResult::Error(FaultError::InvalidAccess)
+        Some(phys) => {
+            // Page exists in VmObject but not in pmap — re-establish mapping.
+            let _ = pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.prot, false);
+            FaultResult::Resolved
         }
     }
 }

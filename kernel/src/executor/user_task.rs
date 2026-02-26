@@ -83,6 +83,8 @@ impl SyscallId {
     const SETPGID: Self = Self(154);
     const GETPGID: Self = Self(155);
     const SIGALTSTACK: Self = Self(132);
+    const PPOLL: Self = Self(73);
+    const FCNTL: Self = Self(25);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -132,6 +134,8 @@ impl core::fmt::Display for SyscallId {
             Self::SETPGID => "setpgid",
             Self::GETPGID => "getpgid",
             Self::SIGALTSTACK => "sigaltstack",
+            Self::PPOLL => "ppoll",
+            Self::FCNTL => "fcntl",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -160,6 +164,14 @@ async fn run_tasks(task: Arc<Task>) {
     SignalWakeHelper(&task).await;
 
     loop {
+        // Activate per-process page table before signal delivery and returning to user mode.
+        // sendsig writes the signal frame to the user stack via copy_user_chunk,
+        // which requires the task's pmap to be active.
+        {
+            let mut pmap = task.pmap.lock();
+            crate::mm::pmap::pmap_activate(&mut pmap);
+        }
+
         // Check for pending signals before returning to user mode.
         match crate::proc::signal::check_pending_signals(&task) {
             Ok(_) => {}       // signal delivered (or none pending), continue
@@ -167,12 +179,6 @@ async fn run_tasks(task: Arc<Task>) {
                 do_exit(&task, -9); // killed by signal
                 break;
             }
-        }
-
-        // Activate per-process page table before returning to user mode.
-        {
-            let mut pmap = task.pmap.lock();
-            crate::mm::pmap::pmap_activate(&mut pmap);
         }
 
         klog!(sched, debug, "run_tasks: calling trap_return pid={}", task.pid);
@@ -248,28 +254,11 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
     // Exception handling
     match code {
         EXC_ECALL_U => {
-            // Advance PC past ecall
-            { task.trap_frame.lock().sepc += 4; }
+            // sepc advance is done inside dispatch_syscall (skipped for sigreturn)
             dispatch_syscall(task).await
         }
         EXC_LOAD_ACCESS_FAULT | EXC_STORE_ACCESS_FAULT |
         EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
-            // FINDING-01 fix: check pcb_onfault for copy_user fixup.
-            // When copy_user_chunk faults from an async syscall handler,
-            // the trap comes through __user_trap, not __kernel_trap.
-            // We must redirect to the landing pad just like kernel_trap_handler does.
-            {
-                let pc = crate::executor::per_cpu::current();
-                let onfault = pc.pcb_onfault.load(core::sync::atomic::Ordering::Relaxed);
-                if onfault != 0 {
-                    // Redirect sepc to landing pad
-                    task.trap_frame.lock().sepc = onfault;
-                    pc.pcb_onfault.store(0, core::sync::atomic::Ordering::Relaxed);
-                    return TrapResult::Continue;
-                }
-            }
-
-            // No fixup — real user page fault, try to resolve it.
             let fault_va = VirtAddr::new(stval & !(PAGE_SIZE - 1));
             let access_type = match code {
                 EXC_STORE_PAGE_FAULT | EXC_STORE_ACCESS_FAULT => PageFaultAccessType::WRITE,
@@ -277,16 +266,35 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                 _ => PageFaultAccessType::READ,
             };
 
-            if let Err(e) = resolve_user_fault(task, fault_va, access_type).await {
-                let pc = task.trap_frame.lock().sepc;
-                klog!(trap, error,
-                    "fatal fault: pid={} va={:#x} pc={:#x} code={} err={:?}",
-                    task.pid, stval, pc, code, e
-                );
-                // Deliver SIGSEGV. If no handler, check_pending_signals will kill.
-                task.signals.post_signal(crate::proc::signal::SIGSEGV);
+            // Try to resolve the fault first (demand paging). pcb_onfault is
+            // only a fallback — if the page can be mapped, the CPU retries the
+            // faulting instruction and the copy continues transparently.
+            match resolve_user_fault(task, fault_va, access_type).await {
+                Ok(_) => {
+                    // Page resolved — return to the faulting instruction.
+                    // pcb_onfault (if set) stays armed for future faults.
+                    TrapResult::Continue
+                }
+                Err(e) => {
+                    // Resolution failed. If pcb_onfault is set (copy_user_chunk),
+                    // redirect to the EFAULT landing pad instead of killing.
+                    let percpu = crate::executor::per_cpu::current();
+                    let onfault = percpu.pcb_onfault.load(core::sync::atomic::Ordering::Relaxed);
+                    if onfault != 0 {
+                        task.trap_frame.lock().sepc = onfault;
+                        percpu.pcb_onfault.store(0, core::sync::atomic::Ordering::Relaxed);
+                        return TrapResult::Continue;
+                    }
+                    // No fixup — truly fatal user fault.
+                    let pc = task.trap_frame.lock().sepc;
+                    klog!(trap, error,
+                        "fatal fault: pid={} va={:#x} pc={:#x} code={} err={:?}",
+                        task.pid, stval, pc, code, e
+                    );
+                    task.signals.post_signal(crate::proc::signal::SIGSEGV);
+                    TrapResult::Continue
+                }
             }
-            TrapResult::Continue
         }
         _ => {
             klog!(trap, error,
@@ -319,6 +327,26 @@ async fn resolve_user_fault(
     fault_va: VirtAddr,
     access_type: PageFaultAccessType,
 ) -> Result<(), FaultError> {
+    // Fast path: if the page is already mapped with sufficient permissions, skip.
+    // Must check PTE flags — not just presence — to avoid bypassing COW faults.
+    {
+        let pmap = task.pmap.lock();
+        let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
+        if let Some((_pa, flags)) = crate::mm::pmap::pmap_extract_with_flags(&pmap, fault_va_aligned) {
+            use crate::mm::pmap::pte::PteFlags;
+            let mut ok = true;
+            if access_type.write && !flags.contains(PteFlags::W) {
+                ok = false; // COW page — must go through fault handler
+            }
+            if access_type.execute && !flags.contains(PteFlags::X) {
+                ok = false;
+            }
+            if ok {
+                return Ok(());
+            }
+        }
+    }
+
     // 1. Sync path: anonymous zero-fill, COW
     let sync_result = {
         let vm_map = task.vm_map.lock();
@@ -329,14 +357,27 @@ async fn resolve_user_fault(
     match sync_result {
         FaultResult::Resolved => Ok(()),
         FaultResult::NeedsAsyncIO => {
+            klog!(vm, error,
+                "resolve_user_fault: NeedsAsyncIO pid={} va={:#x}",
+                task.pid, fault_va.as_usize()
+            );
             // 2. Async path: file-backed pages
             fault_in_page_async(task, fault_va).await
         }
-        FaultResult::Error(e) => Err(e),
+        FaultResult::Error(e) => {
+            klog!(vm, error,
+                "resolve_user_fault: sync FAILED pid={} va={:#x} err={:?}",
+                task.pid, fault_va.as_usize(), e
+            );
+            Err(e)
+        }
     }
 }
 
 /// Async file-backed page fault resolution with TOCTOU re-validation.
+///
+/// Also handles anonymous VMAs (stack, heap, BSS) that reach this path:
+/// allocate a zeroed frame and map it directly.
 async fn fault_in_page_async(
     task: &Arc<Task>,
     fault_va: VirtAddr,
@@ -345,8 +386,54 @@ async fn fault_in_page_async(
     let (vnode_id, vnode_path, file_offset, file_size, _vma_file_offset, vma_start) = {
         let map = task.vm_map.lock();
         let vma = map.find_area(fault_va).ok_or(FaultError::NotMapped)?;
-        let vnode = vma.vnode.as_ref()
-            .ok_or(FaultError::InvalidAccess)?;
+        let vnode = match vma.vnode.as_ref() {
+            Some(v) => v,
+            None => {
+                // Anonymous VMA (stack, heap, BSS): allocate zeroed frame and map.
+                let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
+                let obj_offset = ((fault_va_aligned.as_usize() - vma.range.start.as_usize()) / PAGE_SIZE) as u64
+                    + vma.obj_offset;
+                let prot = vma.prot;
+
+                // TOCTOU: another core may have already resolved this fault.
+                {
+                    let obj = vma.object.read();
+                    if let Some(existing) = obj.lookup_page(obj_offset) {
+                        let mut pmap = task.pmap.lock();
+                        if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
+                            let _ = crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, existing, prot, false);
+                        }
+                        return Ok(());
+                    }
+                }
+
+                let frame = crate::mm::allocator::frame_alloc_sync()
+                    .ok_or(FaultError::OutOfMemory)?;
+                crate::mm::pmap::pmap_zero_page(frame);
+
+                {
+                    let mut obj = vma.object.write();
+                    // Re-check under write lock to avoid double-insert race.
+                    if let Some(existing) = obj.lookup_page(obj_offset) {
+                        // Another core won — use their page, free ours.
+                        drop(obj);
+                        crate::mm::allocator::frame_allocator::frame_free(frame);
+                        let mut pmap = task.pmap.lock();
+                        if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
+                            let _ = crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, existing, prot, false);
+                        }
+                        return Ok(());
+                    }
+                    obj.insert_page(obj_offset, crate::mm::vm::vm_object::OwnedPage::new_anonymous(frame));
+                }
+
+                let mut pmap = task.pmap.lock();
+                if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
+                    let _ = crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, frame, prot, false);
+                }
+                return Ok(());
+            }
+        };
         let page_idx = (fault_va.as_usize() - vma.range.start.as_usize()) / PAGE_SIZE;
         let file_offset = vma.file_offset + (page_idx * PAGE_SIZE) as u64;
         (
@@ -401,6 +488,21 @@ async fn fault_in_page_async(
 
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
         let mut pmap = task.pmap.lock();
+
+        // Guard: if the page is already mapped, don't overwrite it.
+        // This can happen when fault_in_user_buffer pre-faults a page that
+        // was already demand-paged in by a real hardware fault.
+        if let Some(_existing_pa) = crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned) {
+            // Free the frame we just allocated (BSS/partial paths) to avoid leak.
+            // For the FILE path, `pa` came from the page cache — don't free it.
+            if vma_page_byte_offset >= file_size
+                || vma_page_byte_offset + PAGE_SIZE as u64 > file_size
+            {
+                crate::mm::allocator::frame_free(pa);
+            }
+            return Ok(());
+        }
+
         let _ = crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, pa, vma.prot, false);
     }
 
@@ -610,6 +712,13 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         }
         SyscallId::SIGACTION => {
             // a0=signum, a1=act, a2=oldact
+            // Pre-fault user buffers for the synchronous copy_user_chunk calls
+            if a1 != 0 {
+                fault_in_user_buffer(task, a1, 32, PageFaultAccessType::READ).await;
+            }
+            if a2 != 0 {
+                fault_in_user_buffer(task, a2, 32, PageFaultAccessType::WRITE).await;
+            }
             match crate::proc::signal::sys_sigaction(task, a0, a1, a2) {
                 Ok(v) => v,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
@@ -617,6 +726,13 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         }
         SyscallId::SIGPROCMASK => {
             // a0=how, a1=set, a2=oldset, a3=sigsetsize
+            // Pre-fault user buffers for the synchronous copy_user_chunk calls
+            if a1 != 0 {
+                fault_in_user_buffer(task, a1, 8, PageFaultAccessType::READ).await;
+            }
+            if a2 != 0 {
+                fault_in_user_buffer(task, a2, 8, PageFaultAccessType::WRITE).await;
+            }
             match crate::proc::signal::sys_sigprocmask(task, a0, a1, a2) {
                 Ok(v) => v,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
@@ -668,18 +784,58 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         }
         SyscallId::TIMES => 0, // stub
         SyscallId::UNAME => {
-            // TODO: write utsname to user memory
-            0
+            // a0 = pointer to struct utsname (6 fields × 65 bytes each = 390 bytes)
+            match sys_uname(task, a0) {
+                Ok(()) => 0,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
         }
         SyscallId::IOCTL => {
             // a0=fd, a1=request, a2=argp
-            match sys_ioctl(task, a0 as u32, a1, a2) {
+            match sys_ioctl_async(task, a0 as u32, a1, a2).await {
                 Ok(v) => v as usize,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
 
+        SyscallId::GETCWD => {
+            // a0=buf, a1=size
+            match sys_getcwd(task, a0, a1) {
+                Ok(v) => v,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::FCNTL => {
+            // a0=fd, a1=cmd, a2=arg
+            match sys_fcntl(task, a0 as u32, a1 as u32, a2) {
+                Ok(v) => v,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+
         // --- Async syscalls ---
+        SyscallId::WRITEV => {
+            // a0=fd, a1=iov, a2=iovcnt
+            match sys_writev_async(task, a0 as u32, a1, a2).await {
+                Ok(n) => n,
+                Err(Errno::EINTR) => {
+                    maybe_restart_syscall(task);
+                    (-(Errno::EINTR.as_i32() as isize)) as usize
+                }
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::PPOLL => {
+            // a0=fds, a1=nfds, a2=timeout_ts, a3=sigmask
+            match sys_ppoll_async(task, a0, a1, a2).await {
+                Ok(n) => n,
+                Err(Errno::EINTR) => {
+                    maybe_restart_syscall(task);
+                    (-(Errno::EINTR.as_i32() as isize)) as usize
+                }
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
         SyscallId::WRITE => {
             // a0=fd, a1=buf, a2=len
             match sys_write_async(task, a0 as u32, a1, a2).await {
@@ -748,14 +904,14 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::EXECVE => {
             // a0=pathname, a1=argv, a2=envp
             // Read pathname from user memory
-            let path = match copyinstr(a0, 256) {
+            let path = match copyinstr(task, a0, 256).await {
                 Some(s) => s,
                 None => return set_syscall_ret(task, (-(Errno::EFAULT.as_i32() as isize)) as usize),
             };
             // Read argv array from user memory (before exec destroys address space)
-            let argv = copyin_argv(a1, 64, 4096);
+            let argv = copyin_argv(task, a1, 64, 4096).await;
             // Read envp array (optional, musl can cope with empty)
-            let envp = copyin_argv(a2, 64, 4096);
+            let envp = copyin_argv(task, a2, 64, 4096).await;
 
             match crate::proc::exec::exec_with_args(task, &path, &argv, &envp).await {
                 Ok((entry, sp)) => {
@@ -765,14 +921,15 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                     for i in 1..32 {
                         if i != 2 { tf.x[i] = 0; }
                     }
-                    tf.sstatus = 1 << 5; // SPP=0, SPIE=1
+                    tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                     return TrapResult::Continue;
                 }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
         SyscallId::WAIT4 => {
-            match sys_wait4_async(task, a0 as isize, a1).await {
+            let options = a2;
+            match sys_wait4_async(task, a0 as isize, a1, options).await {
                 Ok(pid) => pid as usize,
                 Err(Errno::EINTR) => {
                     maybe_restart_syscall(task);
@@ -788,13 +945,25 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
+        SyscallId::FSTATAT => {
+            // a0=dirfd, a1=pathname, a2=statbuf, a3=flags
+            match sys_fstatat_async(task, a1, a2).await {
+                Ok(()) => 0,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
         _ => {
             klog!(syscall, info, "unimplemented {}", id);
             (-38isize) as usize // ENOSYS
         }
     };
 
-    task.trap_frame.lock().set_ret_val(ret);
+    {
+        klog!(syscall, debug, "pid={} {} -> {:#x}", task.pid, id, ret);
+        let mut tf = task.trap_frame.lock();
+        tf.sepc += 4; // advance past ecall
+        tf.set_ret_val(ret);
+    }
     TrapResult::Continue
 }
 
@@ -1055,13 +1224,60 @@ fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
     }
 
     // Copy stat struct to user memory
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            &st as *const LinuxStat as *const u8,
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
             statbuf as *mut u8,
+            &st as *const LinuxStat as *const u8,
             core::mem::size_of::<LinuxStat>(),
-        );
+        )
+    };
+    if rc != 0 { return Err(Errno::EFAULT); }
+    Ok(())
+}
+
+/// sys_fstatat: stat a file by path (relative to dirfd).
+async fn sys_fstatat_async(
+    task: &Arc<Task>,
+    pathname_ptr: usize,
+    statbuf: usize,
+) -> Result<(), Errno> {
+    if statbuf == 0 {
+        return Err(Errno::EFAULT);
     }
+
+    let path_str = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+
+    // Resolve the path to a vnode
+    let vnode = crate::fs::path::resolve(&path_str).await?;
+
+    let mut st = LinuxStat {
+        st_dev: 0, st_ino: 0, st_mode: 0, st_nlink: 1,
+        st_uid: 0, st_gid: 0, st_rdev: 0, __pad1: 0,
+        st_size: 0, st_blksize: 4096, __pad2: 0, st_blocks: 0,
+        st_atime: 0, st_atime_nsec: 0,
+        st_mtime: 0, st_mtime_nsec: 0,
+        st_ctime: 0, st_ctime_nsec: 0,
+        __unused: [0; 2],
+    };
+
+    st.st_ino = vnode.vnode_id();
+    st.st_size = vnode.size() as i64;
+    st.st_blocks = ((vnode.size() + 511) / 512) as i64;
+    use crate::fs::vnode::VnodeType;
+    st.st_mode = match vnode.vtype() {
+        VnodeType::Regular => 0o100755, // executable
+        VnodeType::Directory => 0o040755,
+    };
+
+    fault_in_user_buffer(task, statbuf, core::mem::size_of::<LinuxStat>(), PageFaultAccessType::WRITE).await;
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            statbuf as *mut u8,
+            &st as *const LinuxStat as *const u8,
+            core::mem::size_of::<LinuxStat>(),
+        )
+    };
+    if rc != 0 { return Err(Errno::EFAULT); }
     Ok(())
 }
 
@@ -1092,13 +1308,14 @@ fn sys_clock_gettime(
 
     // struct timespec { time_t tv_sec; long tv_nsec; } — 16 bytes on rv64
     let ts: [u64; 2] = [secs, nsecs];
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            ts.as_ptr() as *const u8,
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
             tp as *mut u8,
+            ts.as_ptr() as *const u8,
             16,
-        );
-    }
+        )
+    };
+    if rc != 0 { return Err(Errno::EFAULT); }
     Ok(())
 }
 
@@ -1114,13 +1331,14 @@ async fn sys_nanosleep_async(
 
     // Read struct timespec from user memory
     let mut ts = [0u64; 2];
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            req_ptr as *const u8,
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
             ts.as_mut_ptr() as *mut u8,
+            req_ptr as *const u8,
             16,
-        );
-    }
+        )
+    };
+    if rc != 0 { return Err(Errno::EFAULT); }
     let secs = ts[0];
     let nsecs = ts[1];
     let total_ms = secs * 1000 + nsecs / 1_000_000;
@@ -1145,13 +1363,13 @@ async fn sys_nanosleep_async(
                 let rem_secs = remaining_ms / 1000;
                 let rem_nsecs = (remaining_ms % 1000) * 1_000_000;
                 let rem_ts = [rem_secs, rem_nsecs];
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        rem_ts.as_ptr() as *const u8,
+                let _ = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
                         rem_ptr as *mut u8,
+                        rem_ts.as_ptr() as *const u8,
                         16,
-                    );
-                }
+                    )
+                };
             }
             return Err(Errno::EINTR);
         }
@@ -1170,13 +1388,13 @@ async fn sys_nanosleep_async(
     // On normal completion, write zero remaining time
     if rem_ptr != 0 {
         let zero_ts = [0u64; 2];
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                zero_ts.as_ptr() as *const u8,
+        let _ = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
                 rem_ptr as *mut u8,
+                zero_ts.as_ptr() as *const u8,
                 16,
-            );
-        }
+            )
+        };
     }
     Ok(())
 }
@@ -1287,8 +1505,7 @@ async fn sys_read_async(
             if rc != 0 { Err(Errno::EFAULT) } else { Ok(len) }
         }
         ReadSource::DevConsole => {
-            // Console read: return 0 for now (no input buffer yet)
-            Ok(0)
+            ConsoleReadFuture { task, user_buf, len }.await
         }
         ReadSource::PipeRead(pipe) => {
             // Async pipe read: loop until data available or EOF
@@ -1373,6 +1590,41 @@ impl<'a> core::future::Future for PipeReadFuture<'a> {
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+struct ConsoleReadFuture<'a> {
+    task: &'a Arc<Task>,
+    user_buf: usize,
+    len: usize,
+}
+
+impl<'a> core::future::Future for ConsoleReadFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        // EINTR guard
+        if this.task.signals.has_actionable_pending() {
+            return Poll::Ready(Err(Errno::EINTR));
+        }
+        let mut kbuf = alloc::vec![0u8; this.len];
+        let n = crate::console::console_read(&mut kbuf);
+        if n > 0 {
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    this.user_buf as *mut u8, kbuf.as_ptr(), n,
+                )
+            };
+            if rc != 0 {
+                Poll::Ready(Err(Errno::EFAULT))
+            } else {
+                Poll::Ready(Ok(n))
+            }
+        } else {
+            crate::console::console_register_waker(cx.waker());
+            Poll::Pending
         }
     }
 }
@@ -1497,8 +1749,372 @@ impl<'a> core::future::Future for PipeWriteFuture<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// writev
+// ---------------------------------------------------------------------------
+
+/// sys_writev: gather-write from an iovec array.
+async fn sys_writev_async(
+    task: &Arc<Task>,
+    fd: u32,
+    iov_ptr: usize,
+    iovcnt: usize,
+) -> Result<usize, Errno> {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+
+    // Read iovec array from user memory (each entry: *const u8, usize = 16 bytes on rv64)
+    let iov_size = iovcnt * 16;
+    fault_in_user_buffer(task, iov_ptr, iov_size, PageFaultAccessType::READ).await;
+    let mut iov_buf = alloc::vec![0u8; iov_size];
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            iov_buf.as_mut_ptr(), iov_ptr as *const u8, iov_size,
+        )
+    };
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let mut total = 0usize;
+    for i in 0..iovcnt {
+        let off = i * 16;
+        let base = usize::from_le_bytes(iov_buf[off..off + 8].try_into().unwrap());
+        let len = usize::from_le_bytes(iov_buf[off + 8..off + 16].try_into().unwrap());
+        if len == 0 {
+            continue;
+        }
+        match sys_write_async(task, fd, base, len).await {
+            Ok(n) => {
+                total += n;
+                if n < len {
+                    break; // short write
+                }
+            }
+            Err(e) => {
+                if total > 0 {
+                    return Ok(total);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// ppoll
+// ---------------------------------------------------------------------------
+
+/// sys_ppoll: poll file descriptors with timeout.
+async fn sys_ppoll_async(
+    task: &Arc<Task>,
+    fds_ptr: usize,
+    nfds: usize,
+    timeout_ptr: usize,
+) -> Result<usize, Errno> {
+    use crate::fs::fd_table::{FileObject, DeviceKind};
+
+    if nfds > 256 {
+        return Err(Errno::EINVAL);
+    }
+
+    // struct pollfd { int fd; short events; short revents; } = 8 bytes
+    let poll_size = nfds * 8;
+    if nfds > 0 {
+        fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::READ).await;
+    }
+
+    let mut poll_buf = alloc::vec![0u8; poll_size];
+    if nfds > 0 {
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                poll_buf.as_mut_ptr(), fds_ptr as *const u8, poll_size,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+    }
+
+    // Parse timeout
+    let timeout_ms: Option<u64> = if timeout_ptr != 0 {
+        fault_in_user_buffer(task, timeout_ptr, 16, PageFaultAccessType::READ).await;
+        let mut ts_buf = [0u8; 16];
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                ts_buf.as_mut_ptr(), timeout_ptr as *const u8, 16,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+        let sec = i64::from_le_bytes(ts_buf[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts_buf[8..16].try_into().unwrap());
+        if sec < 0 || nsec < 0 {
+            return Err(Errno::EINVAL);
+        }
+        Some(sec as u64 * 1000 + nsec as u64 / 1_000_000)
+    } else {
+        None // block indefinitely
+    };
+
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    const POLLERR: i16 = 0x008;
+    const POLLHUP: i16 = 0x010;
+    const POLLNVAL: i16 = 0x020;
+
+    // Poll loop: check once, if nothing ready either return (timeout=0) or sleep+retry
+    let deadline = timeout_ms.map(|ms| {
+        let now = crate::hal::rv64::timer::read_time_ms();
+        now + ms
+    });
+
+    loop {
+        let mut ready_count = 0usize;
+
+        for i in 0..nfds {
+            let off = i * 8;
+            let fd = i32::from_le_bytes(poll_buf[off..off + 4].try_into().unwrap());
+            let events = i16::from_le_bytes(poll_buf[off + 4..off + 6].try_into().unwrap());
+            let mut revents: i16 = 0;
+
+            if fd < 0 {
+                // Negative fd: ignore, revents=0
+                poll_buf[off + 6..off + 8].copy_from_slice(&0i16.to_le_bytes());
+                continue;
+            }
+
+            let tab = task.fd_table.lock();
+            match tab.get(fd as u32) {
+                None => {
+                    revents = POLLNVAL;
+                }
+                Some(desc) => {
+                    match &desc.object {
+                        FileObject::Device(DeviceKind::ConsoleRead) => {
+                            // Console stdin: always readable (blocking read handles wait)
+                            if events & POLLIN != 0 {
+                                revents |= POLLIN;
+                            }
+                        }
+                        FileObject::Device(DeviceKind::ConsoleWrite) => {
+                            if events & POLLOUT != 0 {
+                                revents |= POLLOUT;
+                            }
+                        }
+                        FileObject::Device(DeviceKind::Null) | FileObject::Device(DeviceKind::Zero) => {
+                            revents |= events & (POLLIN | POLLOUT);
+                        }
+                        FileObject::PipeRead(pipe) => {
+                            if pipe.readable_len() > 0 {
+                                revents |= POLLIN;
+                            }
+                            if pipe.is_writer_closed() {
+                                revents |= POLLHUP;
+                            }
+                        }
+                        FileObject::PipeWrite(pipe) => {
+                            if pipe.is_reader_closed() {
+                                revents |= POLLERR;
+                            } else if events & POLLOUT != 0 {
+                                revents |= POLLOUT;
+                            }
+                        }
+                        FileObject::Vnode(_) => {
+                            // Regular files are always ready
+                            revents |= events & (POLLIN | POLLOUT);
+                        }
+                    }
+                }
+            }
+
+            poll_buf[off + 6..off + 8].copy_from_slice(&revents.to_le_bytes());
+            if revents != 0 {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 || matches!(timeout_ms, Some(0)) {
+            // Write back revents
+            if nfds > 0 {
+                fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE).await;
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        fds_ptr as *mut u8, poll_buf.as_ptr(), poll_size,
+                    )
+                };
+                if rc != 0 {
+                    return Err(Errno::EFAULT);
+                }
+            }
+            return Ok(ready_count);
+        }
+
+        // Check timeout
+        if let Some(dl) = deadline {
+            let now = crate::hal::rv64::timer::read_time_ms();
+            if now >= dl {
+                // Timed out, write back zero revents
+                if nfds > 0 {
+                    fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE).await;
+                    let rc = unsafe {
+                        crate::hal::rv64::copy_user::copy_user_chunk(
+                            fds_ptr as *mut u8, poll_buf.as_ptr(), poll_size,
+                        )
+                    };
+                    if rc != 0 {
+                        return Err(Errno::EFAULT);
+                    }
+                }
+                return Ok(0);
+            }
+        }
+
+        // Check signals
+        if task.signals.has_actionable_pending() {
+            return Err(Errno::EINTR);
+        }
+
+        // Sleep briefly and retry
+        crate::executor::sleep(10).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fcntl
+// ---------------------------------------------------------------------------
+
+/// sys_fcntl: file descriptor control.
+fn sys_fcntl(
+    task: &Arc<Task>,
+    fd: u32,
+    cmd: u32,
+    arg: usize,
+) -> Result<usize, Errno> {
+    const F_DUPFD: u32 = 0;
+    const F_GETFD: u32 = 1;
+    const F_SETFD: u32 = 2;
+    const F_GETFL: u32 = 3;
+    const F_SETFL: u32 = 4;
+    const F_DUPFD_CLOEXEC: u32 = 1030;
+
+    use crate::fs::fd_table::FdFlags;
+
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let mut tab = task.fd_table.lock();
+            let desc = Arc::clone(tab.get(fd).ok_or(Errno::EBADF)?);
+            let flags = if cmd == F_DUPFD_CLOEXEC { FdFlags::CLOEXEC } else { FdFlags::empty() };
+            // Find lowest fd >= arg
+            let new_fd = tab.insert(desc, flags)?;
+            Ok(new_fd as usize)
+        }
+        F_GETFD => {
+            let tab = task.fd_table.lock();
+            let flags = tab.get_flags(fd).ok_or(Errno::EBADF)?;
+            Ok(if flags.contains(FdFlags::CLOEXEC) { 1 } else { 0 })
+        }
+        F_SETFD => {
+            // We only support CLOEXEC (bit 0)
+            // For now, accept silently — FdTable doesn't have set_flags, so stub it
+            let tab = task.fd_table.lock();
+            let _ = tab.get(fd).ok_or(Errno::EBADF)?;
+            Ok(0)
+        }
+        F_GETFL => {
+            let tab = task.fd_table.lock();
+            let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+            let mut fl: usize = 0;
+            if desc.flags.read && desc.flags.write {
+                fl = 2; // O_RDWR
+            } else if desc.flags.write {
+                fl = 1; // O_WRONLY
+            }
+            // O_RDONLY = 0
+            Ok(fl)
+        }
+        F_SETFL => {
+            // Accept silently — we don't support O_NONBLOCK/O_APPEND yet
+            let tab = task.fd_table.lock();
+            let _ = tab.get(fd).ok_or(Errno::EBADF)?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getcwd
+// ---------------------------------------------------------------------------
+
+/// sys_getcwd: return current working directory.
+fn sys_getcwd(
+    task: &Arc<Task>,
+    buf: usize,
+    size: usize,
+) -> Result<usize, Errno> {
+    // We always report "/" as cwd for now
+    let cwd = b"/\0";
+    if size < cwd.len() {
+        return Err(Errno::ERANGE);
+    }
+    if buf == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            buf as *mut u8, cwd.as_ptr(), cwd.len(),
+        )
+    };
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
+// uname
+// ---------------------------------------------------------------------------
+
+/// sys_uname: fill struct utsname in user memory.
+fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
+    if buf == 0 {
+        return Err(Errno::EFAULT);
+    }
+    // struct utsname: 6 fields × 65 bytes = 390 bytes
+    const FIELD_LEN: usize = 65;
+    let mut utsname = [0u8; FIELD_LEN * 6];
+
+    fn write_field(buf: &mut [u8], offset: usize, s: &[u8]) {
+        let end = s.len().min(64);
+        buf[offset..offset + end].copy_from_slice(&s[..end]);
+        // Already zero-filled, NUL terminator is implicit
+    }
+
+    write_field(&mut utsname, FIELD_LEN * 0, b"FreeBSD");        // sysname
+    write_field(&mut utsname, FIELD_LEN * 1, b"chronix");        // nodename
+    write_field(&mut utsname, FIELD_LEN * 2, b"0.1.0");          // release
+    write_field(&mut utsname, FIELD_LEN * 3, b"chronix 0.1.0");  // version
+    write_field(&mut utsname, FIELD_LEN * 4, b"riscv64");        // machine
+    write_field(&mut utsname, FIELD_LEN * 5, b"(none)");         // domainname
+
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            buf as *mut u8, utsname.as_ptr(), utsname.len(),
+        )
+    };
+    if rc != 0 { return Err(Errno::EFAULT); }
+    Ok(())
+}
+
 /// sys_ioctl: handle terminal ioctls for isatty() support.
-fn sys_ioctl(
+async fn sys_ioctl_async(
     task: &Arc<Task>,
     fd: u32,
     request: usize,
@@ -1506,14 +2122,14 @@ fn sys_ioctl(
 ) -> Result<i32, Errno> {
     use crate::fs::fd_table::{FileObject, DeviceKind};
 
-    let tab = task.fd_table.lock();
-    let desc = tab.get(fd).ok_or(Errno::EBADF)?;
-
-    // Only console devices support ioctls
-    let is_console = matches!(
-        &desc.object,
-        FileObject::Device(DeviceKind::ConsoleRead) | FileObject::Device(DeviceKind::ConsoleWrite)
-    );
+    let is_console = {
+        let tab = task.fd_table.lock();
+        let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+        matches!(
+            &desc.object,
+            FileObject::Device(DeviceKind::ConsoleRead) | FileObject::Device(DeviceKind::ConsoleWrite)
+        )
+    };
     if !is_console {
         return Err(Errno::ENOTTY);
     }
@@ -1527,46 +2143,37 @@ fn sys_ioctl(
 
     match request {
         TCGETS => {
-            // Write a basic Termios struct: ICANON|ECHO, B38400
-            // Linux struct termios is 60 bytes (on most arches)
             if argp != 0 {
+                fault_in_user_buffer(task, argp, 60, PageFaultAccessType::WRITE).await;
                 let mut termios = [0u32; 15]; // 60 bytes
                 termios[0] = 0; // c_iflag
                 termios[1] = 0; // c_oflag
                 termios[2] = 0o000017; // c_cflag: CS8 | B38400
                 termios[3] = 0o000012; // c_lflag: ICANON | ECHO
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        termios.as_ptr() as *const u8,
-                        argp as *mut u8,
-                        60,
-                    );
-                }
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        argp as *mut u8, termios.as_ptr() as *const u8, 60,
+                    )
+                };
+                if rc != 0 { return Err(Errno::EFAULT); }
             }
             Ok(0)
         }
         TIOCGWINSZ => {
-            // struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
             if argp != 0 {
+                fault_in_user_buffer(task, argp, 8, PageFaultAccessType::WRITE).await;
                 let winsize: [u16; 4] = [24, 80, 0, 0];
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        winsize.as_ptr() as *const u8,
-                        argp as *mut u8,
-                        8,
-                    );
-                }
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        argp as *mut u8, winsize.as_ptr() as *const u8, 8,
+                    )
+                };
+                if rc != 0 { return Err(Errno::EFAULT); }
             }
             Ok(0)
         }
-        TCSETS | TCSETSW | TCSETSF => {
-            // Accept silently (no hardware effect)
-            Ok(0)
-        }
-        FIONBIO => {
-            // Accept silently
-            Ok(0)
-        }
+        TCSETS | TCSETSW | TCSETSF => Ok(0),
+        FIONBIO => Ok(0),
         _ => Err(Errno::ENOTTY),
     }
 }
@@ -1603,13 +2210,14 @@ fn sys_pipe2(
     // Write [read_fd, write_fd] to user memory
     if pipefd_ptr != 0 {
         let fds: [i32; 2] = [read_fd as i32, write_fd as i32];
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                fds.as_ptr() as *const u8,
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
                 pipefd_ptr as *mut u8,
+                fds.as_ptr() as *const u8,
                 8,
-            );
-        }
+            )
+        };
+        if rc != 0 { return Err(Errno::EFAULT); }
     }
 
     Ok(())
@@ -1624,7 +2232,7 @@ async fn sys_openat_async(
     use crate::fs::fd_table::OpenFlags;
 
     // Read pathname from user memory using fault-safe copyinstr.
-    let path_str = copyinstr(pathname_ptr, 256).ok_or(Errno::EFAULT)?;
+    let path_str = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
 
     let open_flags = OpenFlags {
         read: true,
@@ -1639,11 +2247,57 @@ async fn sys_wait4_async(
     task: &Arc<Task>,
     _pid: isize,
     wstatus_ptr: usize,
+    options: usize,
 ) -> Result<u32, Errno> {
-    use crate::proc::exit_wait::WaitChildFuture;
+    const WNOHANG: usize = 1;
 
-    // WaitChildFuture returns Option<(child_pid, exit_status)>.
-    // None means either no children exist or interrupted by signal.
+    // Pre-fault wstatus page so copy_user_chunk won't EFAULT on demand-paged stack
+    if wstatus_ptr != 0 {
+        fault_in_user_buffer(task, wstatus_ptr, 4, PageFaultAccessType::WRITE).await;
+    }
+
+    // Check if there are any children at all
+    {
+        let children = task.children.lock();
+        if children.is_empty() {
+            return Err(Errno::ECHILD);
+        }
+    }
+
+    if options & WNOHANG != 0 {
+        // Non-blocking: scan for a zombie child, return immediately
+        let children = task.children.lock();
+        for child in children.iter() {
+            if child.state() == crate::proc::task::TaskState::Zombie {
+                let pid = child.pid;
+                let status = child.exit_status.load(core::sync::atomic::Ordering::Acquire);
+                drop(children);
+
+                // Remove the zombie child from parent's children list
+                task.children.lock().retain(|c| c.pid != pid);
+
+                // Write status to user memory if pointer is non-null
+                if wstatus_ptr != 0 {
+                    let encoded = (status << 8) & 0xff00;
+                    let rc = unsafe {
+                        crate::hal::rv64::copy_user::copy_user_chunk(
+                            wstatus_ptr as *mut u8,
+                            &encoded as *const i32 as *const u8,
+                            4,
+                        )
+                    };
+                    if rc != 0 { return Err(Errno::EFAULT); }
+                }
+                return Ok(pid);
+            }
+        }
+        drop(children);
+        // No zombie yet, WNOHANG: return 0 (not an error)
+        return Ok(0);
+    }
+
+    // Blocking path
+    use crate::proc::exit_wait::WaitChildFuture;
     let result = WaitChildFuture::new(Arc::clone(task)).await;
 
     match result {
@@ -1651,7 +2305,14 @@ async fn sys_wait4_async(
             // Write status to user memory if pointer is non-null
             if wstatus_ptr != 0 {
                 let encoded = (status << 8) & 0xff00; // WEXITSTATUS encoding
-                unsafe { *(wstatus_ptr as *mut i32) = encoded; }
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        wstatus_ptr as *mut u8,
+                        &encoded as *const i32 as *const u8,
+                        4,
+                    )
+                };
+                if rc != 0 { return Err(Errno::EFAULT); }
             }
             Ok(child_pid)
         }
@@ -1667,12 +2328,20 @@ async fn sys_wait4_async(
 }
 
 /// Read a NUL-terminated string from user memory. Returns None on fault.
-fn copyinstr(user_ptr: usize, max_len: usize) -> Option<String> {
+///
+/// Pre-faults demand-paged user pages before copying so that copy_user_chunk
+/// doesn't hit pcb_onfault on unmapped pages.
+async fn copyinstr(task: &Arc<Task>, user_ptr: usize, max_len: usize) -> Option<String> {
     if user_ptr == 0 {
         return None;
     }
+    // Pre-fault the first page; for short strings (pathnames) this is enough.
+    // For strings that may span a page boundary we fault the second page too.
+    let first_page_remaining = PAGE_SIZE - (user_ptr & (PAGE_SIZE - 1));
+    let prefault_len = max_len.min(first_page_remaining + PAGE_SIZE);
+    fault_in_user_buffer(task, user_ptr, prefault_len, PageFaultAccessType::READ).await;
+
     let mut buf = alloc::vec![0u8; max_len];
-    // Copy from user memory using fault-safe copy_user_chunk.
     let rc = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
             buf.as_mut_ptr(),
@@ -1691,7 +2360,10 @@ fn copyinstr(user_ptr: usize, max_len: usize) -> Option<String> {
 
 /// Read a NULL-terminated array of string pointers from user memory.
 /// Returns a Vec of Strings. Stops at NULL pointer or max_count.
-fn copyin_argv(user_argv: usize, max_count: usize, max_total: usize) -> alloc::vec::Vec<String> {
+///
+/// Pre-faults demand-paged user pages for both the pointer array and each
+/// string before copying.
+async fn copyin_argv(task: &Arc<Task>, user_argv: usize, max_count: usize, max_total: usize) -> alloc::vec::Vec<String> {
     let mut result = alloc::vec::Vec::new();
     if user_argv == 0 {
         return result;
@@ -1699,6 +2371,8 @@ fn copyin_argv(user_argv: usize, max_count: usize, max_total: usize) -> alloc::v
     let mut total = 0usize;
     for i in 0..max_count {
         let ptr_addr = user_argv + i * core::mem::size_of::<usize>();
+        // Pre-fault the page containing this pointer
+        fault_in_user_buffer(task, ptr_addr, core::mem::size_of::<usize>(), PageFaultAccessType::READ).await;
         let mut str_ptr: usize = 0;
         let rc = unsafe {
             crate::hal::rv64::copy_user::copy_user_chunk(
@@ -1710,7 +2384,7 @@ fn copyin_argv(user_argv: usize, max_count: usize, max_total: usize) -> alloc::v
         if rc != 0 || str_ptr == 0 {
             break;
         }
-        if let Some(s) = copyinstr(str_ptr, 256) {
+        if let Some(s) = copyinstr(task, str_ptr, 256).await {
             total += s.len() + 1;
             if total > max_total {
                 break;

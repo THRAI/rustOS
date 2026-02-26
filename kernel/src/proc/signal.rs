@@ -136,6 +136,7 @@ impl SignalState {
 
     /// Post a signal (atomic, lock-free).
     pub fn post_signal(&self, sig: u8) {
+        klog!(signal, debug, "post_signal sig={}", sig);
         self.pending.fetch_or(sig_bit(sig), Ordering::Release);
     }
 
@@ -262,9 +263,27 @@ const SIGFRAME_SIZE: usize = core::mem::size_of::<SigFrame>();
 // sendsig: build sigframe on user stack, redirect to handler
 // ---------------------------------------------------------------------------
 
+/// Linux siginfo_t size on rv64 (128 bytes).
+const SIGINFO_SIZE: usize = 128;
+
+/// Build a minimal siginfo_t in a 128-byte buffer.
+/// Fields: si_signo (i32 @ 0), si_errno (i32 @ 4), si_code (i32 @ 8).
+fn build_siginfo(sig: u8) -> [u8; SIGINFO_SIZE] {
+    let mut buf = [0u8; SIGINFO_SIZE];
+    // si_signo at offset 0
+    let signo = sig as i32;
+    buf[0..4].copy_from_slice(&signo.to_le_bytes());
+    // si_errno at offset 4 = 0
+    // si_code at offset 8: SI_KERNEL=128 (generic)
+    let si_code: i32 = 128;
+    buf[8..12].copy_from_slice(&si_code.to_le_bytes());
+    buf
+}
+
 /// Build a signal frame on the user stack and redirect execution to the handler.
 /// Returns Ok(()) on success, Err(()) if the user stack is trashed (caller should kill).
 pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> {
+    klog!(signal, debug, "sendsig pid={} sig={} handler={:#x}", task.pid, sig, action.handler);
     let mut tf = task.trap_frame.lock();
     let sig_state = &task.signals;
 
@@ -283,6 +302,25 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
             }
         }
     }
+
+    // If SA_SIGINFO, allocate siginfo_t on the user stack first
+    let siginfo_va = if action.flags & SA_SIGINFO != 0 {
+        sp = (sp - SIGINFO_SIZE) & !0xF;
+        let si = build_siginfo(sig);
+        let ok = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                sp as *mut u8,
+                si.as_ptr(),
+                SIGINFO_SIZE,
+            )
+        };
+        if ok != 0 {
+            return Err(());
+        }
+        sp // pointer to siginfo_t
+    } else {
+        0 // NULL when SA_SIGINFO not set
+    };
 
     // Align SP down and make room for SigFrame
     sp = (sp - SIGFRAME_SIZE) & !0xF; // 16-byte aligned
@@ -314,13 +352,16 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     // Redirect trap frame to handler
     tf.sepc = action.handler;
     tf.x[10] = sig as usize;           // a0 = signo
-    tf.x[11] = 0;                       // a1 = siginfo (NULL for now)
+    tf.x[11] = siginfo_va;              // a1 = siginfo (valid ptr if SA_SIGINFO, else NULL)
     tf.x[12] = sp;                       // a2 = ucontext (pointer to sigframe)
     tf.x[2] = sp;                        // sp = sigframe
     tf.x[1] = SIGCODE_VA;               // ra = sigreturn trampoline
 
-    // Sanitize sstatus: SPP=0 (user mode), SPIE=1
+    // Sanitize sstatus: SPP=0 (user mode), SPIE=1, FS>=Initial
     tf.sstatus = (tf.sstatus & !(1 << 8)) | (1 << 5); // clear SPP, set SPIE
+    if tf.sstatus & (3 << 13) == 0 {
+        tf.sstatus |= 1 << 13; // FS=Initial if Off
+    }
 
     Ok(())
 }
@@ -332,6 +373,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
 /// Restore trap frame from the signal frame on the user stack.
 /// Returns Ok(()) on success, Err(Errno) on invalid frame.
 pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
+    klog!(signal, debug, "sigreturn pid={}", task.pid);
     let sp = task.trap_frame.lock().x[2]; // current SP points to sigframe
 
     // Copyin the sigframe from user memory
@@ -360,8 +402,11 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
         // Restore all GPRs
         tf.x = frame.saved_tf.x;
         tf.sepc = frame.saved_tf.sepc;
-        // Sanitize sstatus: SPP cleared (user mode), SPIE set
+        // Sanitize sstatus: SPP cleared (user mode), SPIE set, FS>=Initial
         tf.sstatus = (frame.saved_tf.sstatus & !(1 << 8)) | (1 << 5);
+        if tf.sstatus & (3 << 13) == 0 {
+            tf.sstatus |= 1 << 13; // FS=Initial if Off
+        }
         // scause/stval not restored (kernel-only)
     }
 
@@ -383,6 +428,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         Some(s) => s,
         None => return Ok(false),
     };
+    klog!(signal, debug, "check_pending pid={} sig={}", task.pid, sig);
 
     // SIGKILL: always fatal, no handler
     if sig == SIGKILL {
@@ -576,6 +622,7 @@ pub fn unregister_task(pid: u32) {
 
 /// Send a signal to a process or process group.
 pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno> {
+    klog!(signal, debug, "kill pid={} -> target={} sig={}", sender.pid, pid, sig);
     if sig > MAX_SIG {
         return Err(Errno::EINVAL);
     }

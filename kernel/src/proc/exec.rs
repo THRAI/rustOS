@@ -126,6 +126,7 @@ fn elf_flags_to_prot(flags: u32) -> MapPerm {
 /// This is an async function because path resolution and ELF header reading
 /// go through the delegate channel.
 pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Errno> {
+    klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
     // 1. Resolve path to vnode
     let vnode = path::resolve(elf_path).await?;
     if vnode.vtype() != VnodeType::Regular {
@@ -163,8 +164,14 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     }
     {
         let mut pmap = task.pmap.lock();
-        crate::mm::pmap::pmap_destroy(&mut pmap);
-        *pmap = crate::mm::pmap::pmap_create();
+        // Create the new pmap BEFORE destroying the old one.  We must switch
+        // satp to the new root page table before freeing the old root,
+        // otherwise any TLB miss would walk freed memory (use-after-free on
+        // the page table), causing a cascading fault.
+        let mut old_pmap = core::mem::replace(&mut *pmap, crate::mm::pmap::pmap_create());
+        crate::mm::pmap::pmap_activate(&mut pmap);
+        // Now satp points to the new root — safe to free the old page tables.
+        crate::mm::pmap::pmap_destroy(&mut old_pmap);
     }
 
     // 4. Create demand-paged VMAs for each PT_LOAD segment
@@ -255,7 +262,11 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     }
     // Clear pending signals on exec
     task.signals.pending.store(0, core::sync::atomic::Ordering::Relaxed);
+    // Clear blocked signal mask on exec (POSIX: signal mask preserved, but
+    // synchronous signals like SIGSEGV must be deliverable)
+    task.signals.blocked.store(0, core::sync::atomic::Ordering::Relaxed);
 
+    klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, entry, USER_STACK_TOP);
     Ok((entry, USER_STACK_TOP))
 }
 

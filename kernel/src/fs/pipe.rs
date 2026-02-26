@@ -101,6 +101,7 @@ impl Pipe {
             let mut buf = self.buf.lock();
             if buf.is_empty() {
                 if self.writer_closed.load(Ordering::Acquire) {
+                    klog!(pipe, debug, "read EOF");
                     return Ok(0); // EOF
                 }
                 return Err(Errno::EAGAIN);
@@ -118,6 +119,7 @@ impl Pipe {
         if let Some(w) = wake_writer {
             w.wake();
         }
+        klog!(pipe, debug, "read {} bytes", n);
         Ok(n)
     }
 
@@ -125,6 +127,7 @@ impl Pipe {
     /// Returns Err(EAGAIN) if full and reader alive.
     pub fn write(&self, data: &[u8]) -> Result<usize, Errno> {
         if self.reader_closed.load(Ordering::Acquire) {
+            klog!(pipe, debug, "write EPIPE (reader closed)");
             return Err(Errno::EPIPE);
         }
         let (n, wake_reader) = {
@@ -153,10 +156,9 @@ impl Pipe {
         if let Some(w) = wake_reader {
             w.wake();
         }
+        klog!(pipe, debug, "write {} bytes", n);
         Ok(n)
     }
-
-    /// Register a waker for the read end (called when read returns EAGAIN).
     pub fn register_reader_waker(&self, waker: &Waker) {
         let mut buf = self.buf.lock();
         buf.reader_waker = Some(waker.clone());
@@ -174,5 +176,10 @@ impl Pipe {
 
     pub fn is_writer_closed(&self) -> bool {
         self.writer_closed.load(Ordering::Acquire)
+    }
+
+    /// How many bytes are available to read without blocking.
+    pub fn readable_len(&self) -> usize {
+        self.buf.lock().available_read()
     }
 }

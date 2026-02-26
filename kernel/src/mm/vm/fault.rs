@@ -105,14 +105,14 @@ pub fn sync_fault_handler(
         }
     };
 
-    klog!(vm, debug, "fault ENTER va={:#x} aligned={:#x} type={} prot={:?} range=[{:#x}..{:#x})",
+    klog!(vm, debug, "fault ENTER va={:#x} aligned={:#x} type={:?} prot={:?} range=[{:#x}..{:#x})",
         fault_va.0, fault_va_aligned.0, vma.vma_type, vma.prot,
         vma.range.start.0, vma.range.end.0);
 
     // 2. Check permissions.
     if !access_type.permitted_by(vma.prot) {
         if !(access_type.write && vma.prot.contains(MapPerm::R)) {
-            klog!(vm, debug, "fault PERM_DENIED va={:#x} type={} prot={:?} w={} r={} x={}",
+            klog!(vm, debug, "fault PERM_DENIED va={:#x} type={:?} prot={:?} w={} r={} x={}",
                 fault_va.0, vma.vma_type, vma.prot,
                 access_type.write, access_type.read, access_type.execute
             );

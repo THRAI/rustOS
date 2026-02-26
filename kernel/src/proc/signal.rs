@@ -38,6 +38,33 @@ pub const SIGSTOP: u8 = 19;
 
 pub const MAX_SIG: u8 = 64;
 
+/// Newtype for human-readable signal display in klog output.
+pub struct Signal(pub u8);
+
+impl core::fmt::Display for Signal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self.0 {
+            SIGHUP  => "SIGHUP",
+            SIGINT  => "SIGINT",
+            SIGILL  => "SIGILL",
+            SIGBUS  => "SIGBUS",
+            SIGFPE  => "SIGFPE",
+            SIGKILL => "SIGKILL",
+            SIGUSR1 => "SIGUSR1",
+            SIGSEGV => "SIGSEGV",
+            SIGUSR2 => "SIGUSR2",
+            SIGPIPE => "SIGPIPE",
+            SIGALRM => "SIGALRM",
+            SIGTERM => "SIGTERM",
+            SIGCHLD => "SIGCHLD",
+            SIGCONT => "SIGCONT",
+            SIGSTOP => "SIGSTOP",
+            _ => return write!(f, "SIG?({})", self.0),
+        };
+        write!(f, "{}({})", name, self.0)
+    }
+}
+
 /// Convert signal number to bitmask bit.
 #[inline]
 fn sig_bit(sig: u8) -> u64 {
@@ -136,7 +163,7 @@ impl SignalState {
 
     /// Post a signal (atomic, lock-free).
     pub fn post_signal(&self, sig: u8) {
-        klog!(signal, debug, "post_signal sig={}", sig);
+        klog!(signal, debug, "post_signal sig={}", Signal(sig));
         self.pending.fetch_or(sig_bit(sig), Ordering::Release);
     }
 
@@ -283,7 +310,7 @@ fn build_siginfo(sig: u8) -> [u8; SIGINFO_SIZE] {
 /// Build a signal frame on the user stack and redirect execution to the handler.
 /// Returns Ok(()) on success, Err(()) if the user stack is trashed (caller should kill).
 pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> {
-    klog!(signal, debug, "sendsig pid={} sig={} handler={:#x}", task.pid, sig, action.handler);
+    klog!(signal, debug, "sendsig pid={} sig={} handler={:#x}", task.pid, Signal(sig), action.handler);
     let mut tf = task.trap_frame.lock();
     let sig_state = &task.signals;
 
@@ -428,7 +455,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         Some(s) => s,
         None => return Ok(false),
     };
-    klog!(signal, debug, "check_pending pid={} sig={}", task.pid, sig);
+    klog!(signal, debug, "check_pending pid={} sig={}", task.pid, Signal(sig));
 
     // SIGKILL: always fatal, no handler
     if sig == SIGKILL {
@@ -622,7 +649,7 @@ pub fn unregister_task(pid: u32) {
 
 /// Send a signal to a process or process group.
 pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno> {
-    klog!(signal, debug, "kill pid={} -> target={} sig={}", sender.pid, pid, sig);
+    klog!(signal, debug, "kill pid={} -> target={} sig={}", sender.pid, pid, Signal(sig));
     if sig > MAX_SIG {
         return Err(Errno::EINVAL);
     }

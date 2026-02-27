@@ -38,8 +38,35 @@ pub const SIGSTOP: u8 = 19;
 
 pub const MAX_SIG: u8 = 64;
 
-/// Newtype for human-readable signal display in klog output.
-pub struct Signal(pub u8);
+/// Strongly-typed POSIX signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Signal(u8);
+
+impl Signal {
+    pub const fn new(sig: u8) -> Option<Self> {
+        if Self::is_legit(sig) {
+            Some(Self(sig))
+        } else {
+            None
+        }
+    }
+
+    pub const fn is_legit(sig: u8) -> bool {
+        sig >= 1 && sig <= MAX_SIG
+    }
+
+    pub const fn new_unchecked(sig: u8) -> Self {
+        Self(sig)
+    }
+
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    pub const fn as_bit(self) -> u64 {
+        1u64 << (self.0 - 1)
+    }
+}
 
 impl core::fmt::Display for Signal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -65,25 +92,56 @@ impl core::fmt::Display for Signal {
     }
 }
 
-impl Signal {
-    pub fn is_legit(&self) -> bool {
-        (1..=MAX_SIG).contains(&self.0)
+/// A strongly-typed bitmap of posix signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SigSet(pub u64);
+
+impl SigSet {
+    pub const fn empty() -> Self {
+        Self(0)
     }
-}
 
-/// Convert signal number to bitmask bit.
-/// TODO: how is signal number used across modules? consider expose signal types rather than passing u8/u64 signal number around.
-/// TODO: consider from u8 or u64 to Signal, after deciding how to use signal number across modules.
-#[inline]
-fn sig_bit(sig: u8) -> u64 {
-    debug_assert!(Signal(sig).is_legit());
-    1u64 << (sig - 1)
-}
+    pub const fn from_u64(bits: u64) -> Self {
+        Self(bits)
+    }
 
-/// Public version of sig_bit for cross-module use.
-#[inline]
-pub fn sig_bit_pub(sig: u8) -> u64 {
-    sig_bit(sig)
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub fn add(&mut self, sig: Signal) -> &mut Self {
+        self.0 |= sig.as_bit();
+        self
+    }
+
+    pub fn remove(&mut self, sig: Signal) -> &mut Self {
+        self.0 &= !sig.as_bit();
+        self
+    }
+
+    pub const fn contains(self, sig: Signal) -> bool {
+        self.0 & sig.as_bit() != 0
+    }
+
+    pub const fn contains_bit(self, bits: u64) -> bool {
+        self.0 & bits != 0
+    }
+
+    pub fn union(self, other: SigSet) -> SigSet {
+        SigSet(self.0 | other.0)
+    }
+
+    pub fn intersect(self, other: SigSet) -> SigSet {
+        SigSet(self.0 & other.0)
+    }
+
+    pub fn difference(self, other: SigSet) -> SigSet {
+        SigSet(self.0 & !other.0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,15 +230,22 @@ impl SignalState {
 
     /// Post a signal (atomic, lock-free).
     pub fn post_signal(&self, sig: u8) {
-        klog!(signal, debug, "post_signal sig={}", Signal(sig));
-        self.pending.fetch_or(sig_bit(sig), Ordering::Release);
+        klog!(
+            signal,
+            debug,
+            "post_signal sig={}",
+            Signal::new_unchecked(sig)
+        );
+        self.pending
+            .fetch_or(Signal::new_unchecked(sig).as_bit(), Ordering::Release);
     }
 
     /// Check if there are unmasked pending signals (raw bitmap check).
     pub fn has_unmasked_pending(&self) -> bool {
         let pending = self.pending.load(Ordering::Acquire);
         let blocked = self.blocked.load(Ordering::Relaxed);
-        let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+        let unblockable =
+            Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
         (pending & (!blocked | unblockable)) != 0
     }
 
@@ -189,7 +254,8 @@ impl SignalState {
     pub fn has_actionable_pending(&self) -> bool {
         let pending = self.pending.load(Ordering::Acquire);
         let blocked = self.blocked.load(Ordering::Relaxed);
-        let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+        let unblockable =
+            Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
         let deliverable = pending & (!blocked | unblockable);
         if deliverable == 0 {
             return false;
@@ -217,8 +283,7 @@ impl SignalState {
 
     /// Check if the given signal's action has SA_RESTART set.
     pub fn is_restart(&self, sig: u8) -> bool {
-        //TODO: use signal::is_legit
-        if !Signal(sig).is_legit() {
+        if !Signal::is_legit(sig) {
             return false;
         }
         let actions = self.actions.lock();
@@ -230,7 +295,8 @@ impl SignalState {
         loop {
             let pending = self.pending.load(Ordering::Acquire);
             let blocked = self.blocked.load(Ordering::Relaxed);
-            let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+            let unblockable =
+                Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
             let deliverable = pending & (!blocked | unblockable);
             if deliverable == 0 {
                 return None;
@@ -376,13 +442,21 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     sp = (sp - SIGFRAME_SIZE) & !0xF; // 16-byte aligned
 
     // Build the sigframe in kernel memory
-    let frame = SigFrame {
+    let mut frame = SigFrame {
         saved_tf: *tf,
         signo: sig as u32,
         _pad: 0,
         saved_mask: sig_state.blocked.load(Ordering::Relaxed),
     };
 
+    // Update blocked mask (add this signal's mask, plus the signal itself
+    // unless SA_NOMASK/SA_NODEFER is set - but we don't implement those yet,
+    // so standard POSIX says the signal is blocked while handled).
+    frame.saved_mask = sig_state.blocked.load(Ordering::Relaxed);
+    sig_state.blocked.store(
+        frame.saved_mask | action.mask | Signal::new_unchecked(sig).as_bit(),
+        Ordering::Relaxed,
+    );
     // Copyout to user stack using pcb_onfault guard
     let ok = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
@@ -406,7 +480,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     );
 
     // Block signals specified in sa_mask + the signal itself during handler
-    let block_mask = action.mask | sig_bit(sig);
+    let block_mask = action.mask | Signal::new_unchecked(sig).as_bit();
     sig_state.blocked.fetch_or(block_mask, Ordering::Release);
 
     // Redirect trap frame to handler

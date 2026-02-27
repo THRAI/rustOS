@@ -9,9 +9,7 @@ use crate::executor::user_task::{
     copyin_argv, copyinstr, do_exit, fault_in_user_buffer, spawn_user_task,
 };
 use crate::klog;
-use crate::proc::signal::{
-    sig_bit_pub, SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP,
-};
+use crate::proc::signal::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
 use crate::proc::task::Task;
 use hal_common::Errno;
 
@@ -133,7 +131,7 @@ pub async fn sys_wait4_async(
 
                 // Consume pending SIGCHLD
                 task.signals.pending.fetch_and(
-                    !sig_bit_pub(crate::proc::signal::SIGCHLD),
+                    !Signal::new_unchecked(crate::proc::signal::SIGCHLD).as_bit(),
                     core::sync::atomic::Ordering::Release,
                 );
 
@@ -174,7 +172,7 @@ pub async fn sys_wait4_async(
         Some((child_pid, status)) => {
             // Consume pending SIGCHLD
             task.signals.pending.fetch_and(
-                !sig_bit_pub(crate::proc::signal::SIGCHLD),
+                !Signal::new_unchecked(crate::proc::signal::SIGCHLD).as_bit(),
                 core::sync::atomic::Ordering::Release,
             );
 
@@ -348,7 +346,8 @@ pub fn sys_sigprocmask(
             return Err(Errno::EFAULT);
         }
 
-        let unblockable = sig_bit_pub(SIGKILL) | sig_bit_pub(SIGSTOP);
+        let unblockable =
+            Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
         new_set &= !unblockable;
 
         match how {
@@ -379,7 +378,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         "kill pid={} -> target={} sig={}",
         sender.pid,
         pid,
-        Signal(sig)
+        Signal::new_unchecked(sig)
     );
     if sig > MAX_SIG {
         return Err(Errno::EINVAL);

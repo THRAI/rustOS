@@ -422,9 +422,9 @@ pub async fn exec_with_args(
     let sp_va = stack_page_vbase.as_usize() + new_offset;
 
     // Now we safely do the allocation to get the mutable slice
-    let mut slice_ptr: *mut u8;
+    let slice_ptr: *mut u8;
     {
-        let mut allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::ENOMEM)?;
+        let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::ENOMEM)?;
         slice_ptr = allocated.as_mut_ptr();
     }
     // Safety: we just created this slice and we know it lives inside our `frame`.

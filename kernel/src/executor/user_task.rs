@@ -12,9 +12,9 @@ use core::task::{Context, Poll};
 
 use hal_common::{Errno, VirtAddr, PAGE_SIZE};
 
-use crate::proc::task::Task;
 use crate::hal::rv64::user_trap::trap_return;
-use crate::mm::vm::fault::{sync_fault_handler, FaultResult, FaultError, PageFaultAccessType};
+use crate::mm::vm::fault::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
+use crate::proc::task::Task;
 
 use super::schedule::{spawn_kernel_task, yield_now};
 // Debug logging is now controlled by standard `klog!` levels and Makefile `LEVEL=trace`.
@@ -179,21 +179,36 @@ async fn run_tasks(task: Arc<Task>) {
 
         // Check for pending signals before returning to user mode.
         match crate::proc::signal::check_pending_signals(&task) {
-            Ok(_) => {}       // signal delivered (or none pending), continue
-            Err(sig) => {    // fatal signal (SIGKILL or unhandled)
+            Ok(_) => {} // signal delivered (or none pending), continue
+            Err(sig) => {
+                // fatal signal (SIGKILL or unhandled)
                 // Linux wstatus for signal-killed: low 7 bits = signal number
                 let wstatus = crate::proc::exit_wait::WaitStatus::signaled(sig);
-                klog!(signal, trace, "run_tasks: FATAL signal pid={} sig={} wstatus={:#x}",
-                    task.pid, crate::proc::signal::Signal(sig), wstatus.0);
+                klog!(
+                    signal,
+                    trace,
+                    "run_tasks: FATAL signal pid={} sig={} wstatus={:#x}",
+                    task.pid,
+                    crate::proc::signal::Signal(sig),
+                    wstatus.0
+                );
                 do_exit(&task, wstatus);
                 break;
             }
         }
 
-        klog!(sched, debug, "run_tasks: calling trap_return pid={}", task.pid);
+        klog!(
+            sched,
+            debug,
+            "run_tasks: calling trap_return pid={}",
+            task.pid
+        );
 
         // DEBUG: dump trap frame a0 and wstatus before returning to userspace
-        klog!(proc, trace, "PRE-SRET pid={} a0={:#x} sepc={:#x} sp={:#x} ra={:#x}",
+        klog!(
+            proc,
+            trace,
+            "PRE-SRET pid={} a0={:#x} sepc={:#x} sp={:#x} ra={:#x}",
             task.pid,
             task.trap_frame.lock().arg(0),
             task.trap_frame.lock().sepc,
@@ -201,11 +216,15 @@ async fn run_tasks(task: Arc<Task>) {
             task.trap_frame.lock().ra()
         );
 
-
         // Return to userspace. Blocks until user traps back.
         trap_return(&task);
 
-        klog!(sched, debug, "run_tasks: returned from trap_return pid={}", task.pid);
+        klog!(
+            sched,
+            debug,
+            "run_tasks: returned from trap_return pid={}",
+            task.pid
+        );
 
         // Dispatch based on scause in the trap frame.
         // Keep user pmap active — syscall handlers need it for copy_user / fault resolution.
@@ -255,7 +274,15 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
     let code = scause & !SCAUSE_INTERRUPT;
 
     // Debug: log all traps for pid=1 after verbose flag is set
-    klog!(trap, trace, "VERBOSE pid={} trap code={} sepc={:#x} stval={:#x}", task.pid, code, sepc, stval);
+    klog!(
+        trap,
+        trace,
+        "VERBOSE pid={} trap code={} sepc={:#x} stval={:#x}",
+        task.pid,
+        code,
+        sepc,
+        stval
+    );
 
     if is_interrupt {
         match code {
@@ -281,8 +308,12 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
             // sepc advance is done inside dispatch_syscall (skipped for sigreturn)
             dispatch_syscall(task).await
         }
-        EXC_LOAD_ACCESS_FAULT | EXC_STORE_ACCESS_FAULT | EXC_INST_ACCESS_FAULT |
-        EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
+        EXC_LOAD_ACCESS_FAULT
+        | EXC_STORE_ACCESS_FAULT
+        | EXC_INST_ACCESS_FAULT
+        | EXC_INST_PAGE_FAULT
+        | EXC_LOAD_PAGE_FAULT
+        | EXC_STORE_PAGE_FAULT => {
             let fault_va = VirtAddr::new(stval & !(PAGE_SIZE - 1));
             let access_type = match code {
                 EXC_STORE_PAGE_FAULT | EXC_STORE_ACCESS_FAULT => PageFaultAccessType::WRITE,
@@ -303,17 +334,27 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                     // Resolution failed. If pcb_onfault is set (copy_user_chunk),
                     // redirect to the EFAULT landing pad instead of killing.
                     let percpu = crate::executor::per_cpu::current();
-                    let onfault = percpu.pcb_onfault.load(core::sync::atomic::Ordering::Relaxed);
+                    let onfault = percpu
+                        .pcb_onfault
+                        .load(core::sync::atomic::Ordering::Relaxed);
                     if onfault != 0 {
                         task.trap_frame.lock().sepc = onfault;
-                        percpu.pcb_onfault.store(0, core::sync::atomic::Ordering::Relaxed);
+                        percpu
+                            .pcb_onfault
+                            .store(0, core::sync::atomic::Ordering::Relaxed);
                         return TrapResult::Continue;
                     }
                     // No fixup — truly fatal user fault.
                     let pc = task.trap_frame.lock().sepc;
-                    klog!(trap, trace,
+                    klog!(
+                        trap,
+                        trace,
                         "fatal fault: pid={} va={:#x} pc={:#x} code={} err={:?}",
-                        task.pid, stval, pc, code, e
+                        task.pid,
+                        stval,
+                        pc,
+                        code,
+                        e
                     );
                     task.signals.post_signal(crate::proc::signal::SIGSEGV);
                     TrapResult::Continue
@@ -321,7 +362,9 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
             }
         }
         _ => {
-            klog!(trap, trace,
+            klog!(
+                trap,
+                trace,
                 "unhandled exception: code={} sepc={:#x} stval={:#x}",
                 code,
                 { task.trap_frame.lock().sepc },
@@ -334,8 +377,15 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
 }
 
 /// Pre-fault all user pages covering [user_ptr, user_ptr+len).
-pub(crate) async fn fault_in_user_buffer(task: &Arc<Task>, user_ptr: usize, len: usize, access: PageFaultAccessType) {
-    if len == 0 { return; }
+pub(crate) async fn fault_in_user_buffer(
+    task: &Arc<Task>,
+    user_ptr: usize,
+    len: usize,
+    access: PageFaultAccessType,
+) {
+    if len == 0 {
+        return;
+    }
     let start = user_ptr & !(PAGE_SIZE - 1);
     let end = (user_ptr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let mut va = start;
@@ -356,7 +406,9 @@ async fn resolve_user_fault(
     {
         let pmap = task.pmap.lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-        if let Some((_pa, flags)) = crate::mm::pmap::pmap_extract_with_flags(&pmap, fault_va_aligned) {
+        if let Some((_pa, flags)) =
+            crate::mm::pmap::pmap_extract_with_flags(&pmap, fault_va_aligned)
+        {
             use crate::mm::pmap::pte::PteFlags;
             let mut ok = true;
             if access_type.write && !flags.contains(PteFlags::W) {
@@ -381,30 +433,49 @@ async fn resolve_user_fault(
     match sync_result {
         FaultResult::Resolved => Ok(()),
         FaultResult::NeedsAsyncIO => {
-            klog!(vm, trace,
+            klog!(
+                vm,
+                trace,
                 "resolve_user_fault: NeedsAsyncIO pid={} va={:#x}",
-                task.pid, fault_va.as_usize()
+                task.pid,
+                fault_va.as_usize()
             );
             // 2. Async path: file-backed pages
-            klog!(vm, trace,
+            klog!(
+                vm,
+                trace,
                 "resolve_user_fault: ENTERING async pid={} va={:#x}",
-                task.pid, fault_va.as_usize()
+                task.pid,
+                fault_va.as_usize()
             );
             let async_result = fault_in_page_async(task, fault_va).await;
             match &async_result {
-                Ok(()) => klog!(vm, trace,
+                Ok(()) => klog!(
+                    vm,
+                    trace,
                     "resolve_user_fault: async OK pid={} va={:#x}",
-                    task.pid, fault_va.as_usize()),
-                Err(e) => klog!(vm, trace,
+                    task.pid,
+                    fault_va.as_usize()
+                ),
+                Err(e) => klog!(
+                    vm,
+                    trace,
                     "resolve_user_fault: async FAILED pid={} va={:#x} err={:?}",
-                    task.pid, fault_va.as_usize(), e),
+                    task.pid,
+                    fault_va.as_usize(),
+                    e
+                ),
             }
             async_result
         }
         FaultResult::Error(e) => {
-            klog!(vm, trace,
+            klog!(
+                vm,
+                trace,
                 "resolve_user_fault: sync FAILED pid={} va={:#x} err={:?}",
-                task.pid, fault_va.as_usize(), e
+                task.pid,
+                fault_va.as_usize(),
+                e
             );
             Err(e)
         }
@@ -415,10 +486,7 @@ async fn resolve_user_fault(
 ///
 /// Also handles anonymous VMAs (stack, heap, BSS) that reach this path:
 /// allocate a zeroed frame and map it directly.
-async fn fault_in_page_async(
-    task: &Arc<Task>,
-    fault_va: VirtAddr,
-) -> Result<(), FaultError> {
+async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(), FaultError> {
     // Time-of-check: snapshot VMA state under lock
     let (vnode_id, vnode_path, file_offset, file_size, _vma_file_offset, vma_start) = {
         let map = task.vm_map.lock();
@@ -428,7 +496,8 @@ async fn fault_in_page_async(
             None => {
                 // Anonymous VMA (stack, heap, BSS): allocate zeroed frame and map.
                 let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-                let obj_offset = ((fault_va_aligned.as_usize() - vma.range.start.as_usize()) / PAGE_SIZE) as u64
+                let obj_offset = ((fault_va_aligned.as_usize() - vma.range.start.as_usize())
+                    / PAGE_SIZE) as u64
                     + vma.obj_offset;
                 let prot = vma.prot;
 
@@ -438,14 +507,20 @@ async fn fault_in_page_async(
                     if let Some(existing) = obj.lookup_page(obj_offset) {
                         let mut pmap = task.pmap.lock();
                         if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-                            let _ = crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, existing, prot, false);
+                            let _ = crate::mm::pmap::pmap_enter(
+                                &mut pmap,
+                                fault_va_aligned,
+                                existing,
+                                prot,
+                                false,
+                            );
                         }
                         return Ok(());
                     }
                 }
 
-                let frame = crate::mm::allocator::frame_alloc_sync()
-                    .ok_or(FaultError::OutOfMemory)?;
+                let frame =
+                    crate::mm::allocator::frame_alloc_sync().ok_or(FaultError::OutOfMemory)?;
                 crate::mm::pmap::pmap_zero_page(frame);
 
                 {
@@ -454,19 +529,34 @@ async fn fault_in_page_async(
                     if let Some(existing) = obj.lookup_page(obj_offset) {
                         // Another core won — use their page, free ours.
                         drop(obj);
-                        crate::mm::allocator::frame_allocator::frame_free(frame);
+                        crate::mm::allocator::frame_free(frame);
                         let mut pmap = task.pmap.lock();
                         if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-                            let _ = crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, existing, prot, false);
+                            let _ = crate::mm::pmap::pmap_enter(
+                                &mut pmap,
+                                fault_va_aligned,
+                                existing,
+                                prot,
+                                false,
+                            );
                         }
                         return Ok(());
                     }
-                    obj.insert_page(obj_offset, crate::mm::vm::vm_object::OwnedPage::new_anonymous(frame));
+                    obj.insert_page(
+                        obj_offset,
+                        crate::mm::vm::vm_object::OwnedPage::new_anonymous(frame),
+                    );
                 }
 
                 let mut pmap = task.pmap.lock();
                 if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-                    let _ = crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, frame, prot, false);
+                    let _ = crate::mm::pmap::pmap_enter(
+                        &mut pmap,
+                        fault_va_aligned,
+                        frame,
+                        prot,
+                        false,
+                    );
                 }
                 return Ok(());
             }
@@ -492,22 +582,22 @@ async fn fault_in_page_async(
 
     let pa = if vma_page_byte_offset >= file_size {
         // Entirely beyond file data — pure BSS zero page
-        let frame = crate::mm::allocator::frame_alloc_sync()
-            .ok_or(FaultError::OutOfMemory)?;
-        unsafe { core::ptr::write_bytes(frame.as_usize() as *mut u8, 0, PAGE_SIZE); }
+        let frame = crate::mm::allocator::frame_alloc_sync().ok_or(FaultError::OutOfMemory)?;
+        unsafe {
+            core::ptr::write_bytes(frame.as_usize() as *mut u8, 0, PAGE_SIZE);
+        }
         frame
     } else if vma_page_byte_offset + PAGE_SIZE as u64 > file_size {
         // Partial page: file data + zero fill for the rest
         let fetched = page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset).await?;
         // Copy file portion to a new frame and zero the tail
-        let frame = crate::mm::allocator::frame_alloc_sync()
-            .ok_or(FaultError::OutOfMemory)?;
+        let frame = crate::mm::allocator::frame_alloc_sync().ok_or(FaultError::OutOfMemory)?;
         let file_bytes = (file_size - vma_page_byte_offset) as usize;
         unsafe {
-            let src = fetched.as_usize() as *const u8;
-            let dst = frame.as_usize() as *mut u8;
-            core::ptr::copy_nonoverlapping(src, dst, file_bytes);
-            core::ptr::write_bytes(dst.add(file_bytes), 0, PAGE_SIZE - file_bytes);
+            let src_slice = fetched.as_slice();
+            let dst_slice = frame.as_mut_slice();
+            dst_slice[..file_bytes].copy_from_slice(&src_slice[..file_bytes]);
+            dst_slice[file_bytes..].fill(0);
         }
         frame
     } else {
@@ -581,7 +671,11 @@ async fn page_cache_fetch_by_id(
             }
             LookupResult::WaitingOnFetch => {
                 // Another task is fetching. Wait via proper future with real waker.
-                PageCacheWaitFuture { vnode_id, page_offset }.await;
+                PageCacheWaitFuture {
+                    vnode_id,
+                    page_offset,
+                }
+                .await;
             }
         }
     }
@@ -609,21 +703,49 @@ impl Future for PageCacheWaitFuture {
 fn noop_waker() -> core::task::Waker {
     use core::task::{RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
-    fn clone_fn(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn clone_fn(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, noop, noop, noop);
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
 }
 
 /// Async syscall dispatch.
 async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
-    let (id, a0, a1, a2, _a3, _a4, _a5) = {
+    let (id, a0, a1, a2, a3, _a4, _a5) = {
         let tf = task.trap_frame.lock();
-        (SyscallId(tf.x[17]), tf.x[10], tf.x[11], tf.x[12], tf.x[13], tf.x[14], tf.x[15])
+        (
+            SyscallId(tf.x[17]),
+            tf.x[10],
+            tf.x[11],
+            tf.x[12],
+            tf.x[13],
+            tf.x[14],
+            tf.x[15],
+        )
     };
 
-    klog!(syscall, debug, "pid={} {} a0={:#x} a1={:#x} a2={:#x}", task.pid, id, a0, a1, a2);
+    klog!(
+        syscall,
+        debug,
+        "pid={} {} a0={:#x} a1={:#x} a2={:#x}",
+        task.pid,
+        id,
+        a0,
+        a1,
+        a2
+    );
 
-    klog!(syscall, trace, "VERBOSE pid={} syscall {} a0={:#x} a1={:#x} a2={:#x}", task.pid, id, a0, a1, a2);
+    klog!(
+        syscall,
+        trace,
+        "VERBOSE pid={} syscall {} a0={:#x} a1={:#x} a2={:#x}",
+        task.pid,
+        id,
+        a0,
+        a1,
+        a2
+    );
 
     let ret: usize = match id {
         // --- Fast-path synchronous syscalls ---
@@ -635,12 +757,10 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::GETEGID => crate::proc::syscalls::sys_getegid(task),
         SyscallId::GETTID => crate::proc::syscalls::sys_gettid(task),
         SyscallId::SET_TID_ADDRESS => crate::proc::syscalls::sys_gettid(task),
-        SyscallId::DUP => {
-            match task.fd_table.lock().dup(a0 as u32) {
-                Ok(fd) => fd as usize,
-                Err(e) => (-(e.as_i32() as isize)) as usize,
-            }
-        }
+        SyscallId::DUP => match task.fd_table.lock().dup(a0 as u32) {
+            Ok(fd) => fd as usize,
+            Err(e) => (-(e.as_i32() as isize)) as usize,
+        },
         SyscallId::DUP3 => {
             // a0=oldfd, a1=newfd, a2=flags
             let cloexec = (a2 & 0o2000000) != 0;
@@ -661,9 +781,9 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             0
         }
         SyscallId::BRK => {
-            use crate::mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
-            use crate::mm::vm::vm_object::VmObject;
+            use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType};
             use crate::mm::vm::vm_object::PageOwnership;
+            use crate::mm::vm::vm_object::VmObject;
 
             let current_brk = task.brk.load(core::sync::atomic::Ordering::Relaxed);
             if a0 == 0 {
@@ -675,9 +795,9 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 if new_brk > old_brk {
                     // --- Expand ---
                     let mut vm = task.vm_map.lock();
-                    if let Some(heap_vma) = vm.find_area_ending_at_mut(
-                        VirtAddr::new(old_brk), VmAreaType::Heap,
-                    ) {
+                    if let Some(heap_vma) =
+                        vm.find_area_ending_at_mut(VirtAddr::new(old_brk), VmAreaType::Heap)
+                    {
                         // In-place extension: slide end, grow VmObject
                         heap_vma.range.end = VirtAddr::new(new_brk);
                         let mut obj = heap_vma.object.write();
@@ -711,9 +831,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                     // 2. Truncate VmObject pages and free anonymous frames
                     let mut vm = task.vm_map.lock();
                     // Find the heap VMA that contains old_brk - 1
-                    if let Some(heap_vma) = vm.find_area_mut(
-                        VirtAddr::new(old_brk - 1),
-                    ) {
+                    if let Some(heap_vma) = vm.find_area_mut(VirtAddr::new(old_brk - 1)) {
                         if heap_vma.vma_type == VmAreaType::Heap {
                             let vma_start = heap_vma.range.start.as_usize();
                             let from_page = ((new_brk - vma_start) / PAGE_SIZE) as u64;
@@ -742,19 +860,14 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                         }
                     }
                 }
-                task.brk.store(new_brk, core::sync::atomic::Ordering::Relaxed);
+                task.brk
+                    .store(new_brk, core::sync::atomic::Ordering::Relaxed);
                 new_brk
             }
         }
-        SyscallId::MMAP => {
-            sys_mmap(task, a0, a1, a2, _a3, _a4 as u32, _a5 as u64)
-        }
-        SyscallId::MUNMAP => {
-            sys_munmap(task, a0, a1)
-        }
-        SyscallId::MPROTECT => {
-            sys_mprotect(task, a0, a1, a2)
-        }
+        SyscallId::MMAP => sys_mmap(task, a0, a1, a2, a3, _a4 as u32, _a5 as u64),
+        SyscallId::MUNMAP => sys_munmap(task, a0, a1),
+        SyscallId::MPROTECT => sys_mprotect(task, a0, a1, a2),
         SyscallId::SIGACTION => {
             // a0=signum, a1=act, a2=oldact
             // Pre-fault user buffers for the synchronous copy_user_chunk calls
@@ -968,7 +1081,9 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                     tf.sepc = entry;
                     tf.x[2] = sp;
                     for i in 1..32 {
-                        if i != 2 { tf.x[i] = 0; }
+                        if i != 2 {
+                            tf.x[i] = 0;
+                        }
                     }
                     tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                     return TrapResult::Continue;
@@ -977,14 +1092,23 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             }
         }
         SyscallId::WAIT4 => {
-            let options = a2;
             let wstatus_ptr = a1;
+            let options = a2;
             // Debug: dump wstatus at user pointer before wait4
             if a1 != 0 {
                 let peek = unsafe { *(a1 as *const i32) };
-                klog!(proc, trace, "VERBOSE wait4 ENTRY pid={} wstatus@{:#x}={:#x}", task.pid, a1, peek);
+                klog!(
+                    proc,
+                    trace,
+                    "VERBOSE wait4 ENTRY pid={} wstatus@{:#x}={:#x}",
+                    task.pid,
+                    a1,
+                    peek
+                );
             }
-            match crate::proc::syscalls::sys_wait4_async(task, a0 as isize, a1, options).await {
+            match crate::proc::syscalls::sys_wait4_async(task, a0 as isize, wstatus_ptr, options)
+                .await
+            {
                 Ok(pid) => pid as usize,
                 // wait4 is never restarted (matches Linux behavior).
                 // The SIGCHLD handler typically calls waitpid() itself,
@@ -1007,14 +1131,29 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             }
         }
         _ => {
-            klog!(syscall, error, "unimplemented {} (a0={:#x} a1={:#x} a2={:#x})", id, a0, a1, a2);
+            klog!(
+                syscall,
+                error,
+                "unimplemented {} (a0={:#x} a1={:#x} a2={:#x})",
+                id,
+                a0,
+                a1,
+                a2
+            );
             (-38isize) as usize // ENOSYS
         }
     };
 
     {
         klog!(syscall, debug, "pid={} {} -> {:#x}", task.pid, id, ret);
-        klog!(syscall, trace, "VERBOSE pid={} {} -> ret={:#x}", task.pid, id, ret);
+        klog!(
+            syscall,
+            trace,
+            "VERBOSE pid={} {} -> ret={:#x}",
+            task.pid,
+            id,
+            ret
+        );
         let mut tf = task.trap_frame.lock();
         tf.sepc += 4; // advance past ecall
         tf.set_ret_val(ret);
@@ -1049,7 +1188,7 @@ fn sys_mmap(
     _fd: u32,
     _offset: u64,
 ) -> usize {
-    use crate::mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
+    use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType};
     use crate::mm::vm::vm_object::VmObject;
 
     let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -1057,8 +1196,8 @@ fn sys_mmap(
         return (-(Errno::EINVAL.as_i32() as isize)) as usize;
     }
 
-    let map_fixed = flags & 0x10 != 0;   // MAP_FIXED
-    let _map_anon = flags & 0x20 != 0;   // MAP_ANONYMOUS
+    let map_fixed = flags & 0x10 != 0; // MAP_FIXED
+    let _map_anon = flags & 0x20 != 0; // MAP_ANONYMOUS
     let _map_private = flags & 0x02 != 0; // MAP_PRIVATE
 
     let mut vm = task.vm_map.lock();
@@ -1082,7 +1221,9 @@ fn sys_mmap(
         let hint_end = VirtAddr::new(hint.as_usize() + aligned_len);
         // Check if hint range is free
         let hint_ok = vm.find_area(hint).is_none()
-            && vm.find_area(VirtAddr::new(hint_end.as_usize().saturating_sub(1))).is_none();
+            && vm
+                .find_area(VirtAddr::new(hint_end.as_usize().saturating_sub(1)))
+                .is_none();
         if hint_ok {
             hint.as_usize()
         } else {
@@ -1101,14 +1242,23 @@ fn sys_mmap(
 
     // Build VMA
     let mut perm = MapPerm::U;
-    if prot_bits & 1 != 0 { perm |= MapPerm::R; }
-    if prot_bits & 2 != 0 { perm |= MapPerm::W; }
-    if prot_bits & 4 != 0 { perm |= MapPerm::X; }
+    if prot_bits & 1 != 0 {
+        perm |= MapPerm::R;
+    }
+    if prot_bits & 2 != 0 {
+        perm |= MapPerm::W;
+    }
+    if prot_bits & 4 != 0 {
+        perm |= MapPerm::X;
+    }
 
     let obj = VmObject::new(aligned_len / PAGE_SIZE);
     let vma = VmArea::new(
         VirtAddr::new(base)..VirtAddr::new(base + aligned_len),
-        perm, obj, 0, VmAreaType::Anonymous,
+        perm,
+        obj,
+        0,
+        VmAreaType::Anonymous,
     );
     match vm.insert(vma) {
         Ok(()) => base,
@@ -1144,9 +1294,15 @@ fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize) -> 
     }
 
     let mut perm = MapPerm::U;
-    if prot_bits & 1 != 0 { perm |= MapPerm::R; }
-    if prot_bits & 2 != 0 { perm |= MapPerm::W; }
-    if prot_bits & 4 != 0 { perm |= MapPerm::X; }
+    if prot_bits & 1 != 0 {
+        perm |= MapPerm::R;
+    }
+    if prot_bits & 2 != 0 {
+        perm |= MapPerm::W;
+    }
+    if prot_bits & 4 != 0 {
+        perm |= MapPerm::X;
+    }
 
     let mut vm = task.vm_map.lock();
     vm.protect_range(start, end, perm);
@@ -1162,12 +1318,7 @@ fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize) -> 
 // ---------------------------------------------------------------------------
 
 /// sys_lseek: move file offset. ESPIPE on pipes.
-fn sys_lseek(
-    task: &Arc<Task>,
-    fd: u32,
-    offset: i64,
-    whence: u32,
-) -> Result<u64, Errno> {
+fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<u64, Errno> {
     use crate::fs::fd_table::FileObject;
     use core::sync::atomic::Ordering;
 
@@ -1242,12 +1393,24 @@ fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
     let desc = tab.get(fd).ok_or(Errno::EBADF)?;
 
     let mut st = LinuxStat {
-        st_dev: 0, st_ino: 0, st_mode: 0, st_nlink: 1,
-        st_uid: 0, st_gid: 0, st_rdev: 0, __pad1: 0,
-        st_size: 0, st_blksize: 4096, __pad2: 0, st_blocks: 0,
-        st_atime: 0, st_atime_nsec: 0,
-        st_mtime: 0, st_mtime_nsec: 0,
-        st_ctime: 0, st_ctime_nsec: 0,
+        st_dev: 0,
+        st_ino: 0,
+        st_mode: 0,
+        st_nlink: 1,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        __pad1: 0,
+        st_size: 0,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: 0,
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
         __unused: [0; 2],
     };
 
@@ -1271,8 +1434,8 @@ fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
             use crate::fs::fd_table::DeviceKind;
             st.st_mode = 0o020666; // S_IFCHR | rw
             st.st_rdev = match dk {
-                DeviceKind::Null => 0x0103,    // 1:3
-                DeviceKind::Zero => 0x0105,    // 1:5
+                DeviceKind::Null => 0x0103,                                   // 1:3
+                DeviceKind::Zero => 0x0105,                                   // 1:5
                 DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite => 0x0501, // 5:1
             };
         }
@@ -1286,7 +1449,9 @@ fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
             core::mem::size_of::<LinuxStat>(),
         )
     };
-    if rc != 0 { return Err(Errno::EFAULT); }
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
     Ok(())
 }
 
@@ -1300,18 +1465,32 @@ async fn sys_fstatat_async(
         return Err(Errno::EFAULT);
     }
 
-    let path_str = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path_str = copyinstr(task, pathname_ptr, 256)
+        .await
+        .ok_or(Errno::EFAULT)?;
 
     // Resolve the path to a vnode
     let vnode = crate::fs::path::resolve(&path_str).await?;
 
     let mut st = LinuxStat {
-        st_dev: 0, st_ino: 0, st_mode: 0, st_nlink: 1,
-        st_uid: 0, st_gid: 0, st_rdev: 0, __pad1: 0,
-        st_size: 0, st_blksize: 4096, __pad2: 0, st_blocks: 0,
-        st_atime: 0, st_atime_nsec: 0,
-        st_mtime: 0, st_mtime_nsec: 0,
-        st_ctime: 0, st_ctime_nsec: 0,
+        st_dev: 0,
+        st_ino: 0,
+        st_mode: 0,
+        st_nlink: 1,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        __pad1: 0,
+        st_size: 0,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: 0,
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
         __unused: [0; 2],
     };
 
@@ -1324,7 +1503,13 @@ async fn sys_fstatat_async(
         VnodeType::Directory => 0o040755,
     };
 
-    fault_in_user_buffer(task, statbuf, core::mem::size_of::<LinuxStat>(), PageFaultAccessType::WRITE).await;
+    fault_in_user_buffer(
+        task,
+        statbuf,
+        core::mem::size_of::<LinuxStat>(),
+        PageFaultAccessType::WRITE,
+    )
+    .await;
     let rc = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
             statbuf as *mut u8,
@@ -1332,14 +1517,18 @@ async fn sys_fstatat_async(
             core::mem::size_of::<LinuxStat>(),
         )
     };
-    if rc != 0 { return Err(Errno::EFAULT); }
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
     Ok(())
 }
 
 /// Read rdtime CSR (RISC-V cycle counter used as time source).
 fn read_rdtime() -> u64 {
     let val: u64;
-    unsafe { core::arch::asm!("rdtime {}", out(reg) val); }
+    unsafe {
+        core::arch::asm!("rdtime {}", out(reg) val);
+    }
     val
 }
 
@@ -1347,11 +1536,7 @@ fn read_rdtime() -> u64 {
 const TIMER_FREQ: u64 = 10_000_000;
 
 /// sys_clock_gettime: read hardware time via rdtime CSR.
-fn sys_clock_gettime(
-    task: &Arc<Task>,
-    _clockid: u32,
-    tp: usize,
-) -> Result<(), Errno> {
+fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(), Errno> {
     let _ = task; // used for user memory access context
     if tp == 0 {
         return Err(Errno::EFAULT);
@@ -1364,13 +1549,11 @@ fn sys_clock_gettime(
     // struct timespec { time_t tv_sec; long tv_nsec; } — 16 bytes on rv64
     let ts: [u64; 2] = [secs, nsecs];
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            tp as *mut u8,
-            ts.as_ptr() as *const u8,
-            16,
-        )
+        crate::hal::rv64::copy_user::copy_user_chunk(tp as *mut u8, ts.as_ptr() as *const u8, 16)
     };
-    if rc != 0 { return Err(Errno::EFAULT); }
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
     Ok(())
 }
 
@@ -1393,7 +1576,9 @@ async fn sys_nanosleep_async(
             16,
         )
     };
-    if rc != 0 { return Err(Errno::EFAULT); }
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
     let secs = ts[0];
     let nsecs = ts[1];
     let total_ms = secs * 1000 + nsecs / 1_000_000;
@@ -1507,7 +1692,7 @@ async fn sys_read_async(
     user_buf: usize,
     len: usize,
 ) -> Result<usize, Errno> {
-    use crate::fs::fd_table::{FileObject, DeviceKind};
+    use crate::fs::fd_table::{DeviceKind, FileObject};
     use crate::mm::uio::{uiomove, UioDir};
 
     if len == 0 {
@@ -1516,7 +1701,12 @@ async fn sys_read_async(
 
     // Snapshot what we need from the fd table
     enum ReadSource {
-        Vnode { id: u64, path: String, size: u64, offset: u64 },
+        Vnode {
+            id: u64,
+            path: String,
+            size: u64,
+            offset: u64,
+        },
         PipeRead(alloc::sync::Arc<crate::fs::pipe::Pipe>),
         DevNull,
         DevZero,
@@ -1554,19 +1744,41 @@ async fn sys_read_async(
             let zeros = alloc::vec![0u8; len];
             let rc = unsafe {
                 crate::hal::rv64::copy_user::copy_user_chunk(
-                    user_buf as *mut u8, zeros.as_ptr(), len,
+                    user_buf as *mut u8,
+                    zeros.as_ptr(),
+                    len,
                 )
             };
-            if rc != 0 { Err(Errno::EFAULT) } else { Ok(len) }
+            if rc != 0 {
+                Err(Errno::EFAULT)
+            } else {
+                Ok(len)
+            }
         }
         ReadSource::DevConsole => {
-            ConsoleReadFuture { task, user_buf, len }.await
+            ConsoleReadFuture {
+                task,
+                user_buf,
+                len,
+            }
+            .await
         }
         ReadSource::PipeRead(pipe) => {
             // Async pipe read: loop until data available or EOF
-            PipeReadFuture { pipe, task, user_buf, len }.await
+            PipeReadFuture {
+                pipe,
+                task,
+                user_buf,
+                len,
+            }
+            .await
         }
-        ReadSource::Vnode { id, path, size, mut offset } => {
+        ReadSource::Vnode {
+            id,
+            path,
+            size,
+            mut offset,
+        } => {
             if offset >= size {
                 return Ok(0);
             }
@@ -1578,7 +1790,8 @@ async fn sys_read_async(
                 let offset_in_page = (offset % PAGE_SIZE as u64) as usize;
                 let chunk = core::cmp::min(PAGE_SIZE - offset_in_page, to_read - total);
 
-                let pa = page_cache_fetch_by_id(id, &path, page_offset * PAGE_SIZE as u64).await
+                let pa = page_cache_fetch_by_id(id, &path, page_offset * PAGE_SIZE as u64)
+                    .await
                     .map_err(|_| Errno::EIO)?;
 
                 let kern = (pa.as_usize() + offset_in_page) as *mut u8;
@@ -1594,14 +1807,17 @@ async fn sys_read_async(
                             task,
                             VirtAddr::new(user_buf + total),
                             PageFaultAccessType::WRITE,
-                        ).await.map_err(|_| Errno::EFAULT)?;
+                        )
+                        .await
+                        .map_err(|_| Errno::EFAULT)?;
                         continue;
                     }
                     Err(e) => return Err(e),
                 }
             }
 
-            desc.offset.store(offset, core::sync::atomic::Ordering::Relaxed);
+            desc.offset
+                .store(offset, core::sync::atomic::Ordering::Relaxed);
             Ok(total)
         }
     }
@@ -1614,25 +1830,35 @@ async fn sys_readv_async(
     iov_ptr: usize,
     iovcnt: usize,
 ) -> Result<usize, Errno> {
-    if iovcnt > 1024 { return Err(Errno::EINVAL); }
-    if iovcnt == 0 { return Ok(0); }
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    if iovcnt == 0 {
+        return Ok(0);
+    }
 
     let iov_size = iovcnt * 16;
     fault_in_user_buffer(task, iov_ptr, iov_size, PageFaultAccessType::READ).await;
     let mut iov_buf = alloc::vec![0u8; iov_size];
     let rc = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
-            iov_buf.as_mut_ptr(), iov_ptr as *const u8, iov_size,
+            iov_buf.as_mut_ptr(),
+            iov_ptr as *const u8,
+            iov_size,
         )
     };
-    if rc != 0 { return Err(Errno::EFAULT); }
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
 
     let mut total_read = 0;
     for i in 0..iovcnt {
         let off = i * 16;
         let base = usize::from_le_bytes(iov_buf[off..off + 8].try_into().unwrap());
         let len = usize::from_le_bytes(iov_buf[off + 8..off + 16].try_into().unwrap());
-        if len == 0 { continue; }
+        if len == 0 {
+            continue;
+        }
 
         match sys_read_async(task, fd, base, len).await {
             Ok(0) => break, // EOF
@@ -1678,7 +1904,9 @@ impl<'a> core::future::Future for PipeReadFuture<'a> {
                 // Copy to user buffer (best-effort, fault in pages first would be ideal)
                 let rc = unsafe {
                     crate::hal::rv64::copy_user::copy_user_chunk(
-                        this.user_buf as *mut u8, kbuf.as_ptr(), n,
+                        this.user_buf as *mut u8,
+                        kbuf.as_ptr(),
+                        n,
                     )
                 };
                 if rc != 0 {
@@ -1716,7 +1944,9 @@ impl<'a> core::future::Future for ConsoleReadFuture<'a> {
         if n > 0 {
             let rc = unsafe {
                 crate::hal::rv64::copy_user::copy_user_chunk(
-                    this.user_buf as *mut u8, kbuf.as_ptr(), n,
+                    this.user_buf as *mut u8,
+                    kbuf.as_ptr(),
+                    n,
                 )
             };
             if rc != 0 {
@@ -1738,7 +1968,7 @@ async fn sys_write_async(
     user_buf: usize,
     len: usize,
 ) -> Result<usize, Errno> {
-    use crate::fs::fd_table::{FileObject, DeviceKind};
+    use crate::fs::fd_table::{DeviceKind, FileObject};
 
     if len == 0 {
         return Ok(0);
@@ -1759,7 +1989,8 @@ async fn sys_write_async(
         match &d.object {
             FileObject::Device(DeviceKind::Null) => WriteTarget::DevNull,
             FileObject::Device(DeviceKind::Zero) => WriteTarget::DevNull,
-            FileObject::Device(DeviceKind::ConsoleWrite) | FileObject::Device(DeviceKind::ConsoleRead) => WriteTarget::DevConsole,
+            FileObject::Device(DeviceKind::ConsoleWrite)
+            | FileObject::Device(DeviceKind::ConsoleRead) => WriteTarget::DevConsole,
             FileObject::PipeWrite(p) => WriteTarget::PipeWrite(Arc::clone(p)),
             FileObject::PipeRead(_) => return Err(Errno::EBADF),
             FileObject::Vnode(_) => return Err(Errno::EPERM), // read-only fs
@@ -1773,7 +2004,9 @@ async fn sys_write_async(
             let mut kbuf = alloc::vec![0u8; len];
             let rc = unsafe {
                 crate::hal::rv64::copy_user::copy_user_chunk(
-                    kbuf.as_mut_ptr(), user_buf as *const u8, len,
+                    kbuf.as_mut_ptr(),
+                    user_buf as *const u8,
+                    len,
                 )
             };
             if rc != 0 {
@@ -1790,13 +2023,21 @@ async fn sys_write_async(
             let mut kbuf = alloc::vec![0u8; len];
             let rc = unsafe {
                 crate::hal::rv64::copy_user::copy_user_chunk(
-                    kbuf.as_mut_ptr(), user_buf as *const u8, len,
+                    kbuf.as_mut_ptr(),
+                    user_buf as *const u8,
+                    len,
                 )
             };
             if rc != 0 {
                 return Err(Errno::EFAULT);
             }
-            let result = PipeWriteFuture { pipe, task, data: kbuf, written: 0 }.await;
+            let result = PipeWriteFuture {
+                pipe,
+                task,
+                data: kbuf,
+                written: 0,
+            }
+            .await;
             // Post SIGPIPE on broken pipe
             if let Err(Errno::EPIPE) = &result {
                 task.signals.post_signal(crate::proc::signal::SIGPIPE);
@@ -1875,7 +2116,9 @@ async fn sys_writev_async(
     let mut iov_buf = alloc::vec![0u8; iov_size];
     let rc = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
-            iov_buf.as_mut_ptr(), iov_ptr as *const u8, iov_size,
+            iov_buf.as_mut_ptr(),
+            iov_ptr as *const u8,
+            iov_size,
         )
     };
     if rc != 0 {
@@ -1919,7 +2162,7 @@ async fn sys_ppoll_async(
     nfds: usize,
     timeout_ptr: usize,
 ) -> Result<usize, Errno> {
-    use crate::fs::fd_table::{FileObject, DeviceKind};
+    use crate::fs::fd_table::{DeviceKind, FileObject};
 
     if nfds > 256 {
         return Err(Errno::EINVAL);
@@ -1935,7 +2178,9 @@ async fn sys_ppoll_async(
     if nfds > 0 {
         let rc = unsafe {
             crate::hal::rv64::copy_user::copy_user_chunk(
-                poll_buf.as_mut_ptr(), fds_ptr as *const u8, poll_size,
+                poll_buf.as_mut_ptr(),
+                fds_ptr as *const u8,
+                poll_size,
             )
         };
         if rc != 0 {
@@ -1949,7 +2194,9 @@ async fn sys_ppoll_async(
         let mut ts_buf = [0u8; 16];
         let rc = unsafe {
             crate::hal::rv64::copy_user::copy_user_chunk(
-                ts_buf.as_mut_ptr(), timeout_ptr as *const u8, 16,
+                ts_buf.as_mut_ptr(),
+                timeout_ptr as *const u8,
+                16,
             )
         };
         if rc != 0 {
@@ -2010,7 +2257,8 @@ async fn sys_ppoll_async(
                                 revents |= POLLOUT;
                             }
                         }
-                        FileObject::Device(DeviceKind::Null) | FileObject::Device(DeviceKind::Zero) => {
+                        FileObject::Device(DeviceKind::Null)
+                        | FileObject::Device(DeviceKind::Zero) => {
                             revents |= events & (POLLIN | POLLOUT);
                         }
                         FileObject::PipeRead(pipe) => {
@@ -2048,7 +2296,9 @@ async fn sys_ppoll_async(
                 fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE).await;
                 let rc = unsafe {
                     crate::hal::rv64::copy_user::copy_user_chunk(
-                        fds_ptr as *mut u8, poll_buf.as_ptr(), poll_size,
+                        fds_ptr as *mut u8,
+                        poll_buf.as_ptr(),
+                        poll_size,
                     )
                 };
                 if rc != 0 {
@@ -2064,10 +2314,13 @@ async fn sys_ppoll_async(
             if now >= dl {
                 // Timed out, write back zero revents
                 if nfds > 0 {
-                    fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE).await;
+                    fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE)
+                        .await;
                     let rc = unsafe {
                         crate::hal::rv64::copy_user::copy_user_chunk(
-                            fds_ptr as *mut u8, poll_buf.as_ptr(), poll_size,
+                            fds_ptr as *mut u8,
+                            poll_buf.as_ptr(),
+                            poll_size,
                         )
                     };
                     if rc != 0 {
@@ -2093,12 +2346,7 @@ async fn sys_ppoll_async(
 // ---------------------------------------------------------------------------
 
 /// sys_fcntl: file descriptor control.
-fn sys_fcntl(
-    task: &Arc<Task>,
-    fd: u32,
-    cmd: u32,
-    arg: usize,
-) -> Result<usize, Errno> {
+fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, _arg: usize) -> Result<usize, Errno> {
     const F_DUPFD: u32 = 0;
     const F_GETFD: u32 = 1;
     const F_SETFD: u32 = 2;
@@ -2112,7 +2360,11 @@ fn sys_fcntl(
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let mut tab = task.fd_table.lock();
             let desc = Arc::clone(tab.get(fd).ok_or(Errno::EBADF)?);
-            let flags = if cmd == F_DUPFD_CLOEXEC { FdFlags::CLOEXEC } else { FdFlags::empty() };
+            let flags = if cmd == F_DUPFD_CLOEXEC {
+                FdFlags::CLOEXEC
+            } else {
+                FdFlags::empty()
+            };
             // Find lowest fd >= arg
             let new_fd = tab.insert(desc, flags)?;
             Ok(new_fd as usize)
@@ -2120,7 +2372,11 @@ fn sys_fcntl(
         F_GETFD => {
             let tab = task.fd_table.lock();
             let flags = tab.get_flags(fd).ok_or(Errno::EBADF)?;
-            Ok(if flags.contains(FdFlags::CLOEXEC) { 1 } else { 0 })
+            Ok(if flags.contains(FdFlags::CLOEXEC) {
+                1
+            } else {
+                0
+            })
         }
         F_SETFD => {
             // We only support CLOEXEC (bit 0)
@@ -2156,11 +2412,7 @@ fn sys_fcntl(
 // ---------------------------------------------------------------------------
 
 /// sys_getcwd: return current working directory.
-fn sys_getcwd(
-    task: &Arc<Task>,
-    buf: usize,
-    size: usize,
-) -> Result<usize, Errno> {
+fn sys_getcwd(_task: &Arc<Task>, buf: usize, size: usize) -> Result<usize, Errno> {
     // We always report "/" as cwd for now
     let cwd = b"/\0";
     if size < cwd.len() {
@@ -2170,9 +2422,7 @@ fn sys_getcwd(
         return Err(Errno::EINVAL);
     }
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            buf as *mut u8, cwd.as_ptr(), cwd.len(),
-        )
+        crate::hal::rv64::copy_user::copy_user_chunk(buf as *mut u8, cwd.as_ptr(), cwd.len())
     };
     if rc != 0 {
         return Err(Errno::EFAULT);
@@ -2185,7 +2435,7 @@ fn sys_getcwd(
 // ---------------------------------------------------------------------------
 
 /// sys_uname: fill struct utsname in user memory.
-fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
+fn sys_uname(_task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
     if buf == 0 {
         return Err(Errno::EFAULT);
     }
@@ -2199,19 +2449,23 @@ fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
         // Already zero-filled, NUL terminator is implicit
     }
 
-    write_field(&mut utsname, FIELD_LEN * 0, b"FreeBSD");        // sysname
-    write_field(&mut utsname, FIELD_LEN * 1, b"chronix");        // nodename
-    write_field(&mut utsname, FIELD_LEN * 2, b"0.1.0");          // release
-    write_field(&mut utsname, FIELD_LEN * 3, b"chronix 0.1.0");  // version
-    write_field(&mut utsname, FIELD_LEN * 4, b"riscv64");        // machine
-    write_field(&mut utsname, FIELD_LEN * 5, b"(none)");         // domainname
+    write_field(&mut utsname, FIELD_LEN * 0, b"FreeBSD"); // sysname
+    write_field(&mut utsname, FIELD_LEN * 1, b"chronix"); // nodename
+    write_field(&mut utsname, FIELD_LEN * 2, b"0.1.0"); // release
+    write_field(&mut utsname, FIELD_LEN * 3, b"chronix 0.1.0"); // version
+    write_field(&mut utsname, FIELD_LEN * 4, b"riscv64"); // machine
+    write_field(&mut utsname, FIELD_LEN * 5, b"(none)"); // domainname
 
     let rc = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
-            buf as *mut u8, utsname.as_ptr(), utsname.len(),
+            buf as *mut u8,
+            utsname.as_ptr(),
+            utsname.len(),
         )
     };
-    if rc != 0 { return Err(Errno::EFAULT); }
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
     Ok(())
 }
 
@@ -2222,14 +2476,15 @@ async fn sys_ioctl_async(
     request: usize,
     argp: usize,
 ) -> Result<i32, Errno> {
-    use crate::fs::fd_table::{FileObject, DeviceKind};
+    use crate::fs::fd_table::{DeviceKind, FileObject};
 
     let is_console = {
         let tab = task.fd_table.lock();
         let desc = tab.get(fd).ok_or(Errno::EBADF)?;
         matches!(
             &desc.object,
-            FileObject::Device(DeviceKind::ConsoleRead) | FileObject::Device(DeviceKind::ConsoleWrite)
+            FileObject::Device(DeviceKind::ConsoleRead)
+                | FileObject::Device(DeviceKind::ConsoleWrite)
         )
     };
     if !is_console {
@@ -2254,10 +2509,14 @@ async fn sys_ioctl_async(
                 termios[3] = 0o000012; // c_lflag: ICANON | ECHO
                 let rc = unsafe {
                     crate::hal::rv64::copy_user::copy_user_chunk(
-                        argp as *mut u8, termios.as_ptr() as *const u8, 60,
+                        argp as *mut u8,
+                        termios.as_ptr() as *const u8,
+                        60,
                     )
                 };
-                if rc != 0 { return Err(Errno::EFAULT); }
+                if rc != 0 {
+                    return Err(Errno::EFAULT);
+                }
             }
             Ok(0)
         }
@@ -2267,10 +2526,14 @@ async fn sys_ioctl_async(
                 let winsize: [u16; 4] = [24, 80, 0, 0];
                 let rc = unsafe {
                     crate::hal::rv64::copy_user::copy_user_chunk(
-                        argp as *mut u8, winsize.as_ptr() as *const u8, 8,
+                        argp as *mut u8,
+                        winsize.as_ptr() as *const u8,
+                        8,
                     )
                 };
-                if rc != 0 { return Err(Errno::EFAULT); }
+                if rc != 0 {
+                    return Err(Errno::EFAULT);
+                }
             }
             Ok(0)
         }
@@ -2281,19 +2544,20 @@ async fn sys_ioctl_async(
 }
 
 /// sys_pipe2: create a pipe and return two fds.
-fn sys_pipe2(
-    task: &Arc<Task>,
-    pipefd_ptr: usize,
-    flags: usize,
-) -> Result<(), Errno> {
+fn sys_pipe2(task: &Arc<Task>, pipefd_ptr: usize, flags: usize) -> Result<(), Errno> {
     use crate::fs::fd_table::{FdFlags, FileDescription, FileObject, OpenFlags};
     use crate::fs::pipe::Pipe;
 
     let pipe = Pipe::new();
     let cloexec = (flags & 0o2000000) != 0;
-    let fd_flags = if cloexec { FdFlags::CLOEXEC } else { FdFlags::empty() };
+    let fd_flags = if cloexec {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
 
-    let read_desc = FileDescription::new(FileObject::PipeRead(Arc::clone(&pipe)), OpenFlags::RDONLY);
+    let read_desc =
+        FileDescription::new(FileObject::PipeRead(Arc::clone(&pipe)), OpenFlags::RDONLY);
     let write_desc = FileDescription::new(FileObject::PipeWrite(pipe), OpenFlags::WRONLY);
 
     let (read_fd, write_fd) = {
@@ -2319,7 +2583,9 @@ fn sys_pipe2(
                 8,
             )
         };
-        if rc != 0 { return Err(Errno::EFAULT); }
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
     }
 
     Ok(())
@@ -2334,7 +2600,9 @@ async fn sys_openat_async(
     use crate::fs::fd_table::OpenFlags;
 
     // Read pathname from user memory using fault-safe copyinstr.
-    let path_str = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path_str = copyinstr(task, pathname_ptr, 256)
+        .await
+        .ok_or(Errno::EFAULT)?;
 
     let open_flags = OpenFlags {
         read: true,
@@ -2343,8 +2611,6 @@ async fn sys_openat_async(
 
     crate::fs::syscalls::sys_open(&task.fd_table, &path_str, open_flags).await
 }
-
-
 
 /// Read a NUL-terminated string from user memory. Returns None on fault.
 ///
@@ -2382,7 +2648,12 @@ pub(crate) async fn copyinstr(task: &Arc<Task>, user_ptr: usize, max_len: usize)
 ///
 /// Pre-faults demand-paged user pages for both the pointer array and each
 /// string before copying.
-pub(crate) async fn copyin_argv(task: &Arc<Task>, user_argv: usize, max_count: usize, max_total: usize) -> alloc::vec::Vec<String> {
+pub(crate) async fn copyin_argv(
+    task: &Arc<Task>,
+    user_argv: usize,
+    max_count: usize,
+    max_total: usize,
+) -> alloc::vec::Vec<String> {
     let mut result = alloc::vec::Vec::new();
     if user_argv == 0 {
         return result;
@@ -2391,7 +2662,13 @@ pub(crate) async fn copyin_argv(task: &Arc<Task>, user_argv: usize, max_count: u
     for i in 0..max_count {
         let ptr_addr = user_argv + i * core::mem::size_of::<usize>();
         // Pre-fault the page containing this pointer
-        fault_in_user_buffer(task, ptr_addr, core::mem::size_of::<usize>(), PageFaultAccessType::READ).await;
+        fault_in_user_buffer(
+            task,
+            ptr_addr,
+            core::mem::size_of::<usize>(),
+            PageFaultAccessType::READ,
+        )
+        .await;
         let mut str_ptr: usize = 0;
         let rc = unsafe {
             crate::hal::rv64::copy_user::copy_user_chunk(
@@ -2427,8 +2704,14 @@ fn set_syscall_ret(task: &Arc<Task>, val: usize) -> TrapResult {
 /// sepc advance and ret_val assignment so the ecall re-executes with
 /// original register state).
 fn should_restart_syscall(task: &Arc<Task>) -> bool {
-    let pending = task.signals.pending.load(core::sync::atomic::Ordering::Acquire);
-    let blocked = task.signals.blocked.load(core::sync::atomic::Ordering::Relaxed);
+    let pending = task
+        .signals
+        .pending
+        .load(core::sync::atomic::Ordering::Acquire);
+    let blocked = task
+        .signals
+        .blocked
+        .load(core::sync::atomic::Ordering::Relaxed);
     let unblockable = crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGKILL)
         | crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGSTOP);
     let deliverable = pending & (!blocked | unblockable);
@@ -2446,9 +2729,16 @@ fn should_restart_syscall(task: &Arc<Task>) -> bool {
 ///   normal exit:  (code << 8) & 0x7f00   (low 7 bits = 0)
 ///   signal kill:  signo & 0x7f           (low 7 bits = signal)
 pub(crate) fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
-    klog!(proc, trace, "do_exit pid={} wstatus={:#x}", task.pid, wstatus.0);
+    klog!(
+        proc,
+        trace,
+        "do_exit pid={} wstatus={:#x}",
+        task.pid,
+        wstatus.0
+    );
     // Debug logging handled globally by Makefile levels now.
-    task.exit_status.store(wstatus.0, core::sync::atomic::Ordering::Release);
+    task.exit_status
+        .store(wstatus.0, core::sync::atomic::Ordering::Release);
     task.set_zombie();
 
     // Unregister from global task registry
@@ -2489,14 +2779,17 @@ struct PmapWrapper<F> {
 impl<F: core::future::Future> core::future::Future for PmapWrapper<F> {
     type Output = F::Output;
 
-    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
-         let this = unsafe { self.get_unchecked_mut() };
-         {
-             let mut pmap = this.task.pmap.lock();
-             crate::mm::pmap::pmap_activate(&mut pmap);
-         }
-         let inner = unsafe { core::pin::Pin::new_unchecked(&mut this.inner) };
-         inner.poll(cx)
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        {
+            let mut pmap = this.task.pmap.lock();
+            crate::mm::pmap::pmap_activate(&mut pmap);
+        }
+        let inner = unsafe { core::pin::Pin::new_unchecked(&mut this.inner) };
+        inner.poll(cx)
     }
 }
 

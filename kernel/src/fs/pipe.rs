@@ -4,7 +4,7 @@
 //! Full implementation in Task 2.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 use hal_common::{Errno, SpinMutex};
 

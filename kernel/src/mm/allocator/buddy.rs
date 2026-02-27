@@ -30,9 +30,18 @@ impl BuddyAllocator {
         // const-init: we build the Vec array at runtime in init()
         Self {
             free_lists: [
-                Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-                Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-                Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ],
             total_pages: 0,
             free_pages: 0,
@@ -42,7 +51,10 @@ impl BuddyAllocator {
     /// Initialize with a physical memory range [start, end).
     /// Both addresses must be page-aligned.
     pub fn init(&mut self, start: PhysAddr, end: PhysAddr) {
-        assert!(start.is_page_aligned(), "buddy init: start not page-aligned");
+        assert!(
+            start.is_page_aligned(),
+            "buddy init: start not page-aligned"
+        );
         assert!(end.is_page_aligned(), "buddy init: end not page-aligned");
         assert!(start.as_usize() < end.as_usize(), "buddy init: empty range");
 
@@ -60,15 +72,13 @@ impl BuddyAllocator {
         let total = (end_addr - addr) / PAGE_SIZE;
         self.total_pages += total;
 
-        let mut count = 0usize;
+        let mut _count = 0usize;
         while addr < end_addr {
             let pages_left = (end_addr - addr) / PAGE_SIZE;
             let mut order = MAX_ORDER;
             while order > 0 {
                 let block_pages = 1 << order;
-                if block_pages <= pages_left
-                    && (addr / PAGE_SIZE) % block_pages == 0
-                {
+                if block_pages <= pages_left && (addr / PAGE_SIZE) % block_pages == 0 {
                     break;
                 }
                 order -= 1;
@@ -76,9 +86,9 @@ impl BuddyAllocator {
             self.free_lists[order].push(PhysAddr::new(addr));
             self.free_pages += 1 << order;
             addr += (1 << order) * PAGE_SIZE;
-            count += 1;
+            _count += 1;
         }
-        crate::klog!(boot, info, "buddy init done: {} blocks inserted", count);
+        crate::klog!(boot, info, "buddy init done: {} blocks inserted", _count);
     }
 
     /// Allocate a block of 2^order contiguous pages.
@@ -275,8 +285,14 @@ mod tests {
     fn multiple_init_regions() {
         // Init with two separate regions, verify total pages accumulate
         let mut b = BuddyAllocator::new();
-        b.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 16 * PAGE_SIZE));
-        b.init(PhysAddr::new(0x9000_0000), PhysAddr::new(0x9000_0000 + 16 * PAGE_SIZE));
+        b.init(
+            PhysAddr::new(0x8000_0000),
+            PhysAddr::new(0x8000_0000 + 16 * PAGE_SIZE),
+        );
+        b.init(
+            PhysAddr::new(0x9000_0000),
+            PhysAddr::new(0x9000_0000 + 16 * PAGE_SIZE),
+        );
         assert_eq!(b.total_pages(), 32);
         assert_eq!(b.available_pages(), 32);
     }

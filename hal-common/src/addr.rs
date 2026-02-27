@@ -33,6 +33,24 @@ impl PhysAddr {
     pub const fn is_page_aligned(self) -> bool {
         self.page_offset() == 0
     }
+
+    /// Interprets this physical address as a pointer to a `PAGE_SIZE` byte slice.
+    /// # Safety
+    /// The caller must ensure that the physical address is mapped and valid
+    /// for reading (e.g. through a direct-map physical mapping window).
+    #[inline]
+    pub unsafe fn as_slice<'a>(self) -> &'a [u8] {
+        core::slice::from_raw_parts(self.0 as *const u8, PAGE_SIZE)
+    }
+
+    /// Interprets this physical address as a pointer to a mutable `PAGE_SIZE` byte slice.
+    /// # Safety
+    /// The caller must ensure that the physical address is mapped and valid
+    /// for writing.
+    #[inline]
+    pub unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
+        core::slice::from_raw_parts_mut(self.0 as *mut u8, PAGE_SIZE)
+    }
 }
 
 /// Virtual address newtype
@@ -66,6 +84,63 @@ impl VirtAddr {
 
     pub const fn is_page_aligned(self) -> bool {
         self.page_offset() == 0
+    }
+}
+
+/// A strongly-typed cursor for safely laying out sequential data within
+/// a single physical page (e.g., building user stacks during `execve`).
+#[derive(Debug)]
+pub struct PageCursor {
+    base: PhysAddr,
+    offset: usize,
+}
+
+impl PageCursor {
+    /// Create a new cursor starting at humanity-defined offset within the page.
+    pub fn new(base: PhysAddr, initial_offset: usize) -> Option<Self> {
+        if initial_offset > PAGE_SIZE {
+            return None;
+        }
+        Some(Self {
+            base,
+            offset: initial_offset,
+        })
+    }
+
+    /// Align the current offset down to the specified alignment (must be power of two).
+    pub fn align_down(&mut self, align: usize) {
+        debug_assert!(align.is_power_of_two());
+        self.offset &= !(align - 1);
+    }
+
+    /// Allocate `size` bytes, progressing downwards (like a stack).
+    /// Returns the active slice region if space permits.
+    pub fn alloc_down_bytes(&mut self, size: usize) -> Option<&mut [u8]> {
+        if self.offset < size {
+            return None;
+        }
+        self.offset -= size;
+        unsafe {
+            let ptr = (self.base.as_usize() + self.offset) as *mut u8;
+            Some(core::slice::from_raw_parts_mut(ptr, size))
+        }
+    }
+
+    /// Write a `usize` progressing downwards.
+    pub fn push_usize(&mut self, val: usize) -> Option<()> {
+        let size = core::mem::size_of::<usize>();
+        let slice = self.alloc_down_bytes(size)?;
+        slice.copy_from_slice(&val.to_ne_bytes());
+        Some(())
+    }
+
+    /// Determine the current virtual equivalent address given a target virtual base.
+    pub fn current_va(&self, vbase: VirtAddr) -> VirtAddr {
+        VirtAddr::new(vbase.as_usize() + self.offset)
+    }
+
+    pub fn current_offset(&self) -> usize {
+        self.offset
     }
 }
 

@@ -11,10 +11,14 @@ use hal_common::{Errno, PhysAddr, PAGE_SIZE};
 use super::delegate;
 use super::fd_table::{FdFlags, FdTable, FileDescription, FileObject, OpenFlags};
 use super::page_cache;
-use super::vnode::{Vnode, VnodeType};
+use super::vnode::VnodeType;
 
 /// sys_open: resolve path, create FileDescription, insert into fd table.
-pub async fn sys_open(fd_table: &hal_common::SpinMutex<FdTable>, path_str: &str, flags: OpenFlags) -> Result<u32, Errno> {
+pub async fn sys_open(
+    fd_table: &hal_common::SpinMutex<FdTable>,
+    path_str: &str,
+    flags: OpenFlags,
+) -> Result<u32, Errno> {
     // Check for /dev/ prefix
     if let Some(dev_name) = path_str.strip_prefix("/dev/") {
         let desc = super::devfs::open_device(dev_name, flags)?;
@@ -54,14 +58,24 @@ pub fn sys_stat(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(u
 
 /// sys_read: read from fd into kernel buffer (for kernel-level tests).
 /// This is a simplified path for vnode reads only.
-pub async fn sys_read(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
+pub async fn sys_read(
+    fd_table: &hal_common::SpinMutex<FdTable>,
+    fd: u32,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
     let (id, path, size, offset, desc) = {
         let tab = fd_table.lock();
         let d = tab.get(fd).ok_or(Errno::EBADF)?;
         match &d.object {
             FileObject::Vnode(v) => {
                 let off = d.offset.load(Ordering::Relaxed);
-                (v.vnode_id(), alloc::string::String::from(v.path()), v.size(), off, Arc::clone(d))
+                (
+                    v.vnode_id(),
+                    alloc::string::String::from(v.path()),
+                    v.size(),
+                    off,
+                    Arc::clone(d),
+                )
             }
             _ => return Err(Errno::ENOSYS),
         }
@@ -79,8 +93,10 @@ pub async fn sys_read(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32, buf: &
         let chunk = core::cmp::min(PAGE_SIZE - in_page, to_read - total);
 
         let pa = page_cache_fetch(id, &path, page_off * PAGE_SIZE as u64).await?;
-        let src = (pa.as_usize() + in_page) as *const u8;
-        unsafe { core::ptr::copy_nonoverlapping(src, buf[total..].as_mut_ptr(), chunk); }
+        unsafe {
+            let src_slice = pa.as_slice();
+            buf[total..total + chunk].copy_from_slice(&src_slice[in_page..in_page + chunk]);
+        }
         total += chunk;
     }
 
@@ -97,16 +113,14 @@ async fn page_cache_fetch(vnode_id: u64, path: &str, file_offset: u64) -> Result
         let noop = noop_waker();
         match page_cache::lookup(vnode_id, page_offset, &noop) {
             LookupResult::Hit(pa) => return Ok(pa),
-            LookupResult::InitiateFetch => {
-                match delegate::fs_read_page(path, file_offset).await {
-                    Ok(pa_usize) => {
-                        let pa = PhysAddr::new(pa_usize);
-                        page_cache::complete(vnode_id, page_offset, pa);
-                        return Ok(pa);
-                    }
-                    Err(_) => return Err(Errno::EIO),
+            LookupResult::InitiateFetch => match delegate::fs_read_page(path, file_offset).await {
+                Ok(pa_usize) => {
+                    let pa = PhysAddr::new(pa_usize);
+                    page_cache::complete(vnode_id, page_offset, pa);
+                    return Ok(pa);
                 }
-            }
+                Err(_) => return Err(Errno::EIO),
+            },
             LookupResult::WaitingOnFetch => {
                 // Yield and retry
                 crate::executor::schedule::yield_now().await;
@@ -118,7 +132,9 @@ async fn page_cache_fetch(vnode_id: u64, path: &str, file_offset: u64) -> Result
 fn noop_waker() -> core::task::Waker {
     use core::task::{RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
-    fn clone_fn(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn clone_fn(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, noop, noop, noop);
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
 }

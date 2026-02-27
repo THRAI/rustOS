@@ -5,11 +5,10 @@
 //! - `frame_free()`: returns frame via per-CPU magazine, drains to buddy when full
 //! - `frame_alloc_contiguous()`: multi-page allocation directly from buddy
 
-use hal_common::addr::{PhysAddr, PAGE_SIZE};
-use hal_common::IrqSafeSpinLock;
 use super::buddy::BuddyAllocator;
 use super::magazine::Magazine;
-use crate::executor::per_cpu;
+use hal_common::addr::{PhysAddr, PAGE_SIZE};
+use hal_common::IrqSafeSpinLock;
 
 /// Debug-build poison pattern: written to every u64 in a freed frame.
 #[cfg(debug_assertions)]
@@ -20,12 +19,11 @@ const POISON_PATTERN: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 pub const STACK_CANARY: u64 = 0xCAFE_BABE_DEAD_C0DE;
 
 /// Global buddy allocator, protected by IrqSafeSpinLock.
-static GLOBAL_BUDDY: IrqSafeSpinLock<BuddyAllocator> =
-    IrqSafeSpinLock::new(BuddyAllocator::new());
+static GLOBAL_BUDDY: IrqSafeSpinLock<BuddyAllocator> = IrqSafeSpinLock::new(BuddyAllocator::new());
 
 /// Per-CPU magazine array. Each CPU gets its own magazine for lock-free
 /// order-0 alloc/free. Indexed by cpu_id.
-static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine>; per_cpu::MAX_CPUS] = [
+static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine>; 8] = [
     IrqSafeSpinLock::new(Magazine::new()),
     IrqSafeSpinLock::new(Magazine::new()),
     IrqSafeSpinLock::new(Magazine::new()),
@@ -43,7 +41,13 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     let mut buddy = alloc::boxed::Box::new(BuddyAllocator::new());
     crate::klog!(boot, info, "frame: box created, calling init...");
     buddy.init(start, end);
-    crate::klog!(boot, info, "frame: init done, total={} free={}", buddy.total_pages(), buddy.available_pages());
+    crate::klog!(
+        boot,
+        info,
+        "frame: init done, total={} free={}",
+        buddy.total_pages(),
+        buddy.available_pages()
+    );
     crate::klog!(boot, info, "frame: swapping into global...");
     // Single-threaded at boot — use lock normally
     {
@@ -67,7 +71,9 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
 /// Get the current CPU's magazine index.
 /// Uses tp-based per_cpu in kernel context.
 fn current_cpu_id() -> usize {
-    per_cpu::current().cpu_id
+    // FIXME: dependency on executor
+    // per_cpu::current().cpu_id
+    0
 }
 
 /// Synchronous frame allocation. Never yields.
@@ -137,8 +143,8 @@ pub async fn frame_alloc() -> Option<PhysAddr> {
     // 3. TODO(Phase 5): Wake page daemon and yield.
     // When the page daemon exists, we would signal it here and
     // yield so it can reclaim pages, then retry.
-    // For now, just yield once to give other tasks a chance.
-    crate::executor::yield_now().await;
+    // For now,    // FIXME: dependency on executor
+    // crate::executor::yield_now().await;
 
     // 4. Retry buddy after yield.
     {

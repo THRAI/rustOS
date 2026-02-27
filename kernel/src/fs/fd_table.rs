@@ -6,8 +6,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
-
+use core::sync::atomic::AtomicU64;
 use hal_common::Errno;
 
 use super::vnode::Vnode;
@@ -35,9 +34,18 @@ pub struct OpenFlags {
 }
 
 impl OpenFlags {
-    pub const RDONLY: Self = Self { read: true, write: false };
-    pub const WRONLY: Self = Self { read: false, write: true };
-    pub const RDWR: Self = Self { read: true, write: true };
+    pub const RDONLY: Self = Self {
+        read: true,
+        write: false,
+    };
+    pub const WRONLY: Self = Self {
+        read: false,
+        write: true,
+    };
+    pub const RDWR: Self = Self {
+        read: true,
+        write: true,
+    };
 }
 
 // ---- DeviceKind ----
@@ -104,7 +112,9 @@ pub struct FdTable {
 impl FdTable {
     /// Create an empty fd table.
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Create fd table with stdio: fd 0=ConsoleRead, fd 1/2=ConsoleWrite.
@@ -146,7 +156,12 @@ impl FdTable {
     }
 
     /// Insert at a specific fd number (for dup2/pipe2). Closes existing if occupied.
-    pub fn insert_at(&mut self, fd: u32, desc: Arc<FileDescription>, fd_flags: FdFlags) -> Result<(), Errno> {
+    pub fn insert_at(
+        &mut self,
+        fd: u32,
+        desc: Arc<FileDescription>,
+        fd_flags: FdFlags,
+    ) -> Result<(), Errno> {
         let idx = fd as usize;
         if idx >= MAX_FDS {
             return Err(Errno::EBADF);
@@ -160,7 +175,10 @@ impl FdTable {
 
     /// Look up a file description by fd.
     pub fn get(&self, fd: u32) -> Option<&Arc<FileDescription>> {
-        self.entries.get(fd as usize)?.as_ref().map(|(desc, _)| desc)
+        self.entries
+            .get(fd as usize)?
+            .as_ref()
+            .map(|(desc, _)| desc)
     }
 
     /// Get fd flags for a slot.
@@ -197,7 +215,11 @@ impl FdTable {
             return Err(Errno::EINVAL);
         }
         let desc = Arc::clone(self.get(old_fd).ok_or(Errno::EBADF)?);
-        let flags = if cloexec { FdFlags::CLOEXEC } else { FdFlags::empty() };
+        let flags = if cloexec {
+            FdFlags::CLOEXEC
+        } else {
+            FdFlags::empty()
+        };
         self.insert_at(new_fd, desc, flags)?;
         Ok(new_fd)
     }

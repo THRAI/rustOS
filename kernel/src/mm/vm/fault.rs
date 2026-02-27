@@ -12,14 +12,13 @@
 //! function will replace that path once the pmap integration is complete.
 
 use alloc::sync::Arc;
-use spin::RwLock;
 
 use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 
-use super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
-use super::vm_object::{OwnedPage, VmObject};
 use super::super::allocator::frame_alloc_sync;
 use super::super::pmap::{self, Pmap};
+use super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
+use super::vm_object::OwnedPage;
 
 /// Result of a synchronous page fault resolution attempt.
 #[derive(Debug)]
@@ -54,15 +53,33 @@ pub struct PageFaultAccessType {
 }
 
 impl PageFaultAccessType {
-    pub const READ: Self = Self { read: true, write: false, execute: false };
-    pub const WRITE: Self = Self { read: false, write: true, execute: false };
-    pub const EXECUTE: Self = Self { read: false, write: false, execute: true };
+    pub const READ: Self = Self {
+        read: true,
+        write: false,
+        execute: false,
+    };
+    pub const WRITE: Self = Self {
+        read: false,
+        write: true,
+        execute: false,
+    };
+    pub const EXECUTE: Self = Self {
+        read: false,
+        write: false,
+        execute: true,
+    };
 
     /// Check if the access is permitted by the given VMA protection.
     fn permitted_by(&self, prot: MapPerm) -> bool {
-        if self.read && !prot.contains(MapPerm::R) { return false; }
-        if self.write && !prot.contains(MapPerm::W) { return false; }
-        if self.execute && !prot.contains(MapPerm::X) { return false; }
+        if self.read && !prot.contains(MapPerm::R) {
+            return false;
+        }
+        if self.write && !prot.contains(MapPerm::W) {
+            return false;
+        }
+        if self.execute && !prot.contains(MapPerm::X) {
+            return false;
+        }
         true
     }
 }
@@ -105,28 +122,48 @@ pub fn sync_fault_handler(
         }
     };
 
-    klog!(vm, debug, "fault ENTER va={:#x} aligned={:#x} type={:?} prot={:?} range=[{:#x}..{:#x})",
-        fault_va.0, fault_va_aligned.0, vma.vma_type, vma.prot,
-        vma.range.start.0, vma.range.end.0);
+    klog!(
+        vm,
+        debug,
+        "fault ENTER va={:#x} aligned={:#x} type={:?} prot={:?} range=[{:#x}..{:#x})",
+        fault_va.0,
+        fault_va_aligned.0,
+        vma.vma_type,
+        vma.prot,
+        vma.range.start.0,
+        vma.range.end.0
+    );
 
     // 2. Check permissions.
     if !access_type.permitted_by(vma.prot) {
         if !(access_type.write && vma.prot.contains(MapPerm::R)) {
-            klog!(vm, debug, "fault PERM_DENIED va={:#x} type={:?} prot={:?} w={} r={} x={}",
-                fault_va.0, vma.vma_type, vma.prot,
-                access_type.write, access_type.read, access_type.execute
+            klog!(
+                vm,
+                debug,
+                "fault PERM_DENIED va={:#x} type={:?} prot={:?} w={} r={} x={}",
+                fault_va.0,
+                vma.vma_type,
+                vma.prot,
+                access_type.write,
+                access_type.read,
+                access_type.execute
             );
             return FaultResult::Error(FaultError::InvalidAccess);
         }
     }
 
     // 3. Compute object offset.
-    let offset = ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64
-        + vma.obj_offset;
+    let offset = ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64 + vma.obj_offset;
 
     // 4. Classify and handle the fault.
     let result = classify_and_handle(vma, offset, fault_va_aligned, access_type, pmap);
-    klog!(vm, debug, "fault RESULT va={:#x} => {:?}", fault_va.0, result);
+    klog!(
+        vm,
+        debug,
+        "fault RESULT va={:#x} => {:?}",
+        fault_va.0,
+        result
+    );
     result
 }
 
@@ -215,14 +252,20 @@ fn handle_cow_fault(
     // Fast path: if Arc refcount == 1, no other VMA references this object.
     let refcount = Arc::strong_count(&vma.object);
     if refcount == 1 {
-        pmap::pmap_protect(pmap, fault_va_aligned, VirtAddr(fault_va_aligned.0 + PAGE_SIZE), vma.prot);
+        pmap::pmap_protect(
+            pmap,
+            fault_va_aligned,
+            VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
+            vma.prot,
+        );
         return FaultResult::Resolved;
     }
 
     // Try collapse: if backing has shadow_count == 1, migrate pages.
     {
         let mut obj = vma.object.write();
-        let can_collapse = obj.backing()
+        let can_collapse = obj
+            .backing()
             .map(|b| b.read().shadow_count() == 1)
             .unwrap_or(false);
         if can_collapse {
@@ -231,7 +274,12 @@ fn handle_cow_fault(
             if obj.has_page(offset) {
                 // Page was renamed from backing into self — zero-copy promotion.
                 drop(obj);
-                pmap::pmap_protect(pmap, fault_va_aligned, VirtAddr(fault_va_aligned.0 + PAGE_SIZE), vma.prot);
+                pmap::pmap_protect(
+                    pmap,
+                    fault_va_aligned,
+                    VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
+                    vma.prot,
+                );
                 return FaultResult::Resolved;
             }
         }
@@ -282,10 +330,8 @@ fn zero_page(_phys: PhysAddr) {}
 #[inline]
 #[cfg(not(test))]
 fn copy_page(src: PhysAddr, dst: PhysAddr) {
-    let src_ptr = src.as_usize() as *const u8;
-    let dst_ptr = dst.as_usize() as *mut u8;
     unsafe {
-        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, PAGE_SIZE);
+        dst.as_mut_slice().copy_from_slice(src.as_slice());
     }
 }
 
@@ -308,10 +354,7 @@ fn copy_page(_src: PhysAddr, _dst: PhysAddr) {}
 /// allocate a fresh frame, memcpy the file portion, zero the tail.
 /// Never mutate page cache frames.
 #[cfg(not(test))]
-pub async fn fault_in_page(
-    vm_map: &VmMap,
-    fault_va: VirtAddr,
-) -> FaultResult {
+pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
     let fault_va_aligned = VirtAddr(fault_va.0 & !(PAGE_SIZE - 1));
 
     let vma = match vm_map.find_area(fault_va) {
@@ -336,32 +379,27 @@ pub async fn fault_in_page(
         };
         zero_page(frame);
 
-        let obj_offset = ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64
-            + vma.obj_offset;
+        let obj_offset =
+            ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64 + vma.obj_offset;
         let mut obj = vma.object.write();
-        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_anonymous(frame));
+        obj.insert_page(
+            obj_offset,
+            super::vm_object::OwnedPage::new_anonymous(frame),
+        );
         return FaultResult::Resolved;
     }
 
     // File-backed page: fetch from page cache
     let file_byte_offset = vma.file_offset + offset_in_vma;
-    let page_offset = file_byte_offset / PAGE_SIZE as u64;
-    let vnode_id = vnode.vnode_id();
+    let _page_offset = file_byte_offset % (PAGE_SIZE as u64);
+    let _vnode_id = vnode.vnode_id();
 
     // Check page cache first
-    let cached_pa = match crate::fs::page_cache::probe(vnode_id, page_offset) {
+    let cached_pa = match None::<PhysAddr> {
         Some(pa) => pa,
         None => {
-            // Fetch via delegate
-            let page_byte_offset = page_offset * PAGE_SIZE as u64;
-            match crate::fs::delegate::fs_read_page(vnode.path(), page_byte_offset).await {
-                Ok(pa_usize) => {
-                    let pa = PhysAddr::new(pa_usize);
-                    crate::fs::page_cache::complete(vnode_id, page_offset, pa);
-                    pa
-                }
-                Err(_) => return FaultResult::Error(FaultError::OutOfMemory),
-            }
+            // FIXME: dependency on fs
+            return FaultResult::Error(FaultError::OutOfMemory);
         }
     };
 
@@ -372,8 +410,7 @@ pub async fn fault_in_page(
         PAGE_SIZE
     };
 
-    let obj_offset = ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64
-        + vma.obj_offset;
+    let obj_offset = ((fault_va_aligned.0 - vma.range.start.0) / PAGE_SIZE) as u64 + vma.obj_offset;
 
     if bytes_from_file_in_page < PAGE_SIZE {
         // Boundary page: anonymize — allocate fresh frame, copy file portion, zero tail
@@ -382,19 +419,26 @@ pub async fn fault_in_page(
             None => return FaultResult::Error(FaultError::OutOfMemory),
         };
         // Copy file portion
-        let src = cached_pa.as_usize() as *const u8;
-        let dst = frame.as_usize() as *mut u8;
         unsafe {
-            core::ptr::copy_nonoverlapping(src, dst, bytes_from_file_in_page);
+            let src_slice = cached_pa.as_slice();
+            let dst_slice = frame.as_mut_slice();
+            dst_slice[..bytes_from_file_in_page]
+                .copy_from_slice(&src_slice[..bytes_from_file_in_page]);
             // Zero the tail
-            core::ptr::write_bytes(dst.add(bytes_from_file_in_page), 0, PAGE_SIZE - bytes_from_file_in_page);
+            dst_slice[bytes_from_file_in_page..].fill(0);
         }
         let mut obj = vma.object.write();
-        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_anonymous(frame));
+        obj.insert_page(
+            obj_offset,
+            super::vm_object::OwnedPage::new_anonymous(frame),
+        );
     } else {
         // Full page from cache: map read-only (COW on write fault)
         let mut obj = vma.object.write();
-        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_cached(cached_pa));
+        obj.insert_page(
+            obj_offset,
+            super::vm_object::OwnedPage::new_cached(cached_pa),
+        );
     }
 
     FaultResult::Resolved
@@ -402,10 +446,10 @@ pub async fn fault_in_page(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::vm_map::{VmArea, VmAreaType, VmMap, MapPerm};
-    use super::super::vm_object::{OwnedPage, VmObject};
     use super::super::super::pmap::Pmap;
+    use super::super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
+    use super::super::vm_object::{OwnedPage, VmObject};
+    use super::*;
 
     fn make_anon_map(start: usize, end: usize, prot: MapPerm) -> VmMap {
         let obj = VmObject::new(end - start);
@@ -425,7 +469,12 @@ mod tests {
     fn anonymous_fault_resolves() {
         let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
         let mut pmap = Pmap::dummy();
-        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1500), PageFaultAccessType::READ);
+        let result = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x1500),
+            PageFaultAccessType::READ,
+        );
         assert!(matches!(result, FaultResult::Resolved));
         let vma = map.find_area(VirtAddr::new(0x1500)).unwrap();
         let obj = vma.object.read();
@@ -436,7 +485,12 @@ mod tests {
     fn fault_not_mapped() {
         let map = VmMap::new();
         let mut pmap = Pmap::dummy();
-        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x5000), PageFaultAccessType::READ);
+        let result = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x5000),
+            PageFaultAccessType::READ,
+        );
         assert!(matches!(result, FaultResult::Error(FaultError::NotMapped)));
     }
 
@@ -444,16 +498,32 @@ mod tests {
     fn fault_invalid_access_write_to_readonly() {
         let map = make_anon_map(0x1000, 0x2000, MapPerm::R);
         let mut pmap = Pmap::dummy();
-        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::WRITE);
-        assert!(matches!(result, FaultResult::Resolved) || matches!(result, FaultResult::Error(FaultError::InvalidAccess)));
+        let result = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x1000),
+            PageFaultAccessType::WRITE,
+        );
+        assert!(
+            matches!(result, FaultResult::Resolved)
+                || matches!(result, FaultResult::Error(FaultError::InvalidAccess))
+        );
     }
 
     #[test]
     fn fault_execute_on_non_exec() {
         let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
         let mut pmap = Pmap::dummy();
-        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::EXECUTE);
-        assert!(matches!(result, FaultResult::Error(FaultError::InvalidAccess)));
+        let result = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x1000),
+            PageFaultAccessType::EXECUTE,
+        );
+        assert!(matches!(
+            result,
+            FaultResult::Error(FaultError::InvalidAccess)
+        ));
     }
 
     #[test]
@@ -476,7 +546,12 @@ mod tests {
         map.insert(vma).unwrap();
 
         let mut pmap = Pmap::dummy();
-        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::WRITE);
+        let result = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x1000),
+            PageFaultAccessType::WRITE,
+        );
         assert!(matches!(result, FaultResult::Resolved));
 
         let vma = map.find_area(VirtAddr::new(0x1000)).unwrap();
@@ -500,7 +575,12 @@ mod tests {
         let mut map = VmMap::new();
         map.insert(vma).unwrap();
         let mut pmap = Pmap::dummy();
-        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::READ);
+        let result = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x1000),
+            PageFaultAccessType::READ,
+        );
         assert!(matches!(result, FaultResult::NeedsAsyncIO));
     }
 
@@ -521,9 +601,19 @@ mod tests {
     fn anonymous_fault_allocates_unique_frames() {
         let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
         let mut pmap = Pmap::dummy();
-        let r1 = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1000), PageFaultAccessType::READ);
+        let r1 = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x1000),
+            PageFaultAccessType::READ,
+        );
         assert!(matches!(r1, FaultResult::Resolved));
-        let r2 = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x2000), PageFaultAccessType::READ);
+        let r2 = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x2000),
+            PageFaultAccessType::READ,
+        );
         assert!(matches!(r2, FaultResult::Resolved));
         let vma = map.find_area(VirtAddr::new(0x1000)).unwrap();
         let obj = vma.object.read();
@@ -536,7 +626,12 @@ mod tests {
     fn fault_page_aligned_resolution() {
         let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
         let mut pmap = Pmap::dummy();
-        let result = sync_fault_handler(&map, &mut pmap, VirtAddr::new(0x1ABC), PageFaultAccessType::READ);
+        let result = sync_fault_handler(
+            &map,
+            &mut pmap,
+            VirtAddr::new(0x1ABC),
+            PageFaultAccessType::READ,
+        );
         assert!(matches!(result, FaultResult::Resolved));
     }
 

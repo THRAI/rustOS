@@ -14,6 +14,7 @@ use super::syscall_result::SyscallResult;
 pub struct WaitStatus(pub i32);
 
 impl WaitStatus {
+    //TODO: a more informative name
     /// Create a wait status for a process that exited normally.
     /// Format: `(code & 0xff) << 8`
     #[inline]
@@ -72,7 +73,7 @@ pub struct WaitChildFuture {
 
 impl WaitChildFuture {
     /// target_pid:
-    ///   > 0  => wait for specific child
+    ///   \> 0  => wait for specific child
     ///   -1   => wait for any child
     pub fn new(parent: Arc<Task>, target_pid: isize) -> Self {
         Self { parent, target_pid }
@@ -98,6 +99,7 @@ impl Future for WaitChildFuture {
         }
 
         // Step 3: Scan children for any ZOMBIE matching target_pid
+        // TODO: maybe for_each_zombie() for children?
         for child in children.iter() {
             if child.state() == TaskState::Zombie {
                 if self.target_pid > 0 && child.pid != self.target_pid as u32 {

@@ -2,20 +2,27 @@
 //!
 //! Phase 4 strategy: deep copy for correctness. COW optimization deferred.
 
-use alloc::sync::Arc;
 use super::task::Task;
 use crate::mm::pmap;
-use crate::mm::vm::vm_map::{MapPerm, VmAreaType};
+use crate::mm::vm::vm_map::MapPerm;
 use crate::mm::vm::vm_object::OwnedPage;
-use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
+use alloc::sync::Arc;
+use hal_common::{VirtAddr, PAGE_SIZE};
 
 /// Fork the parent task with deep-copy of all mapped writable pages.
 pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     let child = Task::new(Arc::downgrade(parent));
-    klog!(proc, debug, "fork parent={} child={}", parent.pid, child.pid);
+    klog!(
+        proc,
+        debug,
+        "fork parent={} child={}",
+        parent.pid,
+        child.pid
+    );
 
     // 1. Fork VmMap structure (shadow objects for anon, shared for file-backed)
     // 2. Deep-copy all pages the parent has mapped in its pmap
+    //TODO: fixme when implementing COW
     {
         let parent_vm = parent.vm_map.lock();
         let child_vm = parent_vm.fork();
@@ -23,10 +30,13 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     }
 
     // Deep-copy: walk parent's pmap, copy mapped pages into child
+    //TODO: fixme when implementing COW
     deep_copy_pages(parent, &child);
 
+    //TODO: fixme when implementing COW
     // Map sigcode trampoline page in child (not in vm_map, so deep_copy misses it)
     {
+        crate::kprintln!("fork: FIXME when using COW");
         let mut child_pmap = child.pmap.lock();
         super::signal::map_sigcode_page(&mut child_pmap);
     }
@@ -39,6 +49,8 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
 
     // Copy parent's trap frame (child resumes past the ecall).
     // Child gets return value 0 in a0 (fork convention).
+    // TODO: consider implement several HAL setter methods in trapframe, and remember to replace it here.
+    // TODO: like skip_an_instruction()
     {
         let mut child_tf = child.trap_frame.lock();
         *child_tf = *parent.trap_frame.lock();
@@ -53,15 +65,25 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     );
 
     // Clear pending signals in child (POSIX: pending signals not inherited).
-    child.signals.pending.store(0, core::sync::atomic::Ordering::Relaxed);
+    // TODO: pack as a setter method in signal?
+    child
+        .signals
+        .pending
+        .store(0, core::sync::atomic::Ordering::Relaxed);
+
     // Copy signal actions from parent.
     {
         let parent_actions = parent.signals.actions.lock();
         *child.signals.actions.lock() = *parent_actions;
     }
+
     // Copy blocked mask from parent.
+    //TODO: pack as a setter method in signal?
     child.signals.blocked.store(
-        parent.signals.blocked.load(core::sync::atomic::Ordering::Relaxed),
+        parent
+            .signals
+            .blocked
+            .load(core::sync::atomic::Ordering::Relaxed),
         core::sync::atomic::Ordering::Relaxed,
     );
 
@@ -95,18 +117,20 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                     // Deep copy: new frame + memcpy
                     if let Some(new_frame) = crate::mm::allocator::frame_alloc_sync() {
                         unsafe {
-                            let src = parent_pa.as_usize() as *const u8;
-                            let dst = new_frame.as_usize() as *mut u8;
-                            core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
+                            new_frame
+                                .as_mut_slice()
+                                .copy_from_slice(parent_pa.as_slice());
                         }
                         // Insert into child's VmObject
                         if let Some(child_vma) = child_vm.find_area(va_virt) {
-                            let obj_offset = ((va - child_vma.range.start.as_usize()) / PAGE_SIZE) as u64
+                            let obj_offset = ((va - child_vma.range.start.as_usize()) / PAGE_SIZE)
+                                as u64
                                 + child_vma.obj_offset;
                             let mut obj = child_vma.object.write();
                             obj.insert_page(obj_offset, OwnedPage::new_anonymous(new_frame));
                         }
-                        let _ = pmap::pmap_enter(&mut child_pmap, va_virt, new_frame, vma.prot, false);
+                        let _ =
+                            pmap::pmap_enter(&mut child_pmap, va_virt, new_frame, vma.prot, false);
                     }
                 } else {
                     // Read-only: share physical page

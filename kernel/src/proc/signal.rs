@@ -11,8 +11,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use hal_common::{Errno, PhysAddr, TrapFrame, VirtAddr, PAGE_SIZE};
 use hal_common::SpinMutex as Mutex;
+use hal_common::{TrapFrame, VirtAddr, PAGE_SIZE};
 
 use super::task::Task;
 
@@ -44,11 +44,11 @@ pub struct Signal(pub u8);
 impl core::fmt::Display for Signal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let name = match self.0 {
-            SIGHUP  => "SIGHUP",
-            SIGINT  => "SIGINT",
-            SIGILL  => "SIGILL",
-            SIGBUS  => "SIGBUS",
-            SIGFPE  => "SIGFPE",
+            SIGHUP => "SIGHUP",
+            SIGINT => "SIGINT",
+            SIGILL => "SIGILL",
+            SIGBUS => "SIGBUS",
+            SIGFPE => "SIGFPE",
             SIGKILL => "SIGKILL",
             SIGUSR1 => "SIGUSR1",
             SIGSEGV => "SIGSEGV",
@@ -65,10 +65,18 @@ impl core::fmt::Display for Signal {
     }
 }
 
+impl Signal {
+    pub fn is_legit(&self) -> bool {
+        (1..=MAX_SIG).contains(&self.0)
+    }
+}
+
 /// Convert signal number to bitmask bit.
+/// TODO: how is signal number used across modules? consider expose signal types rather than passing u8/u64 signal number around.
+/// TODO: consider from u8 or u64 to Signal, after deciding how to use signal number across modules.
 #[inline]
 fn sig_bit(sig: u8) -> u64 {
-    debug_assert!(sig >= 1 && sig <= MAX_SIG);
+    debug_assert!(Signal(sig).is_legit());
     1u64 << (sig - 1)
 }
 
@@ -103,6 +111,7 @@ pub fn default_action(sig: u8) -> SigDefault {
 // SA flags
 // ---------------------------------------------------------------------------
 
+//TODO: bitmask?
 pub const SA_SIGINFO: u64 = 4;
 pub const SA_RESTART: u64 = 0x1000_0000;
 pub const SA_NOCLDWAIT: u64 = 2;
@@ -118,10 +127,10 @@ pub const SIG_IGN: usize = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SigAction {
-    pub handler: usize,   // SIG_DFL, SIG_IGN, or function pointer
+    pub handler: usize, // SIG_DFL, SIG_IGN, or function pointer
     pub flags: u64,
-    pub restorer: usize,  // SA_RESTORER trampoline (unused, we use sigcode page)
-    pub mask: u64,        // signals blocked during handler execution
+    pub restorer: usize, // SA_RESTORER trampoline (unused, we use sigcode page)
+    pub mask: u64,       // signals blocked during handler execution
 }
 
 impl SigAction {
@@ -198,7 +207,7 @@ impl SignalState {
                         return true; // Would terminate/stop
                     }
                 }
-                SIG_IGN => {} // Explicitly ignored
+                SIG_IGN => {}     // Explicitly ignored
                 _ => return true, // User handler installed
             }
             bits &= !(1u64 << bit);
@@ -208,7 +217,8 @@ impl SignalState {
 
     /// Check if the given signal's action has SA_RESTART set.
     pub fn is_restart(&self, sig: u8) -> bool {
-        if sig < 1 || sig > MAX_SIG {
+        //TODO: use signal::is_legit
+        if !Signal(sig).is_legit() {
             return false;
         }
         let actions = self.actions.lock();
@@ -248,7 +258,7 @@ impl SignalState {
 pub const SIGCODE_VA: usize = 0x0000_003F_FFFF_F000;
 
 /// SYS_rt_sigreturn on rv64 Linux = 139
-const SYS_RT_SIGRETURN: usize = 139;
+const _SYS_RT_SIGRETURN: usize = 139;
 
 /// Build the sigcode page contents: `li a7, 139; ecall; unimp`
 /// Returns a page-sized buffer.
@@ -310,12 +320,26 @@ fn build_siginfo(sig: u8) -> [u8; SIGINFO_SIZE] {
 /// Build a signal frame on the user stack and redirect execution to the handler.
 /// Returns Ok(()) on success, Err(()) if the user stack is trashed (caller should kill).
 pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> {
-    klog!(signal, debug, "sendsig pid={} sig={} handler={:#x}", task.pid, Signal(sig), action.handler);
+    klog!(
+        signal,
+        debug,
+        "sendsig pid={} sig={} handler={:#x}",
+        task.pid,
+        Signal(sig),
+        action.handler
+    );
     let mut tf = task.trap_frame.lock();
     let sig_state = &task.signals;
 
-    klog!(signal, error, "sendsig pid={} saving sepc={:#x} a0={:#x} sp={:#x}",
-        task.pid, tf.sepc, tf.x[10], tf.x[2]);
+    klog!(
+        signal,
+        error,
+        "sendsig pid={} saving sepc={:#x} a0={:#x} sp={:#x}",
+        task.pid,
+        tf.sepc,
+        tf.x[10],
+        tf.x[2]
+    );
 
     // Determine stack pointer for signal frame
     let mut sp = tf.x[2]; // current user SP
@@ -338,11 +362,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
         sp = (sp - SIGINFO_SIZE) & !0xF;
         let si = build_siginfo(sig);
         let ok = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                sp as *mut u8,
-                si.as_ptr(),
-                SIGINFO_SIZE,
-            )
+            crate::hal::rv64::copy_user::copy_user_chunk(sp as *mut u8, si.as_ptr(), SIGINFO_SIZE)
         };
         if ok != 0 {
             return Err(());
@@ -375,8 +395,15 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
         return Err(()); // user stack trashed
     }
 
-    klog!(signal, error, "sendsig pid={} sigframe at {:#x}..{:#x} (size={})",
-        task.pid, sp, sp + SIGFRAME_SIZE, SIGFRAME_SIZE);
+    klog!(
+        signal,
+        error,
+        "sendsig pid={} sigframe at {:#x}..{:#x} (size={})",
+        task.pid,
+        sp,
+        sp + SIGFRAME_SIZE,
+        SIGFRAME_SIZE
+    );
 
     // Block signals specified in sa_mask + the signal itself during handler
     let block_mask = action.mask | sig_bit(sig);
@@ -384,11 +411,11 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
 
     // Redirect trap frame to handler
     tf.sepc = action.handler;
-    tf.x[10] = sig as usize;           // a0 = signo
-    tf.x[11] = siginfo_va;              // a1 = siginfo (valid ptr if SA_SIGINFO, else NULL)
-    tf.x[12] = sp;                       // a2 = ucontext (pointer to sigframe)
-    tf.x[2] = sp;                        // sp = sigframe
-    tf.x[1] = SIGCODE_VA;               // ra = sigreturn trampoline
+    tf.x[10] = sig as usize; // a0 = signo
+    tf.x[11] = siginfo_va; // a1 = siginfo (valid ptr if SA_SIGINFO, else NULL)
+    tf.x[12] = sp; // a2 = ucontext (pointer to sigframe)
+    tf.x[2] = sp; // sp = sigframe
+    tf.x[1] = SIGCODE_VA; // ra = sigreturn trampoline
 
     // Sanitize sstatus: SPP=0 (user mode), SPIE=1, FS>=Initial
     tf.sstatus = (tf.sstatus & !(1 << 8)) | (1 << 5); // clear SPP, set SPIE
@@ -411,11 +438,22 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         Some(s) => s,
         None => return Ok(false),
     };
-    klog!(signal, error, "check_pending pid={} sig={}", task.pid, Signal(sig));
+    klog!(
+        signal,
+        error,
+        "check_pending pid={} sig={}",
+        task.pid,
+        Signal(sig)
+    );
 
     // SIGKILL: always fatal, no handler
     if sig == SIGKILL {
-        klog!(signal, error, "check_pending pid={} SIGKILL -> fatal", task.pid);
+        klog!(
+            signal,
+            error,
+            "check_pending pid={} SIGKILL -> fatal",
+            task.pid
+        );
         return Err(sig);
     }
 
@@ -433,22 +471,40 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         SIG_DFL => {
             match default_action(sig) {
                 SigDefault::Terminate => {
-                    klog!(signal, error, "check_pending pid={} sig={} SIG_DFL -> Terminate", task.pid, Signal(sig));
+                    klog!(
+                        signal,
+                        error,
+                        "check_pending pid={} sig={} SIG_DFL -> Terminate",
+                        task.pid,
+                        Signal(sig)
+                    );
                     Err(sig)
                 }
                 SigDefault::Ignore => Ok(false),
-                SigDefault::Stop => Ok(false),   // simplified
+                SigDefault::Stop => Ok(false), // simplified
                 SigDefault::Continue => Ok(false),
             }
         }
         SIG_IGN => Ok(false),
         _handler => {
-            klog!(signal, error, "check_pending pid={} sig={} -> user handler {:#x}", task.pid, Signal(sig), _handler);
+            klog!(
+                signal,
+                error,
+                "check_pending pid={} sig={} -> user handler {:#x}",
+                task.pid,
+                Signal(sig),
+                _handler
+            );
             // Deliver to user handler via sendsig
             match sendsig(task, sig, &action) {
                 Ok(()) => Ok(true),
                 Err(()) => {
-                    klog!(signal, error, "check_pending pid={} sendsig FAILED -> SIGILL", task.pid);
+                    klog!(
+                        signal,
+                        error,
+                        "check_pending pid={} sendsig FAILED -> SIGILL",
+                        task.pid
+                    );
                     // sendsig failed (bad user stack) — kill with SIGILL
                     Err(SIGILL)
                 }
@@ -456,7 +512,6 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // sys_kill + global task registry
@@ -490,7 +545,9 @@ pub(crate) fn for_each_task(mut f: impl FnMut(&Arc<Task>)) {
 }
 
 pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
-    if sig == 0 { return; }
+    if sig == 0 {
+        return;
+    }
     let registry = TASK_REGISTRY.lock();
     for t in registry.iter() {
         if t.pgid.load(Ordering::Relaxed) == pgid {
@@ -518,14 +575,11 @@ pub fn map_sigcode_page(pmap: &mut crate::mm::pmap::Pmap) {
 
     // Write sigcode to the physical frame
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            page_data.as_ptr(),
-            frame.as_usize() as *mut u8,
-            PAGE_SIZE,
-        );
+        frame.as_mut_slice().copy_from_slice(&page_data);
     }
 
     // Map as read-only + user-accessible
+    // TODO: use constants like RXU or something similar from MapPerm. Update it there.
     let prot = MapPerm::R | MapPerm::X | MapPerm::U;
     let _ = pmap_enter(pmap, VirtAddr::new(SIGCODE_VA), frame, prot, false);
 }

@@ -97,4 +97,6 @@ impl TrapFrame {
     pub fn stval(&self) -> usize {
         self.stval
     }
+
+    //TODO: implement several setter methods for process module, like skip-fork-call, etc.
 }

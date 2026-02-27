@@ -5,11 +5,15 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use hal_common::Errno;
-use crate::proc::task::Task;
-use crate::executor::user_task::{fault_in_user_buffer, copyinstr, copyin_argv, do_exit, spawn_user_task};
+use crate::executor::user_task::{
+    copyin_argv, copyinstr, do_exit, fault_in_user_buffer, spawn_user_task,
+};
 use crate::klog;
-use crate::proc::signal::{self, SigAction, SigFrame, Signal, SIG_DFL, SIG_IGN, SIGKILL, SIGSTOP, MAX_SIG, SIGFRAME_SIZE, sig_bit_pub};
+use crate::proc::signal::{
+    sig_bit_pub, SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP,
+};
+use crate::proc::task::Task;
+use hal_common::Errno;
 
 // ---------------------------------------------------------------------------
 // Basic Info Syscalls
@@ -23,10 +27,18 @@ pub fn sys_getppid(task: &Arc<Task>) -> usize {
     task.ppid() as usize
 }
 
-pub fn sys_getuid(_task: &Arc<Task>) -> usize { 0 }
-pub fn sys_geteuid(_task: &Arc<Task>) -> usize { 0 }
-pub fn sys_getgid(_task: &Arc<Task>) -> usize { 0 }
-pub fn sys_getegid(_task: &Arc<Task>) -> usize { 0 }
+pub fn sys_getuid(_task: &Arc<Task>) -> usize {
+    0
+}
+pub fn sys_geteuid(_task: &Arc<Task>) -> usize {
+    0
+}
+pub fn sys_getgid(_task: &Arc<Task>) -> usize {
+    0
+}
+pub fn sys_getegid(_task: &Arc<Task>) -> usize {
+    0
+}
 
 pub fn sys_gettid(task: &Arc<Task>) -> usize {
     task.pid as usize
@@ -36,17 +48,21 @@ pub fn sys_gettid(task: &Arc<Task>) -> usize {
 // Process Lifecycle: clone, execve, exit, wait4
 // ---------------------------------------------------------------------------
 
+//TODO: handle flags
 pub fn sys_clone(task: &Arc<Task>) -> usize {
     // Basic fork (flags ignored for now)
+    //TODO: reimport this
     let child = crate::proc::fork::fork(task);
     let child_pid = child.pid;
     // Spawn child on same CPU
+    //TODO: reimport this
     let cpu = crate::executor::per_cpu::current().cpu_id;
     spawn_user_task(child, cpu);
     child_pid as usize
 }
 
 pub fn sys_exit(task: &Arc<Task>, status: i32) {
+    //TODO: consider reimport this
     let wstatus = crate::proc::exit_wait::WaitStatus::exited(status);
     do_exit(task, wstatus);
 }
@@ -59,8 +75,8 @@ pub async fn sys_execve_async(
 ) -> Result<(usize, usize), Errno> {
     // Read pathname from user memory
     let path = match copyinstr(task, pathname_ptr, 256).await {
-        Some(s) => s,
         None => return Err(Errno::EFAULT),
+        Some(s) => s,
     };
     // Read argv array from user memory (before exec destroys address space)
     let argv = copyin_argv(task, argv_ptr, 64, 4096).await;
@@ -80,7 +96,13 @@ pub async fn sys_wait4_async(
 
     // Pre-fault wstatus page so copy_user_chunk won't EFAULT on demand-paged stack
     if wstatus_ptr != 0 {
-        fault_in_user_buffer(task, wstatus_ptr, 4, crate::mm::vm::fault::PageFaultAccessType::WRITE).await;
+        fault_in_user_buffer(
+            task,
+            wstatus_ptr,
+            4,
+            crate::mm::vm::fault::PageFaultAccessType::WRITE,
+        )
+        .await;
     }
 
     // Check if there are any children at all
@@ -101,7 +123,9 @@ pub async fn sys_wait4_async(
                 }
 
                 let child_pid = child.pid;
-                let status = child.exit_status.load(core::sync::atomic::Ordering::Acquire);
+                let status = child
+                    .exit_status
+                    .load(core::sync::atomic::Ordering::Acquire);
                 drop(children);
 
                 // Remove the zombie child from parent's children list
@@ -115,7 +139,14 @@ pub async fn sys_wait4_async(
 
                 // Write status to user memory if pointer is non-null
                 if wstatus_ptr != 0 {
-                    klog!(proc, trace, "wait4(WNOHANG) pid={} reaped child={} wstatus={:#x}", task.pid, child_pid, status);
+                    klog!(
+                        proc,
+                        trace,
+                        "wait4(WNOHANG) pid={} reaped child={} wstatus={:#x}",
+                        task.pid,
+                        child_pid,
+                        status
+                    );
                     let rc = unsafe {
                         crate::hal::rv64::copy_user::copy_user_chunk(
                             wstatus_ptr as *mut u8,
@@ -123,7 +154,9 @@ pub async fn sys_wait4_async(
                             4,
                         )
                     };
-                    if rc != 0 { return Err(Errno::EFAULT); }
+                    if rc != 0 {
+                        return Err(Errno::EFAULT);
+                    }
                 }
                 return Ok(child_pid);
             }
@@ -154,7 +187,9 @@ pub async fn sys_wait4_async(
                         4,
                     )
                 };
-                if rc != 0 { return Err(Errno::EFAULT); }
+                if rc != 0 {
+                    return Err(Errno::EFAULT);
+                }
             }
             Ok(child_pid)
         }
@@ -209,7 +244,9 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     }
 
     // Restore signal mask
-    task.signals.blocked.store(frame.saved_mask, Ordering::Release);
+    task.signals
+        .blocked
+        .store(frame.saved_mask, Ordering::Release);
 
     Ok(())
 }
@@ -235,12 +272,7 @@ pub fn sys_sigaction(
     // Write old action to user memory
     if oldact_ptr != 0 {
         let old = actions[idx];
-        let buf: [u64; 4] = [
-            old.handler as u64,
-            old.flags,
-            old.restorer as u64,
-            old.mask,
-        ];
+        let buf: [u64; 4] = [old.handler as u64, old.flags, old.restorer as u64, old.mask];
         let rc = unsafe {
             crate::hal::rv64::copy_user::copy_user_chunk(
                 oldact_ptr as *mut u8,
@@ -298,7 +330,9 @@ pub fn sys_sigprocmask(
                 8,
             )
         };
-        if rc != 0 { return Err(Errno::EFAULT); }
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
     }
 
     if set_ptr != 0 {
@@ -310,15 +344,23 @@ pub fn sys_sigprocmask(
                 8,
             )
         };
-        if rc != 0 { return Err(Errno::EFAULT); }
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
 
         let unblockable = sig_bit_pub(SIGKILL) | sig_bit_pub(SIGSTOP);
         new_set &= !unblockable;
 
         match how {
-            SIG_BLOCK => { sig_state.blocked.fetch_or(new_set, Ordering::Release); }
-            SIG_UNBLOCK => { sig_state.blocked.fetch_and(!new_set, Ordering::Release); }
-            SIG_SETMASK => { sig_state.blocked.store(new_set, Ordering::Release); }
+            SIG_BLOCK => {
+                sig_state.blocked.fetch_or(new_set, Ordering::Release);
+            }
+            SIG_UNBLOCK => {
+                sig_state.blocked.fetch_and(!new_set, Ordering::Release);
+            }
+            SIG_SETMASK => {
+                sig_state.blocked.store(new_set, Ordering::Release);
+            }
             _ => return Err(Errno::EINVAL),
         }
     }
@@ -331,7 +373,14 @@ pub fn sys_sigprocmask(
 // ---------------------------------------------------------------------------
 
 pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno> {
-    klog!(signal, debug, "kill pid={} -> target={} sig={}", sender.pid, pid, Signal(sig));
+    klog!(
+        signal,
+        debug,
+        "kill pid={} -> target={} sig={}",
+        sender.pid,
+        pid,
+        Signal(sig)
+    );
     if sig > MAX_SIG {
         return Err(Errno::EINVAL);
     }

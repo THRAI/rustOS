@@ -5,9 +5,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use hal_common::Errno;
 
 /// Unique vnode identifier (inode number within a filesystem).
 pub type VnodeId = u64;

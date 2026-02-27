@@ -4,15 +4,14 @@
 //! demand-paged VMAs with vnode + file_offset + file_size. No physical
 //! frames are allocated at exec time — the fault handler does the rest.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::string::String;
 use hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE};
-use spin::RwLock;
 
 use crate::fs::path;
-use crate::fs::vnode::{Vnode, VnodeType};
-use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
+use crate::fs::vnode::VnodeType;
+use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType};
 use crate::mm::vm::vm_object::VmObject;
 
 use super::task::Task;
@@ -33,7 +32,19 @@ const PF_R: u32 = 4;
 
 /// User stack size: 64KB.
 const USER_STACK_SIZE: usize = 64 * 1024;
-/// User stack top address (just below kernel space).
+/// Helper wrapper to map `fs::vnode::Vnode` into `mm::vm::vm_map::Vnode`.
+struct VnodeWrapper(Arc<dyn crate::fs::vnode::Vnode>);
+
+impl crate::mm::vm::vm_map::Vnode for VnodeWrapper {
+    fn vnode_id(&self) -> u64 {
+        self.0.vnode_id()
+    }
+    fn path(&self) -> &str {
+        self.0.path()
+    }
+}
+
+/// Helper struct for `sys_execve_async`.s (just below kernel space).
 const USER_STACK_TOP: usize = 0x0000_003F_FFFF_F000;
 
 #[repr(C)]
@@ -110,9 +121,15 @@ fn parse_phdrs<'a>(buf: &'a [u8], hdr: &Elf64Header) -> Result<&'a [Elf64Phdr], 
 /// Convert ELF p_flags to MapPerm.
 fn elf_flags_to_prot(flags: u32) -> MapPerm {
     let mut prot = MapPerm::U; // Always user-accessible
-    if flags & PF_R != 0 { prot |= MapPerm::R; }
-    if flags & PF_W != 0 { prot |= MapPerm::W; }
-    if flags & PF_X != 0 { prot |= MapPerm::X; }
+    if flags & PF_R != 0 {
+        prot |= MapPerm::R;
+    }
+    if flags & PF_W != 0 {
+        prot |= MapPerm::W;
+    }
+    if flags & PF_X != 0 {
+        prot |= MapPerm::X;
+    }
     prot
 }
 
@@ -150,9 +167,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     };
 
     // Parse from the physical page (identity-mapped in kernel)
-    let hdr_buf = unsafe {
-        core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE)
-    };
+    let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
     let entry = elf_hdr.e_entry as usize;
@@ -205,7 +220,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             prot,
             obj,
             0,
-            Arc::clone(&vnode) as Arc<dyn Vnode>,
+            Arc::new(VnodeWrapper(Arc::clone(&vnode))),
             file_offset_page_aligned as u64,
             file_size_in_vma,
         );
@@ -221,7 +236,8 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     }
 
     // Set initial brk to end of last PT_LOAD segment (page-aligned)
-    task.brk.store(brk_end, core::sync::atomic::Ordering::Relaxed);
+    task.brk
+        .store(brk_end, core::sync::atomic::Ordering::Relaxed);
 
     // 5. Create user stack VMA (anonymous, RW)
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
@@ -261,11 +277,20 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         }
     }
     // Clear pending signals on exec
-    task.signals.pending.store(0, core::sync::atomic::Ordering::Relaxed);
+    task.signals
+        .pending
+        .store(0, core::sync::atomic::Ordering::Relaxed);
     // Note: POSIX requires blocked signal mask to be preserved across exec.
     // We intentionally DO NOT clear task.signals.blocked here.
 
-    klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, entry, USER_STACK_TOP);
+    klog!(
+        exec,
+        debug,
+        "exec pid={} entry={:#x} sp={:#x}",
+        task.pid,
+        entry,
+        USER_STACK_TOP
+    );
     Ok((entry, USER_STACK_TOP))
 }
 
@@ -311,19 +336,22 @@ pub async fn exec_with_args(
 
     // Eagerly allocate and map the top stack page so we can write to it.
     let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-    let frame = crate::mm::allocator::frame_alloc_sync()
-        .ok_or(Errno::ENOMEM)?;
+    let frame = crate::mm::allocator::frame_alloc_sync().ok_or(Errno::ENOMEM)?;
     crate::mm::pmap::pmap_zero_page(frame);
 
     // Insert page into the stack VMA's VmObject
     {
         let vm = task.vm_map.lock();
-        let vma = vm.find_area(VirtAddr::new(stack_page_va))
+        let vma = vm
+            .find_area(VirtAddr::new(stack_page_va))
             .ok_or(Errno::ENOMEM)?;
-        let page_idx = ((stack_page_va - vma.range.start.as_usize()) / PAGE_SIZE) as u64
-            + vma.obj_offset;
+        let page_idx =
+            ((stack_page_va - vma.range.start.as_usize()) / PAGE_SIZE) as u64 + vma.obj_offset;
         let mut obj = vma.object.write();
-        obj.insert_page(page_idx, crate::mm::vm::vm_object::OwnedPage::new_anonymous(frame));
+        obj.insert_page(
+            page_idx,
+            crate::mm::vm::vm_object::OwnedPage::new_anonymous(frame), //TODO: reimport
+        );
     }
 
     // Map in pmap
@@ -339,49 +367,41 @@ pub async fn exec_with_args(
     }
 
     // Now write the stack layout into the physical frame (identity-mapped).
-    let page_base = frame.as_usize() as *mut u8;
-
-    // Work from the top of the page downward.
-    // The page covers VA [stack_page_va, stack_page_va + PAGE_SIZE).
-    // USER_STACK_TOP = stack_page_va + PAGE_SIZE.
-    let mut str_off = PAGE_SIZE; // offset from page_base, starts at top
-
-    // Helper: push a string into the page, returns its VA.
-    let mut push_str = |s: &[u8], str_off: &mut usize| -> usize {
-        let len = s.len() + 1; // include NUL
-        *str_off -= len;
-        unsafe {
-            let dst = page_base.add(*str_off);
-            core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
-            *dst.add(s.len()) = 0; // NUL terminator
-        }
-        stack_page_va + *str_off
-    };
+    let mut cursor = hal_common::addr::PageCursor::new(frame, PAGE_SIZE).unwrap();
+    let stack_page_vbase = VirtAddr::new(stack_page_va);
 
     // Push 16 random bytes for AT_RANDOM
     let random_va = {
-        str_off -= 16;
-        // Zero is fine for now (deterministic but functional)
-        stack_page_va + str_off
+        let slice = cursor.alloc_down_bytes(16).unwrap();
+        slice.fill(0); // Zero is fine for now (deterministic but functional)
+        cursor.current_va(stack_page_vbase)
     };
 
     // Push all strings and record their VAs
     let mut argv_vas: Vec<usize> = Vec::with_capacity(argv.len());
     for arg in argv {
-        let va = push_str(arg.as_bytes(), &mut str_off);
-        argv_vas.push(va);
+        let s = arg.as_bytes();
+        let len = s.len() + 1; // include NUL
+        let slice = cursor.alloc_down_bytes(len).unwrap();
+        slice[..s.len()].copy_from_slice(s);
+        slice[s.len()] = 0; // NUL terminator
+        argv_vas.push(cursor.current_va(stack_page_vbase).as_usize());
     }
     let mut envp_vas: Vec<usize> = Vec::with_capacity(envp.len());
     for env in envp {
-        let va = push_str(env.as_bytes(), &mut str_off);
-        envp_vas.push(va);
+        let s = env.as_bytes();
+        let len = s.len() + 1; // include NUL
+        let slice = cursor.alloc_down_bytes(len).unwrap();
+        slice[..s.len()].copy_from_slice(s);
+        slice[s.len()] = 0; // NUL terminator
+        envp_vas.push(cursor.current_va(stack_page_vbase).as_usize());
     }
 
     // Build auxv entries
     let auxv: [(usize, usize); 4] = [
         (AT_PAGESZ, PAGE_SIZE),
         (AT_ENTRY, entry),
-        (AT_RANDOM, random_va),
+        (AT_RANDOM, random_va.as_usize()),
         (AT_NULL, 0),
     ];
 
@@ -390,40 +410,51 @@ pub async fn exec_with_args(
     let n_slots = 1 + argv.len() + 1 + envp.len() + 1 + auxv.len() * 2;
     let slots_bytes = n_slots * core::mem::size_of::<usize>();
 
-    // Align str_off down to 16 bytes, then subtract slots
-    str_off &= !0xF;
-    str_off -= slots_bytes;
-    // Align sp to 16 bytes (ABI requirement)
-    str_off &= !0xF;
+    // Align down to 16 bytes for ABI, subtract slots, and align again.
+    cursor.align_down(16);
 
-    let sp_va = stack_page_va + str_off;
+    // First retrieve the current SP and compute the offset
+    let prev_offset = cursor.current_offset();
+    if prev_offset < slots_bytes {
+        return Err(Errno::ENOMEM);
+    }
+    let new_offset = prev_offset - slots_bytes;
+    let sp_va = stack_page_vbase.as_usize() + new_offset;
 
-    // Write the slots
-    let mut slot_off = str_off;
-    let mut write_usize = |val: usize, off: &mut usize| {
-        unsafe {
-            let ptr = page_base.add(*off) as *mut usize;
-            ptr.write(val);
-        }
-        *off += core::mem::size_of::<usize>();
+    // Now we safely do the allocation to get the mutable slice
+    let mut slice_ptr: *mut u8;
+    {
+        let mut allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::ENOMEM)?;
+        slice_ptr = allocated.as_mut_ptr();
+    }
+    // Safety: we just created this slice and we know it lives inside our `frame`.
+    let slice = unsafe { core::slice::from_raw_parts_mut(slice_ptr, slots_bytes) };
+
+    // Write the slots using our pre-allocated slice
+    let mut offset = 0;
+    let mut write_usize = |val: usize| {
+        slice[offset..offset + core::mem::size_of::<usize>()].copy_from_slice(&val.to_ne_bytes());
+        offset += core::mem::size_of::<usize>();
     };
 
     // argc
-    write_usize(argv.len(), &mut slot_off);
+    write_usize(argv.len());
     // argv pointers
     for va in &argv_vas {
-        write_usize(*va, &mut slot_off);
+        write_usize(*va);
     }
-    write_usize(0, &mut slot_off); // NULL terminator
+    write_usize(0); // NULL terminator
+
     // envp pointers
     for va in &envp_vas {
-        write_usize(*va, &mut slot_off);
+        write_usize(*va);
     }
-    write_usize(0, &mut slot_off); // NULL terminator
+    write_usize(0); // NULL terminator
+
     // auxv
     for &(atype, aval) in &auxv {
-        write_usize(atype, &mut slot_off);
-        write_usize(aval, &mut slot_off);
+        write_usize(atype);
+        write_usize(aval);
     }
 
     Ok((entry, sp_va))

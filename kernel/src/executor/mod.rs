@@ -7,7 +7,7 @@ pub mod per_cpu;
 pub mod schedule;
 pub mod user_task;
 
-pub use per_cpu::{current, get, init_per_cpu, MAX_CPUS};
+pub use per_cpu::init_per_cpu;
 pub use schedule::{sleep, spawn_kernel_task, yield_now};
 pub use user_task::spawn_user_task;
 
@@ -44,9 +44,9 @@ pub fn executor_loop() -> ! {
             // after wakeup to safely loop back and re-check the queue.
             unsafe {
                 core::arch::asm!(
-                    "csrsi sstatus, 0x2",  // enable SIE
-                    "wfi",                  // wait for interrupt
-                    "csrci sstatus, 0x2",  // disable SIE
+                    "csrsi sstatus, 0x2", // enable SIE
+                    "wfi",                // wait for interrupt
+                    "csrci sstatus, 0x2", // disable SIE
                 );
             }
         }

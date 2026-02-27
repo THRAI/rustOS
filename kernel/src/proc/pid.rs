@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
 /// Allocate a new unique PID. Never returns 0.
+//TODO: add an alert when pid is too large, like highest bit turns 1?
 pub fn alloc_pid() -> u32 {
     NEXT_PID.fetch_add(1, Ordering::Relaxed)
 }

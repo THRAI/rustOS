@@ -73,7 +73,7 @@ pub fn mount() -> Result<(), i32> {
             -5
         })?;
     EXT4_BW.call_once(|| hal_common::SpinMutex::new(SendSyncBW(bw)));
-    klog!(fs, info, "lwext4 mounted at /");
+    crate::kprintln!("lwext4 mounted at /");
     Ok(())
 }
 

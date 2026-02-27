@@ -9,11 +9,31 @@ use core::task::{Context, Poll};
 use super::task::{Task, TaskState};
 use super::syscall_result::SyscallResult;
 
+/// POSIX wait status wrapper (compatible with Linux waitpid wstatus bitfield).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitStatus(pub i32);
+
+impl WaitStatus {
+    /// Create a wait status for a process that exited normally.
+    /// Format: `(code & 0xff) << 8`
+    #[inline]
+    pub const fn exited(code: i32) -> Self {
+        Self((code & 0xff) << 8)
+    }
+
+    /// Create a wait status for a process terminated by a signal.
+    /// Format: `sig & 0x7f`
+    #[inline]
+    pub const fn signaled(sig: u8) -> Self {
+        Self((sig & 0x7f) as i32)
+    }
+}
+
 /// Exit the current process: store exit status, transition to ZOMBIE, wake parent.
-pub fn sys_exit(task: &Arc<Task>, code: i32) -> SyscallResult {
-    klog!(proc, debug, "exit pid={} code={}", task.pid, code);
+pub fn sys_exit(task: &Arc<Task>, status: WaitStatus) -> SyscallResult {
+    klog!(proc, debug, "exit pid={} wstatus={:#x}", task.pid, status.0);
     // Store exit status with Release ordering
-    task.exit_status.store(code, Ordering::Release);
+    task.exit_status.store(status.0, Ordering::Release);
     // Transition to ZOMBIE with Release ordering
     task.set_zombie();
 
@@ -47,11 +67,15 @@ pub fn sys_exit(task: &Arc<Task>, code: i32) -> SyscallResult {
 /// Registers Waker FIRST, then scans — no lost wakeup gap.
 pub struct WaitChildFuture {
     parent: Arc<Task>,
+    target_pid: isize,
 }
 
 impl WaitChildFuture {
-    pub fn new(parent: Arc<Task>) -> Self {
-        Self { parent }
+    /// target_pid:
+    ///   > 0  => wait for specific child
+    ///   -1   => wait for any child
+    pub fn new(parent: Arc<Task>, target_pid: isize) -> Self {
+        Self { parent, target_pid }
     }
 }
 
@@ -73,9 +97,13 @@ impl Future for WaitChildFuture {
             return Poll::Ready(None);
         }
 
-        // Step 3: Scan children for any ZOMBIE
+        // Step 3: Scan children for any ZOMBIE matching target_pid
         for child in children.iter() {
             if child.state() == TaskState::Zombie {
+                if self.target_pid > 0 && child.pid != self.target_pid as u32 {
+                    continue;
+                }
+
                 let pid = child.pid;
                 let status = child.exit_status.load(Ordering::Acquire);
                 drop(children);

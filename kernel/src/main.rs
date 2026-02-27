@@ -243,7 +243,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                             tf.x[2] = sp;
                             tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                         }
-                        klog!(boot, info, "exec OK: entry={:#x} sp={:#x}", entry, sp);
+                        crate::kprintln!("exec OK: entry={:#x} sp={:#x}", entry, sp);
                         executor::spawn_user_task(init_task2, init_cpu);
                     }
                     Err(e) => {
@@ -380,7 +380,7 @@ fn test_fork_exit_wait4() {
     // (VmMap::fork creates shadow objects for each VMA — with empty parent, child is also empty)
 
     // Child exits with code 42
-    let result = sys_exit(&child, 42);
+    let result = sys_exit(&child, crate::proc::exit_wait::WaitStatus::exited(42));
     match result {
         SyscallResult::Terminated => {},
         _ => panic!("sys_exit must return Terminated"),
@@ -389,8 +389,8 @@ fn test_fork_exit_wait4() {
     // Verify child is now ZOMBIE
     assert_eq!(child.state(), proc::task::TaskState::Zombie);
 
-    // Verify exit status
-    assert_eq!(child.exit_status.load(core::sync::atomic::Ordering::Acquire), 42);
+    // Verify exit status is properly encoded
+    assert_eq!(child.exit_status.load(core::sync::atomic::Ordering::Acquire), 42 << 8);
 
     // Test WaitChildFuture synchronously via a manual poll
     // Since child is already ZOMBIE, the first poll should return Ready
@@ -408,13 +408,13 @@ fn test_fork_exit_wait4() {
     let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
     let mut cx = core::task::Context::from_waker(&waker);
 
-    let mut wait_fut = WaitChildFuture::new(Arc::clone(&init));
+    let mut wait_fut = WaitChildFuture::new(Arc::clone(&init), -1);
     let poll_result = Pin::new(&mut wait_fut).poll(&mut cx);
 
     match poll_result {
         core::task::Poll::Ready(Some((pid, status))) => {
             assert_eq!(pid, child_pid, "wait4 must return child pid");
-            assert_eq!(status, 42, "wait4 must return exit code 42");
+            assert_eq!(status, 42 << 8, "wait4 must return exit code 42 (WaitStatus encoded)");
         }
         other => panic!("wait4 expected Ready(Some), got {:?}", other),
     }
@@ -522,13 +522,13 @@ async fn test_fork_exec_wait4() {
     }
 
     // Child exits with code 7
-    let _ = sys_exit(&child, 7);
+    let _ = sys_exit(&child, crate::proc::exit_wait::WaitStatus::exited(7));
 
     // Parent wait4 collects exit status
-    let wait_result = WaitChildFuture::new(Arc::clone(&init)).await;
+    let wait_result = WaitChildFuture::new(Arc::clone(&init), -1).await;
     match wait_result {
         Some((pid, status)) => {
-            if pid == child_pid && status == 7 {
+            if pid == child_pid && status == 7 << 8 {
                 kprintln!("fork-exec-wait4 PASS");
             } else {
                 kprintln!("fork-exec-wait4 FAIL (pid={}, status={})", pid, status);

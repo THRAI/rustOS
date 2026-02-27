@@ -182,9 +182,9 @@ async fn run_tasks(task: Arc<Task>) {
             Ok(_) => {}       // signal delivered (or none pending), continue
             Err(sig) => {    // fatal signal (SIGKILL or unhandled)
                 // Linux wstatus for signal-killed: low 7 bits = signal number
-                let wstatus = sig as i32;
+                let wstatus = crate::proc::exit_wait::WaitStatus::signaled(sig);
                 klog!(signal, trace, "run_tasks: FATAL signal pid={} sig={} wstatus={:#x}",
-                    task.pid, crate::proc::signal::Signal(sig), wstatus);
+                    task.pid, crate::proc::signal::Signal(sig), wstatus.0);
                 do_exit(&task, wstatus);
                 break;
             }
@@ -955,7 +955,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         }
         SyscallId::EXIT | SyscallId::EXIT_GROUP => {
             // Linux wstatus for normal exit: (code << 8) & 0xff00
-            let wstatus = ((a0 as i32) << 8) & 0xff00;
+            let wstatus = crate::proc::exit_wait::WaitStatus::exited(a0 as i32);
             do_exit(task, wstatus);
             return TrapResult::Exit;
         }
@@ -2367,7 +2367,7 @@ async fn sys_openat_async(
 /// sys_wait4: wait for child process.
 async fn sys_wait4_async(
     task: &Arc<Task>,
-    _pid: isize,
+    pid: isize,
     wstatus_ptr: usize,
     options: usize,
 ) -> Result<u32, Errno> {
@@ -2391,12 +2391,16 @@ async fn sys_wait4_async(
         let children = task.children.lock();
         for child in children.iter() {
             if child.state() == crate::proc::task::TaskState::Zombie {
-                let pid = child.pid;
+                if pid > 0 && child.pid != pid as u32 {
+                    continue;
+                }
+
+                let child_pid = child.pid;
                 let status = child.exit_status.load(core::sync::atomic::Ordering::Acquire);
                 drop(children);
 
                 // Remove the zombie child from parent's children list
-                task.children.lock().retain(|c| c.pid != pid);
+                task.children.lock().retain(|c| c.pid != child_pid);
 
                 // Consume pending SIGCHLD so the handler doesn't run
                 // spuriously after wait4 already reaped the child.
@@ -2410,7 +2414,7 @@ async fn sys_wait4_async(
                 // Write status to user memory if pointer is non-null
                 if wstatus_ptr != 0 {
                     klog!(proc, trace, "wait4(WNOHANG) pid={} reaped child={} wstatus={:#x}",
-                        task.pid, pid, status);
+                        task.pid, child_pid, status);
                     let rc = unsafe {
                         crate::hal::rv64::copy_user::copy_user_chunk(
                             wstatus_ptr as *mut u8,
@@ -2420,7 +2424,7 @@ async fn sys_wait4_async(
                     };
                     if rc != 0 { return Err(Errno::EFAULT); }
                 }
-                return Ok(pid);
+                return Ok(child_pid);
             }
         }
         drop(children);
@@ -2430,7 +2434,7 @@ async fn sys_wait4_async(
 
     // Blocking path
     use crate::proc::exit_wait::WaitChildFuture;
-    let result = WaitChildFuture::new(Arc::clone(task)).await;
+    let result = WaitChildFuture::new(Arc::clone(task), pid).await;
 
     match result {
         Some((child_pid, status)) => {
@@ -2590,10 +2594,10 @@ fn should_restart_syscall(task: &Arc<Task>) -> bool {
 /// `wstatus` must be pre-encoded in Linux format:
 ///   normal exit:  (code << 8) & 0x7f00   (low 7 bits = 0)
 ///   signal kill:  signo & 0x7f           (low 7 bits = signal)
-fn do_exit(task: &Arc<Task>, wstatus: i32) {
-    klog!(proc, trace, "do_exit pid={} wstatus={:#x}", task.pid, wstatus);
+fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
+    klog!(proc, trace, "do_exit pid={} wstatus={:#x}", task.pid, wstatus.0);
     // Debug logging handled globally by Makefile levels now.
-    task.exit_status.store(wstatus, core::sync::atomic::Ordering::Release);
+    task.exit_status.store(wstatus.0, core::sync::atomic::Ordering::Release);
     task.set_zombie();
 
     // Unregister from global task registry

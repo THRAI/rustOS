@@ -55,8 +55,8 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     crate::klog!(boot, info, "frame: guard dropped");
     {
         let guard = GLOBAL_BUDDY.lock();
-        crate::klog!(
-            boot, info, "frame: buddy initialized: {} total pages, {} free ({} MB)",
+        crate::kprintln!(
+            "frame: buddy initialized: {} total pages, {} free ({} MB)",
             guard.total_pages(),
             guard.available_pages(),
             guard.available_pages() * PAGE_SIZE / (1024 * 1024)

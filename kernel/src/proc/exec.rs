@@ -262,9 +262,8 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     }
     // Clear pending signals on exec
     task.signals.pending.store(0, core::sync::atomic::Ordering::Relaxed);
-    // Clear blocked signal mask on exec (POSIX: signal mask preserved, but
-    // synchronous signals like SIGSEGV must be deliverable)
-    task.signals.blocked.store(0, core::sync::atomic::Ordering::Relaxed);
+    // Note: POSIX requires blocked signal mask to be preserved across exec.
+    // We intentionally DO NOT clear task.signals.blocked here.
 
     klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, entry, USER_STACK_TOP);
     Ok((entry, USER_STACK_TOP))

@@ -22,8 +22,8 @@ use crate::fs::fd_table::FdTable;
 use super::pid::alloc_pid;
 use super::signal::SignalState;
 
-/// Kernel stack size: 2 pages (8KB).
-const KSTACK_ORDER: usize = 1; // 2^1 = 2 pages
+/// Kernel stack size: 4 pages (16KB).
+const KSTACK_ORDER: usize = 2; // 2^2 = 4 pages
 const KSTACK_SIZE: usize = PAGE_SIZE * (1 << KSTACK_ORDER);
 
 // ---------------------------------------------------------------------------

@@ -11,3 +11,4 @@ pub mod ipi;
 pub mod smp;
 pub mod copy_user;
 pub mod user_trap;
+pub mod plic;

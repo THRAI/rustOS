@@ -23,6 +23,12 @@ log-pipe    = []
 log-proc    = []
 log-all     = ["log-boot", "log-syscall", "log-trap", "log-vm", "log-sched", "log-fs", "log-driver", "log-smp", "log-signal", "log-exec", "log-pipe", "log-proc"]
 
+log-level-error = []
+log-level-warn  = ["log-level-error"]
+log-level-info  = ["log-level-warn"]
+log-level-debug = ["log-level-info"]
+log-level-trace = ["log-level-debug"]
+log-level-all   = ["log-level-trace"]
 [dependencies]
 hal-common = { path = "../hal-common" }
 async-task = { version = "4.7", default-features = false }

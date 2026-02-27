@@ -1,0 +1,39 @@
+{
+  "metadata": {
+    "created": "2026-02-21T20:21:06.582543",
+    "last_modified": "2026-02-21T20:21:06.582568",
+    "version": "1.0"
+  },
+  "assumptions": [],
+  "ungrounded_claims": [],
+  "review_history": [],
+  "summary": {
+    "total": 0,
+    "by_status": {
+      "pending": 0,
+      "approved": 0,
+      "rejected": 0,
+      "modified": 0
+    },
+    "by_category": {
+      "scope": 0,
+      "feasibility": 0,
+      "architecture": 0,
+      "domain_knowledge": 0,
+      "technology": 0,
+      "constraint": 0,
+      "stakeholder": 0,
+      "other": 0
+    },
+    "by_impact": {
+      "low": 0,
+      "medium": 0,
+      "high": 0,
+      "critical": 0
+    },
+    "by_phase": {},
+    "pending_count": 0,
+    "approved_count": 0,
+    "ready_for_document": true
+  }
+}

@@ -12,3 +12,7 @@ ai/
 concept_docs/
 reports/
 resources.md
+scripts/*.bin
+scripts/*.S
+*.expect
+*.txt

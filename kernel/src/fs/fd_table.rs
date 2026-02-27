@@ -65,6 +65,16 @@ pub enum FileObject {
     Device(DeviceKind),
 }
 
+impl Drop for FileObject {
+    fn drop(&mut self) {
+        match self {
+            FileObject::PipeRead(pipe) => pipe.close_read(),
+            FileObject::PipeWrite(pipe) => pipe.close_write(),
+            _ => {}
+        }
+    }
+}
+
 // ---- FileDescription (Layer 2) ----
 
 /// An open file description, shared across dup() and fork().

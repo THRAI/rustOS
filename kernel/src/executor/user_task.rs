@@ -17,7 +17,7 @@ use crate::hal::rv64::user_trap::trap_return;
 use crate::mm::vm::fault::{sync_fault_handler, FaultResult, FaultError, PageFaultAccessType};
 
 use super::schedule::{spawn_kernel_task, yield_now};
-
+// Debug logging is now controlled by standard `klog!` levels and Makefile `LEVEL=trace`.
 // Interrupt bit in scause (bit 63 on rv64)
 const SCAUSE_INTERRUPT: usize = 1 << 63;
 
@@ -32,6 +32,7 @@ const EXC_INST_PAGE_FAULT: usize = 12;
 const EXC_LOAD_PAGE_FAULT: usize = 13;
 const EXC_LOAD_ACCESS_FAULT: usize = 5;
 const EXC_STORE_ACCESS_FAULT: usize = 7;
+const EXC_INST_ACCESS_FAULT: usize = 1;
 const EXC_STORE_PAGE_FAULT: usize = 15;
 
 // Linux-compatible rv64 syscall numbers
@@ -49,7 +50,9 @@ impl SyscallId {
     const LSEEK: Self = Self(62);
     const READ: Self = Self(63);
     const WRITE: Self = Self(64);
+    const READV: Self = Self(65);
     const WRITEV: Self = Self(66);
+    const SENDFILE: Self = Self(71);
     const FSTATAT: Self = Self(79);
     const FSTAT: Self = Self(80);
     const EXIT: Self = Self(93);
@@ -99,8 +102,10 @@ impl core::fmt::Display for SyscallId {
             Self::GETDENTS64 => "getdents64",
             Self::LSEEK => "lseek",
             Self::READ => "read",
+            Self::READV => "readv",
             Self::WRITE => "write",
             Self::WRITEV => "writev",
+            Self::SENDFILE => "sendfile",
             Self::FSTATAT => "fstatat",
             Self::FSTAT => "fstat",
             Self::EXIT => "exit",
@@ -175,13 +180,27 @@ async fn run_tasks(task: Arc<Task>) {
         // Check for pending signals before returning to user mode.
         match crate::proc::signal::check_pending_signals(&task) {
             Ok(_) => {}       // signal delivered (or none pending), continue
-            Err(_sig) => {    // fatal signal (SIGKILL or unhandled)
-                do_exit(&task, -9); // killed by signal
+            Err(sig) => {    // fatal signal (SIGKILL or unhandled)
+                // Linux wstatus for signal-killed: low 7 bits = signal number
+                let wstatus = sig as i32;
+                klog!(signal, trace, "run_tasks: FATAL signal pid={} sig={} wstatus={:#x}",
+                    task.pid, crate::proc::signal::Signal(sig), wstatus);
+                do_exit(&task, wstatus);
                 break;
             }
         }
 
         klog!(sched, debug, "run_tasks: calling trap_return pid={}", task.pid);
+
+        // DEBUG: dump trap frame a0 and wstatus before returning to userspace
+        klog!(proc, trace, "PRE-SRET pid={} a0={:#x} sepc={:#x} sp={:#x} ra={:#x}",
+            task.pid,
+            task.trap_frame.lock().arg(0),
+            task.trap_frame.lock().sepc,
+            task.trap_frame.lock().sp(),
+            task.trap_frame.lock().ra()
+        );
+
 
         // Return to userspace. Blocks until user traps back.
         trap_return(&task);
@@ -224,14 +243,19 @@ impl<'a> Future for SignalWakeHelper<'a> {
 async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
     let scause;
     let stval;
+    let sepc;
     {
         let tf = task.trap_frame.lock();
         scause = tf.scause;
         stval = tf.stval;
+        sepc = tf.sepc;
     }
 
     let is_interrupt = scause & SCAUSE_INTERRUPT != 0;
     let code = scause & !SCAUSE_INTERRUPT;
+
+    // Debug: log all traps for pid=1 after verbose flag is set
+    klog!(trap, trace, "VERBOSE pid={} trap code={} sepc={:#x} stval={:#x}", task.pid, code, sepc, stval);
 
     if is_interrupt {
         match code {
@@ -257,12 +281,12 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
             // sepc advance is done inside dispatch_syscall (skipped for sigreturn)
             dispatch_syscall(task).await
         }
-        EXC_LOAD_ACCESS_FAULT | EXC_STORE_ACCESS_FAULT |
+        EXC_LOAD_ACCESS_FAULT | EXC_STORE_ACCESS_FAULT | EXC_INST_ACCESS_FAULT |
         EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
             let fault_va = VirtAddr::new(stval & !(PAGE_SIZE - 1));
             let access_type = match code {
                 EXC_STORE_PAGE_FAULT | EXC_STORE_ACCESS_FAULT => PageFaultAccessType::WRITE,
-                EXC_INST_PAGE_FAULT => PageFaultAccessType::EXECUTE,
+                EXC_INST_PAGE_FAULT | EXC_INST_ACCESS_FAULT => PageFaultAccessType::EXECUTE,
                 _ => PageFaultAccessType::READ,
             };
 
@@ -287,7 +311,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                     }
                     // No fixup — truly fatal user fault.
                     let pc = task.trap_frame.lock().sepc;
-                    klog!(trap, error,
+                    klog!(trap, trace,
                         "fatal fault: pid={} va={:#x} pc={:#x} code={} err={:?}",
                         task.pid, stval, pc, code, e
                     );
@@ -297,14 +321,14 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
             }
         }
         _ => {
-            klog!(trap, error,
+            klog!(trap, trace,
                 "unhandled exception: code={} sepc={:#x} stval={:#x}",
                 code,
                 { task.trap_frame.lock().sepc },
                 stval
             );
-            do_exit(task, -1);
-            TrapResult::Exit
+            task.signals.post_signal(crate::proc::signal::SIGSEGV);
+            TrapResult::Continue
         }
     }
 }
@@ -357,15 +381,28 @@ async fn resolve_user_fault(
     match sync_result {
         FaultResult::Resolved => Ok(()),
         FaultResult::NeedsAsyncIO => {
-            klog!(vm, error,
+            klog!(vm, trace,
                 "resolve_user_fault: NeedsAsyncIO pid={} va={:#x}",
                 task.pid, fault_va.as_usize()
             );
             // 2. Async path: file-backed pages
-            fault_in_page_async(task, fault_va).await
+            klog!(vm, trace,
+                "resolve_user_fault: ENTERING async pid={} va={:#x}",
+                task.pid, fault_va.as_usize()
+            );
+            let async_result = fault_in_page_async(task, fault_va).await;
+            match &async_result {
+                Ok(()) => klog!(vm, trace,
+                    "resolve_user_fault: async OK pid={} va={:#x}",
+                    task.pid, fault_va.as_usize()),
+                Err(e) => klog!(vm, trace,
+                    "resolve_user_fault: async FAILED pid={} va={:#x} err={:?}",
+                    task.pid, fault_va.as_usize(), e),
+            }
+            async_result
         }
         FaultResult::Error(e) => {
-            klog!(vm, error,
+            klog!(vm, trace,
                 "resolve_user_fault: sync FAILED pid={} va={:#x} err={:?}",
                 task.pid, fault_va.as_usize(), e
             );
@@ -436,6 +473,9 @@ async fn fault_in_page_async(
         };
         let page_idx = (fault_va.as_usize() - vma.range.start.as_usize()) / PAGE_SIZE;
         let file_offset = vma.file_offset + (page_idx * PAGE_SIZE) as u64;
+        // Debug: log file-backed fault details
+        klog!(vm, trace, "fault_in_page_async pid={} va={:#x} vnode={} path={} file_offset={:#x} file_size={:#x} vma_start={:#x} page_idx={}",
+            task.pid, fault_va.as_usize(), vnode.vnode_id(), vnode.path(), file_offset, vma.file_size, vma.range.start.as_usize(), page_idx);
         (
             vnode.vnode_id(),
             String::from(vnode.path()),
@@ -582,6 +622,8 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
     };
 
     klog!(syscall, debug, "pid={} {} a0={:#x} a1={:#x} a2={:#x}", task.pid, id, a0, a1, a2);
+
+    klog!(syscall, trace, "VERBOSE pid={} syscall {} a0={:#x} a1={:#x} a2={:#x}", task.pid, id, a0, a1, a2);
 
     let ret: usize = match id {
         // --- Fast-path synchronous syscalls ---
@@ -819,7 +861,9 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             match sys_writev_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => n,
                 Err(Errno::EINTR) => {
-                    maybe_restart_syscall(task);
+                    if should_restart_syscall(task) {
+                        return TrapResult::Continue; // re-execute ecall with original args
+                    }
                     (-(Errno::EINTR.as_i32() as isize)) as usize
                 }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
@@ -830,7 +874,9 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             match sys_ppoll_async(task, a0, a1, a2).await {
                 Ok(n) => n,
                 Err(Errno::EINTR) => {
-                    maybe_restart_syscall(task);
+                    if should_restart_syscall(task) {
+                        return TrapResult::Continue;
+                    }
                     (-(Errno::EINTR.as_i32() as isize)) as usize
                 }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
@@ -841,7 +887,9 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             match sys_write_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => n,
                 Err(Errno::EINTR) => {
-                    maybe_restart_syscall(task);
+                    if should_restart_syscall(task) {
+                        return TrapResult::Continue;
+                    }
                     (-(Errno::EINTR.as_i32() as isize)) as usize
                 }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
@@ -852,11 +900,30 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             match sys_read_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => n,
                 Err(Errno::EINTR) => {
-                    maybe_restart_syscall(task);
+                    if should_restart_syscall(task) {
+                        return TrapResult::Continue;
+                    }
                     (-(Errno::EINTR.as_i32() as isize)) as usize
                 }
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
+        }
+        SyscallId::READV => {
+            // a0=fd, a1=iov, a2=iovcnt
+            match sys_readv_async(task, a0 as u32, a1, a2).await {
+                Ok(n) => n,
+                Err(Errno::EINTR) => {
+                    if should_restart_syscall(task) {
+                        return TrapResult::Continue;
+                    }
+                    (-(Errno::EINTR.as_i32() as isize)) as usize
+                }
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::SENDFILE => {
+            // Signal to Busybox `cat` that it should fall back to read/write for pipes.
+            (-(Errno::EINVAL.as_i32() as isize)) as usize
         }
         SyscallId::OPENAT => {
             // a0=dirfd, a1=pathname, a2=flags, a3=mode
@@ -887,7 +954,9 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             }
         }
         SyscallId::EXIT | SyscallId::EXIT_GROUP => {
-            do_exit(task, a0 as i32);
+            // Linux wstatus for normal exit: (code << 8) & 0xff00
+            let wstatus = ((a0 as i32) << 8) & 0xff00;
+            do_exit(task, wstatus);
             return TrapResult::Exit;
         }
         SyscallId::CLONE => {
@@ -929,12 +998,17 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         }
         SyscallId::WAIT4 => {
             let options = a2;
+            let wstatus_ptr = a1;
+            // Debug: dump wstatus at user pointer before wait4
+            if a1 != 0 {
+                let peek = unsafe { *(a1 as *const i32) };
+                klog!(proc, trace, "VERBOSE wait4 ENTRY pid={} wstatus@{:#x}={:#x}", task.pid, a1, peek);
+            }
             match sys_wait4_async(task, a0 as isize, a1, options).await {
                 Ok(pid) => pid as usize,
-                Err(Errno::EINTR) => {
-                    maybe_restart_syscall(task);
-                    (-(Errno::EINTR.as_i32() as isize)) as usize
-                }
+                // wait4 is never restarted (matches Linux behavior).
+                // The SIGCHLD handler typically calls waitpid() itself,
+                // so restarting would find no children and loop with ECHILD.
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
@@ -953,13 +1027,14 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             }
         }
         _ => {
-            klog!(syscall, info, "unimplemented {}", id);
+            klog!(syscall, error, "unimplemented {} (a0={:#x} a1={:#x} a2={:#x})", id, a0, a1, a2);
             (-38isize) as usize // ENOSYS
         }
     };
 
     {
         klog!(syscall, debug, "pid={} {} -> {:#x}", task.pid, id, ret);
+        klog!(syscall, trace, "VERBOSE pid={} {} -> ret={:#x}", task.pid, id, ret);
         let mut tf = task.trap_frame.lock();
         tf.sepc += 4; // advance past ecall
         tf.set_ret_val(ret);
@@ -1550,6 +1625,53 @@ async fn sys_read_async(
             Ok(total)
         }
     }
+}
+
+/// sys_readv: read into multiple user buffers (iovecs)
+async fn sys_readv_async(
+    task: &Arc<Task>,
+    fd: u32,
+    iov_ptr: usize,
+    iovcnt: usize,
+) -> Result<usize, Errno> {
+    if iovcnt > 1024 { return Err(Errno::EINVAL); }
+    if iovcnt == 0 { return Ok(0); }
+
+    let iov_size = iovcnt * 16;
+    fault_in_user_buffer(task, iov_ptr, iov_size, PageFaultAccessType::READ).await;
+    let mut iov_buf = alloc::vec![0u8; iov_size];
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            iov_buf.as_mut_ptr(), iov_ptr as *const u8, iov_size,
+        )
+    };
+    if rc != 0 { return Err(Errno::EFAULT); }
+
+    let mut total_read = 0;
+    for i in 0..iovcnt {
+        let off = i * 16;
+        let base = usize::from_le_bytes(iov_buf[off..off + 8].try_into().unwrap());
+        let len = usize::from_le_bytes(iov_buf[off + 8..off + 16].try_into().unwrap());
+        if len == 0 { continue; }
+
+        match sys_read_async(task, fd, base, len).await {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                total_read += n;
+                if n < len {
+                    // Short read (e.g. pipe empty after reading some bytes)
+                    break;
+                }
+            }
+            Err(e) => {
+                if total_read > 0 {
+                    return Ok(total_read);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(total_read)
 }
 
 /// Future for async pipe read.
@@ -2276,13 +2398,23 @@ async fn sys_wait4_async(
                 // Remove the zombie child from parent's children list
                 task.children.lock().retain(|c| c.pid != pid);
 
+                // Consume pending SIGCHLD so the handler doesn't run
+                // spuriously after wait4 already reaped the child.
+                // The handler's stack frame would overlap the caller's
+                // wstatus variable and corrupt it.
+                task.signals.pending.fetch_and(
+                    !crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGCHLD),
+                    core::sync::atomic::Ordering::Release,
+                );
+
                 // Write status to user memory if pointer is non-null
                 if wstatus_ptr != 0 {
-                    let encoded = (status << 8) & 0xff00;
+                    klog!(proc, trace, "wait4(WNOHANG) pid={} reaped child={} wstatus={:#x}",
+                        task.pid, pid, status);
                     let rc = unsafe {
                         crate::hal::rv64::copy_user::copy_user_chunk(
                             wstatus_ptr as *mut u8,
-                            &encoded as *const i32 as *const u8,
+                            &status as *const i32 as *const u8,
                             4,
                         )
                     };
@@ -2302,25 +2434,57 @@ async fn sys_wait4_async(
 
     match result {
         Some((child_pid, status)) => {
+            // Consume pending SIGCHLD so the handler doesn't run
+            // spuriously after wait4 already reaped the child.
+            task.signals.pending.fetch_and(
+                !crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGCHLD),
+                core::sync::atomic::Ordering::Release,
+            );
+
             // Write status to user memory if pointer is non-null
             if wstatus_ptr != 0 {
-                let encoded = (status << 8) & 0xff00; // WEXITSTATUS encoding
+                klog!(proc, trace, "wait4 pid={} reaped child={} wstatus={:#x} wstatus_ptr={:#x}",
+                    task.pid, child_pid, status, wstatus_ptr);
                 let rc = unsafe {
                     crate::hal::rv64::copy_user::copy_user_chunk(
                         wstatus_ptr as *mut u8,
-                        &encoded as *const i32 as *const u8,
+                        &status as *const i32 as *const u8,
                         4,
                     )
                 };
                 if rc != 0 { return Err(Errno::EFAULT); }
+                // Readback verification
+                let mut readback: i32 = 0;
+                let _ = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        &mut readback as *mut i32 as *mut u8,
+                        wstatus_ptr as *const u8,
+                        4,
+                    )
+                };
+                klog!(proc, trace, "wait4 wstatus readback={:#x} at {:#x}", readback, wstatus_ptr);
+                // Extract PA backing the wstatus page
+                let pa = {
+                    let pmap = task.pmap.lock();
+                    crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(wstatus_ptr & !0xFFF))
+                };
+                klog!(proc, trace, "wait4 wstatus page PA={:?}", pa);
+                // Also read directly from PA to verify
+                if let Some(phys) = pa {
+                    let pa_addr = phys.as_usize() + (wstatus_ptr & 0xFFF);
+                    let direct_val = unsafe { core::ptr::read_volatile(pa_addr as *const i32) };
+                    klog!(proc, trace, "wait4 wstatus DIRECT PA read @{:#x}={:#x}", pa_addr, direct_val);
+                }
             }
             Ok(child_pid)
         }
         None => {
             // Distinguish EINTR from ECHILD
             if task.signals.has_actionable_pending() {
+                klog!(proc, trace, "wait4 pid={} returning EINTR (signal pending)", task.pid);
                 Err(Errno::EINTR)
             } else {
+                klog!(proc, trace, "wait4 pid={} returning ECHILD", task.pid);
                 Err(Errno::ECHILD)
             }
         }
@@ -2403,10 +2567,11 @@ fn set_syscall_ret(task: &Arc<Task>, val: usize) -> TrapResult {
     TrapResult::Continue
 }
 
-/// SA_RESTART: if the pending signal has SA_RESTART, rewind sepc by 4
-/// so the ecall instruction re-executes after signal delivery.
-fn maybe_restart_syscall(task: &Arc<Task>) {
-    // Peek at the lowest pending unmasked signal to check SA_RESTART
+/// SA_RESTART: check if the pending signal has SA_RESTART.
+/// Returns true if the syscall should be restarted (caller must skip
+/// sepc advance and ret_val assignment so the ecall re-executes with
+/// original register state).
+fn should_restart_syscall(task: &Arc<Task>) -> bool {
     let pending = task.signals.pending.load(core::sync::atomic::Ordering::Acquire);
     let blocked = task.signals.blocked.load(core::sync::atomic::Ordering::Relaxed);
     let unblockable = crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGKILL)
@@ -2415,16 +2580,20 @@ fn maybe_restart_syscall(task: &Arc<Task>) {
     if deliverable != 0 {
         let bit = deliverable.trailing_zeros() as u8;
         let sig = bit + 1;
-        if task.signals.is_restart(sig) {
-            // Rewind sepc past the ecall (dispatch_syscall already advanced by 4)
-            task.trap_frame.lock().sepc -= 4;
-        }
+        task.signals.is_restart(sig)
+    } else {
+        false
     }
 }
 
 /// Mark process as zombie and wake parent.
-fn do_exit(task: &Arc<Task>, status: i32) {
-    task.exit_status.store(status, core::sync::atomic::Ordering::Release);
+/// `wstatus` must be pre-encoded in Linux format:
+///   normal exit:  (code << 8) & 0x7f00   (low 7 bits = 0)
+///   signal kill:  signo & 0x7f           (low 7 bits = signal)
+fn do_exit(task: &Arc<Task>, wstatus: i32) {
+    klog!(proc, trace, "do_exit pid={} wstatus={:#x}", task.pid, wstatus);
+    // Debug logging handled globally by Makefile levels now.
+    task.exit_status.store(wstatus, core::sync::atomic::Ordering::Release);
     task.set_zombie();
 
     // Unregister from global task registry
@@ -2454,10 +2623,38 @@ fn do_exit(task: &Arc<Task>, status: i32) {
     }
 }
 
+/// Wrapper future that activates the task's pmap on every `poll`.
+/// This ensures that if the executor resumes an `.await` point (e.g. inside `sys_wait4_async`),
+/// the correct user page table is loaded into `satp` before accessing user memory.
+struct PmapWrapper<F> {
+    task: Arc<Task>,
+    inner: F,
+}
+
+impl<F: core::future::Future> core::future::Future for PmapWrapper<F> {
+    type Output = F::Output;
+
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
+         let this = unsafe { self.get_unchecked_mut() };
+         {
+             let mut pmap = this.task.pmap.lock();
+             crate::mm::pmap::pmap_activate(&mut pmap);
+         }
+         let inner = unsafe { core::pin::Pin::new_unchecked(&mut this.inner) };
+         inner.poll(cx)
+    }
+}
+
 /// Spawn a user task on the given CPU.
 pub fn spawn_user_task(task: Arc<Task>, cpu: usize) {
     // Register in global task registry for kill/getpgid lookups
     crate::proc::signal::register_task(&task);
-    let handle = spawn_kernel_task(run_tasks(task), cpu);
+
+    let wrapper = PmapWrapper {
+        task: Arc::clone(&task),
+        inner: run_tasks(task),
+    };
+
+    let handle = spawn_kernel_task(wrapper, cpu);
     handle.detach();
 }

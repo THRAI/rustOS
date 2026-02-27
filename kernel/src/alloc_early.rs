@@ -7,7 +7,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use linked_list_allocator::Heap;
 use hal_common::IrqSafeSpinLock;
 
-const HEAP_SIZE: usize = 512 * 1024; // 512KB
+const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16MB
 static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 static HEAP: IrqSafeSpinLock<Heap> = IrqSafeSpinLock::new(Heap::empty());

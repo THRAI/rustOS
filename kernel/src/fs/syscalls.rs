@@ -30,13 +30,7 @@ pub async fn sys_open(fd_table: &hal_common::SpinMutex<FdTable>, path_str: &str,
 
 /// sys_close: remove fd from table.
 pub fn sys_close(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(), Errno> {
-    let desc = fd_table.lock().remove(fd).ok_or(Errno::EBADF)?;
-    // Handle pipe close: notify the other end
-    match &desc.object {
-        FileObject::PipeRead(pipe) => pipe.close_read(),
-        FileObject::PipeWrite(pipe) => pipe.close_write(),
-        _ => {}
-    }
+    let _desc = fd_table.lock().remove(fd).ok_or(Errno::EBADF)?;
     Ok(())
 }
 

@@ -15,10 +15,11 @@ QEMU_RV64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_R
 OBJCOPY := rust-objcopy
 
 # Kernel log control: LOG=all | LOG=boot,fs,driver | (empty = quiet)
-# Available modules: boot syscall trap vm sched fs driver smp
+# Available modules: boot syscall trap vm sched fs driver smp signal pipe exec proc
 comma := ,
 space := $(subst ,, )
 LOG ?=
+LEVEL ?= trace
 ifdef LOG
   ifeq ($(LOG),all)
     _LOG_FEATURES := log-all
@@ -26,8 +27,16 @@ ifdef LOG
     _LOG_FEATURES := $(patsubst %,log-%,$(subst $(comma), ,$(LOG)))
   endif
 endif
-_CARGO_LOG = $(if $(_LOG_FEATURES),--features $(subst $(space),$(comma),$(_LOG_FEATURES)))
-_TEST_FEATURES = qemu-test$(if $(_LOG_FEATURES),$(comma)$(subst $(space),$(comma),$(_LOG_FEATURES)))
+
+_LOG_LEVEL_FEATURE := log-level-$(LEVEL)
+
+ifdef _LOG_FEATURES
+  _CARGO_LOG = --features $(subst $(space),$(comma),$(_LOG_FEATURES)),$(_LOG_LEVEL_FEATURE)
+  _TEST_FEATURES = qemu-test,$(subst $(space),$(comma),$(_LOG_FEATURES)),$(_LOG_LEVEL_FEATURE)
+else
+  _CARGO_LOG = --features $(_LOG_LEVEL_FEATURE)
+  _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
+endif
 
 .PHONY: kernel-rv64 kernel-rv64-test run-rv64 debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
 
@@ -48,7 +57,8 @@ disk-img:
 	cd scripts && ./make_test_img.sh
 
 run-rv64: kernel-rv64 $(DISK_IMG)
-	$(QEMU_RV64) $(QEMU_RV64_FLAGS)
+	@echo "=== Running QEMU Interactively (LOG=$(_LOG_FEATURES)) ==="
+	uv run --with pexpect python3 scripts/test_runner.py --interactive $(QEMU_RV64) -- $(QEMU_RV64_FLAGS)
 
 # GDB debug: halt on start, GDB server on port 1234
 debug-rv64: kernel-rv64
@@ -141,7 +151,12 @@ test:
 	cargo test --lib -p hal-common --target $(HOST_TARGET)
 	cargo test --lib -p kernel-mm --target $(HOST_TARGET)
 
-test-all: test qemu-test-rv64
+test-all: test qemu-test-rv64 python-test-rv64
+
+# QEMU python interactive test
+python-test-rv64: kernel-rv64 $(DISK_IMG)
+	@echo "=== QEMU Python Integration Test (SMP=$(SMP), LOG=$(_LOG_FEATURES)) ==="
+	uv run --with pexpect python3 scripts/test_runner.py $(QEMU_RV64) -- $(QEMU_RV64_FLAGS)
 
 clean:
 	cargo clean

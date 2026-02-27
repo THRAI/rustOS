@@ -65,8 +65,11 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         unsafe { executor::per_cpu::set_tp(cpu0) };
         klog!(boot, info, "per-cpu data initialized for {} harts", num_cpus);
 
-        // Initialize trap infrastructure (stvec + STIE + SSIE)
+        // Initialize trap infrastructure (stvec + STIE + SSIE + SEIE)
         trap::init();
+
+        // Initialize PLIC for UART IRQ on boot hart
+        hal::rv64::plic::init_hart(hartid);
 
         // Arm the first timer interrupt (10ms interval)
         hal::rv64::timer::init();
@@ -224,8 +227,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 executor::sleep(100).await;
                 let argv = alloc::vec![
                     alloc::string::String::from("/bin/busybox"),
-                    alloc::string::String::from("echo"),
-                    alloc::string::String::from("hello from busybox"),
+                    alloc::string::String::from("sh"),
+                    //alloc::string::String::from("echo"),
+                    //alloc::string::String::from("hello from busybox"),
                 ];
                 let envp = alloc::vec![
                     alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
@@ -237,7 +241,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                             let mut tf = init_task2.trap_frame.lock();
                             tf.sepc = entry;
                             tf.x[2] = sp;
-                            tf.sstatus = 1 << 5; // SPP=0, SPIE=1
+                            tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                         }
                         klog!(boot, info, "exec OK: entry={:#x} sp={:#x}", entry, sp);
                         executor::spawn_user_task(init_task2, init_cpu);

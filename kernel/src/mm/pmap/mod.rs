@@ -132,6 +132,17 @@ pub fn pmap_create() -> Pmap {
         );
         unsafe { l1_ptr.add(128).write(mmio_mega_pte); }
 
+        // PLIC MMIO: 0x0C00_0000..0x0C40_0000 (priority regs + claim/complete).
+        // L1 index 96 = 0x0C00_0000 >> 21, index 97 = 0x0C20_0000 >> 21.
+        // Without this, any external interrupt while a user pmap is active
+        // causes a kernel page fault when reading the PLIC claim register.
+        let plic_flags = pte::PteFlags::V | pte::PteFlags::R | pte::PteFlags::W
+            | pte::PteFlags::A | pte::PteFlags::D | pte::PteFlags::G;
+        unsafe {
+            l1_ptr.add(96).write(pte::encode_pte(0x0C00_0000, plic_flags));
+            l1_ptr.add(97).write(pte::encode_pte(0x0C20_0000, plic_flags));
+        }
+
         (frame, l1_frame)
     };
     #[cfg(not(target_arch = "riscv64"))]
@@ -315,6 +326,25 @@ pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) && pte_is_leaf(raw) {
             Some(PhysAddr::new(pte_pa(raw) | va.page_offset()))
+        } else {
+            None
+        }
+    }
+}
+
+/// Extract physical address AND PTE flags for a mapped virtual address.
+/// Returns None if the page is not mapped (no valid leaf PTE).
+pub fn pmap_extract_with_flags(pmap: &Pmap, va: VirtAddr) -> Option<(PhysAddr, PteFlags)> {
+    unsafe {
+        let pte_ptr = walk::walk::<SV39_LEVELS>(
+            pmap.root.as_usize(),
+            va.as_usize(),
+            false,
+            &mut || None,
+        )?;
+        let raw = pte_ptr.read_volatile();
+        if pte_is_valid(raw) && pte_is_leaf(raw) {
+            Some((PhysAddr::new(pte_pa(raw) | va.page_offset()), pte_flags(raw)))
         } else {
             None
         }

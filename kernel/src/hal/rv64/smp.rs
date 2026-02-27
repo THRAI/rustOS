@@ -67,6 +67,9 @@ extern "C" fn secondary_rust_main(cpu_id: usize) -> ! {
     // Set up trap vectors
     super::trap::init();
 
+    // Initialize PLIC for UART IRQ on this hart
+    super::plic::init_hart(hartid);
+
     // Arm timer
     super::timer::init();
 

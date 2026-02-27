@@ -25,6 +25,12 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     // Deep-copy: walk parent's pmap, copy mapped pages into child
     deep_copy_pages(parent, &child);
 
+    // Map sigcode trampoline page in child (not in vm_map, so deep_copy misses it)
+    {
+        let mut child_pmap = child.pmap.lock();
+        super::signal::map_sigcode_page(&mut child_pmap);
+    }
+
     // Fork fd table (Arc-shared OpenFile entries per POSIX)
     {
         let parent_fds = parent.fd_table.lock();

@@ -27,9 +27,10 @@ extern "C" {
 /// Initialize trap infrastructure: set stvec, enable timer + software interrupts in sie.
 pub fn init() {
     set_kernel_trap_entry();
-    // Enable S-mode timer interrupt (STIE = bit 5) and software interrupt (SSIE = bit 1)
+    // Enable S-mode timer interrupt (STIE = bit 5), software interrupt (SSIE = bit 1),
+    // and external interrupt (SEIE = bit 9) in sie.
     unsafe {
-        core::arch::asm!("csrs sie, {}", in(reg) (1usize << 5) | (1usize << 1));
+        core::arch::asm!("csrs sie, {}", in(reg) (1usize << 5) | (1usize << 1) | (1usize << 9));
     }
     klog!(trap, info, "stvec set, STIE+SSIE enabled");
 }
@@ -123,7 +124,21 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
 
 /// Stub: external interrupt handler (expanded in later phases).
 fn handle_external_irq() {
-    klog!(trap, debug, "external IRQ (stub)");
+    let hart = crate::executor::per_cpu::current().hartid;
+    // FreeBSD-style claim loop: handle all pending IRQs per trap entry
+    loop {
+        let irq = super::plic::claim(hart);
+        if irq == 0 {
+            break;
+        }
+        if irq == super::plic::UART_IRQ {
+            // Drain entire UART FIFO (handles interrupt coalescing)
+            while let Some(ch) = super::uart::getchar() {
+                crate::console::console_irq_push(ch);
+            }
+        }
+        super::plic::complete(hart, irq);
+    }
 }
 
 // ---------------------------------------------------------------------------

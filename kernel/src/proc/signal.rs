@@ -314,6 +314,9 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     let mut tf = task.trap_frame.lock();
     let sig_state = &task.signals;
 
+    klog!(signal, error, "sendsig pid={} saving sepc={:#x} a0={:#x} sp={:#x}",
+        task.pid, tf.sepc, tf.x[10], tf.x[2]);
+
     // Determine stack pointer for signal frame
     let mut sp = tf.x[2]; // current user SP
 
@@ -372,6 +375,9 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
         return Err(()); // user stack trashed
     }
 
+    klog!(signal, error, "sendsig pid={} sigframe at {:#x}..{:#x} (size={})",
+        task.pid, sp, sp + SIGFRAME_SIZE, SIGFRAME_SIZE);
+
     // Block signals specified in sa_mask + the signal itself during handler
     let block_mask = action.mask | sig_bit(sig);
     sig_state.blocked.fetch_or(block_mask, Ordering::Release);
@@ -417,6 +423,9 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     }
     let frame = unsafe { frame.assume_init() };
 
+    klog!(signal, error, "sigreturn pid={} sp={:#x} restored_sepc={:#x} restored_a0={:#x} restored_sp={:#x}",
+        task.pid, sp, frame.saved_tf.sepc, frame.saved_tf.x[10], frame.saved_tf.x[2]);
+
     // Validate sepc: must be in user space (< 0x0000_0040_0000_0000)
     const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
     if frame.saved_tf.sepc >= USER_MAX_VA {
@@ -440,6 +449,21 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     // Restore signal mask
     task.signals.blocked.store(frame.saved_mask, Ordering::Release);
 
+    // DEBUG: read wstatus at 0x3fffffe85c to check if handler corrupted it
+    {
+        let mut wstatus_val: i32 = 0;
+        let wstatus_addr: usize = 0x3fffffe85c;
+        let _ = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                &mut wstatus_val as *mut i32 as *mut u8,
+                wstatus_addr as *const u8,
+                4,
+            )
+        };
+        klog!(signal, error, "sigreturn pid={} wstatus@{:#x}={:#x} ({})",
+            task.pid, wstatus_addr, wstatus_val, wstatus_val);
+    }
+
     Ok(())
 }
 
@@ -455,10 +479,11 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         Some(s) => s,
         None => return Ok(false),
     };
-    klog!(signal, debug, "check_pending pid={} sig={}", task.pid, Signal(sig));
+    klog!(signal, error, "check_pending pid={} sig={}", task.pid, Signal(sig));
 
     // SIGKILL: always fatal, no handler
     if sig == SIGKILL {
+        klog!(signal, error, "check_pending pid={} SIGKILL -> fatal", task.pid);
         return Err(sig);
     }
 
@@ -475,7 +500,10 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
     match action.handler {
         SIG_DFL => {
             match default_action(sig) {
-                SigDefault::Terminate => Err(sig),
+                SigDefault::Terminate => {
+                    klog!(signal, error, "check_pending pid={} sig={} SIG_DFL -> Terminate", task.pid, Signal(sig));
+                    Err(sig)
+                }
                 SigDefault::Ignore => Ok(false),
                 SigDefault::Stop => Ok(false),   // simplified
                 SigDefault::Continue => Ok(false),
@@ -483,10 +511,12 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         }
         SIG_IGN => Ok(false),
         _handler => {
+            klog!(signal, error, "check_pending pid={} sig={} -> user handler {:#x}", task.pid, Signal(sig), _handler);
             // Deliver to user handler via sendsig
             match sendsig(task, sig, &action) {
                 Ok(()) => Ok(true),
                 Err(()) => {
+                    klog!(signal, error, "check_pending pid={} sendsig FAILED -> SIGILL", task.pid);
                     // sendsig failed (bad user stack) — kill with SIGILL
                     Err(SIGILL)
                 }

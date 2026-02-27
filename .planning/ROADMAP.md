@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: VM Core + PMAP** - Virtual memory subsystem with page tables, ASID management, fault handling, and frame allocation (~6K LOC)
 - [x] **Phase 3: Exception Fixup + VFS + Disk + Process** - User/kernel copy safety, filesystem, block I/O, and fork/exec/wait (~10K LOC, hard gate on fixup tests at 3a)
 - [ ] **Phase 3.1: Verification Bookkeeping + User Memory Safety** - INSERTED: Close audit gaps — pcb_onfault in user trap, fault-safe string copy, verification docs (~200 LOC)
-- [ ] **Phase 4: Pipes + Signals + Full Syscalls** - IPC pipes, signal delivery, and remaining syscall surface for test suite compatibility (~4K LOC)
+- [x] **Phase 4: Pipes + Signals + Full Syscalls** - IPC pipes, signal delivery, and remaining syscall surface for test suite compatibility (~4K LOC) (completed 2026-02-25)
 - [ ] **Phase 5: Page Reclamation + LA64 Port** - Page daemon, writeback daemon, shadow collapse, and full LoongArch64 HAL/PMAP port (~6K LOC)
 - [ ] **Phase 6: Network + Sockets** - VirtIO-net, smoltcp integration, TCP sockets, kqueue, and LTP test coverage (~8K LOC)
 - [ ] **Phase 7: Apps + Physical Hardware + Tuning** - git, vim, gcc, rustc validation on QEMU and physical board bring-up (~2K LOC)
@@ -174,7 +174,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | 2. VM Core + PMAP | 5/5 | Complete | 2026-02-23 |
 | 3. Exception Fixup + VFS + Disk + Process | 5/5 | Complete | 2026-02-23 |
 | 3.1 Verification Bookkeeping + User Memory Safety | 0/1 | Not started | - |
-| 4. Pipes + Signals + Full Syscalls | 0/3 | Not started | - |
+| 4. Pipes + Signals + Full Syscalls | 0/3 | Complete    | 2026-02-25 |
 | 5. Page Reclamation + LA64 Port | 0/3 | Not started | - |
 | 6. Network + Sockets | 0/3 | Not started | - |
 | 7. Apps + Physical Hardware + Tuning | 0/2 | Not started | - |

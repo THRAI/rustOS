@@ -147,26 +147,45 @@ macro_rules! kprintln {
 #[macro_export]
 macro_rules! klog {
     ($mod:ident, error, $($arg:tt)*) => {
-        $crate::kprintln!(concat!("[", stringify!($mod), "] {}"), format_args!($($arg)*))
+        if cfg!(any(not(any(feature="log-level-error", feature="log-level-warn", feature="log-level-info", feature="log-level-debug", feature="log-level-trace")), feature="log-level-error")) {
+            $crate::kprintln!(concat!("[", stringify!($mod), "] ERROR: {}"), format_args!($($arg)*))
+        }
     };
-    ($mod:ident, $lvl:ident, $($arg:tt)*) => {
-        $crate::_klog_if!($mod, $($arg)*)
+    ($mod:ident, warn, $($arg:tt)*) => {
+        if cfg!(any(not(any(feature="log-level-error", feature="log-level-warn", feature="log-level-info", feature="log-level-debug", feature="log-level-trace")), feature="log-level-warn")) {
+            $crate::_klog_if!($mod, "WARN: ", $($arg)*)
+        }
+    };
+    ($mod:ident, info, $($arg:tt)*) => {
+        if cfg!(any(not(any(feature="log-level-error", feature="log-level-warn", feature="log-level-info", feature="log-level-debug", feature="log-level-trace")), feature="log-level-info")) {
+            $crate::_klog_if!($mod, "INFO: ", $($arg)*)
+        }
+    };
+    ($mod:ident, debug, $($arg:tt)*) => {
+        if cfg!(any(not(any(feature="log-level-error", feature="log-level-warn", feature="log-level-info", feature="log-level-debug", feature="log-level-trace")), feature="log-level-debug")) {
+            $crate::_klog_if!($mod, "DEBUG: ", $($arg)*)
+        }
+    };
+    ($mod:ident, trace, $($arg:tt)*) => {
+        if cfg!(any(not(any(feature="log-level-error", feature="log-level-warn", feature="log-level-info", feature="log-level-debug", feature="log-level-trace")), feature="log-level-trace")) {
+            $crate::_klog_if!($mod, "TRACE: ", $($arg)*)
+        }
     };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! _klog_if {
-    (boot,    $($arg:tt)*) => { #[cfg(feature = "log-boot")]    { $crate::kprintln!(concat!("[boot] {}"),    format_args!($($arg)*)); } };
-    (syscall, $($arg:tt)*) => { #[cfg(feature = "log-syscall")] { $crate::kprintln!(concat!("[syscall] {}"), format_args!($($arg)*)); } };
-    (trap,    $($arg:tt)*) => { #[cfg(feature = "log-trap")]    { $crate::kprintln!(concat!("[trap] {}"),    format_args!($($arg)*)); } };
-    (vm,      $($arg:tt)*) => { #[cfg(feature = "log-vm")]      { $crate::kprintln!(concat!("[vm] {}"),      format_args!($($arg)*)); } };
-    (sched,   $($arg:tt)*) => { #[cfg(feature = "log-sched")]   { $crate::kprintln!(concat!("[sched] {}"),   format_args!($($arg)*)); } };
-    (fs,      $($arg:tt)*) => { #[cfg(feature = "log-fs")]      { $crate::kprintln!(concat!("[fs] {}"),      format_args!($($arg)*)); } };
-    (driver,  $($arg:tt)*) => { #[cfg(feature = "log-driver")]  { $crate::kprintln!(concat!("[driver] {}"),  format_args!($($arg)*)); } };
-    (smp,     $($arg:tt)*) => { #[cfg(feature = "log-smp")]     { $crate::kprintln!(concat!("[smp] {}"),     format_args!($($arg)*)); } };
-    (signal,  $($arg:tt)*) => { #[cfg(feature = "log-signal")]  { $crate::kprintln!(concat!("[signal] {}"),  format_args!($($arg)*)); } };
-    (exec,    $($arg:tt)*) => { #[cfg(feature = "log-exec")]    { $crate::kprintln!(concat!("[exec] {}"),    format_args!($($arg)*)); } };
-    (pipe,    $($arg:tt)*) => { #[cfg(feature = "log-pipe")]    { $crate::kprintln!(concat!("[pipe] {}"),    format_args!($($arg)*)); } };
-    (proc,    $($arg:tt)*) => { #[cfg(feature = "log-proc")]    { $crate::kprintln!(concat!("[proc] {}"),    format_args!($($arg)*)); } };
+    (boot,    $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-boot")    { $crate::kprintln!(concat!("[boot] ", $lvl, "{}"),    format_args!($($arg)*)); } };
+    (syscall, $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-syscall") { $crate::kprintln!(concat!("[syscall] ", $lvl, "{}"), format_args!($($arg)*)); } };
+    (trap,    $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-trap")    { $crate::kprintln!(concat!("[trap] ", $lvl, "{}"),    format_args!($($arg)*)); } };
+    (vm,      $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-vm")      { $crate::kprintln!(concat!("[vm] ", $lvl, "{}"),      format_args!($($arg)*)); } };
+    (sched,   $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-sched")   { $crate::kprintln!(concat!("[sched] ", $lvl, "{}"),   format_args!($($arg)*)); } };
+    (fs,      $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-fs")      { $crate::kprintln!(concat!("[fs] ", $lvl, "{}"),      format_args!($($arg)*)); } };
+    (driver,  $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-driver")  { $crate::kprintln!(concat!("[driver] ", $lvl, "{}"),  format_args!($($arg)*)); } };
+    (smp,     $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-smp")     { $crate::kprintln!(concat!("[smp] ", $lvl, "{}"),     format_args!($($arg)*)); } };
+    (signal,  $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-signal")  { $crate::kprintln!(concat!("[signal] ", $lvl, "{}"),  format_args!($($arg)*)); } };
+    (exec,    $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-exec")    { $crate::kprintln!(concat!("[exec] ", $lvl, "{}"),    format_args!($($arg)*)); } };
+    (pipe,    $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-pipe")    { $crate::kprintln!(concat!("[pipe] ", $lvl, "{}"),    format_args!($($arg)*)); } };
+    (proc,    $lvl:literal, $($arg:tt)*) => { if cfg!(feature = "log-proc")    { $crate::kprintln!(concat!("[proc] ", $lvl, "{}"),    format_args!($($arg)*)); } };
 }

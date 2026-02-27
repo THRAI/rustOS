@@ -334,7 +334,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
 }
 
 /// Pre-fault all user pages covering [user_ptr, user_ptr+len).
-async fn fault_in_user_buffer(task: &Arc<Task>, user_ptr: usize, len: usize, access: PageFaultAccessType) {
+pub(crate) async fn fault_in_user_buffer(task: &Arc<Task>, user_ptr: usize, len: usize, access: PageFaultAccessType) {
     if len == 0 { return; }
     let start = user_ptr & !(PAGE_SIZE - 1);
     let end = (user_ptr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -627,11 +627,14 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
 
     let ret: usize = match id {
         // --- Fast-path synchronous syscalls ---
-        SyscallId::GETPID => task.pid as usize,
-        SyscallId::GETPPID => task.ppid() as usize,
-        SyscallId::GETUID | SyscallId::GETEUID | SyscallId::GETGID | SyscallId::GETEGID => 0,
-        SyscallId::GETTID => task.pid as usize,
-        SyscallId::SET_TID_ADDRESS => task.pid as usize,
+        SyscallId::GETPID => crate::proc::syscalls::sys_getpid(task),
+        SyscallId::GETPPID => crate::proc::syscalls::sys_getppid(task),
+        SyscallId::GETUID => crate::proc::syscalls::sys_getuid(task),
+        SyscallId::GETEUID => crate::proc::syscalls::sys_geteuid(task),
+        SyscallId::GETGID => crate::proc::syscalls::sys_getgid(task),
+        SyscallId::GETEGID => crate::proc::syscalls::sys_getegid(task),
+        SyscallId::GETTID => crate::proc::syscalls::sys_gettid(task),
+        SyscallId::SET_TID_ADDRESS => crate::proc::syscalls::sys_gettid(task),
         SyscallId::DUP => {
             match task.fd_table.lock().dup(a0 as u32) {
                 Ok(fd) => fd as usize,
@@ -761,7 +764,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             if a2 != 0 {
                 fault_in_user_buffer(task, a2, 32, PageFaultAccessType::WRITE).await;
             }
-            match crate::proc::signal::sys_sigaction(task, a0, a1, a2) {
+            match crate::proc::syscalls::sys_sigaction(task, a0, a1, a2) {
                 Ok(v) => v,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
@@ -775,33 +778,33 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             if a2 != 0 {
                 fault_in_user_buffer(task, a2, 8, PageFaultAccessType::WRITE).await;
             }
-            match crate::proc::signal::sys_sigprocmask(task, a0, a1, a2) {
+            match crate::proc::syscalls::sys_sigprocmask(task, a0, a1, a2) {
                 Ok(v) => v,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
         SyscallId::SIGRETURN => {
-            let _ = crate::proc::signal::sys_sigreturn(task);
+            let _ = crate::proc::syscalls::sys_sigreturn(task);
             // sigreturn sets sepc/sstatus directly; don't overwrite a0
             return TrapResult::Continue;
         }
         SyscallId::KILL => {
             // a0=pid (or -pgid), a1=sig
-            match crate::proc::signal::sys_kill(task, a0 as isize, a1 as u8) {
+            match crate::proc::syscalls::sys_kill(task, a0 as isize, a1 as u8) {
                 Ok(v) => v,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
         SyscallId::SETPGID => {
             // a0=pid, a1=pgid
-            match crate::proc::signal::sys_setpgid(task, a0 as u32, a1 as u32) {
+            match crate::proc::syscalls::sys_setpgid(task, a0 as u32, a1 as u32) {
                 Ok(v) => v,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
         SyscallId::GETPGID => {
-            // a0=pid (0 = self)
-            match crate::proc::signal::sys_getpgid(task, a0 as u32) {
+            // a0=pid
+            match crate::proc::syscalls::sys_getpgid(task, a0 as u32) {
                 Ok(v) => v,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
@@ -954,35 +957,12 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             }
         }
         SyscallId::EXIT | SyscallId::EXIT_GROUP => {
-            // Linux wstatus for normal exit: (code << 8) & 0xff00
-            let wstatus = crate::proc::exit_wait::WaitStatus::exited(a0 as i32);
-            do_exit(task, wstatus);
+            crate::proc::syscalls::sys_exit(task, a0 as i32);
             return TrapResult::Exit;
         }
-        SyscallId::CLONE => {
-            // Basic fork (flags ignored for now)
-            let child = crate::proc::fork::fork(task);
-            let child_pid = child.pid;
-            // Parent gets child PID in a0
-            let parent_ret = child_pid as usize;
-            // Spawn child on same CPU (child's trap_frame already has a0=0 from fork)
-            let cpu = super::per_cpu::current().cpu_id;
-            spawn_user_task(child, cpu);
-            parent_ret
-        }
+        SyscallId::CLONE => crate::proc::syscalls::sys_clone(task),
         SyscallId::EXECVE => {
-            // a0=pathname, a1=argv, a2=envp
-            // Read pathname from user memory
-            let path = match copyinstr(task, a0, 256).await {
-                Some(s) => s,
-                None => return set_syscall_ret(task, (-(Errno::EFAULT.as_i32() as isize)) as usize),
-            };
-            // Read argv array from user memory (before exec destroys address space)
-            let argv = copyin_argv(task, a1, 64, 4096).await;
-            // Read envp array (optional, musl can cope with empty)
-            let envp = copyin_argv(task, a2, 64, 4096).await;
-
-            match crate::proc::exec::exec_with_args(task, &path, &argv, &envp).await {
+            match crate::proc::syscalls::sys_execve_async(task, a0, a1, a2).await {
                 Ok((entry, sp)) => {
                     let mut tf = task.trap_frame.lock();
                     tf.sepc = entry;
@@ -1004,7 +984,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 let peek = unsafe { *(a1 as *const i32) };
                 klog!(proc, trace, "VERBOSE wait4 ENTRY pid={} wstatus@{:#x}={:#x}", task.pid, a1, peek);
             }
-            match sys_wait4_async(task, a0 as isize, a1, options).await {
+            match crate::proc::syscalls::sys_wait4_async(task, a0 as isize, a1, options).await {
                 Ok(pid) => pid as usize,
                 // wait4 is never restarted (matches Linux behavior).
                 // The SIGCHLD handler typically calls waitpid() itself,
@@ -2364,142 +2344,13 @@ async fn sys_openat_async(
     crate::fs::syscalls::sys_open(&task.fd_table, &path_str, open_flags).await
 }
 
-/// sys_wait4: wait for child process.
-async fn sys_wait4_async(
-    task: &Arc<Task>,
-    pid: isize,
-    wstatus_ptr: usize,
-    options: usize,
-) -> Result<u32, Errno> {
-    const WNOHANG: usize = 1;
 
-    // Pre-fault wstatus page so copy_user_chunk won't EFAULT on demand-paged stack
-    if wstatus_ptr != 0 {
-        fault_in_user_buffer(task, wstatus_ptr, 4, PageFaultAccessType::WRITE).await;
-    }
-
-    // Check if there are any children at all
-    {
-        let children = task.children.lock();
-        if children.is_empty() {
-            return Err(Errno::ECHILD);
-        }
-    }
-
-    if options & WNOHANG != 0 {
-        // Non-blocking: scan for a zombie child, return immediately
-        let children = task.children.lock();
-        for child in children.iter() {
-            if child.state() == crate::proc::task::TaskState::Zombie {
-                if pid > 0 && child.pid != pid as u32 {
-                    continue;
-                }
-
-                let child_pid = child.pid;
-                let status = child.exit_status.load(core::sync::atomic::Ordering::Acquire);
-                drop(children);
-
-                // Remove the zombie child from parent's children list
-                task.children.lock().retain(|c| c.pid != child_pid);
-
-                // Consume pending SIGCHLD so the handler doesn't run
-                // spuriously after wait4 already reaped the child.
-                // The handler's stack frame would overlap the caller's
-                // wstatus variable and corrupt it.
-                task.signals.pending.fetch_and(
-                    !crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGCHLD),
-                    core::sync::atomic::Ordering::Release,
-                );
-
-                // Write status to user memory if pointer is non-null
-                if wstatus_ptr != 0 {
-                    klog!(proc, trace, "wait4(WNOHANG) pid={} reaped child={} wstatus={:#x}",
-                        task.pid, child_pid, status);
-                    let rc = unsafe {
-                        crate::hal::rv64::copy_user::copy_user_chunk(
-                            wstatus_ptr as *mut u8,
-                            &status as *const i32 as *const u8,
-                            4,
-                        )
-                    };
-                    if rc != 0 { return Err(Errno::EFAULT); }
-                }
-                return Ok(child_pid);
-            }
-        }
-        drop(children);
-        // No zombie yet, WNOHANG: return 0 (not an error)
-        return Ok(0);
-    }
-
-    // Blocking path
-    use crate::proc::exit_wait::WaitChildFuture;
-    let result = WaitChildFuture::new(Arc::clone(task), pid).await;
-
-    match result {
-        Some((child_pid, status)) => {
-            // Consume pending SIGCHLD so the handler doesn't run
-            // spuriously after wait4 already reaped the child.
-            task.signals.pending.fetch_and(
-                !crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGCHLD),
-                core::sync::atomic::Ordering::Release,
-            );
-
-            // Write status to user memory if pointer is non-null
-            if wstatus_ptr != 0 {
-                klog!(proc, trace, "wait4 pid={} reaped child={} wstatus={:#x} wstatus_ptr={:#x}",
-                    task.pid, child_pid, status, wstatus_ptr);
-                let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
-                        wstatus_ptr as *mut u8,
-                        &status as *const i32 as *const u8,
-                        4,
-                    )
-                };
-                if rc != 0 { return Err(Errno::EFAULT); }
-                // Readback verification
-                let mut readback: i32 = 0;
-                let _ = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
-                        &mut readback as *mut i32 as *mut u8,
-                        wstatus_ptr as *const u8,
-                        4,
-                    )
-                };
-                klog!(proc, trace, "wait4 wstatus readback={:#x} at {:#x}", readback, wstatus_ptr);
-                // Extract PA backing the wstatus page
-                let pa = {
-                    let pmap = task.pmap.lock();
-                    crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(wstatus_ptr & !0xFFF))
-                };
-                klog!(proc, trace, "wait4 wstatus page PA={:?}", pa);
-                // Also read directly from PA to verify
-                if let Some(phys) = pa {
-                    let pa_addr = phys.as_usize() + (wstatus_ptr & 0xFFF);
-                    let direct_val = unsafe { core::ptr::read_volatile(pa_addr as *const i32) };
-                    klog!(proc, trace, "wait4 wstatus DIRECT PA read @{:#x}={:#x}", pa_addr, direct_val);
-                }
-            }
-            Ok(child_pid)
-        }
-        None => {
-            // Distinguish EINTR from ECHILD
-            if task.signals.has_actionable_pending() {
-                klog!(proc, trace, "wait4 pid={} returning EINTR (signal pending)", task.pid);
-                Err(Errno::EINTR)
-            } else {
-                klog!(proc, trace, "wait4 pid={} returning ECHILD", task.pid);
-                Err(Errno::ECHILD)
-            }
-        }
-    }
-}
 
 /// Read a NUL-terminated string from user memory. Returns None on fault.
 ///
 /// Pre-faults demand-paged user pages before copying so that copy_user_chunk
 /// doesn't hit pcb_onfault on unmapped pages.
-async fn copyinstr(task: &Arc<Task>, user_ptr: usize, max_len: usize) -> Option<String> {
+pub(crate) async fn copyinstr(task: &Arc<Task>, user_ptr: usize, max_len: usize) -> Option<String> {
     if user_ptr == 0 {
         return None;
     }
@@ -2531,7 +2382,7 @@ async fn copyinstr(task: &Arc<Task>, user_ptr: usize, max_len: usize) -> Option<
 ///
 /// Pre-faults demand-paged user pages for both the pointer array and each
 /// string before copying.
-async fn copyin_argv(task: &Arc<Task>, user_argv: usize, max_count: usize, max_total: usize) -> alloc::vec::Vec<String> {
+pub(crate) async fn copyin_argv(task: &Arc<Task>, user_argv: usize, max_count: usize, max_total: usize) -> alloc::vec::Vec<String> {
     let mut result = alloc::vec::Vec::new();
     if user_argv == 0 {
         return result;
@@ -2594,7 +2445,7 @@ fn should_restart_syscall(task: &Arc<Task>) -> bool {
 /// `wstatus` must be pre-encoded in Linux format:
 ///   normal exit:  (code << 8) & 0x7f00   (low 7 bits = 0)
 ///   signal kill:  signo & 0x7f           (low 7 bits = signal)
-fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
+pub(crate) fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
     klog!(proc, trace, "do_exit pid={} wstatus={:#x}", task.pid, wstatus.0);
     // Debug logging handled globally by Makefile levels now.
     task.exit_status.store(wstatus.0, core::sync::atomic::Ordering::Release);

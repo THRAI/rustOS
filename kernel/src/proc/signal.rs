@@ -284,7 +284,7 @@ pub struct SigFrame {
     pub saved_mask: u64,
 }
 
-const SIGFRAME_SIZE: usize = core::mem::size_of::<SigFrame>();
+pub const SIGFRAME_SIZE: usize = core::mem::size_of::<SigFrame>();
 
 // ---------------------------------------------------------------------------
 // sendsig: build sigframe on user stack, redirect to handler
@@ -400,74 +400,6 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
 }
 
 // ---------------------------------------------------------------------------
-// sigreturn: restore context from sigframe
-// ---------------------------------------------------------------------------
-
-/// Restore trap frame from the signal frame on the user stack.
-/// Returns Ok(()) on success, Err(Errno) on invalid frame.
-pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
-    klog!(signal, debug, "sigreturn pid={}", task.pid);
-    let sp = task.trap_frame.lock().x[2]; // current SP points to sigframe
-
-    // Copyin the sigframe from user memory
-    let mut frame = core::mem::MaybeUninit::<SigFrame>::uninit();
-    let ok = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            frame.as_mut_ptr() as *mut u8,
-            sp as *const u8,
-            SIGFRAME_SIZE,
-        )
-    };
-    if ok != 0 {
-        return Err(Errno::EFAULT);
-    }
-    let frame = unsafe { frame.assume_init() };
-
-    klog!(signal, error, "sigreturn pid={} sp={:#x} restored_sepc={:#x} restored_a0={:#x} restored_sp={:#x}",
-        task.pid, sp, frame.saved_tf.sepc, frame.saved_tf.x[10], frame.saved_tf.x[2]);
-
-    // Validate sepc: must be in user space (< 0x0000_0040_0000_0000)
-    const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
-    if frame.saved_tf.sepc >= USER_MAX_VA {
-        return Err(Errno::EINVAL);
-    }
-
-    // Restore trap frame with sanitization
-    {
-        let mut tf = task.trap_frame.lock();
-        // Restore all GPRs
-        tf.x = frame.saved_tf.x;
-        tf.sepc = frame.saved_tf.sepc;
-        // Sanitize sstatus: SPP cleared (user mode), SPIE set, FS>=Initial
-        tf.sstatus = (frame.saved_tf.sstatus & !(1 << 8)) | (1 << 5);
-        if tf.sstatus & (3 << 13) == 0 {
-            tf.sstatus |= 1 << 13; // FS=Initial if Off
-        }
-        // scause/stval not restored (kernel-only)
-    }
-
-    // Restore signal mask
-    task.signals.blocked.store(frame.saved_mask, Ordering::Release);
-
-    // DEBUG: read wstatus at 0x3fffffe85c to check if handler corrupted it
-    {
-        let mut wstatus_val: i32 = 0;
-        let wstatus_addr: usize = 0x3fffffe85c;
-        let _ = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                &mut wstatus_val as *mut i32 as *mut u8,
-                wstatus_addr as *const u8,
-                4,
-            )
-        };
-        klog!(signal, error, "sigreturn pid={} wstatus@{:#x}={:#x} ({})",
-            task.pid, wstatus_addr, wstatus_val, wstatus_val);
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // check_pending_signals: called at userret
 // ---------------------------------------------------------------------------
 
@@ -525,138 +457,6 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// sys_sigaction
-// ---------------------------------------------------------------------------
-
-/// Linux rt_sigaction struct layout (rv64):
-/// - sa_handler: u64
-/// - sa_flags: u64
-/// - sa_restorer: u64
-/// - sa_mask: u64
-const SIGACTION_USER_SIZE: usize = 32; // 4 * 8
-
-pub fn sys_sigaction(
-    task: &Arc<Task>,
-    sig: usize,
-    act_ptr: usize,
-    oldact_ptr: usize,
-) -> Result<usize, Errno> {
-    if sig < 1 || sig > MAX_SIG as usize {
-        return Err(Errno::EINVAL);
-    }
-    // Cannot change SIGKILL or SIGSTOP
-    if sig == SIGKILL as usize || sig == SIGSTOP as usize {
-        return Err(Errno::EINVAL);
-    }
-
-    let idx = sig - 1;
-    let mut actions = task.signals.actions.lock();
-
-    // Write old action to user memory
-    if oldact_ptr != 0 {
-        let old = actions[idx];
-        let buf: [u64; 4] = [
-            old.handler as u64,
-            old.flags,
-            old.restorer as u64,
-            old.mask,
-        ];
-        let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                oldact_ptr as *mut u8,
-                buf.as_ptr() as *const u8,
-                SIGACTION_USER_SIZE,
-            )
-        };
-        if rc != 0 {
-            return Err(Errno::EFAULT);
-        }
-    }
-
-    // Read new action from user memory
-    if act_ptr != 0 {
-        let mut buf = [0u64; 4];
-        let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                buf.as_mut_ptr() as *mut u8,
-                act_ptr as *const u8,
-                SIGACTION_USER_SIZE,
-            )
-        };
-        if rc != 0 {
-            return Err(Errno::EFAULT);
-        }
-        actions[idx] = SigAction {
-            handler: buf[0] as usize,
-            flags: buf[1],
-            restorer: buf[2] as usize,
-            mask: buf[3],
-        };
-    }
-
-    Ok(0)
-}
-
-// ---------------------------------------------------------------------------
-// sys_sigprocmask
-// ---------------------------------------------------------------------------
-
-pub const SIG_BLOCK: usize = 0;
-pub const SIG_UNBLOCK: usize = 1;
-pub const SIG_SETMASK: usize = 2;
-
-pub fn sys_sigprocmask(
-    task: &Arc<Task>,
-    how: usize,
-    set_ptr: usize,
-    oldset_ptr: usize,
-) -> Result<usize, Errno> {
-    let sig_state = &task.signals;
-
-    // Write old mask
-    if oldset_ptr != 0 {
-        let old = sig_state.blocked.load(Ordering::Relaxed);
-        let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                oldset_ptr as *mut u8,
-                &old as *const u64 as *const u8,
-                8,
-            )
-        };
-        if rc != 0 {
-            return Err(Errno::EFAULT);
-        }
-    }
-
-    // Read new set and apply
-    if set_ptr != 0 {
-        let mut new_set: u64 = 0;
-        let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                &mut new_set as *mut u64 as *mut u8,
-                set_ptr as *const u8,
-                8,
-            )
-        };
-        if rc != 0 {
-            return Err(Errno::EFAULT);
-        }
-
-        // Cannot block SIGKILL or SIGSTOP
-        let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
-        new_set &= !unblockable;
-
-        match how {
-            SIG_BLOCK => { sig_state.blocked.fetch_or(new_set, Ordering::Release); }
-            SIG_UNBLOCK => { sig_state.blocked.fetch_and(!new_set, Ordering::Release); }
-            SIG_SETMASK => { sig_state.blocked.store(new_set, Ordering::Release); }
-            _ => return Err(Errno::EINVAL),
-        }
-    }
-
-    Ok(0)
-}
 
 // ---------------------------------------------------------------------------
 // sys_kill + global task registry
@@ -677,58 +477,19 @@ pub fn unregister_task(pid: u32) {
     TASK_REGISTRY.lock().retain(|t| t.pid != pid);
 }
 
-/// Send a signal to a process or process group.
-pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno> {
-    klog!(signal, debug, "kill pid={} -> target={} sig={}", sender.pid, pid, Signal(sig));
-    if sig > MAX_SIG {
-        return Err(Errno::EINVAL);
-    }
+pub(crate) fn find_task_by_pid(pid: u32) -> Option<Arc<Task>> {
+    let registry = TASK_REGISTRY.lock();
+    registry.iter().find(|t| t.pid == pid).cloned()
+}
 
-    if pid > 0 {
-        // Send to specific process
-        let target = {
-            let registry = TASK_REGISTRY.lock();
-            registry.iter().find(|t| t.pid == pid as u32).cloned()
-        };
-        match target {
-            Some(t) => {
-                if sig > 0 {
-                    t.signals.post_signal(sig);
-                    // Wake the task's top-level waker if set
-                    if let Some(w) = t.top_level_waker.lock().take() {
-                        w.wake();
-                    }
-                }
-                Ok(0)
-            }
-            None => Err(Errno::ESRCH),
-        }
-    } else if pid == 0 {
-        // Send to all processes in sender's process group
-        let pgid = sender.pgid.load(Ordering::Relaxed);
-        kill_pgrp(pgid, sig);
-        Ok(0)
-    } else if pid == -1 {
-        // Send to all processes (except init)
-        let registry = TASK_REGISTRY.lock();
-        for t in registry.iter() {
-            if t.pid != 1 && sig > 0 {
-                t.signals.post_signal(sig);
-                if let Some(w) = t.top_level_waker.lock().take() {
-                    w.wake();
-                }
-            }
-        }
-        Ok(0)
-    } else {
-        // pid < -1: send to process group |pid|
-        let pgid = (-pid) as u32;
-        kill_pgrp(pgid, sig);
-        Ok(0)
+pub(crate) fn for_each_task(mut f: impl FnMut(&Arc<Task>)) {
+    let registry = TASK_REGISTRY.lock();
+    for t in registry.iter() {
+        f(t);
     }
 }
 
-fn kill_pgrp(pgid: u32, sig: u8) {
+pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
     if sig == 0 { return; }
     let registry = TASK_REGISTRY.lock();
     for t in registry.iter() {
@@ -738,44 +499,6 @@ fn kill_pgrp(pgid: u32, sig: u8) {
                 w.wake();
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// sys_setpgid / sys_getpgid
-// ---------------------------------------------------------------------------
-
-pub fn sys_setpgid(task: &Arc<Task>, pid: u32, pgid: u32) -> Result<usize, Errno> {
-    let target_pid = if pid == 0 { task.pid } else { pid };
-    let new_pgid = if pgid == 0 { target_pid } else { pgid };
-
-    if target_pid == task.pid {
-        task.pgid.store(new_pgid, Ordering::Release);
-        Ok(0)
-    } else {
-        // Find child with matching pid
-        let children = task.children.lock();
-        for child in children.iter() {
-            if child.pid == target_pid {
-                child.pgid.store(new_pgid, Ordering::Release);
-                return Ok(0);
-            }
-        }
-        Err(Errno::ESRCH)
-    }
-}
-
-pub fn sys_getpgid(task: &Arc<Task>, pid: u32) -> Result<usize, Errno> {
-    if pid == 0 {
-        Ok(task.pgid.load(Ordering::Relaxed) as usize)
-    } else {
-        let registry = TASK_REGISTRY.lock();
-        for t in registry.iter() {
-            if t.pid == pid {
-                return Ok(t.pgid.load(Ordering::Relaxed) as usize);
-            }
-        }
-        Err(Errno::ESRCH)
     }
 }
 

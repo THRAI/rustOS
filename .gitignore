@@ -16,3 +16,7 @@ scripts/*.bin
 scripts/*.S
 *.expect
 *.txt
+*.log
+*.bin
+*.expect
+*.img

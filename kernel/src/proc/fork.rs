@@ -55,7 +55,7 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
         let mut child_tf = child.trap_frame.lock();
         *child_tf = *parent.trap_frame.lock();
         child_tf.set_ret_val(0);
-        child_tf.sepc += 4; // skip ecall — parent's sepc is advanced by dispatcher, child's must be done here
+        child_tf.advance_pc(); // skip ecall — parent's sepc is advanced by dispatcher, child's must be done here
     }
 
     // Copy brk
@@ -65,11 +65,11 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     );
 
     // Clear pending signals in child (POSIX: pending signals not inherited).
-    // TODO: pack as a setter method in signal?
-    child
-        .signals
-        .pending
-        .store(0, core::sync::atomic::Ordering::Relaxed);
+    // TODO: pack as a setter method    // Initial signals state
+    child.signals.pending.store(
+        crate::proc::signal::SigSet::empty(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 
     // Copy signal actions from parent.
     {

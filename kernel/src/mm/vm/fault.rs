@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn anonymous_fault_resolves() {
-        let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
+        let map = make_anon_map(0x1000, 0x3000, crate::map_perm!(R, W));
         let mut pmap = Pmap::dummy();
         let result = sync_fault_handler(
             &map,
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn fault_execute_on_non_exec() {
-        let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
+        let map = make_anon_map(0x1000, 0x2000, crate::map_perm!(R, W));
         let mut pmap = Pmap::dummy();
         let result = sync_fault_handler(
             &map,
@@ -537,7 +537,7 @@ mod tests {
         let _sibling_ref = Arc::clone(&shadow);
         let vma = VmArea::new(
             VirtAddr::new(0x1000)..VirtAddr::new(0x2000),
-            MapPerm::R | MapPerm::W,
+            crate::map_perm!(R, W),
             shadow,
             0,
             VmAreaType::Anonymous,
@@ -586,12 +586,12 @@ mod tests {
 
     #[test]
     fn page_fault_access_type_permitted() {
-        let rw = MapPerm::R | MapPerm::W;
+        let rw = crate::map_perm!(R, W);
         assert!(PageFaultAccessType::READ.permitted_by(rw));
         assert!(PageFaultAccessType::WRITE.permitted_by(rw));
         assert!(!PageFaultAccessType::EXECUTE.permitted_by(rw));
 
-        let rx = MapPerm::R | MapPerm::X;
+        let rx = crate::map_perm!(R, X);
         assert!(PageFaultAccessType::READ.permitted_by(rx));
         assert!(!PageFaultAccessType::WRITE.permitted_by(rx));
         assert!(PageFaultAccessType::EXECUTE.permitted_by(rx));
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn anonymous_fault_allocates_unique_frames() {
-        let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
+        let map = make_anon_map(0x1000, 0x3000, crate::map_perm!(R, W));
         let mut pmap = Pmap::dummy();
         let r1 = sync_fault_handler(
             &map,
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn fault_page_aligned_resolution() {
-        let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
+        let map = make_anon_map(0x1000, 0x2000, crate::map_perm!(R, W));
         let mut pmap = Pmap::dummy();
         let result = sync_fault_handler(
             &map,
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn rwx_permission_combinations() {
-        let all = MapPerm::R | MapPerm::W | MapPerm::X;
+        let all = crate::map_perm!(R, W, X);
         assert!(PageFaultAccessType::READ.permitted_by(all));
         assert!(PageFaultAccessType::WRITE.permitted_by(all));
         assert!(PageFaultAccessType::EXECUTE.permitted_by(all));

@@ -189,7 +189,7 @@ async fn run_tasks(task: Arc<Task>) {
                     trace,
                     "run_tasks: FATAL signal pid={} sig={} wstatus={:#x}",
                     task.pid,
-                    crate::proc::signal::Signal(sig),
+                    crate::proc::signal::Signal::new_unchecked(sig),
                     wstatus.0
                 );
                 do_exit(&task, wstatus);
@@ -781,7 +781,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             0
         }
         SyscallId::BRK => {
-            use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType};
+            use crate::mm::vm::vm_map::{VmArea, VmAreaType};
             use crate::mm::vm::vm_object::PageOwnership;
             use crate::mm::vm::vm_object::VmObject;
 
@@ -808,7 +808,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                         let obj = VmObject::new(size);
                         let vma = VmArea::new(
                             VirtAddr::new(old_brk)..VirtAddr::new(new_brk),
-                            MapPerm::R | MapPerm::W | MapPerm::U,
+                            crate::map_perm!(R, W, U),
                             obj,
                             0,
                             VmAreaType::Heap,
@@ -1155,7 +1155,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             ret
         );
         let mut tf = task.trap_frame.lock();
-        tf.sepc += 4; // advance past ecall
+        tf.advance_pc(); // advance past ecall
         tf.set_ret_val(ret);
     }
     TrapResult::Continue
@@ -2712,11 +2712,19 @@ fn should_restart_syscall(task: &Arc<Task>) -> bool {
         .signals
         .blocked
         .load(core::sync::atomic::Ordering::Relaxed);
-    let unblockable = crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGKILL)
-        | crate::proc::signal::sig_bit_pub(crate::proc::signal::SIGSTOP);
-    let deliverable = pending & (!blocked | unblockable);
-    if deliverable != 0 {
-        let bit = deliverable.trailing_zeros() as u8;
+
+    let mut unblockable = crate::proc::signal::SigSet::empty();
+    unblockable
+        .add(crate::proc::signal::Signal::new_unchecked(
+            crate::proc::signal::SIGKILL,
+        ))
+        .add(crate::proc::signal::Signal::new_unchecked(
+            crate::proc::signal::SIGSTOP,
+        ));
+    let deliverable = pending.intersect(blocked.union(unblockable).difference(blocked));
+
+    if !deliverable.is_empty() {
+        let bit = deliverable.as_u64().trailing_zeros() as u8;
         let sig = bit + 1;
         task.signals.is_restart(sig)
     } else {

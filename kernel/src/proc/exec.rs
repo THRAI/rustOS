@@ -244,7 +244,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     let stack_obj = VmObject::new(USER_STACK_SIZE / PAGE_SIZE);
     let stack_vma = VmArea::new(
         VirtAddr::new(stack_bottom)..VirtAddr::new(USER_STACK_TOP),
-        MapPerm::R | MapPerm::W | MapPerm::U,
+        crate::map_perm!(R, W, U),
         stack_obj,
         0,
         VmAreaType::Stack,
@@ -277,9 +277,10 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         }
     }
     // Clear pending signals on exec
-    task.signals
-        .pending
-        .store(0, core::sync::atomic::Ordering::Relaxed);
+    task.signals.pending.store(
+        crate::proc::signal::SigSet::empty(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     // Note: POSIX requires blocked signal mask to be preserved across exec.
     // We intentionally DO NOT clear task.signals.blocked here.
 
@@ -361,7 +362,7 @@ pub async fn exec_with_args(
             &mut pmap,
             VirtAddr::new(stack_page_va),
             frame,
-            MapPerm::R | MapPerm::W | MapPerm::U,
+            crate::map_perm!(R, W, U),
             false,
         );
     }

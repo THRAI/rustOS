@@ -130,11 +130,11 @@ pub async fn sys_wait4_async(
                 task.children.lock().retain(|c| c.pid != child_pid);
 
                 // Consume pending SIGCHLD
-                task.signals.pending.fetch_and(
-                    !Signal::new_unchecked(crate::proc::signal::SIGCHLD).as_bit(),
-                    core::sync::atomic::Ordering::Release,
-                );
-
+                let mut sig_chld = crate::proc::signal::SigSet::empty();
+                sig_chld.add(Signal::new_unchecked(crate::proc::signal::SIGCHLD));
+                task.signals
+                    .pending
+                    .fetch_difference(sig_chld, core::sync::atomic::Ordering::Release);
                 // Write status to user memory if pointer is non-null
                 if wstatus_ptr != 0 {
                     klog!(
@@ -171,11 +171,11 @@ pub async fn sys_wait4_async(
     match result {
         Some((child_pid, status)) => {
             // Consume pending SIGCHLD
-            task.signals.pending.fetch_and(
-                !Signal::new_unchecked(crate::proc::signal::SIGCHLD).as_bit(),
-                core::sync::atomic::Ordering::Release,
-            );
-
+            let mut sig_chld = crate::proc::signal::SigSet::empty();
+            sig_chld.add(Signal::new_unchecked(crate::proc::signal::SIGCHLD));
+            task.signals
+                .pending
+                .fetch_difference(sig_chld, core::sync::atomic::Ordering::Release);
             // Write status to user memory if pointer is non-null
             if wstatus_ptr != 0 {
                 let rc = unsafe {
@@ -242,9 +242,10 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     }
 
     // Restore signal mask
-    task.signals
-        .blocked
-        .store(frame.saved_mask, Ordering::Release);
+    task.signals.blocked.store(
+        crate::proc::signal::SigSet::from_u64(frame.saved_mask),
+        Ordering::Release,
+    );
 
     Ok(())
 }
@@ -321,10 +322,11 @@ pub fn sys_sigprocmask(
 
     if oldset_ptr != 0 {
         let old = sig_state.blocked.load(Ordering::Relaxed);
+        let old_u64 = old.as_u64();
         let rc = unsafe {
             crate::hal::rv64::copy_user::copy_user_chunk(
                 oldset_ptr as *mut u8,
-                &old as *const u64 as *const u8,
+                &old_u64 as *const u64 as *const u8,
                 8,
             )
         };
@@ -346,19 +348,23 @@ pub fn sys_sigprocmask(
             return Err(Errno::EFAULT);
         }
 
-        let unblockable =
-            Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
+        let unblockable = crate::proc::signal::SigSet::empty()
+            .add(Signal::new_unchecked(SIGKILL))
+            .add(Signal::new_unchecked(SIGSTOP))
+            .as_u64();
+
         new_set &= !unblockable;
+        let set = crate::proc::signal::SigSet::from_u64(new_set);
 
         match how {
             SIG_BLOCK => {
-                sig_state.blocked.fetch_or(new_set, Ordering::Release);
+                sig_state.blocked.fetch_union(set, Ordering::Release);
             }
             SIG_UNBLOCK => {
-                sig_state.blocked.fetch_and(!new_set, Ordering::Release);
+                sig_state.blocked.fetch_difference(set, Ordering::Release);
             }
             SIG_SETMASK => {
-                sig_state.blocked.store(new_set, Ordering::Release);
+                sig_state.blocked.store(set, Ordering::Release);
             }
             _ => return Err(Errno::EINVAL),
         }

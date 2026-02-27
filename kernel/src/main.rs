@@ -27,7 +27,8 @@ global_asm!(include_str!("hal/rv64/trap.S"));
 global_asm!(include_str!("hal/rv64/memops.S"));
 
 /// Atomic flag: first hart to reach rust_main claims boot role.
-static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Entry point called from boot.S
 /// a0 = hartid, a1 = dtb_ptr
@@ -42,7 +43,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Ensure SIE=0 and set stvec before anything that uses IrqSafeSpinLock.
         // OpenSBI may leave SIE=1; IrqSafeSpinLock restore would re-enable it,
         // causing stray interrupts before per-CPU data is ready.
-        unsafe { core::arch::asm!("csrci sstatus, 0x2"); }
+        unsafe {
+            core::arch::asm!("csrci sstatus, 0x2");
+        }
         hal::rv64::trap::set_kernel_trap_entry();
 
         // Initialize kernel heap first — everything below may allocate
@@ -63,7 +66,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         }
         let cpu0 = hal::rv64::fdt::hart_to_cpu(hartid).unwrap_or(0);
         unsafe { executor::per_cpu::set_tp(cpu0) };
-        klog!(boot, info, "per-cpu data initialized for {} harts", num_cpus);
+        klog!(
+            boot,
+            info,
+            "per-cpu data initialized for {} harts",
+            num_cpus
+        );
 
         // Initialize trap infrastructure (stvec + STIE + SSIE + SEIE)
         trap::init();
@@ -76,12 +84,18 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Initialize frame allocator with physical memory after kernel image
         {
-            extern "C" { static ekernel: u8; }
-            let mem_start = hal_common::PhysAddr::new(
-                unsafe { &ekernel as *const u8 as usize }
-            );
+            extern "C" {
+                static ekernel: u8;
+            }
+            let mem_start = hal_common::PhysAddr::new(unsafe { &ekernel as *const u8 as usize });
             let mem_end = hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
-            klog!(boot, info, "init_frame_allocator({:#x}..{:#x})", mem_start.as_usize(), mem_end.as_usize());
+            klog!(
+                boot,
+                info,
+                "init_frame_allocator({:#x}..{:#x})",
+                mem_start.as_usize(),
+                mem_end.as_usize()
+            );
             // Test heap allocation before buddy init
             {
                 let v: alloc::vec::Vec<u64> = alloc::vec![1, 2, 3, 4, 5];
@@ -120,101 +134,181 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             register_clobber_test();
 
             // Async executor test: prove the path works
-            executor::spawn_kernel_task(async {
-                kprintln!("hello from async future!");
-            }, cpu0).detach();
+            executor::spawn_kernel_task(
+                async {
+                    kprintln!("hello from async future!");
+                },
+                cpu0,
+            )
+            .detach();
 
             // Sleep future (should wake after ~100ms)
-            executor::spawn_kernel_task(async {
-                executor::sleep(100).await;
-                kprintln!("woke after 100ms!");
-            }, cpu0).detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(100).await;
+                    kprintln!("woke after 100ms!");
+                },
+                cpu0,
+            )
+            .detach();
 
             // Cross-CPU tests (delay to let secondary harts finish per_cpu re-init)
             if num_cpus > 1 {
-                executor::spawn_kernel_task(async {
-                    executor::sleep(50).await;
-                    kprintln!("hello from CPU 1");
-                }, 1).detach();
+                executor::spawn_kernel_task(
+                    async {
+                        executor::sleep(50).await;
+                        kprintln!("hello from CPU 1");
+                    },
+                    1,
+                )
+                .detach();
             }
             if num_cpus > 1 {
-                executor::spawn_kernel_task(async {
-                    executor::sleep(50).await;
-                    executor::spawn_kernel_task(async {
-                        kprintln!("cross-cpu wake on CPU 1");
-                    }, 1).detach();
-                }, cpu0).detach();
+                executor::spawn_kernel_task(
+                    async {
+                        executor::sleep(50).await;
+                        executor::spawn_kernel_task(
+                            async {
+                                kprintln!("cross-cpu wake on CPU 1");
+                            },
+                            1,
+                        )
+                        .detach();
+                    },
+                    cpu0,
+                )
+                .detach();
             }
 
             // Pmap tests
-            executor::spawn_kernel_task(async {
-                mm::pmap::test_integration::test_pmap_extract_only();
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(200).await;
-                mm::pmap::test_integration::test_pmap_satp_switch();
-            }, cpu0).detach();
+            executor::spawn_kernel_task(
+                async {
+                    mm::pmap::test_integration::test_pmap_extract_only();
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(200).await;
+                    mm::pmap::test_integration::test_pmap_satp_switch();
+                },
+                cpu0,
+            )
+            .detach();
 
             // VM tests
-            executor::spawn_kernel_task(async {
-                executor::sleep(400).await;
-                mm::vm::test_integration::test_anonymous_page_fault();
-                mm::vm::test_integration::test_cow_fault();
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(400).await;
-                mm::vm::test_integration::test_frame_alloc_sync_works();
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(400).await;
-                mm::vm::test_integration::test_iterative_drop_500();
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(500).await;
-                mm::vm::test_integration::test_fork_bomb_stress();
-            }, cpu0).detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(400).await;
+                    mm::vm::test_integration::test_anonymous_page_fault();
+                    mm::vm::test_integration::test_cow_fault();
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(400).await;
+                    mm::vm::test_integration::test_frame_alloc_sync_works();
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(400).await;
+                    mm::vm::test_integration::test_iterative_drop_500();
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(500).await;
+                    mm::vm::test_integration::test_fork_bomb_stress();
+                },
+                cpu0,
+            )
+            .detach();
 
             // Filesystem tests (need delegate mount time)
-            executor::spawn_kernel_task(async {
-                executor::sleep(200).await;
-                test_delegate_read().await;
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(400).await;
-                test_vfs_read().await;
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(600).await;
-                test_fork_exec_wait4().await;
-            }, cpu0).detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(200).await;
+                    test_delegate_read().await;
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(400).await;
+                    test_vfs_read().await;
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(600).await;
+                    test_fork_exec_wait4().await;
+                },
+                cpu0,
+            )
+            .detach();
 
             // Phase 4 integration tests
-            executor::spawn_kernel_task(async {
-                executor::sleep(700).await;
-                test_pipe_data_transfer().await;
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(800).await;
-                test_signal_pending_delivery();
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(800).await;
-                test_mmap_munmap();
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(800).await;
-                test_device_nodes().await;
-            }, cpu0).detach();
-            executor::spawn_kernel_task(async {
-                executor::sleep(900).await;
-                test_futex_wake();
-            }, cpu0).detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(700).await;
+                    test_pipe_data_transfer().await;
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(800).await;
+                    test_signal_pending_delivery();
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(800).await;
+                    test_mmap_munmap();
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(800).await;
+                    test_device_nodes().await;
+                },
+                cpu0,
+            )
+            .detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(900).await;
+                    test_futex_wake();
+                },
+                cpu0,
+            )
+            .detach();
 
             // Shutdown after all tests complete (12s generous timeout)
-            executor::spawn_kernel_task(async {
-                executor::sleep(12_000).await;
-                hal::rv64::sbi::shutdown();
-            }, cpu0).detach();
+            executor::spawn_kernel_task(
+                async {
+                    executor::sleep(12_000).await;
+                    hal::rv64::sbi::shutdown();
+                },
+                cpu0,
+            )
+            .detach();
         }
 
         // Spawn init process: exec /bin/init, then enter user mode
@@ -222,35 +316,41 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             let init_task = proc::task::Task::new_init();
             let init_task2 = init_task.clone();
             let init_cpu = cpu0;
-            executor::spawn_kernel_task(async move {
-                // Wait for delegate mount to complete
-                executor::sleep(100).await;
-                let argv = alloc::vec![
-                    alloc::string::String::from("/bin/busybox"),
-                    alloc::string::String::from("sh"),
-                    //alloc::string::String::from("echo"),
-                    //alloc::string::String::from("hello from busybox"),
-                ];
-                let envp = alloc::vec![
-                    alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
-                    alloc::string::String::from("HOME=/"),
-                ];
-                match proc::exec::exec_with_args(&init_task2, "/bin/busybox", &argv, &envp).await {
-                    Ok((entry, sp)) => {
-                        {
-                            let mut tf = init_task2.trap_frame.lock();
-                            tf.sepc = entry;
-                            tf.x[2] = sp;
-                            tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+            executor::spawn_kernel_task(
+                async move {
+                    // Wait for delegate mount to complete
+                    executor::sleep(100).await;
+                    let argv = alloc::vec![
+                        alloc::string::String::from("/bin/busybox"),
+                        alloc::string::String::from("sh"),
+                        //alloc::string::String::from("echo"),
+                        //alloc::string::String::from("hello from busybox"),
+                    ];
+                    let envp = alloc::vec![
+                        alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
+                        alloc::string::String::from("HOME=/"),
+                    ];
+                    match proc::exec::exec_with_args(&init_task2, "/bin/busybox", &argv, &envp)
+                        .await
+                    {
+                        Ok((entry, sp)) => {
+                            {
+                                let mut tf = init_task2.trap_frame.lock();
+                                tf.sepc = entry;
+                                tf.x[2] = sp;
+                                tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                            }
+                            crate::kprintln!("exec OK: entry={:#x} sp={:#x}", entry, sp);
+                            executor::spawn_user_task(init_task2, init_cpu);
                         }
-                        crate::kprintln!("exec OK: entry={:#x} sp={:#x}", entry, sp);
-                        executor::spawn_user_task(init_task2, init_cpu);
+                        Err(e) => {
+                            klog!(boot, error, "exec /bin/busybox failed: {:?}", e);
+                        }
                     }
-                    Err(e) => {
-                        klog!(boot, error, "exec /bin/busybox failed: {:?}", e);
-                    }
-                }
-            }, cpu0).detach();
+                },
+                cpu0,
+            )
+            .detach();
         }
 
         // Enable global interrupts
@@ -326,7 +426,7 @@ fn test_uiomove_short_read() {
     let mut dst = [0u8; 128];
     let r = uiomove(dst.as_mut_ptr(), src.as_mut_ptr(), 128, UioDir::CopyIn);
     match r {
-        Ok(res) if res.done == 128 => {},
+        Ok(res) if res.done == 128 => {}
         other => {
             kprintln!("uiomove short-read FAIL (full copy: {:?})", other);
             return;
@@ -341,7 +441,7 @@ fn test_uiomove_short_read() {
         UioDir::CopyIn,
     );
     match r {
-        Err(hal_common::Errno::EFAULT) => {},
+        Err(hal_common::Errno::EFAULT) => {}
         other => {
             kprintln!("uiomove short-read FAIL (efault: {:?})", other);
             return;
@@ -354,10 +454,10 @@ fn test_uiomove_short_read() {
 #[cfg(feature = "qemu-test")]
 fn test_fork_exit_wait4() {
     use alloc::sync::Arc;
-    use proc::task::Task;
-    use proc::fork::fork;
     use proc::exit_wait::{sys_exit, WaitChildFuture};
+    use proc::fork::fork;
     use proc::syscall_result::SyscallResult;
+    use proc::task::Task;
 
     // Create init task (pid 1)
     let init = Task::new_init();
@@ -382,7 +482,7 @@ fn test_fork_exit_wait4() {
     // Child exits with code 42
     let result = sys_exit(&child, crate::proc::exit_wait::WaitStatus::exited(42));
     match result {
-        SyscallResult::Terminated => {},
+        SyscallResult::Terminated => {}
         _ => panic!("sys_exit must return Terminated"),
     }
 
@@ -390,18 +490,25 @@ fn test_fork_exit_wait4() {
     assert_eq!(child.state(), proc::task::TaskState::Zombie);
 
     // Verify exit status is properly encoded
-    assert_eq!(child.exit_status.load(core::sync::atomic::Ordering::Acquire), 42 << 8);
+    assert_eq!(
+        child
+            .exit_status
+            .load(core::sync::atomic::Ordering::Acquire),
+        42 << 8
+    );
 
     // Test WaitChildFuture synchronously via a manual poll
     // Since child is already ZOMBIE, the first poll should return Ready
-    use core::task::{RawWaker, RawWakerVTable, Waker};
-    use core::pin::Pin;
     use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
 
     // Create a no-op waker for manual polling
     fn noop_raw_waker() -> RawWaker {
         fn no_op(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTABLE)
     }
@@ -414,7 +521,11 @@ fn test_fork_exit_wait4() {
     match poll_result {
         core::task::Poll::Ready(Some((pid, status))) => {
             assert_eq!(pid, child_pid, "wait4 must return child pid");
-            assert_eq!(status, 42 << 8, "wait4 must return exit code 42 (WaitStatus encoded)");
+            assert_eq!(
+                status,
+                42 << 8,
+                "wait4 must return exit code 42 (WaitStatus encoded)"
+            );
         }
         other => panic!("wait4 expected Ready(Some), got {:?}", other),
     }
@@ -463,15 +574,21 @@ async fn test_vfs_read() {
                         let mut buf2 = [0u8; 64];
                         // Reopen to reset offset
                         let _ = fs::syscalls::sys_close(&fd_table, fd);
-                        match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
+                        match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY)
+                            .await
+                        {
                             Ok(fd2) => {
                                 match fs::syscalls::sys_read(&fd_table, fd2, &mut buf2).await {
                                     Ok(n2) => {
-                                        let content2 = core::str::from_utf8(&buf2[..n2]).unwrap_or("<invalid utf8>");
+                                        let content2 = core::str::from_utf8(&buf2[..n2])
+                                            .unwrap_or("<invalid utf8>");
                                         if content2.trim_end() == "hello from ext4" {
                                             kprintln!("vfs read PASS");
                                         } else {
-                                            kprintln!("vfs read FAIL (cache content={:?})", content2);
+                                            kprintln!(
+                                                "vfs read FAIL (cache content={:?})",
+                                                content2
+                                            );
                                         }
                                     }
                                     Err(_) => kprintln!("vfs read FAIL (cache read err)"),
@@ -494,9 +611,9 @@ async fn test_vfs_read() {
 #[cfg(feature = "qemu-test")]
 async fn test_fork_exec_wait4() {
     use alloc::sync::Arc;
-    use proc::task::Task;
-    use proc::fork::fork;
     use proc::exit_wait::{sys_exit, WaitChildFuture};
+    use proc::fork::fork;
+    use proc::task::Task;
 
     // Create init task
     let init = Task::new_init();
@@ -580,9 +697,8 @@ async fn test_pipe_data_transfer() {
 
 #[cfg(feature = "qemu-test")]
 fn test_signal_pending_delivery() {
-    use alloc::sync::Arc;
+    use proc::signal::{SA_RESTART, SIGUSR1};
     use proc::task::Task;
-    use proc::signal::{SignalState, SIGUSR1, SIGCHLD, SA_RESTART};
 
     let task = Task::new_init();
 
@@ -619,17 +735,21 @@ fn test_signal_pending_delivery() {
     }
 
     // Test blocked signals: block SIGUSR1, post it, should not be unmasked-pending
-    task.signals.blocked.store(
-        proc::signal::sig_bit_pub(SIGUSR1),
-        core::sync::atomic::Ordering::Release,
-    );
+    let mut new_blocked = proc::signal::SigSet::empty();
+    new_blocked.add(proc::signal::Signal::try_from(SIGUSR1).unwrap());
+    task.signals
+        .blocked
+        .store(new_blocked, core::sync::atomic::Ordering::Release);
     task.signals.post_signal(SIGUSR1);
     if task.signals.has_unmasked_pending() {
         kprintln!("signal pending delivery FAIL (blocked signal visible)");
         return;
     }
     // Clear blocked, now it should be visible
-    task.signals.blocked.store(0, core::sync::atomic::Ordering::Release);
+    task.signals.blocked.store(
+        proc::signal::SigSet::empty(),
+        core::sync::atomic::Ordering::Release,
+    );
     if !task.signals.has_unmasked_pending() {
         kprintln!("signal pending delivery FAIL (unblocked signal not visible)");
         return;
@@ -642,10 +762,9 @@ fn test_signal_pending_delivery() {
 
 #[cfg(feature = "qemu-test")]
 fn test_mmap_munmap() {
-    use alloc::sync::Arc;
-    use mm::vm::vm_map::{VmArea, VmAreaType, MapPerm};
-    use mm::vm::vm_object::VmObject;
     use hal_common::{VirtAddr, PAGE_SIZE};
+    use mm::vm::vm_map::{VmArea, VmAreaType};
+    use mm::vm::vm_object::VmObject;
 
     let task = proc::task::Task::new_init();
 
@@ -655,8 +774,10 @@ fn test_mmap_munmap() {
     let obj = VmObject::new(1);
     let vma = VmArea::new(
         base..VirtAddr::new(base.as_usize() + len),
-        MapPerm::R | MapPerm::W | MapPerm::U,
-        obj, 0, VmAreaType::Anonymous,
+        crate::map_perm!(R, W, U),
+        obj,
+        0,
+        VmAreaType::Anonymous,
     );
     {
         let mut vm = task.vm_map.lock();
@@ -685,9 +806,7 @@ fn test_mmap_munmap() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_device_nodes() {
-    use fs::fd_table::{FdTable, FileDescription, FileObject, DeviceKind, OpenFlags};
-    use alloc::sync::Arc;
-    use core::sync::atomic::AtomicU64;
+    use fs::fd_table::FdTable;
 
     // Test /dev/null behavior directly via FileObject
     // Write to /dev/null: always succeeds (swallowed)
@@ -740,8 +859,8 @@ async fn test_device_nodes() {
 
 #[cfg(feature = "qemu-test")]
 fn test_futex_wake() {
-    use ipc::futex;
     use hal_common::PhysAddr;
+    use ipc::futex;
 
     // futex_wake on a key with no waiters should return 0
     let key = PhysAddr::new(0xDEAD_0000);
@@ -760,9 +879,7 @@ fn test_fixup() {
     let src_buf = [0xABu8; 16];
 
     // Test 1: bad destination pointer
-    let ret = unsafe {
-        copy_user_chunk(0xDEAD_0000 as *mut u8, src_buf.as_ptr(), 16)
-    };
+    let ret = unsafe { copy_user_chunk(0xDEAD_0000 as *mut u8, src_buf.as_ptr(), 16) };
     if ret == 14 {
         kprintln!("fixup bad-dst PASS");
     } else {
@@ -771,9 +888,7 @@ fn test_fixup() {
 
     // Test 2: bad source pointer
     let mut dst_buf = [0u8; 16];
-    let ret = unsafe {
-        copy_user_chunk(dst_buf.as_mut_ptr(), 0xDEAD_0000 as *const u8, 16)
-    };
+    let ret = unsafe { copy_user_chunk(dst_buf.as_mut_ptr(), 0xDEAD_0000 as *const u8, 16) };
     if ret == 14 {
         kprintln!("fixup bad-src PASS");
     } else {

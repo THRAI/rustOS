@@ -56,6 +56,16 @@ bitflags::bitflags! {
     //TODO: add flag packs like RW, RX, UW, etc.
 }
 
+/// A declarative macro to combine MapPerm flags.
+/// Usage: `map_perm!(R, W, U)`
+#[macro_export]
+macro_rules! map_perm {
+    () => { $crate::mm::vm::vm_map::MapPerm::empty() };
+    ($($flag:ident),+) => {
+        $($crate::mm::vm::vm_map::MapPerm::$flag)|+
+    };
+}
+
 // ---------------------------------------------------------------------------
 // VmAreaType
 // ---------------------------------------------------------------------------

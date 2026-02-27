@@ -119,7 +119,10 @@ mod tests {
         let leaf_x = encode_pte(0x1000, PteFlags::V | PteFlags::X);
         assert!(pte_is_leaf(leaf_x));
 
-        let leaf_rwx = encode_pte(0x1000, PteFlags::V | PteFlags::R | PteFlags::W | PteFlags::X);
+        let leaf_rwx = encode_pte(
+            0x1000,
+            PteFlags::V | PteFlags::R | PteFlags::W | PteFlags::X,
+        );
         assert!(pte_is_leaf(leaf_rwx));
     }
 
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn map_perm_conversion() {
-        let perm = MapPerm::R | MapPerm::W;
+        let perm = crate::map_perm!(R, W);
         let flags = map_perm_to_pte_flags(perm);
         assert!(flags.contains(PteFlags::V));
         assert!(flags.contains(PteFlags::R));
@@ -155,7 +158,7 @@ mod tests {
 
     #[test]
     fn map_perm_user_exec() {
-        let perm = MapPerm::R | MapPerm::X | MapPerm::U;
+        let perm = crate::map_perm!(R, X, U);
         let flags = map_perm_to_pte_flags(perm);
         assert!(flags.contains(PteFlags::R));
         assert!(flags.contains(PteFlags::X));

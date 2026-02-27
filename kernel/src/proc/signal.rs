@@ -144,6 +144,43 @@ impl SigSet {
     }
 }
 
+/// An atomic equivalent of `SigSet`, wrapping `AtomicU64`.
+pub struct AtomicSigSet(AtomicU64);
+
+impl AtomicSigSet {
+    pub const fn new(set: SigSet) -> Self {
+        Self(AtomicU64::new(set.as_u64()))
+    }
+
+    pub fn load(&self, order: Ordering) -> SigSet {
+        SigSet::from_u64(self.0.load(order))
+    }
+
+    pub fn store(&self, set: SigSet, order: Ordering) {
+        self.0.store(set.as_u64(), order)
+    }
+
+    pub fn fetch_add(&self, sig: Signal, order: Ordering) -> SigSet {
+        SigSet::from_u64(self.0.fetch_or(sig.as_bit(), order))
+    }
+
+    pub fn fetch_remove(&self, sig: Signal, order: Ordering) -> SigSet {
+        SigSet::from_u64(self.0.fetch_and(!sig.as_bit(), order))
+    }
+
+    pub fn fetch_union(&self, set: SigSet, order: Ordering) -> SigSet {
+        SigSet::from_u64(self.0.fetch_or(set.as_u64(), order))
+    }
+
+    pub fn fetch_intersect(&self, set: SigSet, order: Ordering) -> SigSet {
+        SigSet::from_u64(self.0.fetch_and(set.as_u64(), order))
+    }
+
+    pub fn fetch_difference(&self, set: SigSet, order: Ordering) -> SigSet {
+        SigSet::from_u64(self.0.fetch_and(!set.as_u64(), order))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Default signal dispositions
 // ---------------------------------------------------------------------------
@@ -211,9 +248,9 @@ pub struct SignalState {
     /// Per-signal actions (indexed by signo - 1, 0..63).
     pub actions: Mutex<[SigAction; MAX_SIG as usize]>,
     /// Pending signals bitmap (atomic for lock-free post_signal).
-    pub pending: AtomicU64,
+    pub pending: AtomicSigSet,
     /// Blocked signals bitmap.
-    pub blocked: AtomicU64,
+    pub blocked: AtomicSigSet,
     /// Sigaltstack: (ss_sp, ss_size, ss_flags). 0 = not set.
     pub altstack: Mutex<(usize, usize, u32)>,
 }
@@ -222,8 +259,8 @@ impl SignalState {
     pub fn new() -> Self {
         Self {
             actions: Mutex::new([SigAction::default(); MAX_SIG as usize]),
-            pending: AtomicU64::new(0),
-            blocked: AtomicU64::new(0),
+            pending: AtomicSigSet::new(SigSet::empty()),
+            blocked: AtomicSigSet::new(SigSet::empty()),
             altstack: Mutex::new((0, 0, 0)),
         }
     }
@@ -237,16 +274,20 @@ impl SignalState {
             Signal::new_unchecked(sig)
         );
         self.pending
-            .fetch_or(Signal::new_unchecked(sig).as_bit(), Ordering::Release);
+            .fetch_add(Signal::new_unchecked(sig), Ordering::Release);
     }
 
-    /// Check if there are unmasked pending signals (raw bitmap check).
+    /// Check if there are unmasked pending signals.
     pub fn has_unmasked_pending(&self) -> bool {
         let pending = self.pending.load(Ordering::Acquire);
         let blocked = self.blocked.load(Ordering::Relaxed);
-        let unblockable =
-            Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
-        (pending & (!blocked | unblockable)) != 0
+        let mut unblockable = SigSet::empty();
+        unblockable
+            .add(Signal::new_unchecked(SIGKILL))
+            .add(Signal::new_unchecked(SIGSTOP));
+
+        let deliverable = pending.intersect(blocked.union(unblockable).difference(blocked));
+        !deliverable.is_empty()
     }
 
     /// Check if there are unmasked pending signals that would actually
@@ -254,15 +295,19 @@ impl SignalState {
     pub fn has_actionable_pending(&self) -> bool {
         let pending = self.pending.load(Ordering::Acquire);
         let blocked = self.blocked.load(Ordering::Relaxed);
-        let unblockable =
-            Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
-        let deliverable = pending & (!blocked | unblockable);
-        if deliverable == 0 {
+        let mut unblockable = SigSet::empty();
+        unblockable
+            .add(Signal::new_unchecked(SIGKILL))
+            .add(Signal::new_unchecked(SIGSTOP));
+
+        let deliverable = pending.intersect(blocked.union(unblockable).difference(blocked));
+        if deliverable.is_empty() {
             return false;
         }
+
         // Check each deliverable signal: skip those with default-ignore disposition
         let actions = self.actions.lock();
-        let mut bits = deliverable;
+        let mut bits = deliverable.as_u64();
         while bits != 0 {
             let bit = bits.trailing_zeros() as u8;
             let sig = bit + 1;
@@ -295,20 +340,25 @@ impl SignalState {
         loop {
             let pending = self.pending.load(Ordering::Acquire);
             let blocked = self.blocked.load(Ordering::Relaxed);
-            let unblockable =
-                Signal::new_unchecked(SIGKILL).as_bit() | Signal::new_unchecked(SIGSTOP).as_bit();
-            let deliverable = pending & (!blocked | unblockable);
-            if deliverable == 0 {
+
+            let mut unblockable = SigSet::empty();
+            unblockable
+                .add(Signal::new_unchecked(SIGKILL))
+                .add(Signal::new_unchecked(SIGSTOP));
+            let deliverable = pending.intersect(blocked.union(unblockable).difference(blocked));
+
+            if deliverable.is_empty() {
                 return None;
             }
+
             // Pick lowest-numbered signal
-            let bit = deliverable.trailing_zeros() as u8;
-            let sig = bit + 1;
-            let mask = 1u64 << bit;
+            let bit = deliverable.as_u64().trailing_zeros() as u8;
+            let sig = Signal::new_unchecked(bit + 1);
+
             // Atomically clear the bit
-            let old = self.pending.fetch_and(!mask, Ordering::AcqRel);
-            if old & mask != 0 {
-                return Some(sig);
+            let old = self.pending.fetch_remove(sig, Ordering::AcqRel);
+            if old.contains(sig) {
+                return Some(sig.as_u8());
             }
             // Race: someone else cleared it, retry
         }
@@ -442,21 +492,19 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     sp = (sp - SIGFRAME_SIZE) & !0xF; // 16-byte aligned
 
     // Build the sigframe in kernel memory
-    let mut frame = SigFrame {
+    let frame = SigFrame {
         saved_tf: *tf,
         signo: sig as u32,
         _pad: 0,
-        saved_mask: sig_state.blocked.load(Ordering::Relaxed),
+        saved_mask: sig_state.blocked.load(Ordering::Relaxed).as_u64(),
     };
 
     // Update blocked mask (add this signal's mask, plus the signal itself
     // unless SA_NOMASK/SA_NODEFER is set - but we don't implement those yet,
     // so standard POSIX says the signal is blocked while handled).
-    frame.saved_mask = sig_state.blocked.load(Ordering::Relaxed);
-    sig_state.blocked.store(
-        frame.saved_mask | action.mask | Signal::new_unchecked(sig).as_bit(),
-        Ordering::Relaxed,
-    );
+    let mut new_blocked = SigSet::from_u64(frame.saved_mask | action.mask);
+    new_blocked.add(Signal::new_unchecked(sig));
+    sig_state.blocked.store(new_blocked, Ordering::Relaxed);
     // Copyout to user stack using pcb_onfault guard
     let ok = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
@@ -481,7 +529,9 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
 
     // Block signals specified in sa_mask + the signal itself during handler
     let block_mask = action.mask | Signal::new_unchecked(sig).as_bit();
-    sig_state.blocked.fetch_or(block_mask, Ordering::Release);
+    sig_state
+        .blocked
+        .fetch_union(SigSet::from_u64(block_mask), Ordering::Release);
 
     // Redirect trap frame to handler
     tf.sepc = action.handler;
@@ -642,7 +692,6 @@ pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
 pub fn map_sigcode_page(pmap: &mut crate::mm::pmap::Pmap) {
     use crate::mm::allocator::frame_alloc_sync;
     use crate::mm::pmap::pmap_enter;
-    use crate::mm::vm::vm_map::MapPerm;
 
     let frame = frame_alloc_sync().expect("sigcode page alloc failed");
     let page_data = build_sigcode_page();
@@ -654,6 +703,6 @@ pub fn map_sigcode_page(pmap: &mut crate::mm::pmap::Pmap) {
 
     // Map as read-only + user-accessible
     // TODO: use constants like RXU or something similar from MapPerm. Update it there.
-    let prot = MapPerm::R | MapPerm::X | MapPerm::U;
+    let prot = crate::map_perm!(R, X, U);
     let _ = pmap_enter(pmap, VirtAddr::new(SIGCODE_VA), frame, prot, false);
 }

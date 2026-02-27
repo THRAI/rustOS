@@ -5,12 +5,8 @@
 
 use hal_common::{VirtAddr, PAGE_SIZE};
 
-use super::{
-    pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove,
-    pmap_activate,
-};
-use super::super::vm::vm_map::MapPerm;
 use super::super::allocator::frame_alloc_sync;
+use super::{pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove};
 
 /// Tier 2.a: Verify pmap walk logic with real allocated frames.
 /// No satp switch — purely tests the radix tree construction.
@@ -23,8 +19,7 @@ pub fn test_pmap_extract_only() {
 
     // 3. Enter mapping: VA 0x1_0000_0000 → frame, R|W
     let va = VirtAddr::new(0x1_0000_0000);
-    pmap_enter(&mut pmap, va, frame, MapPerm::R | MapPerm::W, false)
-        .expect("pmap_enter failed");
+    pmap_enter(&mut pmap, va, frame, crate::map_perm!(R, W), false).expect("pmap_enter failed");
 
     // 4. Extract and verify
     let extracted = pmap_extract(&pmap, va).expect("pmap_extract returned None");
@@ -33,8 +28,11 @@ pub fn test_pmap_extract_only() {
     // 5. Second mapping at different VA
     let va2 = VirtAddr::new(0x1_0000_1000);
     let frame2 = frame_alloc_sync().expect("OOM");
-    pmap_enter(&mut pmap, va2, frame2, MapPerm::R | MapPerm::X, false).unwrap();
-    assert_eq!(pmap_extract(&pmap, va2).unwrap().as_usize(), frame2.as_usize());
+    pmap_enter(&mut pmap, va2, frame2, crate::map_perm!(R, X), false).unwrap();
+    assert_eq!(
+        pmap_extract(&pmap, va2).unwrap().as_usize(),
+        frame2.as_usize()
+    );
 
     // 6. Unmapped VA returns None
     assert!(pmap_extract(&pmap, VirtAddr::new(0x1_0000_2000)).is_none());
@@ -44,7 +42,10 @@ pub fn test_pmap_extract_only() {
     assert!(pmap_extract(&pmap, va).is_none());
 
     // 8. Second mapping still intact
-    assert_eq!(pmap_extract(&pmap, va2).unwrap().as_usize(), frame2.as_usize());
+    assert_eq!(
+        pmap_extract(&pmap, va2).unwrap().as_usize(),
+        frame2.as_usize()
+    );
 
     pmap_destroy(&mut pmap);
     crate::kprintln!("pmap extract-only PASS");
@@ -62,7 +63,14 @@ pub fn test_pmap_satp_switch() {
     // 2. Map a high VA to a fresh frame
     let test_frame = frame_alloc_sync().expect("OOM in satp test");
     let test_va = VirtAddr::new(0xDEAD_0000);
-    pmap_enter(&mut pmap, test_va, test_frame, MapPerm::R | MapPerm::W, false).unwrap();
+    pmap_enter(
+        &mut pmap,
+        test_va,
+        test_frame,
+        crate::map_perm!(R, W),
+        false,
+    )
+    .unwrap();
 
     // === BEGIN IRQ-LOCKED WINDOW ===
     let saved = hal_common::irq_lock::arch_irq::disable_and_save();
@@ -86,10 +94,7 @@ pub fn test_pmap_satp_switch() {
 
     // 6. Deactivate: return to bare mode (satp=0)
     unsafe {
-        core::arch::asm!(
-            "csrw satp, zero",
-            "sfence.vma zero, zero",
-        );
+        core::arch::asm!("csrw satp, zero", "sfence.vma zero, zero",);
     }
 
     // === END IRQ-LOCKED WINDOW ===

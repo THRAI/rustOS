@@ -3,14 +3,14 @@
 //! These tests run on real hardware (QEMU rv64) with the actual frame
 //! allocator, verifying fault handler, COW, iterative drop, and
 //! frame_alloc_sync behavior under real kernel conditions.
-
+use crate::mm::vm::vm_map::MapPerm;
 use alloc::sync::Arc;
 
 use hal_common::{VirtAddr, PAGE_SIZE};
 
 use super::super::allocator::{frame_alloc_sync, frame_free};
 use super::super::pmap;
-use super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
+use super::vm_map::{VmArea, VmAreaType, VmMap};
 use super::vm_object::{OwnedPage, VmObject};
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
@@ -18,7 +18,7 @@ pub fn test_anonymous_page_fault() {
     let obj = VmObject::new(PAGE_SIZE);
     let vma = VmArea::new(
         VirtAddr::new(0x1000_0000)..VirtAddr::new(0x1000_0000 + PAGE_SIZE),
-        MapPerm::R | MapPerm::W,
+        crate::map_perm!(R, W),
         obj,
         0,
         VmAreaType::Anonymous,
@@ -73,7 +73,7 @@ pub fn test_cow_fault() {
 
     let vma = VmArea::new(
         VirtAddr::new(0x2000_0000)..VirtAddr::new(0x2000_0000 + PAGE_SIZE),
-        MapPerm::R | MapPerm::W,
+        crate::map_perm!(R, W),
         shadow,
         0,
         VmAreaType::Anonymous,

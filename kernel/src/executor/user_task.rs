@@ -88,6 +88,7 @@ impl SyscallId {
     const SIGALTSTACK: Self = Self(132);
     const PPOLL: Self = Self(73);
     const FCNTL: Self = Self(25);
+    const REBOOT: Self = Self(142); // busybox poweroff / reboot 使用此 syscall
 }
 
 impl core::fmt::Display for SyscallId {
@@ -141,6 +142,7 @@ impl core::fmt::Display for SyscallId {
             Self::SIGALTSTACK => "sigaltstack",
             Self::PPOLL => "ppoll",
             Self::FCNTL => "fcntl",
+            Self::REBOOT => "reboot",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -958,6 +960,12 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             let wstatus = ((a0 as i32) << 8) & 0xff00;
             do_exit(task, wstatus);
             return TrapResult::Exit;
+        }
+        SyscallId::REBOOT => {
+            // busybox poweroff/reboot 触发此 syscall，直接调用 SBI 关机
+            // a0=magic1, a1=magic2, a2=cmd: 无论参数，只要 cmd!=0 就关机
+            klog!(syscall, info, "reboot syscall: shutting down (cmd={:#x})", a2);
+            crate::hal::rv64::sbi::shutdown();
         }
         SyscallId::CLONE => {
             // Basic fork (flags ignored for now)

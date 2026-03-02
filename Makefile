@@ -12,6 +12,17 @@ DISK_IMG := scripts/test.img
 QEMU_RV64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_RV64) -smp $(SMP) -m 128M \
 	-drive file=$(DISK_IMG),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 $(QEMU_TRACE)
 
+# ---- 赛题评测标准参数 ----
+# TEST_FS: 含测试程序的 ext4 磁盘镜像（sdcard-rv.img 或赛平台注入的 fs 镜像）
+TEST_FS ?= scripts/sdcard-rv.img
+# OSCOMP_FLAGS 严格对齐赛题 README 的 QEMU 启动命令
+OSCOMP_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_RV64) \
+	-smp $(SMP) -m 128M -no-reboot \
+	-drive file=$(TEST_FS),if=none,format=raw,id=x0 \
+	-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+	-device virtio-net-device,netdev=net -netdev user,id=net \
+	-rtc base=utc
+
 OBJCOPY := rust-objcopy
 
 # Kernel log control: LOG=all | LOG=boot,fs,driver | (empty = quiet)
@@ -38,7 +49,14 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: kernel-rv64 kernel-rv64-test run-rv64 debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
+.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest run-rv64 run-oscomp sdcard-rv debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
+
+# 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
+all: kernel-rv
+
+kernel-rv:
+	cargo build --release -p kernel --target $(TARGET_RV64) --features autotest,$(_LOG_LEVEL_FEATURE)
+	cp $(KERNEL_ELF_RV64) kernel-rv
 
 kernel-rv64:
 	cargo build --release -p kernel --target $(TARGET_RV64) $(_CARGO_LOG)
@@ -46,6 +64,11 @@ kernel-rv64:
 
 kernel-rv64-test:
 	cargo build --release -p kernel --target $(TARGET_RV64) --features $(_TEST_FEATURES)
+	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
+
+# 编译带 autotest feature 的内核（自动运行测试脚本，完成后关机）
+kernel-rv64-autotest:
+	cargo build --release -p kernel --target $(TARGET_RV64) --features autotest,$(_LOG_LEVEL_FEATURE)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
 
 $(DISK_IMG): scripts/make_test_img.sh $(wildcard scripts/init)
@@ -59,6 +82,39 @@ disk-img:
 run-rv64: kernel-rv64 $(DISK_IMG)
 	@echo "=== Running QEMU Interactively (LOG=$(_LOG_FEATURES)) ==="
 	uv run --with pexpect python3 scripts/test_runner.py --interactive $(QEMU_RV64) -- $(QEMU_RV64_FLAGS)
+
+# 赛题标准评测：编译 autotest 内核 + 赛题磁盘镜像，直接用赛题 QEMU 参数运行
+run-oscomp: kernel-rv
+	@echo "=== OS COMP 评测模式 TEST_FS=$(TEST_FS) ==="
+	@test -f $(TEST_FS) || (echo "ERROR: $(TEST_FS) 不存在，请先准备测试镜像" && exit 1)
+	$(QEMU_RV64) -machine virt -nographic -bios default -kernel kernel-rv \
+		-smp $(SMP) -m 128M -no-reboot \
+		-drive file=$(TEST_FS),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-device virtio-net-device,netdev=net -netdev user,id=net \
+		-rtc base=utc
+
+# 用官方 Docker 容器编译所有测试程序并打包成 ext4 镜像
+TESTSUITS_DIR := $(shell cd .. && pwd)/testsuits-for-oskernel
+CHRONIX_DIR   := $(shell cd .. && pwd)/Chronix
+DOCKER_IMG := docker.educg.net/cg/os-contest:20250614
+
+# 直接复用 Chronix 的 testcase.tar.xz + fs.mk 构建磁盘镜像（需要 sudo 挂载）
+sdcard-rv:
+	@echo "=== 解压 Chronix testcase ==="
+	cd $(CHRONIX_DIR) && chmod +x scripts/archive.sh && ./scripts/archive.sh extract
+	@echo "=== 构建 4G ext4 磁盘镜像 ==="
+	rm -f scripts/sdcard-rv.img
+	dd if=/dev/zero of=scripts/sdcard-rv.img bs=1M count=512
+	mkfs.ext4 -F -O ^metadata_csum_seed scripts/sdcard-rv.img
+	mkdir -p scripts/mnt
+	sudo mount scripts/sdcard-rv.img scripts/mnt
+	sudo cp -r $(CHRONIX_DIR)/testcase/* scripts/mnt/
+	sudo cp $(CHRONIX_DIR)/scripts/run-rv-oj.sh scripts/mnt/riscv/run-oj.sh
+	sudo mkdir -p scripts/mnt/bin scripts/mnt/lib scripts/mnt/lib64 scripts/mnt/etc
+	sudo cp -r $(CHRONIX_DIR)/etc/. scripts/mnt/etc/ 2>/dev/null || true
+	sudo umount scripts/mnt && rmdir scripts/mnt
+	@echo "=== scripts/sdcard-rv.img 已就绪 ==="
 
 # GDB debug: halt on start, GDB server on port 1234
 debug-rv64: kernel-rv64

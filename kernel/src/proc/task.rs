@@ -9,6 +9,7 @@
 //! __user_trap / trap_return for the setjmp/longjmp trap mechanism.
 
 use alloc::sync::{Arc, Weak};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use hal_common::{PhysAddr, TrapFrame, PAGE_SIZE};
@@ -64,6 +65,8 @@ pub struct Task {
     pub vm_map: Mutex<VmMap>,
     /// File descriptor table placeholder (expanded in VFS plan).
     pub fd_table: Mutex<FdTable>,
+    /// Current working directory (absolute normalized path).
+    pub cwd: Mutex<String>,
     /// Current state (Running / Zombie). Stored as AtomicU8 for lock-free access.
     state: AtomicU8,
     /// Exit status, set by sys_exit with Release ordering.
@@ -110,6 +113,7 @@ impl Task {
             children: Mutex::new(Vec::new()),
             vm_map: Mutex::new(VmMap::new()),
             fd_table: Mutex::new(FdTable::new()),
+            cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
             parent_waker: Mutex::new(None),
@@ -134,6 +138,7 @@ impl Task {
             children: Mutex::new(Vec::new()),
             vm_map: Mutex::new(VmMap::new()),
             fd_table: Mutex::new(FdTable::new_with_stdio()),
+            cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
             parent_waker: Mutex::new(None),

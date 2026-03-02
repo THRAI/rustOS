@@ -16,6 +16,8 @@ scripts/*.bin
 scripts/*.S
 *.expect
 *.txt
+scripts/sdcard-rv.img
+scripts/sdcard-la.img
 *.log
 *.bin
 *.expect

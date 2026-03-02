@@ -316,36 +316,58 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             let init_task = proc::task::Task::new_init();
             let init_task2 = init_task.clone();
             let init_cpu = cpu0;
-            executor::spawn_kernel_task(
-                async move {
-                    // Wait for delegate mount to complete
-                    executor::sleep(100).await;
-                    let argv = alloc::vec![
+            executor::spawn_kernel_task(async move {
+                // Wait for delegate mount to complete
+                executor::sleep(100).await;
+
+                // autotest 模式：赛题评测，磁盘布局与 Chronix testcase.tar.xz 一致：
+                //   /riscv/musl/busybox  /riscv/musl/*_testcode.sh
+                //   /riscv/glibc/busybox /riscv/glibc/*_testcode.sh
+                //   /riscv/run-oj.sh  （总控脚本，依次跑所有测试组后 exit）
+                #[cfg(feature = "autotest")]
+                let (exec_path, argv) = (
+                    "/riscv/musl/busybox",
+                    alloc::vec![
+                        alloc::string::String::from("/riscv/musl/busybox"),
+                        alloc::string::String::from("sh"),
+                        alloc::string::String::from("/riscv/run-oj.sh"),
+                    ],
+                );
+
+                // 正常模式：交互式 shell，用于开发调试
+                #[cfg(not(feature = "autotest"))]
+                let (exec_path, argv) = (
+                    "/bin/busybox",
+                    alloc::vec![
                         alloc::string::String::from("/bin/busybox"),
                         alloc::string::String::from("sh"),
-                        //alloc::string::String::from("echo"),
-                        //alloc::string::String::from("hello from busybox"),
-                    ];
-                    let envp = alloc::vec![
-                        alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
-                        alloc::string::String::from("HOME=/"),
-                    ];
-                    match proc::exec::exec_with_args(&init_task2, "/bin/busybox", &argv, &envp)
-                        .await
-                    {
-                        Ok((entry, sp)) => {
-                            {
-                                let mut tf = init_task2.trap_frame.lock();
-                                tf.sepc = entry;
-                                tf.x[2] = sp;
-                                tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
-                            }
-                            crate::kprintln!("exec OK: entry={:#x} sp={:#x}", entry, sp);
-                            executor::spawn_user_task(init_task2, init_cpu);
+                    ],
+                );
+
+                #[cfg(feature = "autotest")]
+                let envp = alloc::vec![
+                    alloc::string::String::from("PATH=/riscv/musl:/riscv/glibc:/bin:/sbin"),
+                    alloc::string::String::from("HOME=/"),
+                ];
+                #[cfg(not(feature = "autotest"))]
+                let envp = alloc::vec![
+                    alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
+                    alloc::string::String::from("HOME=/"),
+                ];
+
+                match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await {
+                    Ok((entry, sp)) => {
+                        {
+                            let mut tf = init_task2.trap_frame.lock();
+                            tf.sepc = entry;
+                            tf.x[2] = sp;
+                            tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                         }
-                        Err(e) => {
-                            klog!(boot, error, "exec /bin/busybox failed: {:?}", e);
-                        }
+                        klog!(boot, info, "exec OK: entry={:#x} sp={:#x}", entry, sp);
+                        executor::spawn_user_task(init_task2, init_cpu);
+                    }
+                    Err(e) => {
+                        klog!(boot, error, "exec {} failed: {:?}", exec_path, e);
                     }
                 },
                 cpu0,

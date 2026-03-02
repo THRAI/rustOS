@@ -1093,6 +1093,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             // a0=magic1, a1=magic2, a2=cmd: 无论参数，只要 cmd!=0 就关机
             klog!(syscall, info, "reboot syscall: shutting down (cmd={:#x})", a2);
             crate::hal::rv64::sbi::shutdown();
+            0
         }
         SyscallId::CLONE => {
             // Basic fork (flags ignored for now)

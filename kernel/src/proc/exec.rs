@@ -176,9 +176,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
 
-    // PIE: ET_DYN 需要一个加载基址，ET_EXEC 基址为 0
-    let load_bias: usize = if elf_hdr.e_type == ET_DYN { 0x0 } else { 0x0 };
-    let entry = elf_hdr.e_entry as usize + load_bias;
+    let entry = elf_hdr.e_entry as usize;
 
     // 扫描 PT_INTERP，获取动态链接器路径
     let mut interp_path: Option<alloc::string::String> = None;

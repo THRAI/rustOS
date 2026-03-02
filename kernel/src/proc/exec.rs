@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE};
 
 use crate::fs::path;
-use crate::fs::vnode::VnodeType;
+use crate::fs::vnode::{Vnode, VnodeType};
 use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType};
 use crate::mm::vm::vm_object::VmObject;
 
@@ -37,19 +37,7 @@ const DL_INTERP_OFFSET: usize = 0x20_0000_0000;
 
 /// User stack size: 64KB.
 const USER_STACK_SIZE: usize = 64 * 1024;
-/// Helper wrapper to map `fs::vnode::Vnode` into `mm::vm::vm_map::Vnode`.
-struct VnodeWrapper(Arc<dyn crate::fs::vnode::Vnode>);
-
-impl crate::mm::vm::vm_map::Vnode for VnodeWrapper {
-    fn vnode_id(&self) -> u64 {
-        self.0.vnode_id()
-    }
-    fn path(&self) -> &str {
-        self.0.path()
-    }
-}
-
-/// Helper struct for `sys_execve_async`.s (just below kernel space).
+/// User stack top address (just below kernel space).
 const USER_STACK_TOP: usize = 0x0000_003F_FFFF_F000;
 
 #[repr(C)]
@@ -176,7 +164,9 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
 
-    let entry = elf_hdr.e_entry as usize;
+    // PIE: ET_DYN 需要一个加载基址，ET_EXEC 基址为 0
+    let load_bias: usize = if elf_hdr.e_type == ET_DYN { 0x0 } else { 0x0 };
+    let entry = elf_hdr.e_entry as usize + load_bias;
 
     // 扫描 PT_INTERP，获取动态链接器路径
     let mut interp_path: Option<alloc::string::String> = None;
@@ -244,7 +234,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             prot,
             obj,
             0,
-            Arc::new(VnodeWrapper(Arc::clone(&vnode))),
+            Arc::clone(&vnode) as Arc<dyn Vnode>,
             file_offset_page_aligned as u64,
             file_size_in_vma,
         );

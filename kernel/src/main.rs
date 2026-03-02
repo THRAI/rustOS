@@ -369,10 +369,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     Err(e) => {
                         klog!(boot, error, "exec {} failed: {:?}", exec_path, e);
                     }
-                },
-                cpu0,
-            )
-            .detach();
+                }
+            }, cpu0).detach();
         }
 
         // Enable global interrupts

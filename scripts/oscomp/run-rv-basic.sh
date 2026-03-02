@@ -1,14 +1,15 @@
 #!/bin/sh
 set +e
 
+BB=/riscv/musl/busybox
 echo "start to set up libs"
-mkdir -p /lib
-ln -sf /riscv/glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64-lp64d.so.1
-ln -sf /riscv/glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64-lp64.so.1
-ln -sf /riscv/glibc/lib/libc.so /lib/libc.so.6
-ln -sf /riscv/glibc/lib/libm.so /lib/libm.so.6
-ln -sf /riscv/musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1
-ln -sf /riscv/musl/lib/libc.so /lib/ld-musl-riscv64.so.1
+$BB mkdir -p /lib
+$BB ln -sf /riscv/glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64-lp64d.so.1
+$BB ln -sf /riscv/glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64-lp64.so.1
+$BB ln -sf /riscv/glibc/lib/libc.so /lib/libc.so.6
+$BB ln -sf /riscv/glibc/lib/libm.so /lib/libm.so.6
+$BB ln -sf /riscv/musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1
+$BB ln -sf /riscv/musl/lib/libc.so /lib/ld-musl-riscv64.so.1
 echo "finish set up libs"
 
 echo "#### OS COMP TEST GROUP START basic-musl ####"

@@ -1,0 +1,1082 @@
+warning: unstable feature specified for `-Ctarget-feature`: `zaamo`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: unstable feature specified for `-Ctarget-feature`: `zalrsc`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `hal-common` (lib) generated 2 warnings
+    Checking kernel v0.1.0 (/Users/3y/playground/c/freebsd/kernel)
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:177:5
+    |
+176 |       #[test]
+    |       ------- in this procedural macro expansion
+177 | /     fn alloc_single_page() {
+178 | |         let mut b = make_buddy(16);
+179 | |         let addr = b.alloc(0).expect("alloc order-0");
+180 | |         assert!(addr.is_page_aligned());
+181 | |         assert_eq!(b.available_pages(), 15);
+182 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:185:5
+    |
+184 |       #[test]
+    |       ------- in this procedural macro expansion
+185 | /     fn alloc_free_roundtrip() {
+186 | |         let mut b = make_buddy(16);
+187 | |         let addr = b.alloc(0).unwrap();
+188 | |         b.free(addr, 0);
+189 | |         assert_eq!(b.available_pages(), 16);
+190 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:193:5
+    |
+192 |       #[test]
+    |       ------- in this procedural macro expansion
+193 | /     fn coalesce_buddies() {
+194 | |         let mut b = make_buddy(16);
+195 | |         // Alloc two order-0 blocks that are buddies
+196 | |         let a1 = b.alloc(0).unwrap();
+...   |
+205 | |         assert!(big.is_some());
+206 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:209:5
+    |
+208 |       #[test]
+    |       ------- in this procedural macro expansion
+209 | /     fn alloc_various_orders() {
+210 | |         let mut b = make_buddy(256);
+211 | |         let o0 = b.alloc(0).unwrap(); // 1 page
+212 | |         let o1 = b.alloc(1).unwrap(); // 2 pages
+...   |
+218 | |         assert_eq!(b.available_pages(), 256);
+219 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:222:5
+    |
+221 |       #[test]
+    |       ------- in this procedural macro expansion
+222 | /     fn exhaust_and_oom() {
+223 | |         let mut b = make_buddy(4);
+224 | |         let _a = b.alloc(0).unwrap();
+225 | |         let _b2 = b.alloc(0).unwrap();
+...   |
+229 | |         assert!(b.alloc(0).is_none());
+230 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:233:5
+    |
+232 |       #[test]
+    |       ------- in this procedural macro expansion
+233 | /     fn split_large_block() {
+234 | |         let mut b = make_buddy(1024);
+235 | |         // Alloc order-0 should split from the largest block
+236 | |         let addr = b.alloc(0).unwrap();
+...   |
+240 | |         assert_eq!(b.available_pages(), 1024);
+241 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:244:5
+    |
+243 |       #[test]
+    |       ------- in this procedural macro expansion
+244 | /     fn total_pages_tracking() {
+245 | |         let b = make_buddy(128);
+246 | |         assert_eq!(b.total_pages(), 128);
+247 | |         assert_eq!(b.available_pages(), 128);
+248 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:251:5
+    |
+250 |       #[test]
+    |       ------- in this procedural macro expansion
+251 | /     fn alignment_preserved() {
+252 | |         let mut b = make_buddy(64);
+253 | |         // Order-3 = 8 pages, should be 8-page aligned
+254 | |         let addr = b.alloc(3).unwrap();
+255 | |         assert_eq!(addr.as_usize() % (8 * PAGE_SIZE), 0);
+256 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:259:5
+    |
+258 |       #[test]
+    |       ------- in this procedural macro expansion
+259 | /     fn coalesce_roundtrip_alloc_larger() {
+260 | |         // Alloc two adjacent order-0 blocks, free both, then alloc order-1.
+261 | |         // This verifies coalescing actually produces a usable larger block.
+262 | |         let mut b = make_buddy(2);
+...   |
+272 | |         assert_eq!(b.available_pages(), 0);
+273 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:276:5
+    |
+275 |       #[test]
+    |       ------- in this procedural macro expansion
+276 | /     fn split_from_order10_to_order0() {
+277 | |         // Init with 1024 pages (order-10 block), alloc order-0 — must split all the way down
+278 | |         let mut b = make_buddy(1024);
+279 | |         let addr = b.alloc(0).unwrap();
+280 | |         assert!(addr.is_page_aligned());
+281 | |         assert_eq!(b.available_pages(), 1023);
+282 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:285:5
+    |
+284 |       #[test]
+    |       ------- in this procedural macro expansion
+285 | /     fn multiple_init_regions() {
+286 | |         // Init with two separate regions, verify total pages accumulate
+287 | |         let mut b = BuddyAllocator::new();
+288 | |         b.init(
+...   |
+297 | |         assert_eq!(b.available_pages(), 32);
+298 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/buddy.rs:301:5
+    |
+300 |       #[test]
+    |       ------- in this procedural macro expansion
+301 | /     fn alloc_order_too_large_for_pool() {
+302 | |         // 4 pages can't satisfy order-3 (8 pages)
+303 | |         let mut b = make_buddy(4);
+304 | |         assert!(b.alloc(3).is_none());
+305 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:105:5
+    |
+104 |       #[test]
+    |       ------- in this procedural macro expansion
+105 | /     fn new_magazine_is_empty() {
+106 | |         let m = Magazine::new();
+107 | |         assert!(m.is_empty());
+108 | |         assert_eq!(m.len(), 0);
+109 | |         assert!(!m.is_full());
+110 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:113:5
+    |
+112 |       #[test]
+    |       ------- in this procedural macro expansion
+113 | /     fn push_pop_single() {
+114 | |         let mut m = Magazine::new();
+115 | |         let addr = PhysAddr::new(0x1000);
+116 | |         assert!(m.push(addr).is_ok());
+...   |
+120 | |         assert!(m.is_empty());
+121 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:124:5
+    |
+123 |       #[test]
+    |       ------- in this procedural macro expansion
+124 | /     fn push_pop_lifo_order() {
+125 | |         let mut m = Magazine::new();
+126 | |         let a1 = PhysAddr::new(0x1000);
+127 | |         let a2 = PhysAddr::new(0x2000);
+...   |
+134 | |         assert_eq!(m.pop().unwrap(), a1);
+135 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:138:5
+    |
+137 |       #[test]
+    |       ------- in this procedural macro expansion
+138 | /     fn push_full_returns_err() {
+139 | |         let mut m = Magazine::new();
+140 | |         for i in 0..MAGAZINE_CAPACITY {
+141 | |             m.push(PhysAddr::new(i * 0x1000)).unwrap();
+...   |
+145 | |         assert_eq!(m.push(overflow), Err(overflow));
+146 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:149:5
+    |
+148 |       #[test]
+    |       ------- in this procedural macro expansion
+149 | /     fn pop_empty_returns_none() {
+150 | |         let mut m = Magazine::new();
+151 | |         assert!(m.pop().is_none());
+152 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:155:5
+    |
+154 |       #[test]
+    |       ------- in this procedural macro expansion
+155 | /     fn refill_from_buddy() {
+156 | |         let mut buddy = BuddyAllocator::new();
+157 | |         buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+158 | |         let mut m = Magazine::new();
+159 | |         m.refill(&mut buddy, 8);
+160 | |         assert_eq!(m.len(), 8);
+161 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:164:5
+    |
+163 |       #[test]
+    |       ------- in this procedural macro expansion
+164 | /     fn drain_to_buddy() {
+165 | |         let mut buddy = BuddyAllocator::new();
+166 | |         buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+167 | |         let mut m = Magazine::new();
+...   |
+172 | |         assert_eq!(buddy.available_pages(), before + 8);
+173 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/allocator/magazine.rs:176:5
+    |
+175 |       #[test]
+    |       ------- in this procedural macro expansion
+176 | /     fn drain_half() {
+177 | |         let mut buddy = BuddyAllocator::new();
+178 | |         buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+179 | |         let mut m = Magazine::new();
+...   |
+182 | |         assert_eq!(m.len(), 5);
+183 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+  --> kernel/src/mm/pmap/pte.rs:86:5
+   |
+85 |       #[test]
+   |       ------- in this procedural macro expansion
+86 | /     fn encode_decode_roundtrip() {
+87 | |         let pa = 0x8020_0000usize;
+88 | |         let flags = PteFlags::V | PteFlags::R | PteFlags::W | PteFlags::A | PteFlags::D;
+89 | |         let raw = encode_pte(pa, flags);
+90 | |         assert_eq!(pte_pa(raw), pa);
+91 | |         assert_eq!(pte_flags(raw), flags);
+92 | |     }
+   | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:95:5
+    |
+94  |       #[test]
+    |       ------- in this procedural macro expansion
+95  | /     fn encode_decode_all_flags() {
+96  | |         let pa = 0x1000usize;
+97  | |         let flags = PteFlags::all();
+98  | |         let raw = encode_pte(pa, flags);
+99  | |         assert_eq!(pte_pa(raw), pa);
+100 | |         assert_eq!(pte_flags(raw), flags);
+101 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:104:5
+    |
+103 |       #[test]
+    |       ------- in this procedural macro expansion
+104 | /     fn zero_pa() {
+105 | |         let raw = encode_pte(0, PteFlags::V);
+106 | |         assert_eq!(pte_pa(raw), 0);
+107 | |         assert!(pte_is_valid(raw));
+108 | |         assert!(!pte_is_leaf(raw)); // V only = non-leaf
+109 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:112:5
+    |
+111 |       #[test]
+    |       ------- in this procedural macro expansion
+112 | /     fn leaf_detection() {
+113 | |         let non_leaf = encode_pte(0x1000, PteFlags::V);
+114 | |         assert!(!pte_is_leaf(non_leaf));
+...   |
+123 | |         assert!(pte_is_leaf(leaf_rwx));
+124 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:127:5
+    |
+126 |       #[test]
+    |       ------- in this procedural macro expansion
+127 | /     fn invalid_pte() {
+128 | |         assert!(!pte_is_valid(0));
+129 | |         assert!(!pte_is_leaf(0));
+130 | |         assert_eq!(pte_pa(0), 0);
+131 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:134:5
+    |
+133 |       #[test]
+    |       ------- in this procedural macro expansion
+134 | /     fn sw_bits_preserved() {
+135 | |         let pa = 0x4000usize;
+136 | |         let flags = PteFlags::V | PteFlags::R | PteFlags::SW_WIRED | PteFlags::SW_MANAGED;
+137 | |         let raw = encode_pte(pa, flags);
+...   |
+140 | |         assert!(extracted.contains(PteFlags::SW_MANAGED));
+141 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:144:5
+    |
+143 |       #[test]
+    |       ------- in this procedural macro expansion
+144 | /     fn map_perm_conversion() {
+145 | |         let perm = MapPerm::R | MapPerm::W;
+146 | |         let flags = map_perm_to_pte_flags(perm);
+147 | |         assert!(flags.contains(PteFlags::V));
+...   |
+153 | |         assert!(!flags.contains(PteFlags::U));
+154 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:157:5
+    |
+156 |       #[test]
+    |       ------- in this procedural macro expansion
+157 | /     fn map_perm_user_exec() {
+158 | |         let perm = MapPerm::R | MapPerm::X | MapPerm::U;
+159 | |         let flags = map_perm_to_pte_flags(perm);
+160 | |         assert!(flags.contains(PteFlags::R));
+...   |
+163 | |         assert!(!flags.contains(PteFlags::W));
+164 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/pte.rs:167:5
+    |
+166 |       #[test]
+    |       ------- in this procedural macro expansion
+167 | /     fn large_pa_roundtrip() {
+168 | |         // Test with a PA that uses upper PPN bits
+169 | |         let pa = 0x1_0000_0000usize; // 4 GiB
+170 | |         let flags = PteFlags::V | PteFlags::R;
+171 | |         let raw = encode_pte(pa, flags);
+172 | |         assert_eq!(pte_pa(raw), pa);
+173 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+  --> kernel/src/mm/pmap/asid.rs:78:5
+   |
+77 |       #[test]
+   |       ------- in this procedural macro expansion
+78 | /     fn sequential_allocation() {
+79 | |         reset_asid_state();
+80 | |         let (a1, g1) = alloc_asid();
+81 | |         let (a2, g2) = alloc_asid();
+...  |
+87 | |         assert_eq!(g2, g3);
+88 | |     }
+   | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/pmap/asid.rs:91:5
+    |
+90  |       #[test]
+    |       ------- in this procedural macro expansion
+91  | /     fn generation_increments_on_rollover() {
+92  | |         reset_asid_state();
+...   |
+107 | |         assert_eq!(gen2, 2);
+108 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:474:5
+    |
+473 |       #[test]
+    |       ------- in this procedural macro expansion
+474 | /     fn anonymous_fault_resolves() {
+475 | |         let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
+476 | |         let mut pmap = Pmap::dummy();
+477 | |         let result = sync_fault_handler(
+...   |
+486 | |         assert_eq!(obj.resident_count(), 1);
+487 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:490:5
+    |
+489 |       #[test]
+    |       ------- in this procedural macro expansion
+490 | /     fn fault_not_mapped() {
+491 | |         let map = VmMap::new();
+492 | |         let mut pmap = Pmap::dummy();
+493 | |         let result = sync_fault_handler(
+...   |
+499 | |         assert!(matches!(result, FaultResult::Error(FaultError::NotMapped)));
+500 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:503:5
+    |
+502 |       #[test]
+    |       ------- in this procedural macro expansion
+503 | /     fn fault_invalid_access_write_to_readonly() {
+504 | |         let map = make_anon_map(0x1000, 0x2000, MapPerm::R);
+505 | |         let mut pmap = Pmap::dummy();
+506 | |         let result = sync_fault_handler(
+...   |
+515 | |         );
+516 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:519:5
+    |
+518 |       #[test]
+    |       ------- in this procedural macro expansion
+519 | /     fn fault_execute_on_non_exec() {
+520 | |         let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
+521 | |         let mut pmap = Pmap::dummy();
+522 | |         let result = sync_fault_handler(
+...   |
+531 | |         ));
+532 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:535:5
+    |
+534 |       #[test]
+    |       ------- in this procedural macro expansion
+535 | /     fn cow_fault_copies_page() {
+536 | |         let parent_obj = VmObject::new(4096);
+537 | |         {
+538 | |             let mut w = parent_obj.write();
+...   |
+567 | |         assert_eq!(obj.resident_count(), 1);
+568 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:571:5
+    |
+570 |       #[test]
+    |       ------- in this procedural macro expansion
+571 | /     fn file_backed_returns_needs_async() {
+572 | |         let obj = VmObject::new(4096);
+573 | |         let vma = VmArea::new(
+574 | |             VirtAddr::new(0x1000)..VirtAddr::new(0x2000),
+...   |
+589 | |         assert!(matches!(result, FaultResult::NeedsAsyncIO));
+590 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:593:5
+    |
+592 |       #[test]
+    |       ------- in this procedural macro expansion
+593 | /     fn page_fault_access_type_permitted() {
+594 | |         let rw = MapPerm::R | MapPerm::W;
+595 | |         assert!(PageFaultAccessType::READ.permitted_by(rw));
+596 | |         assert!(PageFaultAccessType::WRITE.permitted_by(rw));
+...   |
+602 | |         assert!(PageFaultAccessType::EXECUTE.permitted_by(rx));
+603 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:606:5
+    |
+605 |       #[test]
+    |       ------- in this procedural macro expansion
+606 | /     fn anonymous_fault_allocates_unique_frames() {
+607 | |         let map = make_anon_map(0x1000, 0x3000, MapPerm::R | MapPerm::W);
+608 | |         let mut pmap = Pmap::dummy();
+609 | |         let r1 = sync_fault_handler(
+...   |
+627 | |         assert_ne!(p1, p2);
+628 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:631:5
+    |
+630 |       #[test]
+    |       ------- in this procedural macro expansion
+631 | /     fn fault_page_aligned_resolution() {
+632 | |         let map = make_anon_map(0x1000, 0x2000, MapPerm::R | MapPerm::W);
+633 | |         let mut pmap = Pmap::dummy();
+634 | |         let result = sync_fault_handler(
+...   |
+640 | |         assert!(matches!(result, FaultResult::Resolved));
+641 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/fault.rs:644:5
+    |
+643 |       #[test]
+    |       ------- in this procedural macro expansion
+644 | /     fn rwx_permission_combinations() {
+645 | |         let all = MapPerm::R | MapPerm::W | MapPerm::X;
+646 | |         assert!(PageFaultAccessType::READ.permitted_by(all));
+647 | |         assert!(PageFaultAccessType::WRITE.permitted_by(all));
+...   |
+653 | |         assert!(!PageFaultAccessType::EXECUTE.permitted_by(none));
+654 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:624:5
+    |
+623 |       #[test]
+    |       ------- in this procedural macro expansion
+624 | /     fn insert_and_find() {
+625 | |         let mut map = VmMap::new();
+626 | |         let vma = make_vma(0x1000, 0x3000);
+627 | |         let id = vma.id;
+...   |
+630 | |         assert_eq!(found.id, id);
+631 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:634:5
+    |
+633 |       #[test]
+    |       ------- in this procedural macro expansion
+634 | /     fn find_at_boundaries() {
+635 | |         let mut map = VmMap::new();
+636 | |         map.insert(make_vma(0x1000, 0x3000)).unwrap();
+...   |
+644 | |         assert!(map.find_area(VirtAddr::new(0x0FFF)).is_none());
+645 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:648:5
+    |
+647 |       #[test]
+    |       ------- in this procedural macro expansion
+648 | /     fn insert_overlap_rejected() {
+649 | |         let mut map = VmMap::new();
+650 | |         map.insert(make_vma(0x1000, 0x3000)).unwrap();
+651 | |         let result = map.insert(make_vma(0x2000, 0x4000));
+652 | |         assert_eq!(result, Err(VmError::Overlap));
+653 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:656:5
+    |
+655 |       #[test]
+    |       ------- in this procedural macro expansion
+656 | /     fn insert_adjacent_ok() {
+657 | |         let mut map = VmMap::new();
+658 | |         map.insert(make_vma(0x1000, 0x2000)).unwrap();
+...   |
+661 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:664:5
+    |
+663 |       #[test]
+    |       ------- in this procedural macro expansion
+664 | /     fn remove_existing() {
+665 | |         let mut map = VmMap::new();
+666 | |         map.insert(make_vma(0x1000, 0x3000)).unwrap();
+667 | |         assert!(map.remove(VirtAddr::new(0x1000)).is_some());
+668 | |         assert!(map.find_area(VirtAddr::new(0x1500)).is_none());
+669 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:672:5
+    |
+671 |       #[test]
+    |       ------- in this procedural macro expansion
+672 | /     fn remove_nonexistent() {
+673 | |         let mut map = VmMap::new();
+674 | |         assert!(map.remove(VirtAddr::new(0x1000)).is_none());
+675 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:678:5
+    |
+677 |       #[test]
+    |       ------- in this procedural macro expansion
+678 | /     fn multiple_vmas() {
+679 | |         let mut map = VmMap::new();
+680 | |         map.insert(make_vma(0x1000, 0x2000)).unwrap();
+681 | |         map.insert(make_vma(0x3000, 0x4000)).unwrap();
+...   |
+686 | |         assert!(map.find_area(VirtAddr::new(0x2500)).is_none()); // gap
+687 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:690:5
+    |
+689 |       #[test]
+    |       ------- in this procedural macro expansion
+690 | /     fn fork_creates_shadows() {
+691 | |         let mut parent_map = VmMap::new();
+692 | |         let obj = VmObject::new(4096);
+...   |
+719 | |         assert_eq!(child_obj.resident_count(), 0);
+720 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:723:5
+    |
+722 |       #[test]
+    |       ------- in this procedural macro expansion
+723 | /     fn vma_ids_are_unique() {
+724 | |         let v1 = make_vma(0x1000, 0x2000);
+725 | |         let v2 = make_vma(0x3000, 0x4000);
+726 | |         let v3 = make_vma(0x5000, 0x6000);
+...   |
+729 | |         assert_ne!(v1.id, v3.id);
+730 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:733:5
+    |
+732 |       #[test]
+    |       ------- in this procedural macro expansion
+733 | /     fn iter_all_vmas() {
+734 | |         let mut map = VmMap::new();
+735 | |         map.insert(make_vma(0x1000, 0x2000)).unwrap();
+736 | |         map.insert(make_vma(0x3000, 0x4000)).unwrap();
+737 | |         let count = map.iter().count();
+738 | |         assert_eq!(count, 2);
+739 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:742:5
+    |
+741 |       #[test]
+    |       ------- in this procedural macro expansion
+742 | /     fn fork_shadow_has_backing_chain() {
+743 | |         // Verify that after fork, child's VmObject has a backing pointer
+744 | |         // that ultimately reaches the original parent object.
+745 | |         let mut parent_map = VmMap::new();
+...   |
+784 | |         );
+785 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:788:5
+    |
+787 |       #[test]
+    |       ------- in this procedural macro expansion
+788 | /     fn fork_preserves_vma_count() {
+789 | |         let mut map = VmMap::new();
+790 | |         map.insert(make_vma(0x1000, 0x2000)).unwrap();
+791 | |         map.insert(make_vma(0x3000, 0x4000)).unwrap();
+...   |
+794 | |         assert_eq!(child.iter().count(), 3);
+795 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_map.rs:798:5
+    |
+797 |       #[test]
+    |       ------- in this procedural macro expansion
+798 | /     fn insert_invalid_range_rejected() {
+799 | |         let mut map = VmMap::new();
+800 | |         // start >= end should fail
+801 | |         let obj = VmObject::new(4096);
+...   |
+809 | |         assert!(map.insert(vma).is_err());
+810 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:327:5
+    |
+326 |       #[test]
+    |       ------- in this procedural macro expansion
+327 | /     fn new_object_is_empty() {
+328 | |         let obj = VmObject::new(4096);
+329 | |         let r = obj.read();
+330 | |         assert_eq!(r.size(), 4096);
+331 | |         assert_eq!(r.resident_count(), 0);
+332 | |         assert!(r.lookup_page(0).is_none());
+333 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:336:5
+    |
+335 |       #[test]
+    |       ------- in this procedural macro expansion
+336 | /     fn insert_and_lookup_page() {
+337 | |         let obj = VmObject::new(8192);
+338 | |         {
+339 | |             let mut w = obj.write();
+...   |
+347 | |         assert!(r.lookup_page(2).is_none());
+348 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:351:5
+    |
+350 |       #[test]
+    |       ------- in this procedural macro expansion
+351 | /     fn shadow_chain_creation() {
+352 | |         let parent = VmObject::new(4096);
+353 | |         {
+354 | |             let mut w = parent.write();
+...   |
+369 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:372:5
+    |
+371 |       #[test]
+    |       ------- in this procedural macro expansion
+372 | /     fn shadow_chain_lookup_iterative() {
+373 | |         let grandparent = VmObject::new(4096);
+374 | |         {
+375 | |             let mut w = grandparent.write();
+...   |
+392 | |         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0xA000));
+393 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:396:5
+    |
+395 |       #[test]
+    |       ------- in this procedural macro expansion
+396 | /     fn page_ownership_types() {
+397 | |         let anon = OwnedPage::new_anonymous(PhysAddr::new(0x1000));
+398 | |         assert_eq!(anon.ownership, PageOwnership::Anonymous);
+399 | |         let cached = OwnedPage::new_cached(PhysAddr::new(0x2000));
+400 | |         assert_eq!(cached.ownership, PageOwnership::Cached);
+401 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:404:5
+    |
+403 |       #[test]
+    |       ------- in this procedural macro expansion
+404 | /     fn iterative_drop_deep_chain_500() {
+405 | |         // Build a 500-deep shadow chain. If Drop were recursive, this
+406 | |         // would overflow the stack. Iterative Drop handles it.
+407 | |         let mut current = VmObject::new(4096);
+...   |
+420 | |         drop(current);
+421 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:424:5
+    |
+423 |       #[test]
+    |       ------- in this procedural macro expansion
+424 | /     fn iterative_drop_shared_stops_at_refcount() {
+425 | |         let parent = VmObject::new(4096);
+426 | |         let shadow1 = VmObject::new_shadow(Arc::clone(&parent), 4096);
+427 | |         let shadow2 = VmObject::new_shadow(Arc::clone(&parent), 4096);
+...   |
+433 | |         assert_eq!(Arc::strong_count(&parent), 1);
+434 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:437:5
+    |
+436 |       #[test]
+    |       ------- in this procedural macro expansion
+437 | /     fn insert_page_overwrites_existing() {
+438 | |         let obj = VmObject::new(4096);
+439 | |         {
+440 | |             let mut w = obj.write();
+...   |
+445 | |         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x2000));
+446 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:449:5
+    |
+448 |       #[test]
+    |       ------- in this procedural macro expansion
+449 | /     fn iterative_drop_1000_deep() {
+450 | |         // Stress test: 1000-deep chain
+451 | |         let mut current = VmObject::new(4096);
+452 | |         for _ in 0..1000 {
+...   |
+455 | |         drop(current);
+456 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:459:5
+    |
+458 |       #[test]
+    |       ------- in this procedural macro expansion
+459 | /     fn shadow_override_hides_parent_page() {
+460 | |         // Insert page at offset 0 in parent, then insert different page
+461 | |         // at same offset in shadow — shadow's page should win.
+462 | |         let parent = VmObject::new(4096);
+...   |
+476 | |         assert_eq!(rp.lookup_page(0).unwrap(), PhysAddr::new(0xAAAA_0000));
+477 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:480:5
+    |
+479 |       #[test]
+    |       ------- in this procedural macro expansion
+480 | /     fn shadow_depth_reports_chain_length() {
+481 | |         let root = VmObject::new(4096);
+482 | |         assert_eq!(root.read().shadow_depth(), 0);
+483 | |         let s1 = VmObject::new_shadow(Arc::clone(&root), 4096);
+...   |
+488 | |         assert_eq!(s3.read().shadow_depth(), 3);
+489 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:492:5
+    |
+491 |       #[test]
+    |       ------- in this procedural macro expansion
+492 | /     fn iterative_drop_600_deep() {
+493 | |         // 600-deep chain — verifies iterative Drop beyond the 500 threshold
+494 | |         let mut current = VmObject::new(4096);
+495 | |         for i in 0..600 {
+...   |
+506 | |         drop(current);
+507 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:510:5
+    |
+509 |       #[test]
+    |       ------- in this procedural macro expansion
+510 | /     fn remove_page_decrements_resident_count() {
+511 | |         let obj = VmObject::new(4096);
+512 | |         {
+513 | |             let mut w = obj.write();
+...   |
+521 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:524:5
+    |
+523 |       #[test]
+    |       ------- in this procedural macro expansion
+524 | /     fn remove_nonexistent_page_returns_none() {
+525 | |         let obj = VmObject::new(4096);
+526 | |         let mut w = obj.write();
+527 | |         assert!(w.remove_page(42).is_none());
+528 | |         assert_eq!(w.resident_count(), 0);
+529 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:532:5
+    |
+531 |       #[test]
+    |       ------- in this procedural macro expansion
+532 | /     fn backing_returns_parent_ref() {
+533 | |         let parent = VmObject::new(4096);
+534 | |         let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
+535 | |         let r = shadow.read();
+...   |
+539 | |         assert!(rr.backing().is_none());
+540 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:547:5
+    |
+546 |       #[test]
+    |       ------- in this procedural macro expansion
+547 | /     fn shadow_count_incremented_on_new_shadow() {
+548 | |         let parent = VmObject::new(4096);
+549 | |         assert_eq!(parent.read().shadow_count(), 0);
+550 | |         let s1 = VmObject::new_shadow(Arc::clone(&parent), 4096);
+...   |
+557 | |         assert_eq!(parent.read().shadow_count(), 0);
+558 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:565:5
+    |
+564 |       #[test]
+    |       ------- in this procedural macro expansion
+565 | /     fn collapse_migrates_pages_from_backing() {
+566 | |         // Backing has pages at offsets 0 and 1.
+567 | |         let backing = VmObject::new(8192);
+...   |
+586 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:589:5
+    |
+588 |       #[test]
+    |       ------- in this procedural macro expansion
+589 | /     fn collapse_frees_phantom_on_conflict() {
+590 | |         // Backing has page at offset 0 (the "phantom").
+591 | |         let backing = VmObject::new(8192);
+...   |
+616 | |         assert_eq!(backing.read().resident_count(), 0);
+617 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:620:5
+    |
+619 |       #[test]
+    |       ------- in this procedural macro expansion
+620 | /     fn collapse_refuses_when_shadow_count_gt_1() {
+621 | |         let backing = VmObject::new(4096);
+622 | |         {
+623 | |             let mut w = backing.write();
+...   |
+638 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:641:5
+    |
+640 |       #[test]
+    |       ------- in this procedural macro expansion
+641 | /     fn collapse_adopts_grandparent() {
+642 | |         // grandparent -> parent -> child
+643 | |         let grandparent = VmObject::new(4096);
+...   |
+670 | |         assert_eq!(grandparent.read().shadow_count(), 1);
+671 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:686:5
+    |
+685 |       #[test]
+    |       ------- in this procedural macro expansion
+686 | /     fn phantom_page_eliminated_by_collapse() {
+687 | |         // Step 1: backing with F0 and F1.
+688 | |         let backing = VmObject::new(8192);
+...   |
+723 | |         assert_eq!(backing.read().resident_count(), 0);
+724 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:729:5
+    |
+728 |       #[test]
+    |       ------- in this procedural macro expansion
+729 | /     fn phantom_page_freed_when_child_has_cow_copy() {
+730 | |         let backing = VmObject::new(8192);
+731 | |         {
+732 | |             let mut w = backing.write();
+...   |
+760 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:770:5
+    |
+769 |       #[test]
+    |       ------- in this procedural macro expansion
+770 | /     fn fork_bomb_shadow_count_consistency() {
+771 | |         let backing = VmObject::new(4096);
+772 | |         {
+773 | |             let mut w = backing.write();
+...   |
+802 | |         assert_eq!(backing.read().resident_count(), 0);
+803 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:809:5
+    |
+808 |       #[test]
+    |       ------- in this procedural macro expansion
+809 | /     fn fork_bomb_deep_chain_200() {
+810 | |         let root = VmObject::new(4096);
+811 | |         {
+812 | |             let mut w = root.write();
+...   |
+849 | |         assert_eq!(_root_ref.read().shadow_count(), 0);
+850 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+   --> kernel/src/mm/vm/vm_object.rs:855:5
+    |
+854 |       #[test]
+    |       ------- in this procedural macro expansion
+855 | /     fn fork_bomb_wide_fan_with_cow_pages() {
+856 | |         let backing = VmObject::new(4096 * 4);
+857 | |         {
+858 | |             let mut w = backing.write();
+...   |
+909 | |     }
+    | |_____^ can't find crate
+
+error[E0463]: can't find crate for `test`
+
+For more information about this error, try `rustc --explain E0463`.
+error: could not compile `kernel` (bin "kernel" test) due to 80 previous errors

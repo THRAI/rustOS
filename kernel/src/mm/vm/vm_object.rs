@@ -41,11 +41,17 @@ pub struct OwnedPage {
 
 impl OwnedPage {
     pub fn new_anonymous(phys: PhysAddr) -> Self {
-        Self { ownership: PageOwnership::Anonymous, phys }
+        Self {
+            ownership: PageOwnership::Anonymous,
+            phys,
+        }
     }
 
     pub fn new_cached(phys: PhysAddr) -> Self {
-        Self { ownership: PageOwnership::Cached, phys }
+        Self {
+            ownership: PageOwnership::Cached,
+            phys,
+        }
     }
 }
 
@@ -208,7 +214,7 @@ impl VmObject {
                 backing.resident_count = backing.resident_count.saturating_sub(1);
                 if matches!(page.ownership, PageOwnership::Anonymous) {
                     #[cfg(not(test))]
-                    crate::mm::allocator::frame_free(page.phys);
+                    super::super::allocator::frame_free(page.phys);
                 }
             } else {
                 // No conflict: rename page from backing to self.
@@ -272,7 +278,7 @@ impl Drop for VmObject {
         for (_offset, page) in pages {
             if matches!(page.ownership, PageOwnership::Anonymous) {
                 #[cfg(not(test))]
-                crate::mm::allocator::frame_free(page.phys);
+                super::super::allocator::frame_free(page.phys);
             }
         }
 
@@ -294,7 +300,7 @@ impl Drop for VmObject {
                     for (_offset, page) in ancestor_pages {
                         if matches!(page.ownership, PageOwnership::Anonymous) {
                             #[cfg(not(test))]
-                            crate::mm::allocator::frame_free(page.phys);
+                            super::super::allocator::frame_free(page.phys);
                         }
                     }
                     // Decrement next ancestor's shadow_count.
@@ -314,8 +320,8 @@ impl Drop for VmObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     #[test]
     fn new_object_is_empty() {
@@ -403,7 +409,10 @@ mod tests {
             let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
             {
                 let mut w = shadow.write();
-                w.insert_page(i as u64, OwnedPage::new_anonymous(PhysAddr::new((i + 1) * 0x1000)));
+                w.insert_page(
+                    i as u64,
+                    OwnedPage::new_anonymous(PhysAddr::new((i + 1) * 0x1000)),
+                );
             }
             current = shadow;
         }
@@ -487,7 +496,10 @@ mod tests {
             let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
             {
                 let mut w = shadow.write();
-                w.insert_page(i as u64, OwnedPage::new_anonymous(PhysAddr::new((i + 1) * 0x1000)));
+                w.insert_page(
+                    i as u64,
+                    OwnedPage::new_anonymous(PhysAddr::new((i + 1) * 0x1000)),
+                );
             }
             current = shadow;
         }
@@ -811,7 +823,10 @@ mod tests {
         }
 
         // All 201 objects alive. Deepest can see root's page.
-        assert_eq!(all.last().unwrap().read().lookup_page(0).unwrap(), PhysAddr::new(0x2007));
+        assert_eq!(
+            all.last().unwrap().read().lookup_page(0).unwrap(),
+            PhysAddr::new(0x2007)
+        );
         assert_eq!(all.last().unwrap().read().shadow_depth(), 200);
 
         // Kill all except root and the deepest.
@@ -821,7 +836,10 @@ mod tests {
         drop(all);
 
         // Deepest still sees the page (chain walk through root).
-        assert_eq!(deepest.read().lookup_page(0).unwrap(), PhysAddr::new(0x2007));
+        assert_eq!(
+            deepest.read().lookup_page(0).unwrap(),
+            PhysAddr::new(0x2007)
+        );
 
         // Shadow counts should be consistent after mass drop.
         // The chain may have partially collapsed during drops.
@@ -839,7 +857,10 @@ mod tests {
         {
             let mut w = backing.write();
             for i in 0..4u64 {
-                w.insert_page(i, OwnedPage::new_anonymous(PhysAddr::new((0xA000 + i as usize) * 0x1000)));
+                w.insert_page(
+                    i,
+                    OwnedPage::new_anonymous(PhysAddr::new((0xA000 + i as usize) * 0x1000)),
+                );
             }
         }
 
@@ -851,9 +872,10 @@ mod tests {
                 let mut w = s.write();
                 // Each shadow writes to offset (i % 4).
                 let offset = (i % 4) as u64;
-                w.insert_page(offset, OwnedPage::new_anonymous(
-                    PhysAddr::new(0xC000_0000 + i * 0x1000),
-                ));
+                w.insert_page(
+                    offset,
+                    OwnedPage::new_anonymous(PhysAddr::new(0xC000_0000 + i * 0x1000)),
+                );
             }
             shadows.push(s);
         }
@@ -863,8 +885,10 @@ mod tests {
         for (i, s) in shadows.iter().enumerate() {
             let offset = (i % 4) as u64;
             let r = s.read();
-            assert_eq!(r.lookup_page(offset).unwrap(),
-                PhysAddr::new(0xC000_0000 + i * 0x1000));
+            assert_eq!(
+                r.lookup_page(offset).unwrap(),
+                PhysAddr::new(0xC000_0000 + i * 0x1000)
+            );
         }
 
         // Kill all but one.

@@ -4,8 +4,8 @@
 //! This stub provides the same API surface so that fault.rs compiles and
 //! tests can verify fault logic without real page table walks.
 
-use hal_common::{PhysAddr, VirtAddr};
 use super::vm::vm_map::MapPerm;
+use hal_common::{PhysAddr, VirtAddr};
 
 pub struct Pmap {
     _dummy: (),
@@ -15,6 +15,10 @@ impl Pmap {
     pub fn dummy() -> Self {
         Pmap { _dummy: () }
     }
+}
+
+pub fn pmap_create() -> Pmap {
+    Pmap::dummy()
 }
 
 /// No-op: record that a mapping was created.
@@ -29,10 +33,4 @@ pub fn pmap_enter(
 }
 
 /// No-op: record that permissions were changed.
-pub fn pmap_protect(
-    _pmap: &mut Pmap,
-    _va_start: VirtAddr,
-    _va_end: VirtAddr,
-    _prot: MapPerm,
-) {
-}
+pub fn pmap_protect(_pmap: &mut Pmap, _va_start: VirtAddr, _va_end: VirtAddr, _prot: MapPerm) {}

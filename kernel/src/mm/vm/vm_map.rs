@@ -16,7 +16,12 @@ use hal_common::VirtAddr;
 use super::vm_object::VmObject;
 
 #[cfg(not(test))]
-use crate::fs::vnode::Vnode;
+// FIXME: dependency on fs
+// use crate::fs::vnode::Vnode;
+pub trait Vnode: Send + Sync {
+    fn vnode_id(&self) -> u64;
+    fn path(&self) -> &str;
+}
 
 /// Placeholder trait for test builds where the fs module is not available.
 #[cfg(test)]
@@ -48,6 +53,17 @@ bitflags::bitflags! {
         const X = 1 << 2;
         const U = 1 << 3;
     }
+    //TODO: add flag packs like RW, RX, UW, etc.
+}
+
+/// A declarative macro to combine MapPerm flags.
+/// Usage: `map_perm!(R, W, U)`
+#[macro_export]
+macro_rules! map_perm {
+    () => { $crate::mm::vm::vm_map::MapPerm::empty() };
+    ($($flag:ident),+) => {
+        $($crate::mm::vm::vm_map::MapPerm::$flag)|+
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +303,7 @@ impl VmMap {
 
     /// MMAP region: top-down allocation below stack.
     const MMAP_BASE: usize = 0x0000_003F_FFF0_0000; // just below USER_STACK_TOP
-    const MMAP_MIN: usize  = 0x0000_0020_0000_0000; // floor
+    const MMAP_MIN: usize = 0x0000_0020_0000_0000; // floor
 
     /// Find a free region of `size` bytes, searching top-down from MMAP_BASE.
     /// Returns the start address of the free region.
@@ -298,9 +314,13 @@ impl VmMap {
         }
 
         // Collect VMAs in the mmap region, sorted by start address
-        let mmap_vmas: Vec<(usize, usize)> = self.areas.values()
-            .filter(|vma| vma.range.end.as_usize() > Self::MMAP_MIN
-                       && vma.range.start.as_usize() < Self::MMAP_BASE)
+        let mmap_vmas: Vec<(usize, usize)> = self
+            .areas
+            .values()
+            .filter(|vma| {
+                vma.range.end.as_usize() > Self::MMAP_MIN
+                    && vma.range.start.as_usize() < Self::MMAP_BASE
+            })
             .map(|vma| (vma.range.start.as_usize(), vma.range.end.as_usize()))
             .collect();
 
@@ -338,7 +358,9 @@ impl VmMap {
         }
 
         // Collect keys of all VMAs that overlap [start, end)
-        let overlapping: Vec<VirtAddr> = self.areas.range(..end)
+        let overlapping: Vec<VirtAddr> = self
+            .areas
+            .range(..end)
             .filter(|(_, vma)| vma.range.end > start)
             .map(|(&k, _)| k)
             .collect();
@@ -370,7 +392,11 @@ impl VmMap {
                     vma_type: vma.vma_type,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: if vma.file_size > left_size as u64 { left_size as u64 } else { vma.file_size },
+                    file_size: if vma.file_size > left_size as u64 {
+                        left_size as u64
+                    } else {
+                        vma.file_size
+                    },
                 };
                 self.areas.insert(vma_start, left_vma);
 
@@ -406,7 +432,11 @@ impl VmMap {
                     vma_type: vma.vma_type,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: if vma.file_size > keep_size as u64 { keep_size as u64 } else { vma.file_size },
+                    file_size: if vma.file_size > keep_size as u64 {
+                        keep_size as u64
+                    } else {
+                        vma.file_size
+                    },
                 };
                 self.areas.insert(vma_start, kept);
                 removed.push(vma);
@@ -443,7 +473,9 @@ impl VmMap {
         }
 
         // Collect keys of overlapping VMAs
-        let overlapping: Vec<VirtAddr> = self.areas.range(..end)
+        let overlapping: Vec<VirtAddr> = self
+            .areas
+            .range(..end)
             .filter(|(_, vma)| vma.range.end > start)
             .map(|(&k, _)| k)
             .collect();
@@ -485,7 +517,10 @@ impl VmMap {
                     vma_type: vma.vma_type,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + mid_offset,
-                    file_size: vma.file_size.saturating_sub(mid_offset).min(mid_size as u64),
+                    file_size: vma
+                        .file_size
+                        .saturating_sub(mid_offset)
+                        .min(mid_size as u64),
                 };
                 self.areas.insert(start, mid);
 
@@ -581,8 +616,8 @@ impl VmMap {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::vm_object::VmObject;
+    use super::*;
 
     fn make_vma(start: usize, end: usize) -> VmArea {
         let obj = VmObject::new((end - start) as usize);
@@ -667,9 +702,12 @@ mod tests {
         let obj = VmObject::new(4096);
         {
             let mut w = obj.write();
-            w.insert_page(0, super::super::vm_object::OwnedPage::new_anonymous(
-                hal_common::PhysAddr::new(0xA000),
-            ));
+            w.insert_page(
+                0,
+                super::super::vm_object::OwnedPage::new_anonymous(hal_common::PhysAddr::new(
+                    0xA000,
+                )),
+            );
         }
         let vma = VmArea::new(
             VirtAddr::new(0x1000)..VirtAddr::new(0x2000),
@@ -718,12 +756,18 @@ mod tests {
         let obj = VmObject::new(8192);
         {
             let mut w = obj.write();
-            w.insert_page(0, super::super::vm_object::OwnedPage::new_anonymous(
-                hal_common::PhysAddr::new(0xDEAD_0000),
-            ));
-            w.insert_page(1, super::super::vm_object::OwnedPage::new_anonymous(
-                hal_common::PhysAddr::new(0xBEEF_0000),
-            ));
+            w.insert_page(
+                0,
+                super::super::vm_object::OwnedPage::new_anonymous(hal_common::PhysAddr::new(
+                    0xDEAD_0000,
+                )),
+            );
+            w.insert_page(
+                1,
+                super::super::vm_object::OwnedPage::new_anonymous(hal_common::PhysAddr::new(
+                    0xBEEF_0000,
+                )),
+            );
         }
         let vma = VmArea::new(
             VirtAddr::new(0x1000)..VirtAddr::new(0x3000),
@@ -740,8 +784,14 @@ mod tests {
         // Shadow depth should be 1 (child shadow -> parent object)
         assert_eq!(child_obj.shadow_depth(), 1);
         // Parent's pages visible through shadow chain
-        assert_eq!(child_obj.lookup_page(0).unwrap(), hal_common::PhysAddr::new(0xDEAD_0000));
-        assert_eq!(child_obj.lookup_page(1).unwrap(), hal_common::PhysAddr::new(0xBEEF_0000));
+        assert_eq!(
+            child_obj.lookup_page(0).unwrap(),
+            hal_common::PhysAddr::new(0xDEAD_0000)
+        );
+        assert_eq!(
+            child_obj.lookup_page(1).unwrap(),
+            hal_common::PhysAddr::new(0xBEEF_0000)
+        );
     }
 
     #[test]

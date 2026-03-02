@@ -3,23 +3,22 @@
 //! These tests run on real hardware (QEMU rv64) with the actual frame
 //! allocator, verifying fault handler, COW, iterative drop, and
 //! frame_alloc_sync behavior under real kernel conditions.
-
+use crate::mm::vm::vm_map::MapPerm;
 use alloc::sync::Arc;
 
-use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
+use hal_common::{VirtAddr, PAGE_SIZE};
 
-use super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
-use super::vm_object::{OwnedPage, VmObject};
-use super::fault::{sync_fault_handler, FaultResult, PageFaultAccessType};
 use super::super::allocator::{frame_alloc_sync, frame_free};
 use super::super::pmap;
+use super::vm_map::{VmArea, VmAreaType, VmMap};
+use super::vm_object::{OwnedPage, VmObject};
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
 pub fn test_anonymous_page_fault() {
     let obj = VmObject::new(PAGE_SIZE);
     let vma = VmArea::new(
         VirtAddr::new(0x1000_0000)..VirtAddr::new(0x1000_0000 + PAGE_SIZE),
-        MapPerm::R | MapPerm::W,
+        crate::map_perm!(R, W),
         obj,
         0,
         VmAreaType::Anonymous,
@@ -28,13 +27,21 @@ pub fn test_anonymous_page_fault() {
     map.insert(vma).unwrap();
 
     let mut test_pmap = pmap::pmap_create();
-    let result = sync_fault_handler(&map, &mut test_pmap, VirtAddr::new(0x1000_0000), PageFaultAccessType::READ);
+    let result = super::fault::sync_fault_handler(
+        &map,
+        &mut test_pmap,
+        VirtAddr::new(0x1000_0000),
+        super::fault::PageFaultAccessType::READ,
+    );
     match result {
-        FaultResult::Resolved => {
+        super::fault::FaultResult::Resolved => {
             // Verify a page was inserted into the VmObject
             let vma = map.find_area(VirtAddr::new(0x1000_0000)).unwrap();
             let obj = vma.object.read();
-            assert!(obj.lookup_page(0).is_some(), "page not inserted after fault");
+            assert!(
+                obj.lookup_page(0).is_some(),
+                "page not inserted after fault"
+            );
             crate::kprintln!("vm anonymous fault PASS");
         }
         other => {
@@ -66,7 +73,7 @@ pub fn test_cow_fault() {
 
     let vma = VmArea::new(
         VirtAddr::new(0x2000_0000)..VirtAddr::new(0x2000_0000 + PAGE_SIZE),
-        MapPerm::R | MapPerm::W,
+        crate::map_perm!(R, W),
         shadow,
         0,
         VmAreaType::Anonymous,
@@ -75,12 +82,17 @@ pub fn test_cow_fault() {
     map.insert(vma).unwrap();
 
     let mut test_pmap = pmap::pmap_create();
-    let result = sync_fault_handler(&map, &mut test_pmap, VirtAddr::new(0x2000_0000), PageFaultAccessType::WRITE);
+    let result = super::fault::sync_fault_handler(
+        &map,
+        &mut test_pmap,
+        VirtAddr::new(0x2000_0000),
+        super::fault::PageFaultAccessType::WRITE,
+    );
     match result {
-        FaultResult::Resolved => {
+        super::fault::FaultResult::Resolved => {
             let vma = map.find_area(VirtAddr::new(0x2000_0000)).unwrap();
             let obj = vma.object.read();
-            let new_phys = obj.lookup_page(0).expect("COW page not inserted");
+            let _new_phys = obj.lookup_page(0).expect("COW page not inserted");
             // COW may either:
             // - copy to a new frame (shared backing, no collapse possible), or
             // - rename the page in-place via collapse (sole shadow, zero-copy)
@@ -122,10 +134,14 @@ pub fn test_frame_alloc_sync_works() {
                     frame_free(f2);
                     crate::kprintln!("vm frame_alloc_sync PASS");
                 }
-                None => crate::kprintln!("vm frame_alloc_sync FAIL: second alloc returned None"),
+                None => {
+                    crate::kprintln!("vm frame_alloc_sync FAIL: second alloc returned None");
+                }
             }
         }
-        None => crate::kprintln!("vm frame_alloc_sync FAIL: first alloc returned None"),
+        None => {
+            crate::kprintln!("vm frame_alloc_sync FAIL: first alloc returned None");
+        }
     }
 }
 
@@ -160,14 +176,21 @@ pub fn test_fork_bomb_stress() {
     // Phase 1: Fork bomb — create N children, each shadowing root.
     let mut children: Vec<Arc<spin::RwLock<VmObject>>> = Vec::new();
     for _ in 0..NUM_CHILDREN {
-        children.push(VmObject::new_shadow(Arc::clone(&root), PAGES_PER_OBJ * PAGE_SIZE));
+        children.push(VmObject::new_shadow(
+            Arc::clone(&root),
+            PAGES_PER_OBJ * PAGE_SIZE,
+        ));
     }
 
     // Verify shadow_count on root.
     {
         let r = root.read();
         if r.shadow_count() != NUM_CHILDREN {
-            crate::kprintln!("vm fork bomb FAIL: root shadow_count {} != {}", r.shadow_count(), NUM_CHILDREN);
+            crate::kprintln!(
+                "vm fork bomb FAIL: root shadow_count {} != {}",
+                r.shadow_count(),
+                NUM_CHILDREN
+            );
             return;
         }
     }
@@ -175,7 +198,10 @@ pub fn test_fork_bomb_stress() {
     // Phase 2: Each child forks a grandchild (deeper chain).
     let mut grandchildren: Vec<Arc<spin::RwLock<VmObject>>> = Vec::new();
     for child in children.iter() {
-        grandchildren.push(VmObject::new_shadow(Arc::clone(child), PAGES_PER_OBJ * PAGE_SIZE));
+        grandchildren.push(VmObject::new_shadow(
+            Arc::clone(child),
+            PAGES_PER_OBJ * PAGE_SIZE,
+        ));
     }
 
     // Phase 3: Kill all children (simulates parent exits, child inherits).
@@ -193,13 +219,13 @@ pub fn test_fork_bomb_stress() {
 
     // Phase 4: Drop grandchildren one by one. As each grandchild drops,
     // its backing (child) may become sole owner and get unwound.
-    for (i, gc) in grandchildren.into_iter().enumerate() {
+    for (_i, gc) in grandchildren.into_iter().enumerate() {
         // Before dropping, verify grandchild can still see root's pages.
         {
             let r = gc.read();
             for p in 0..PAGES_PER_OBJ {
                 if r.lookup_page(p as u64).is_none() {
-                    crate::kprintln!("vm fork bomb FAIL: gc[{}] can't see page {}", i, p);
+                    crate::kprintln!("vm fork bomb FAIL: gc[{}] can't see page {}", _i, p);
                     return;
                 }
             }
@@ -211,7 +237,10 @@ pub fn test_fork_bomb_stress() {
     {
         let r = root.read();
         if r.shadow_count() != 0 {
-            crate::kprintln!("vm fork bomb FAIL: root shadow_count {} after full teardown", r.shadow_count());
+            crate::kprintln!(
+                "vm fork bomb FAIL: root shadow_count {} after full teardown",
+                r.shadow_count()
+            );
             return;
         }
     }

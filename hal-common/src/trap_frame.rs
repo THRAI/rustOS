@@ -53,6 +53,12 @@ impl TrapFrame {
         self.sepc = val;
     }
 
+    /// Advance the program counter to the next instruction (useful for skipping ecall).
+    #[inline]
+    pub fn advance_pc(&mut self) {
+        self.sepc = self.sepc.wrapping_add(4);
+    }
+
     /// Get syscall/function argument by index (a0=x10 .. a7=x17).
     /// Panics if n > 7.
     #[inline]
@@ -97,4 +103,6 @@ impl TrapFrame {
     pub fn stval(&self) -> usize {
         self.stval
     }
+
+    //TODO: implement several setter methods for process module, like skip-fork-call, etc.
 }

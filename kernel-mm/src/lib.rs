@@ -2,15 +2,12 @@
 
 extern crate alloc;
 
-/// No-op kprintln for test builds (the real macro lives in the kernel crate).
-#[cfg(test)]
+/// Real macros injected by the kernel or dummy implementations for mm testing
 #[macro_export]
 macro_rules! kprintln {
     ($($arg:tt)*) => {};
 }
 
-/// No-op klog for test builds (the real macro lives in the kernel crate).
-#[cfg(test)]
 #[macro_export]
 macro_rules! klog {
     ($($arg:tt)*) => {};

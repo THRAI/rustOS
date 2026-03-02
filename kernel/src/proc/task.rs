@@ -53,6 +53,7 @@ impl TaskState {
 // ---------------------------------------------------------------------------
 
 /// A process / task.
+//TODO: can we group fields into different groups, like mm, proc, etc.
 pub struct Task {
     /// Process ID (unique, monotonic).
     pub pid: u32,
@@ -98,6 +99,7 @@ fn alloc_kstack() -> (PhysAddr, usize) {
     (base, sp)
 }
 
+// TODO: consider extract some methods from other modules here to ease syscall implementation
 impl Task {
     /// Create a new task with the given parent.
     pub fn new(parent: Weak<Task>) -> Arc<Self> {

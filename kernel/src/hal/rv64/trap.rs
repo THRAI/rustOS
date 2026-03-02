@@ -90,8 +90,11 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                 let syscall_num = frame.arg(7);
                 dispatch_syscall(frame, syscall_num);
             }
-            EXC_LOAD_ACCESS_FAULT | EXC_STORE_ACCESS_FAULT |
-            EXC_INST_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => {
+            EXC_LOAD_ACCESS_FAULT
+            | EXC_STORE_ACCESS_FAULT
+            | EXC_INST_PAGE_FAULT
+            | EXC_LOAD_PAGE_FAULT
+            | EXC_STORE_PAGE_FAULT => {
                 // Check pcb_onfault for exception fixup (copy_user path)
                 let pc = crate::executor::per_cpu::current();
                 let onfault = pc.pcb_onfault.load(Ordering::Relaxed);
@@ -220,8 +223,8 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
             // Stub: return newfd
             a1
         }
-        SYS_FCNTL => 0,   // stub success
-        SYS_IOCTL => 0,   // stub success
+        SYS_FCNTL => 0, // stub success
+        SYS_IOCTL => 0, // stub success
         SYS_MKDIRAT | SYS_UNLINKAT | SYS_LINKAT => {
             (-38isize) as usize // ENOSYS — read-only FS
         }
@@ -232,7 +235,14 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
             // here we just record the syscall args and return -EAGAIN
             // to signal the executor to handle it asynchronously.
             // For synchronous stub: return fd 3+ or error
-            klog!(syscall, debug, "openat(dirfd={}, path={:#x}, flags={:#x})", a0 as isize, a1, a2);
+            klog!(
+                syscall,
+                debug,
+                "openat(dirfd={}, path={:#x}, flags={:#x})",
+                a0 as isize,
+                a1,
+                a2
+            );
             (-38isize) as usize // handled async by executor
         }
         SYS_CLOSE => {
@@ -250,7 +260,14 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
         }
         SYS_READ => {
             // a0=fd, a1=buf, a2=count — async, handled by executor
-            klog!(syscall, debug, "read(fd={}, buf={:#x}, count={})", a0, a1, a2);
+            klog!(
+                syscall,
+                debug,
+                "read(fd={}, buf={:#x}, count={})",
+                a0,
+                a1,
+                a2
+            );
             (-38isize) as usize // handled async by executor
         }
         SYS_WRITE => {
@@ -318,16 +335,16 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
             if a1 != 0 {
                 let ts = a1 as *mut u64;
                 unsafe {
-                    ts.write(0);          // tv_sec
-                    ts.add(1).write(0);   // tv_nsec
+                    ts.write(0); // tv_sec
+                    ts.add(1).write(0); // tv_nsec
                 }
             }
             0
         }
         SYS_SCHED_YIELD => 0,
-        SYS_KILL => 0,          // stub
-        SYS_SIGACTION => 0,     // stub
-        SYS_SIGPROCMASK => 0,   // stub
+        SYS_KILL => 0,        // stub
+        SYS_SIGACTION => 0,   // stub
+        SYS_SIGPROCMASK => 0, // stub
         SYS_TIMES => {
             // a0 = tms ptr; stub: zero it out
             if a0 != 0 {
@@ -341,30 +358,29 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
         SYS_UNAME => {
             // a0 = utsname ptr (65-byte fields)
             if a0 != 0 {
-                let buf = a0 as *mut u8;
-                unsafe {
-                    core::ptr::write_bytes(buf, 0, 65 * 6);
-                    // sysname
-                    let sysname = b"Linux\0";
-                    core::ptr::copy_nonoverlapping(sysname.as_ptr(), buf, sysname.len());
-                    // nodename
-                    let nodename = b"chronix\0";
-                    core::ptr::copy_nonoverlapping(nodename.as_ptr(), buf.add(65), nodename.len());
-                    // release
-                    let release = b"5.10.0\0";
-                    core::ptr::copy_nonoverlapping(release.as_ptr(), buf.add(130), release.len());
-                    // version
-                    let version = b"#1\0";
-                    core::ptr::copy_nonoverlapping(version.as_ptr(), buf.add(195), version.len());
-                    // machine
-                    let machine = b"riscv64\0";
-                    core::ptr::copy_nonoverlapping(machine.as_ptr(), buf.add(260), machine.len());
-                }
+                let buf = unsafe { core::slice::from_raw_parts_mut(a0 as *mut u8, 65 * 6) };
+                buf.fill(0);
+
+                // sysname
+                let sysname = b"Linux\0";
+                buf[0..sysname.len()].copy_from_slice(sysname);
+                // nodename
+                let nodename = b"chronix\0";
+                buf[65..65 + nodename.len()].copy_from_slice(nodename);
+                // release
+                let release = b"5.10.0\0";
+                buf[130..130 + release.len()].copy_from_slice(release);
+                // version
+                let version = b"#1\0";
+                buf[195..195 + version.len()].copy_from_slice(version);
+                // machine
+                let machine = b"riscv64\0";
+                buf[260..260 + machine.len()].copy_from_slice(machine);
             }
             0
         }
-        SYS_GETPID => 1,    // stub: always pid 1 for init
-        SYS_GETPPID => 0,   // init has no parent
+        SYS_GETPID => 1,  // stub: always pid 1 for init
+        SYS_GETPPID => 0, // init has no parent
         SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 0,
         SYS_BRK => {
             // a0 = new brk address (0 = query current)
@@ -375,7 +391,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
                 a0 // accept any brk
             }
         }
-        SYS_MUNMAP => 0,    // stub success
+        SYS_MUNMAP => 0, // stub success
         SYS_CLONE => {
             // Stub: return 0 (child) — real fork handled by executor
             klog!(syscall, debug, "clone(flags={:#x})", a0);
@@ -403,7 +419,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, syscall_num: usize) {
                 addr
             }
         }
-        SYS_MPROTECT => 0,  // stub success
+        SYS_MPROTECT => 0, // stub success
         SYS_WAIT4 => {
             // a0=pid, a1=wstatus, a2=options — async, handled by executor
             klog!(syscall, debug, "wait4(pid={})", a0 as isize);

@@ -1,1 +1,2 @@
+echo "hi"
 /bin/busybox echo hello | /bin/busybox cat | /bin/busybox wc -l

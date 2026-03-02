@@ -9,7 +9,7 @@ use hal_common::Errno;
 
 use super::dentry;
 use super::delegate;
-use super::vnode::{Ext4Vnode, Vnode, VnodeId, VnodeType};
+use super::vnode::{Ext4Vnode, Vnode, VnodeType};
 
 /// Root inode number for ext4.
 const EXT4_ROOT_INO: u32 = 2;

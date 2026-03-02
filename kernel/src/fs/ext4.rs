@@ -5,11 +5,9 @@
 //! Metadata queries (`stat`, `exists`) use the native C APIs
 //! (`ext4_raw_inode_fill`, `ext4_inode_exist`) instead of file-open hacks.
 
-use lwext4_rust::bindings::{
-    self, ext4_dir, ext4_direntry, ext4_inode, EOK, ENOENT,
-};
-use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
 use super::lwext4_disk::Disk;
+use lwext4_rust::bindings::{self, ext4_dir, ext4_direntry, ext4_inode, EOK};
+use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
 
 // SAFETY: All lwext4 access is serialized through the delegate task.
 unsafe impl Send for Disk {}
@@ -67,13 +65,12 @@ pub mod flags {
 /// Mount the ext4 filesystem from VirtIO-blk.
 pub fn mount() -> Result<(), i32> {
     let disk = Disk::new();
-    let bw = Ext4BlockWrapper::<Disk>::new(disk, "/", "ext4_fs")
-        .map_err(|e| {
-            klog!(fs, error, "ext4 mount failed: {}", e);
-            -5
-        })?;
+    let bw = Ext4BlockWrapper::<Disk>::new(disk, "/", "ext4_fs").map_err(|e| {
+        klog!(fs, error, "ext4 mount failed: {}", e);
+        -5
+    })?;
     EXT4_BW.call_once(|| hal_common::SpinMutex::new(SendSyncBW(bw)));
-    klog!(fs, info, "lwext4 mounted at /");
+    crate::kprintln!("lwext4 mounted at /");
     Ok(())
 }
 
@@ -154,12 +151,8 @@ pub fn exists(_tok: &mut DelegateToken, path: &str) -> bool {
 pub fn dir_open(_tok: &mut DelegateToken, path: &str) -> Result<ext4_dir, i32> {
     let cpath = path_to_cstr(path);
     let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
-    let rc = unsafe {
-        bindings::ext4_dir_open(
-            &mut dir,
-            cpath.as_ptr() as *const core::ffi::c_char,
-        )
-    };
+    let rc =
+        unsafe { bindings::ext4_dir_open(&mut dir, cpath.as_ptr() as *const core::ffi::c_char) };
     if rc != EOK as i32 {
         return Err(-(rc.abs()));
     }

@@ -18,3 +18,7 @@ scripts/*.S
 *.txt
 scripts/sdcard-rv.img
 scripts/sdcard-la.img
+*.log
+*.bin
+*.expect
+*.img

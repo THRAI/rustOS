@@ -3,11 +3,11 @@
 //! Bridges the MI VM subsystem (VmMap, VmObject, fault handler) and
 //! the hardware Sv39 page tables. API matches BLACKBOX §4.3.
 
-pub mod pte;
-pub mod walk;
 pub mod asid;
+pub mod pte;
 pub mod shootdown;
 pub mod test_integration;
+pub mod walk;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use self::pte::{
-    PteFlags, encode_pte, pte_pa, pte_flags, pte_is_valid, pte_is_leaf, map_perm_to_pte_flags,
+    encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa, PteFlags,
 };
 use super::vm::vm_map::MapPerm;
 
@@ -94,8 +94,8 @@ impl Pmap {
 pub fn pmap_create() -> Pmap {
     #[cfg(target_arch = "riscv64")]
     let (root, extra_pt) = {
-        let frame = super::allocator::frame_alloc_sync()
-            .expect("pmap_create: out of memory for root PT");
+        let frame =
+            super::allocator::frame_alloc_sync().expect("pmap_create: out of memory for root PT");
         pmap_zero_page(frame);
 
         // Identity-map kernel RAM as a 1GB Sv39 gigapage at root entry 2.
@@ -105,11 +105,18 @@ pub fn pmap_create() -> Pmap {
         let root_ptr = frame.as_usize() as *mut u64;
         let kernel_giga_pte = pte::encode_pte(
             0x8000_0000,
-            pte::PteFlags::V | pte::PteFlags::R | pte::PteFlags::W | pte::PteFlags::X
-                | pte::PteFlags::A | pte::PteFlags::D | pte::PteFlags::G,
+            pte::PteFlags::V
+                | pte::PteFlags::R
+                | pte::PteFlags::W
+                | pte::PteFlags::X
+                | pte::PteFlags::A
+                | pte::PteFlags::D
+                | pte::PteFlags::G,
         );
         // Root entry index 2 covers VA 0x8000_0000..0xBFFF_FFFF
-        unsafe { root_ptr.add(2).write(kernel_giga_pte); }
+        unsafe {
+            root_ptr.add(2).write(kernel_giga_pte);
+        }
 
         // Map MMIO region (UART 0x1000_0000, virtio 0x1000_8000) via a
         // level-1 page table under root entry 0 (VA 0..0x3FFF_FFFF).
@@ -121,26 +128,42 @@ pub fn pmap_create() -> Pmap {
 
         // Root entry 0: non-leaf PTE pointing to L1 table
         let root0_pte = pte::encode_pte(l1_frame.as_usize(), pte::PteFlags::V);
-        unsafe { root_ptr.add(0).write(root0_pte); }
+        unsafe {
+            root_ptr.add(0).write(root0_pte);
+        }
 
         // L1 entry 128: 2MB megapage at 0x1000_0000 (UART + virtio-blk)
         // index = 0x1000_0000 >> 21 = 0x80 = 128
         let mmio_mega_pte = pte::encode_pte(
             0x1000_0000,
-            pte::PteFlags::V | pte::PteFlags::R | pte::PteFlags::W
-                | pte::PteFlags::A | pte::PteFlags::D | pte::PteFlags::G,
+            pte::PteFlags::V
+                | pte::PteFlags::R
+                | pte::PteFlags::W
+                | pte::PteFlags::A
+                | pte::PteFlags::D
+                | pte::PteFlags::G,
         );
-        unsafe { l1_ptr.add(128).write(mmio_mega_pte); }
+        unsafe {
+            l1_ptr.add(128).write(mmio_mega_pte);
+        }
 
         // PLIC MMIO: 0x0C00_0000..0x0C40_0000 (priority regs + claim/complete).
         // L1 index 96 = 0x0C00_0000 >> 21, index 97 = 0x0C20_0000 >> 21.
         // Without this, any external interrupt while a user pmap is active
         // causes a kernel page fault when reading the PLIC claim register.
-        let plic_flags = pte::PteFlags::V | pte::PteFlags::R | pte::PteFlags::W
-            | pte::PteFlags::A | pte::PteFlags::D | pte::PteFlags::G;
+        let plic_flags = pte::PteFlags::V
+            | pte::PteFlags::R
+            | pte::PteFlags::W
+            | pte::PteFlags::A
+            | pte::PteFlags::D
+            | pte::PteFlags::G;
         unsafe {
-            l1_ptr.add(96).write(pte::encode_pte(0x0C00_0000, plic_flags));
-            l1_ptr.add(97).write(pte::encode_pte(0x0C20_0000, plic_flags));
+            l1_ptr
+                .add(96)
+                .write(pte::encode_pte(0x0C00_0000, plic_flags));
+            l1_ptr
+                .add(97)
+                .write(pte::encode_pte(0x0C20_0000, plic_flags));
         }
 
         (frame, l1_frame)
@@ -200,13 +223,11 @@ pub fn pmap_enter(
     }
 
     unsafe {
-        let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.as_usize(),
-            va.as_usize(),
-            true,
-            &mut || pmap.alloc_pt_page(),
-        )
-        .ok_or(())?;
+        let pte_ptr =
+            walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va.as_usize(), true, &mut || {
+                pmap.alloc_pt_page()
+            })
+            .ok_or(())?;
 
         let old = pte_ptr.read_volatile();
         let was_valid = pte_is_valid(old);
@@ -245,12 +266,9 @@ pub fn pmap_remove(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr) {
     let mut va = va_start.as_usize();
     while va < va_end.as_usize() {
         unsafe {
-            if let Some(pte_ptr) = walk::walk::<SV39_LEVELS>(
-                pmap.root.as_usize(),
-                va,
-                false,
-                &mut || None,
-            ) {
+            if let Some(pte_ptr) =
+                walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va, false, &mut || None)
+            {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) {
                     pte_ptr.write_volatile(0);
@@ -284,12 +302,9 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
     let mut va = va_start.as_usize();
     while va < va_end.as_usize() {
         unsafe {
-            if let Some(pte_ptr) = walk::walk::<SV39_LEVELS>(
-                pmap.root.as_usize(),
-                va,
-                false,
-                &mut || None,
-            ) {
+            if let Some(pte_ptr) =
+                walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va, false, &mut || None)
+            {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) && pte_is_leaf(old) {
                     let pa = pte_pa(old);
@@ -317,12 +332,8 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
 /// Translate a virtual address to a physical address.
 pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
     unsafe {
-        let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.as_usize(),
-            va.as_usize(),
-            false,
-            &mut || None,
-        )?;
+        let pte_ptr =
+            walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va.as_usize(), false, &mut || None)?;
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) && pte_is_leaf(raw) {
             Some(PhysAddr::new(pte_pa(raw) | va.page_offset()))
@@ -336,15 +347,14 @@ pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
 /// Returns None if the page is not mapped (no valid leaf PTE).
 pub fn pmap_extract_with_flags(pmap: &Pmap, va: VirtAddr) -> Option<(PhysAddr, PteFlags)> {
     unsafe {
-        let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.as_usize(),
-            va.as_usize(),
-            false,
-            &mut || None,
-        )?;
+        let pte_ptr =
+            walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va.as_usize(), false, &mut || None)?;
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) && pte_is_leaf(raw) {
-            Some((PhysAddr::new(pte_pa(raw) | va.page_offset()), pte_flags(raw)))
+            Some((
+                PhysAddr::new(pte_pa(raw) | va.page_offset()),
+                pte_flags(raw),
+            ))
         } else {
             None
         }
@@ -367,9 +377,7 @@ pub fn pmap_activate(pmap: &mut Pmap) {
     pmap.active[cpu_id].store(true, Ordering::Release);
 
     // satp = Mode(8=Sv39) | ASID | PPN
-    let satp: usize = (8usize << 60)
-        | ((pmap.asid as usize) << 44)
-        | (pmap.root.as_usize() >> 12);
+    let satp: usize = (8usize << 60) | ((pmap.asid as usize) << 44) | (pmap.root.as_usize() >> 12);
 
     unsafe {
         core::arch::asm!(
@@ -391,15 +399,13 @@ pub fn pmap_deactivate(pmap: &mut Pmap) {
 /// Returns true if the fault was resolved (PTE updated), false otherwise.
 pub fn pmap_fault(pmap: &Pmap, va: VirtAddr, write: bool) -> bool {
     unsafe {
-        let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.as_usize(),
-            va.as_usize(),
-            false,
-            &mut || None,
-        ) {
-            Some(p) => p,
-            None => return false,
-        };
+        let pte_ptr =
+            match walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va.as_usize(), false, &mut || {
+                None
+            }) {
+                Some(p) => p,
+                None => return false,
+            };
         let raw = pte_ptr.read_volatile();
         if !pte_is_valid(raw) || !pte_is_leaf(raw) {
             return false;
@@ -454,10 +460,8 @@ pub fn pmap_zero_page(pa: PhysAddr) {
 
 /// Copy PAGE_SIZE bytes from src to dst (identity-mapped).
 pub fn pmap_copy_page(src: PhysAddr, dst: PhysAddr) {
-    let s = src.as_usize() as *const u8;
-    let d = dst.as_usize() as *mut u8;
     unsafe {
-        core::ptr::copy_nonoverlapping(s, d, PAGE_SIZE);
+        dst.as_mut_slice().copy_from_slice(src.as_slice());
     }
 }
 
@@ -479,15 +483,13 @@ pub fn pmap_enter_range(pmap: &mut Pmap, pa_start: usize, pa_end: usize, prot: M
 
 fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
     unsafe {
-        let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.as_usize(),
-            va.as_usize(),
-            false,
-            &mut || None,
-        ) {
-            Some(p) => p,
-            None => return false,
-        };
+        let pte_ptr =
+            match walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va.as_usize(), false, &mut || {
+                None
+            }) {
+                Some(p) => p,
+                None => return false,
+            };
         let raw = pte_ptr.read_volatile();
         pte_is_valid(raw) && pte_flags(raw).contains(bit)
     }
@@ -495,15 +497,13 @@ fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
 
 fn pte_bit_clear(pmap: &mut Pmap, va: VirtAddr, bit: PteFlags) {
     unsafe {
-        let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.as_usize(),
-            va.as_usize(),
-            false,
-            &mut || None,
-        ) {
-            Some(p) => p,
-            None => return,
-        };
+        let pte_ptr =
+            match walk::walk::<SV39_LEVELS>(pmap.root.as_usize(), va.as_usize(), false, &mut || {
+                None
+            }) {
+                Some(p) => p,
+                None => return,
+            };
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) {
             let flags = pte_flags(raw) & !bit;

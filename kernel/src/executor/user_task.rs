@@ -2939,7 +2939,10 @@ pub(crate) fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitSta
     // In autotest flow, init exits after all test commands finish.
     // Power off QEMU so the judge can collect results.
     if task.pid == 1 {
-        crate::hal::rv64::sbi::shutdown();
+        #[cfg(feature = "autotest")]
+        {
+            crate::hal::rv64::sbi::shutdown();
+        }
     }
 }
 

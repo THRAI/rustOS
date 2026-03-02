@@ -26,10 +26,15 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EM_RISCV: u16 = 243;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
+
+/// 动态链接器加载的固定偏移地址（参考 Chronix: 0x20_0000_0000）
+const DL_INTERP_OFFSET: usize = 0x20_0000_0000;
 
 /// User stack size: 64KB.
 const USER_STACK_SIZE: usize = 64 * 1024;
@@ -87,8 +92,8 @@ fn parse_elf_header(buf: &[u8]) -> Result<&Elf64Header, Errno> {
     if hdr.e_ident[4] != ELFCLASS64 || hdr.e_ident[5] != ELFDATA2LSB {
         return Err(Errno::ENOEXEC);
     }
-    // Must be executable, RISC-V
-    if hdr.e_type != ET_EXEC || hdr.e_machine != EM_RISCV {
+    // Must be executable or shared object (PIE), RISC-V
+    if (hdr.e_type != ET_EXEC && hdr.e_type != ET_DYN) || hdr.e_machine != EM_RISCV {
         return Err(Errno::ENOEXEC);
     }
     Ok(hdr)
@@ -155,7 +160,28 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     };
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
-    let entry = elf_hdr.e_entry as usize;
+
+    // PIE: ET_DYN 需要一个加载基址，ET_EXEC 基址为 0
+    let load_bias: usize = if elf_hdr.e_type == ET_DYN { 0x0 } else { 0x0 };
+    let entry = elf_hdr.e_entry as usize + load_bias;
+
+    // 扫描 PT_INTERP，获取动态链接器路径
+    let mut interp_path: Option<alloc::string::String> = None;
+    for phdr in phdrs {
+        if phdr.p_type == PT_INTERP {
+            let off = phdr.p_offset as usize;
+            let sz = phdr.p_filesz as usize;
+            if off + sz <= PAGE_SIZE {
+                let bytes = &hdr_buf[off..off + sz];
+                // 去掉末尾 NUL
+                let s = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+                if let Ok(p) = core::str::from_utf8(s) {
+                    interp_path = Some(alloc::string::String::from(p));
+                }
+            }
+            break;
+        }
+    }
 
     // 3. Reset vm_map and pmap: tear down old address space
     {
@@ -181,8 +207,8 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             continue;
         }
 
-        let va_start = (phdr.p_vaddr as usize) & !(PAGE_SIZE - 1);
-        let va_end_raw = phdr.p_vaddr as usize + phdr.p_memsz as usize;
+        let va_start = ((phdr.p_vaddr as usize) + load_bias) & !(PAGE_SIZE - 1);
+        let va_end_raw = phdr.p_vaddr as usize + load_bias + phdr.p_memsz as usize;
         let va_end = (va_end_raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         let prot = elf_flags_to_prot(phdr.p_flags);
@@ -222,6 +248,23 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 
     // Set initial brk to end of last PT_LOAD segment (page-aligned)
     task.brk.store(brk_end, core::sync::atomic::Ordering::Relaxed);
+
+    // 4b. 如果有动态链接器 (PT_INTERP)，加载它并以其 entry 为入口
+    let final_entry = if let Some(ref ipath) = interp_path {
+        klog!(exec, debug, "exec pid={} loading interp={}", task.pid, ipath);
+        match load_interp(task, ipath, DL_INTERP_OFFSET).await {
+            Ok(interp_entry) => {
+                klog!(exec, debug, "exec pid={} interp entry={:#x}", task.pid, interp_entry);
+                interp_entry
+            }
+            Err(e) => {
+                klog!(exec, error, "exec pid={} failed to load interp {}: {:?}", task.pid, ipath, e);
+                return Err(e);
+            }
+        }
+    } else {
+        entry
+    };
 
     // 5. Create user stack VMA (anonymous, RW)
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
@@ -266,8 +309,72 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     // synchronous signals like SIGSEGV must be deliverable)
     task.signals.blocked.store(0, core::sync::atomic::Ordering::Relaxed);
 
-    klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, entry, USER_STACK_TOP);
-    Ok((entry, USER_STACK_TOP))
+    klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, final_entry, USER_STACK_TOP);
+    Ok((final_entry, USER_STACK_TOP))
+}
+
+// ---------------------------------------------------------------------------
+// load_interp: 将动态链接器 ELF 加载到 offset 偏移处
+// ---------------------------------------------------------------------------
+async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Result<usize, Errno> {
+    let vnode = path::resolve(interp_path).await?;
+    if vnode.vtype() != VnodeType::Regular {
+        return Err(Errno::ENOEXEC);
+    }
+
+    let hdr_pa = match crate::fs::delegate::fs_read_page(vnode.path(), 0).await {
+        Ok(pa) => {
+            let pa = PhysAddr::new(pa);
+            crate::fs::page_cache::complete(vnode.vnode_id(), 0, pa);
+            pa
+        }
+        Err(_) => return Err(Errno::ENOEXEC),
+    };
+
+    let hdr_buf = unsafe {
+        core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE)
+    };
+    let elf_hdr = parse_elf_header(hdr_buf)?;
+    let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
+    let interp_entry = elf_hdr.e_entry as usize + offset;
+
+    for phdr in phdrs {
+        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+            continue;
+        }
+
+        let va_start = ((phdr.p_vaddr as usize) + offset) & !(PAGE_SIZE - 1);
+        let va_end_raw = phdr.p_vaddr as usize + offset + phdr.p_memsz as usize;
+        let va_end = (va_end_raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        let prot = elf_flags_to_prot(phdr.p_flags);
+        let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
+        let va_adjust = (phdr.p_vaddr as usize + offset) - va_start;
+        let file_size_in_vma = if phdr.p_filesz > 0 {
+            phdr.p_filesz as u64 + va_adjust as u64
+        } else {
+            0
+        };
+
+        let obj_size = (va_end - va_start) / PAGE_SIZE;
+        let obj = VmObject::new(obj_size);
+        let vma = VmArea::new_file_backed(
+            VirtAddr::new(va_start)..VirtAddr::new(va_end),
+            prot,
+            obj,
+            0,
+            Arc::clone(&vnode) as Arc<dyn Vnode>,
+            file_offset_page_aligned as u64,
+            file_size_in_vma,
+        );
+
+        let mut vm = task.vm_map.lock();
+        if vm.insert(vma).is_err() {
+            return Err(Errno::ENOMEM);
+        }
+    }
+
+    Ok(interp_entry)
 }
 
 // ---------------------------------------------------------------------------

@@ -1003,11 +1003,24 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
                 Err(e) => return set_syscall_ret(task, (-(e.as_i32() as isize)) as usize),
             };
             // Read argv array from user memory (before exec destroys address space)
-            let argv = copyin_argv(task, a1, 64, 4096).await;
+            let mut argv = copyin_argv(task, a1, 64, 4096).await;
             // Read envp array (optional, musl can cope with empty)
             let envp = copyin_argv(task, a2, 64, 4096).await;
 
-            match crate::proc::exec::exec_with_args(task, &path, &argv, &envp).await {
+            // .sh 脚本：参考 Chronix，重定向到 busybox sh 执行
+            let exec_path = if path.ends_with(".sh") {
+                #[cfg(feature = "autotest")]
+                let busybox = alloc::string::String::from("/riscv/musl/busybox");
+                #[cfg(not(feature = "autotest"))]
+                let busybox = alloc::string::String::from("/bin/busybox");
+                argv.insert(0, busybox.clone());
+                argv.insert(1, alloc::string::String::from("sh"));
+                busybox
+            } else {
+                path.clone()
+            };
+
+            match crate::proc::exec::exec_with_args(task, &exec_path, &argv, &envp).await {
                 Ok((entry, sp)) => {
                     let mut tf = task.trap_frame.lock();
                     tf.sepc = entry;

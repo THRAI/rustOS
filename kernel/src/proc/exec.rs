@@ -37,6 +37,12 @@ const DL_INTERP_OFFSET: usize = 0x20_0000_0000;
 
 /// User stack size: 64KB.
 const USER_STACK_SIZE: usize = 64 * 1024;
+/// Bridges `fs::vnode::Vnode` → `mm::vm::vm_map::Vnode` (two separate traits).
+struct VnodeWrapper(Arc<dyn crate::fs::vnode::Vnode>);
+impl crate::mm::vm::vm_map::Vnode for VnodeWrapper {
+    fn vnode_id(&self) -> u64 { self.0.vnode_id() }
+    fn path(&self) -> &str { self.0.path() }
+}
 /// User stack top address (just below kernel space).
 const USER_STACK_TOP: usize = 0x0000_003F_FFFF_F000;
 
@@ -234,7 +240,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             prot,
             obj,
             0,
-            Arc::clone(&vnode) as Arc<dyn Vnode>,
+            Arc::new(VnodeWrapper(Arc::clone(&vnode))),
             file_offset_page_aligned as u64,
             file_size_in_vma,
         );
@@ -308,10 +314,10 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         }
     }
     // Clear pending signals on exec
-    task.signals.pending.store(0, core::sync::atomic::Ordering::Relaxed);
+    task.signals.pending.store(super::signal::SigSet(0), core::sync::atomic::Ordering::Relaxed);
     // Clear blocked signal mask on exec (POSIX: signal mask preserved, but
     // synchronous signals like SIGSEGV must be deliverable)
-    task.signals.blocked.store(0, core::sync::atomic::Ordering::Relaxed);
+    task.signals.blocked.store(super::signal::SigSet(0), core::sync::atomic::Ordering::Relaxed);
 
     klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, final_entry, USER_STACK_TOP);
     Ok((final_entry, USER_STACK_TOP))
@@ -367,7 +373,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
             prot,
             obj,
             0,
-            Arc::clone(&vnode) as Arc<dyn Vnode>,
+            Arc::new(VnodeWrapper(Arc::clone(&vnode))),
             file_offset_page_aligned as u64,
             file_size_in_vma,
         );

@@ -36,6 +36,10 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
         let parent_fds = parent.fd_table.lock();
         *child.fd_table.lock() = parent_fds.fork();
     }
+    {
+        let parent_cwd = parent.cwd.lock().clone();
+        *child.cwd.lock() = parent_cwd;
+    }
 
     // Copy parent's trap frame (child resumes past the ecall).
     // Child gets return value 0 in a0 (fork convention).

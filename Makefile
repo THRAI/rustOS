@@ -49,7 +49,7 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest run-rv64 run-oscomp sdcard-rv debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
+.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
@@ -94,27 +94,37 @@ run-oscomp: kernel-rv
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc
 
-# 用官方 Docker 容器编译所有测试程序并打包成 ext4 镜像
-TESTSUITS_DIR := $(shell cd .. && pwd)/testsuits-for-oskernel
-CHRONIX_DIR   := $(shell cd .. && pwd)/Chronix
-DOCKER_IMG := docker.educg.net/cg/os-contest:20250614
+OSCOMP_SRC := $(CURDIR)/scripts/oscomp
+OSCOMP_TC := $(CURDIR)/testcase
+OSCOMP_RUN := $(OSCOMP_SRC)/run-rv-oj.sh
 
-# 直接复用 Chronix 的 testcase.tar.xz + fs.mk 构建磁盘镜像（需要 sudo 挂载）
+# 便捷目标：一条命令完成构建镜像 + 运行
+# make oscomp        → 全量测试
+# make oscomp-basic  → 仅跑 basic 测试
+oscomp: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-oj.sh
+oscomp: sdcard-rv run-oscomp
+
+oscomp-basic: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-basic.sh
+oscomp-basic: sdcard-rv run-oscomp
+
+
 sdcard-rv:
-	@echo "=== 解压 Chronix testcase ==="
-	cd $(CHRONIX_DIR) && chmod +x scripts/archive.sh && ./scripts/archive.sh extract
-	@echo "=== 构建 4G ext4 磁盘镜像 ==="
+	@test -d $(OSCOMP_TC) || (echo "missing $(OSCOMP_TC)"; exit 1)
+	@test -f $(OSCOMP_RUN) || (echo "missing $(OSCOMP_RUN)"; exit 1)
 	rm -f scripts/sdcard-rv.img
 	dd if=/dev/zero of=scripts/sdcard-rv.img bs=1M count=512
 	mkfs.ext4 -F -O ^metadata_csum_seed scripts/sdcard-rv.img
 	mkdir -p scripts/mnt
 	sudo mount scripts/sdcard-rv.img scripts/mnt
-	sudo cp -r $(CHRONIX_DIR)/testcase/* scripts/mnt/
-	sudo cp $(CHRONIX_DIR)/scripts/run-rv-oj.sh scripts/mnt/riscv/run-oj.sh
+	sudo cp -r $(OSCOMP_TC)/* scripts/mnt/
+	sudo cp $(OSCOMP_RUN) scripts/mnt/riscv/run-oj.sh
+	sudo find scripts/mnt -type f -name "*.sh" -exec chmod +x {} \;
+	sudo chmod +x scripts/mnt/riscv/run-oj.sh
 	sudo mkdir -p scripts/mnt/bin scripts/mnt/lib scripts/mnt/lib64 scripts/mnt/etc
-	sudo cp -r $(CHRONIX_DIR)/etc/. scripts/mnt/etc/ 2>/dev/null || true
-	sudo umount scripts/mnt && rmdir scripts/mnt
-	@echo "=== scripts/sdcard-rv.img 已就绪 ==="
+	sudo umount scripts/mnt
+	rmdir scripts/mnt
+	@echo "=== scripts/sdcard-rv.img ready ==="
+
 
 # GDB debug: halt on start, GDB server on port 1234
 debug-rv64: kernel-rv64

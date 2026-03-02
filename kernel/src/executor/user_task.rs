@@ -6,6 +6,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -44,6 +45,7 @@ impl SyscallId {
     const DUP: Self = Self(23);
     const DUP3: Self = Self(24);
     const IOCTL: Self = Self(29);
+    const CHDIR: Self = Self(49);
     const OPENAT: Self = Self(56);
     const CLOSE: Self = Self(57);
     const GETDENTS64: Self = Self(61);
@@ -98,6 +100,7 @@ impl core::fmt::Display for SyscallId {
             Self::DUP => "dup",
             Self::DUP3 => "dup3",
             Self::IOCTL => "ioctl",
+            Self::CHDIR => "chdir",
             Self::OPENAT => "openat",
             Self::CLOSE => "close",
             Self::GETDENTS64 => "getdents64",
@@ -162,6 +165,9 @@ enum TrapResult {
     /// Process has exited.
     Exit,
 }
+
+/// Linux special dirfd value: use current working directory.
+const AT_FDCWD: isize = -100;
 
 /// The persistent trap loop for a user process.
 async fn run_tasks(task: Arc<Task>) {
@@ -929,8 +935,15 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         }
         SyscallId::OPENAT => {
             // a0=dirfd, a1=pathname, a2=flags, a3=mode
-            match sys_openat_async(task, a1, a2).await {
+            match sys_openat_async(task, a0 as isize, a1, a2).await {
                 Ok(fd) => fd as usize,
+                Err(e) => (-(e.as_i32() as isize)) as usize,
+            }
+        }
+        SyscallId::CHDIR => {
+            // a0=pathname
+            match sys_chdir_async(task, a0).await {
+                Ok(()) => 0,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
         }
@@ -981,9 +994,13 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         SyscallId::EXECVE => {
             // a0=pathname, a1=argv, a2=envp
             // Read pathname from user memory
-            let path = match copyinstr(task, a0, 256).await {
+            let raw_path = match copyinstr(task, a0, 256).await {
                 Some(s) => s,
                 None => return set_syscall_ret(task, (-(Errno::EFAULT.as_i32() as isize)) as usize),
+            };
+            let path = match absolutize_path(task, AT_FDCWD, &raw_path) {
+                Ok(p) => p,
+                Err(e) => return set_syscall_ret(task, (-(e.as_i32() as isize)) as usize),
             };
             // Read argv array from user memory (before exec destroys address space)
             let argv = copyin_argv(task, a1, 64, 4096).await;
@@ -1029,7 +1046,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
         }
         SyscallId::FSTATAT => {
             // a0=dirfd, a1=pathname, a2=statbuf, a3=flags
-            match sys_fstatat_async(task, a1, a2).await {
+            match sys_fstatat_async(task, a0 as isize, a1, a2).await {
                 Ok(()) => 0,
                 Err(e) => (-(e.as_i32() as isize)) as usize,
             }
@@ -1321,6 +1338,7 @@ fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
 /// sys_fstatat: stat a file by path (relative to dirfd).
 async fn sys_fstatat_async(
     task: &Arc<Task>,
+    dirfd: isize,
     pathname_ptr: usize,
     statbuf: usize,
 ) -> Result<(), Errno> {
@@ -1328,7 +1346,8 @@ async fn sys_fstatat_async(
         return Err(Errno::EFAULT);
     }
 
-    let path_str = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path_str = absolutize_path(task, dirfd, &raw_path)?;
 
     // Resolve the path to a vnode
     let vnode = crate::fs::path::resolve(&path_str).await?;
@@ -2180,8 +2199,20 @@ fn sys_fcntl(
 }
 
 // ---------------------------------------------------------------------------
-// getcwd
+// chdir / getcwd
 // ---------------------------------------------------------------------------
+
+/// sys_chdir: change current working directory.
+async fn sys_chdir_async(task: &Arc<Task>, pathname_ptr: usize) -> Result<(), Errno> {
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path = absolutize_path(task, AT_FDCWD, &raw_path)?;
+    let vnode = crate::fs::path::resolve(&path).await?;
+    if vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    *task.cwd.lock() = path;
+    Ok(())
+}
 
 /// sys_getcwd: return current working directory.
 fn sys_getcwd(
@@ -2189,17 +2220,19 @@ fn sys_getcwd(
     buf: usize,
     size: usize,
 ) -> Result<usize, Errno> {
-    // We always report "/" as cwd for now
-    let cwd = b"/\0";
-    if size < cwd.len() {
+    let cwd = task.cwd.lock().clone();
+    let needed = cwd.len() + 1;
+    if size < needed {
         return Err(Errno::ERANGE);
     }
     if buf == 0 {
         return Err(Errno::EINVAL);
     }
+    let mut out = cwd.into_bytes();
+    out.push(0);
     let rc = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(
-            buf as *mut u8, cwd.as_ptr(), cwd.len(),
+            buf as *mut u8, out.as_ptr(), out.len(),
         )
     };
     if rc != 0 {
@@ -2353,16 +2386,100 @@ fn sys_pipe2(
     Ok(())
 }
 
+/// Normalize a path to an absolute canonical form.
+/// Collapses duplicate '/', '.' and '..' components.
+fn normalize_absolute_path(path: &str) -> String {
+    let mut comps: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                let _ = comps.pop();
+            }
+            _ => comps.push(comp),
+        }
+    }
+
+    if comps.is_empty() {
+        return String::from("/");
+    }
+
+    let mut out = String::from("/");
+    for (idx, comp) in comps.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        out.push_str(comp);
+    }
+    out
+}
+
+/// Convert a user-provided path to an absolute path with cwd/dirfd semantics.
+fn absolutize_path(task: &Arc<Task>, dirfd: isize, raw_path: &str) -> Result<String, Errno> {
+    if raw_path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    if raw_path.starts_with('/') {
+        return Ok(normalize_absolute_path(raw_path));
+    }
+
+    // Relative path from cwd.
+    if dirfd == AT_FDCWD {
+        let cwd = task.cwd.lock().clone();
+        let mut combined = String::new();
+        if cwd == "/" {
+            combined.push('/');
+            combined.push_str(raw_path);
+        } else {
+            combined.push_str(&cwd);
+            combined.push('/');
+            combined.push_str(raw_path);
+        }
+        return Ok(normalize_absolute_path(&combined));
+    }
+
+    // Relative path from directory fd.
+    if dirfd >= 0 {
+        let base = {
+            let tab = task.fd_table.lock();
+            let desc = tab.get(dirfd as u32).ok_or(Errno::EBADF)?;
+            match &desc.object {
+                crate::fs::fd_table::FileObject::Vnode(v) => {
+                    if v.vtype() != crate::fs::vnode::VnodeType::Directory {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    String::from(v.path())
+                }
+                _ => return Err(Errno::ENOTDIR),
+            }
+        };
+        let mut combined = String::new();
+        if base == "/" {
+            combined.push('/');
+            combined.push_str(raw_path);
+        } else {
+            combined.push_str(&base);
+            combined.push('/');
+            combined.push_str(raw_path);
+        }
+        return Ok(normalize_absolute_path(&combined));
+    }
+
+    Err(Errno::EINVAL)
+}
+
 /// sys_openat: resolve path and open file.
 async fn sys_openat_async(
     task: &Arc<Task>,
+    dirfd: isize,
     pathname_ptr: usize,
     flags: usize,
 ) -> Result<u32, Errno> {
     use crate::fs::fd_table::OpenFlags;
 
     // Read pathname from user memory using fault-safe copyinstr.
-    let path_str = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path_str = absolutize_path(task, dirfd, &raw_path)?;
 
     let open_flags = OpenFlags {
         read: true,
@@ -2628,6 +2745,12 @@ fn do_exit(task: &Arc<Task>, wstatus: i32) {
         if let Some(waker) = parent.top_level_waker.lock().take() {
             waker.wake();
         }
+    }
+
+    // In autotest flow, init exits after all test commands finish.
+    // Power off QEMU so the judge can collect results.
+    if task.pid == 1 {
+        crate::hal::rv64::sbi::shutdown();
     }
 }
 

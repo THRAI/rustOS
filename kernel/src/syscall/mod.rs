@@ -377,14 +377,14 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         }
         SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::EINVAL)),
         SyscallId::OPENAT => {
-            let ret = match io_async::sys_openat_async(task, a0 as isize, a1, a2).await {
+            let ret = match fs::sys_openat_async(task, a0 as isize, a1, a2).await {
                 Ok(fd) => fd as usize,
                 Err(e) => errno_ret(e),
             };
             SyscallAction::Return(ret)
         }
         SyscallId::CHDIR => {
-            let ret = match io_async::sys_chdir_async(task, a0).await {
+            let ret = match fs::sys_chdir_async(task, a0).await {
                 Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };
@@ -464,7 +464,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         }
         SyscallId::FSTATAT => {
-            let ret = match io_async::sys_fstatat_async(task, a0 as isize, a1, a2).await {
+            let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2).await {
                 Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };

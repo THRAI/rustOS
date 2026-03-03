@@ -1,6 +1,6 @@
 //! Asynchronous I/O system calls.
 //!
-//! Implements read, write, readv, writev, openat, chdir, fstatat, ioctl, ppoll.
+//! Implements read, write, readv, writev, ioctl, ppoll.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -14,7 +14,7 @@ use crate::mm::uio::{uiomove, UioDir};
 use crate::mm::vm::fault::PageFaultAccessType;
 use crate::mm::vm::fault_async::{page_cache_fetch_by_id, resolve_user_fault};
 use crate::proc::task::Task;
-use crate::proc::user_copy::{copyinstr, fault_in_user_buffer};
+use crate::proc::user_copy::fault_in_user_buffer;
 
 /// sys_read_async: read from file descriptor.
 pub async fn sys_read_async(
@@ -338,48 +338,6 @@ pub async fn sys_writev_async(
         }
     }
     Ok(total)
-}
-
-/// sys_openat_async: open file relative to directory fd.
-pub async fn sys_openat_async(
-    task: &Arc<Task>,
-    dirfd: isize,
-    pathname_ptr: usize,
-    flags: usize,
-) -> Result<u32, Errno> {
-    use crate::fs::fd_table::OpenFlags;
-
-    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
-    let path_str = super::fs::absolutize_path(task, dirfd, &raw_path)?;
-
-    let open_flags = OpenFlags {
-        read: true,
-        write: (flags & 0x1) != 0 || (flags & 0x2) != 0,
-    };
-
-    crate::fs::syscalls::sys_open(&task.fd_table, &path_str, open_flags).await
-}
-
-/// sys_chdir_async: change current working directory.
-pub async fn sys_chdir_async(task: &Arc<Task>, pathname_ptr: usize) -> Result<(), Errno> {
-    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
-    let path = super::fs::absolutize_path(task, -100, &raw_path)?;
-    let vnode = crate::fs::path::resolve(&path).await?;
-    if vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
-        return Err(Errno::ENOTDIR);
-    }
-    *task.cwd.lock() = path;
-    Ok(())
-}
-
-/// sys_fstatat_async: get file status relative to directory fd.
-pub async fn sys_fstatat_async(
-    task: &Arc<Task>,
-    dirfd: isize,
-    pathname_ptr: usize,
-    statbuf: usize,
-) -> Result<(), Errno> {
-    super::fs::sys_fstatat_async(task, dirfd, pathname_ptr, statbuf).await
 }
 
 /// sys_ioctl_async: device control.

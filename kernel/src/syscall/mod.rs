@@ -276,7 +276,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Continue
         }
         SyscallId::KILL => {
-            let ret = match process::sys_kill(task, a0 as isize, a1 as u8) {
+            let ret = match signal::sys_kill(task, a0 as isize, a1 as u8) {
                 Ok(v) => v,
                 Err(e) => errno_ret(e),
             };
@@ -450,7 +450,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             }
         }
         SyscallId::WAIT4 => {
-            let ret = match crate::proc::syscalls::sys_wait4_async(task, a0 as isize, a1, a2).await {
+            let ret = match process::sys_wait4_async(task, a0 as isize, a1, a2).await {
                 Ok(pid) => pid as usize,
                 Err(e) => errno_ret(e),
             };

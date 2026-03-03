@@ -7,5 +7,4 @@ pub mod fork;
 pub mod exit_wait;
 pub mod exec;
 pub mod signal;
-pub mod syscalls;
 pub mod user_copy;

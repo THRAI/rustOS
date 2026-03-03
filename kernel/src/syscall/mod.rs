@@ -186,7 +186,7 @@ fn should_restart_syscall(task: &Arc<Task>) -> bool {
 /// This function is called from the trap handler in executor/user_task.rs.
 pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> SyscallAction {
     use crate::mm::vm::fault::PageFaultAccessType;
-    use crate::proc::user_copy::{copyin_argv, copyinstr, fault_in_user_buffer};
+    use crate::proc::user_copy::fault_in_user_buffer;
 
     const AT_FDCWD: isize = -100;
 
@@ -391,7 +391,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         }
         SyscallId::CLOSE => {
-            let ret = match crate::fs::syscalls::sys_close(&task.fd_table, a0 as u32) {
+            let ret = match fs::sys_close(task, a0 as u32) {
                 Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };
@@ -422,18 +422,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         }
         SyscallId::CLONE => SyscallAction::Return(process::sys_clone(task)),
         SyscallId::EXECVE => {
-            let raw_path = match copyinstr(task, a0, 256).await {
-                Some(s) => s,
-                None => return SyscallAction::Return(errno_ret(Errno::EFAULT)),
-            };
-            let path = match fs::absolutize_path(task, AT_FDCWD, &raw_path) {
-                Ok(p) => p,
-                Err(e) => return SyscallAction::Return(errno_ret(e)),
-            };
-            let argv = copyin_argv(task, a1, 64, 4096).await;
-            let envp = copyin_argv(task, a2, 64, 4096).await;
-
-            match crate::proc::exec::exec_with_args(task, &path, &argv, &envp).await {
+            match process::sys_execve_async(task, AT_FDCWD, a0, a1, a2).await {
                 Ok((entry, sp)) => {
                     let mut tf = task.trap_frame.lock();
                     tf.sepc = entry;

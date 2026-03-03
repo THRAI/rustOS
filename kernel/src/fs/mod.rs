@@ -8,6 +8,5 @@ pub mod dentry;
 pub mod page_cache;
 pub mod fd_table;
 pub mod path;
-pub mod syscalls;
 pub mod pipe;
 pub mod devfs;

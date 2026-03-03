@@ -64,15 +64,17 @@ pub fn sys_exit(task: &Arc<Task>, status: i32) {
 
 pub async fn sys_execve_async(
     task: &Arc<Task>,
+    dirfd: isize,
     pathname_ptr: usize,
     argv_ptr: usize,
     envp_ptr: usize,
 ) -> Result<(usize, usize), Errno> {
     // Read pathname from user memory
-    let path = match copyinstr(task, pathname_ptr, 256).await {
+    let raw_path = match copyinstr(task, pathname_ptr, 256).await {
         None => return Err(Errno::EFAULT),
         Some(s) => s,
     };
+    let path = super::fs::absolutize_path(task, dirfd, &raw_path)?;
     // Read argv array from user memory (before exec destroys address space)
     let argv = copyin_argv(task, argv_ptr, 64, 4096).await;
     // Read envp array

@@ -1,5 +1,9 @@
 //! File system related system calls.
 
+use crate::fs::delegate;
+use crate::fs::fd_table::{FdFlags, FdTable, FileDescription, FileObject, OpenFlags};
+use crate::fs::page_cache;
+use crate::fs::vnode::VnodeType;
 use hal_common::Errno;
 use crate::mm::vm::fault::PageFaultAccessType;
 use crate::proc::task::Task;
@@ -7,6 +11,8 @@ use crate::proc::user_copy::{copyinstr, fault_in_user_buffer};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use hal_common::PhysAddr;
+use core::sync::atomic::Ordering;
 
 const AT_FDCWD: isize = -100;
 const PAGE_SIZE: usize = 4096;
@@ -33,6 +39,127 @@ struct LinuxStat {
     st_ctime: i64,
     st_ctime_nsec: i64,
     __unused: [i32; 2],
+}
+
+/// Resolve path, create `FileDescription`, and insert into fd table.
+pub async fn open(
+    fd_table: &hal_common::SpinMutex<FdTable>,
+    path_str: &str,
+    flags: OpenFlags,
+) -> Result<u32, Errno> {
+    if let Some(dev_name) = path_str.strip_prefix("/dev/") {
+        let desc = crate::fs::devfs::open_device(dev_name, flags)?;
+        let fd = fd_table.lock().insert(desc, FdFlags::empty())?;
+        return Ok(fd);
+    }
+
+    let vnode = crate::fs::path::resolve(path_str).await?;
+    let desc = FileDescription::new(FileObject::Vnode(vnode), flags);
+    let fd = fd_table.lock().insert(desc, FdFlags::empty())?;
+    Ok(fd)
+}
+
+/// Remove fd from table.
+pub fn close(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(), Errno> {
+    let _desc = fd_table.lock().remove(fd).ok_or(Errno::EBADF)?;
+    Ok(())
+}
+
+/// Get file metadata by fd.
+pub fn stat(fd_table: &hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(u64, u8), Errno> {
+    let table = fd_table.lock();
+    let desc = table.get(fd).ok_or(Errno::EBADF)?;
+    match &desc.object {
+        FileObject::Vnode(vnode) => {
+            let size = vnode.size();
+            let vtype = match vnode.vtype() {
+                VnodeType::Regular => 1u8,
+                VnodeType::Directory => 2u8,
+            };
+            Ok((size, vtype))
+        }
+        FileObject::Device(_) => Ok((0, 3)),
+        FileObject::PipeRead(_) | FileObject::PipeWrite(_) => Ok((0, 4)),
+    }
+}
+
+/// Read from fd into kernel buffer (for kernel-level tests).
+/// This is a simplified path for vnode reads only.
+pub async fn read(
+    fd_table: &hal_common::SpinMutex<FdTable>,
+    fd: u32,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    let (id, path, size, offset, desc) = {
+        let tab = fd_table.lock();
+        let d = tab.get(fd).ok_or(Errno::EBADF)?;
+        match &d.object {
+            FileObject::Vnode(v) => (
+                v.vnode_id(),
+                alloc::string::String::from(v.path()),
+                v.size(),
+                d.offset.load(Ordering::Relaxed),
+                Arc::clone(d),
+            ),
+            _ => return Err(Errno::ENOSYS),
+        }
+    };
+
+    if offset >= size {
+        return Ok(0);
+    }
+    let to_read = core::cmp::min(buf.len(), (size - offset) as usize);
+    let mut total = 0usize;
+
+    while total < to_read {
+        let page_off = (offset + total as u64) / PAGE_SIZE as u64;
+        let in_page = ((offset + total as u64) % PAGE_SIZE as u64) as usize;
+        let chunk = core::cmp::min(PAGE_SIZE - in_page, to_read - total);
+
+        let pa = page_cache_fetch(id, &path, page_off * PAGE_SIZE as u64).await?;
+        unsafe {
+            let src_slice = pa.as_slice();
+            buf[total..total + chunk].copy_from_slice(&src_slice[in_page..in_page + chunk]);
+        }
+        total += chunk;
+    }
+
+    desc.offset.store(offset + total as u64, Ordering::Relaxed);
+    Ok(total)
+}
+
+/// Fetch a page from the page cache (kernel-side helper for `read`).
+async fn page_cache_fetch(vnode_id: u64, path: &str, file_offset: u64) -> Result<PhysAddr, Errno> {
+    use crate::fs::page_cache::LookupResult;
+
+    let page_offset = file_offset / PAGE_SIZE as u64;
+    loop {
+        let noop = noop_waker();
+        match page_cache::lookup(vnode_id, page_offset, &noop) {
+            LookupResult::Hit(pa) => return Ok(pa),
+            LookupResult::InitiateFetch => match delegate::fs_read_page(path, file_offset).await {
+                Ok(pa_usize) => {
+                    let pa = PhysAddr::new(pa_usize);
+                    page_cache::complete(vnode_id, page_offset, pa);
+                    return Ok(pa);
+                }
+                Err(_) => return Err(Errno::EIO),
+            },
+            LookupResult::WaitingOnFetch => {
+                crate::executor::schedule::yield_now().await;
+            }
+        }
+    }
+}
+
+fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone_fn(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, noop, noop, noop);
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
 }
 
 /// sys_lseek: reposition file offset.
@@ -373,8 +500,6 @@ pub async fn sys_openat_async(
     pathname_ptr: usize,
     flags: usize,
 ) -> Result<u32, Errno> {
-    use crate::fs::fd_table::OpenFlags;
-
     // Read pathname from user memory using fault-safe copyinstr.
     let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
@@ -384,7 +509,12 @@ pub async fn sys_openat_async(
         write: (flags & 0x1) != 0 || (flags & 0x2) != 0,
     };
 
-    crate::fs::syscalls::sys_open(&task.fd_table, &path_str, open_flags).await
+    open(&task.fd_table, &path_str, open_flags).await
+}
+
+/// sys_close: close a file descriptor.
+pub fn sys_close(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
+    close(&task.fd_table, fd)
 }
 
 /// Normalize a path to an absolute canonical form.

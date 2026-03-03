@@ -604,21 +604,21 @@ async fn test_vfs_read() {
     let fd_table = hal_common::SpinMutex::new(FdTable::new());
 
     // First read: goes through delegate
-    match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
+    match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
         Ok(fd) => {
             let mut buf = [0u8; 64];
-            match fs::syscalls::sys_read(&fd_table, fd, &mut buf).await {
+            match syscall::fs::read(&fd_table, fd, &mut buf).await {
                 Ok(n) => {
                     let content = core::str::from_utf8(&buf[..n]).unwrap_or("<invalid utf8>");
                     if content.trim_end() == "hello from ext4" {
                         let mut buf2 = [0u8; 64];
                         // Reopen to reset offset
-                        let _ = fs::syscalls::sys_close(&fd_table, fd);
-                        match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY)
+                        let _ = syscall::fs::close(&fd_table, fd);
+                        match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY)
                             .await
                         {
                             Ok(fd2) => {
-                                match fs::syscalls::sys_read(&fd_table, fd2, &mut buf2).await {
+                                match syscall::fs::read(&fd_table, fd2, &mut buf2).await {
                                     Ok(n2) => {
                                         let content2 = core::str::from_utf8(&buf2[..n2])
                                             .unwrap_or("<invalid utf8>");
@@ -633,7 +633,7 @@ async fn test_vfs_read() {
                                     }
                                     Err(_) => kprintln!("vfs read FAIL (cache read err)"),
                                 }
-                                let _ = fs::syscalls::sys_close(&fd_table, fd2);
+                                let _ = syscall::fs::close(&fd_table, fd2);
                             }
                             Err(_) => kprintln!("vfs read FAIL (reopen err)"),
                         }
@@ -857,14 +857,14 @@ async fn test_device_nodes() {
     let fd_table = hal_common::SpinMutex::new(FdTable::new_with_stdio());
 
     // Open /dev/null
-    match fs::syscalls::sys_open(&fd_table, "/dev/null", OpenFlags::RDWR).await {
+    match syscall::fs::open(&fd_table, "/dev/null", OpenFlags::RDWR).await {
         Ok(fd) => {
             // Verify it opened (fd >= 3 since 0,1,2 are stdio)
             if fd < 3 {
                 kprintln!("device nodes FAIL (/dev/null fd={} too low)", fd);
                 return;
             }
-            let _ = fs::syscalls::sys_close(&fd_table, fd);
+            let _ = syscall::fs::close(&fd_table, fd);
         }
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/null open: {:?})", e);
@@ -873,9 +873,9 @@ async fn test_device_nodes() {
     }
 
     // Open /dev/zero
-    match fs::syscalls::sys_open(&fd_table, "/dev/zero", OpenFlags::RDONLY).await {
+    match syscall::fs::open(&fd_table, "/dev/zero", OpenFlags::RDONLY).await {
         Ok(fd) => {
-            let _ = fs::syscalls::sys_close(&fd_table, fd);
+            let _ = syscall::fs::close(&fd_table, fd);
         }
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/zero open: {:?})", e);
@@ -884,9 +884,9 @@ async fn test_device_nodes() {
     }
 
     // Open /dev/console
-    match fs::syscalls::sys_open(&fd_table, "/dev/console", OpenFlags::RDWR).await {
+    match syscall::fs::open(&fd_table, "/dev/console", OpenFlags::RDWR).await {
         Ok(fd) => {
-            let _ = fs::syscalls::sys_close(&fd_table, fd);
+            let _ = syscall::fs::close(&fd_table, fd);
         }
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/console open: {:?})", e);

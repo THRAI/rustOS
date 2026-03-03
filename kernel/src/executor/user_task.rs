@@ -281,31 +281,47 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
 
 /// Spawn a user task on the specified CPU.
 pub fn spawn_user_task(task: Arc<Task>, cpu: usize) {
-    spawn_kernel_task(UserTaskFuture { task }, cpu);
+    //crate::kprintln!("[DEBUG] spawn_user_task pid={} cpu={}", task.pid, cpu);
+    spawn_kernel_task(UserTaskFuture::new(task), cpu).detach();
 }
 
 /// Wrapper future that activates the task's page table on poll.
 struct UserTaskFuture {
     task: Arc<Task>,
+    inner: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl UserTaskFuture {
+    fn new(task: Arc<Task>) -> Self {
+        let t = task.clone();
+        Self {
+            task,
+            inner: Box::pin(run_tasks(t)),
+        }
+    }
 }
 
 impl Future for UserTaskFuture {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        // Activate the task's page table before running.
-        let mut pmap = self.task.pmap.lock();
-        crate::mm::pmap::pmap_activate(&mut pmap);
-        drop(pmap);
+        let this = unsafe { self.get_unchecked_mut() };
+        //crate::kprintln!("[DEBUG] UserTaskFuture::poll pid={}", this.task.pid);
 
-        // Poll the actual task loop.
-        let task = self.task.clone();
-        let mut fut = Box::pin(run_tasks(task));
-        let result = fut.as_mut().poll(cx);
+        // Activate the task's page table before running.
+        {
+            let mut pmap = this.task.pmap.lock();
+            crate::mm::pmap::pmap_activate(&mut pmap);
+        }
+
+        // Poll the persistent inner future.
+        let result = this.inner.as_mut().poll(cx);
 
         // Deactivate the page table after running.
-        let mut pmap = self.task.pmap.lock();
-        crate::mm::pmap::pmap_deactivate(&mut pmap);
+        {
+            let mut pmap = this.task.pmap.lock();
+            crate::mm::pmap::pmap_deactivate(&mut pmap);
+        }
 
         result
     }

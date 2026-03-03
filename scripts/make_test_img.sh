@@ -5,7 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMG="$SCRIPT_DIR/test.img"
-MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
+MKE2FS="$(command -v mke2fs || echo /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)"
 
 if [ -f "$IMG" ]; then
     echo "test.img already exists, skipping"

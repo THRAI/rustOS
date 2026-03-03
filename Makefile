@@ -60,12 +60,12 @@ kernel-rv:
 	cp $(KERNEL_ELF_RV64) kernel-rv
 
 user-rv64:
-	cargo build --release -p user --target $(TARGET_RV64)
-	cp $(USER_ELF_RV64) scripts/initproc
+	cd user && CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-Tsrc/linker.ld" cargo build --release --target $(TARGET_RV64)
+	cp user/target/$(TARGET_RV64)/release/initproc scripts/initproc
 
 user-rv64-autotest:
-	cargo build --release -p user --target $(TARGET_RV64) --features autotest
-	cp $(USER_ELF_RV64) scripts/initproc
+	cd user && CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-Tsrc/linker.ld" cargo build --release --target $(TARGET_RV64) --features autotest
+	cp user/target/$(TARGET_RV64)/release/initproc scripts/initproc
 
 kernel-rv64:
 	cargo build --release -p kernel --target $(TARGET_RV64) $(_CARGO_LOG)

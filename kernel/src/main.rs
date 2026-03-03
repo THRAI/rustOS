@@ -776,7 +776,7 @@ fn test_signal_pending_delivery() {
 
     // Test blocked signals: block SIGUSR1, post it, should not be unmasked-pending
     let mut new_blocked = proc::signal::SigSet::empty();
-    new_blocked.add(proc::signal::Signal::try_from(SIGUSR1).unwrap());
+    new_blocked.add(proc::signal::Signal::new_unchecked(SIGUSR1));
     task.signals
         .blocked
         .store(new_blocked, core::sync::atomic::Ordering::Release);
@@ -846,7 +846,7 @@ fn test_mmap_munmap() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_device_nodes() {
-    use fs::fd_table::FdTable;
+    use fs::fd_table::{FdTable, OpenFlags};
 
     // Test /dev/null behavior directly via FileObject
     // Write to /dev/null: always succeeds (swallowed)

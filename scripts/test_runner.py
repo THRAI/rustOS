@@ -3,11 +3,27 @@ import sys
 import pexpect
 import argparse
 import os
+import time
+
+
+def sendline_throttled(child, text, char_delay):
+    """Send a command to UART one byte at a time to avoid RX FIFO overruns."""
+    for ch in text:
+        child.send(ch)
+        if char_delay > 0:
+            time.sleep(char_delay)
+    child.send('\n')
 
 def main():
     parser = argparse.ArgumentParser(description="QEMU Integration Test Runner")
     parser.add_argument('--interactive', action='store_true', help="Run in interactive mode (drop to shell)")
-    parser.add_argument('--timeout', type=int, default=15, help="Timeout for expect in script mode")
+    parser.add_argument('--timeout', type=int, default=30, help="Timeout for expect in script mode")
+    parser.add_argument(
+        '--char-delay',
+        type=float,
+        default=0.003,
+        help="Delay between each sent character in script mode",
+    )
     parser.add_argument('--cmd-file', default='scripts/intergration_command', help="Path to the file containing test commands")
     parser.add_argument('qemu_cmd', help="The QEMU executable")
     parser.add_argument('qemu_args', nargs=argparse.REMAINDER, help="Arguments passed to QEMU")
@@ -38,10 +54,16 @@ def main():
         else:
             print(f"[!] Warning: Command file {args.cmd_file} not found. Running with no commands.")
 
-        run_script_test(args.qemu_cmd, args.qemu_args, args.timeout, commands)
+        run_script_test(
+            args.qemu_cmd,
+            args.qemu_args,
+            args.timeout,
+            commands,
+            args.char_delay,
+        )
 
 
-def run_script_test(qemu_cmd, qemu_args, timeout, commands):
+def run_script_test(qemu_cmd, qemu_args, timeout, commands, char_delay):
     # Spawn the QEMU process.
     # Log everything to stdout so we can watch it happen live
     child = pexpect.spawn(qemu_cmd, args=qemu_args, encoding='utf-8', timeout=timeout)
@@ -65,7 +87,7 @@ def run_script_test(qemu_cmd, qemu_args, timeout, commands):
                     break
 
             # Send the command
-            child.sendline(cmd)
+            sendline_throttled(child, cmd, char_delay)
 
             # Since LOG=all creates extreme spam, we just wait for the prompt to return.
             # We don't assert the command was cleanly echoed, because kernel logs will interleave.

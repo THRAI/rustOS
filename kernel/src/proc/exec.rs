@@ -11,7 +11,7 @@ use hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE};
 
 use crate::fs::path;
 use crate::fs::vnode::{Vnode, VnodeType};
-use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType};
+use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType, VmError, VmMap};
 use crate::mm::vm::vm_object::VmObject;
 
 use super::task::Task;
@@ -132,6 +132,41 @@ fn elf_flags_to_prot(flags: u32) -> MapPerm {
     prot
 }
 
+/// Insert a file-backed VMA, merging exact same-page overlaps produced by
+/// ELF PT_LOAD headers that split permissions inside one page.
+fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmArea) -> Result<(), VmError> {
+    if new_vma.vma_type == VmAreaType::FileBacked {
+        if let Some(existing) = vm.find_area_mut(new_vma.range.start) {
+            let same_range = existing.range.start == new_vma.range.start
+                && existing.range.end == new_vma.range.end;
+            let same_file = match (existing.vnode.as_ref(), new_vma.vnode.as_ref()) {
+                (Some(a), Some(b)) => a.vnode_id() == b.vnode_id(),
+                _ => false,
+            };
+            let same_backing = existing.vma_type == VmAreaType::FileBacked
+                && new_vma.vma_type == VmAreaType::FileBacked
+                && existing.file_offset == new_vma.file_offset
+                && existing.obj_offset == new_vma.obj_offset;
+
+            if same_range && same_file && same_backing {
+                // Merge segment perms (e.g. RX + R -> RX), and preserve the
+                // longest file-visible byte span for partial last-page zeroing.
+                existing.prot |= new_vma.prot;
+                existing.file_size = core::cmp::max(existing.file_size, new_vma.file_size);
+                return Ok(());
+            }
+        }
+    }
+    vm.insert(new_vma)
+}
+
+fn map_insert_err(err: VmError) -> Errno {
+    match err {
+        VmError::Overlap | VmError::InvalidRange => Errno::ENOEXEC,
+        VmError::NotFound => Errno::ENOMEM,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // exec()
 // ---------------------------------------------------------------------------
@@ -246,8 +281,8 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         );
 
         let mut vm = task.vm_map.lock();
-        if vm.insert(vma).is_err() {
-            return Err(Errno::ENOMEM);
+        if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
+            return Err(map_insert_err(e));
         }
 
         if va_end > brk_end {
@@ -379,8 +414,8 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         );
 
         let mut vm = task.vm_map.lock();
-        if vm.insert(vma).is_err() {
-            return Err(Errno::ENOMEM);
+        if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
+            return Err(map_insert_err(e));
         }
     }
 

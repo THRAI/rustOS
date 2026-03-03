@@ -17,6 +17,7 @@ mod ipc;
 mod libc_stubs;
 mod mm;
 mod proc;
+mod syscall;
 mod trap;
 
 // Include boot assembly
@@ -320,30 +321,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 // Wait for delegate mount to complete
                 executor::sleep(100).await;
 
-                // autotest 模式：赛题评测，磁盘布局与 Chronix testcase.tar.xz 一致：
-                //   /riscv/musl/busybox  /riscv/musl/*_testcode.sh
-                //   /riscv/glibc/busybox /riscv/glibc/*_testcode.sh
-                //   /riscv/run-oj.sh  （总控脚本，依次跑所有测试组后 exit）
-                #[cfg(feature = "autotest")]
-                let (exec_path, argv) = (
-                    "/riscv/musl/busybox",
-                    alloc::vec![
-                        alloc::string::String::from("/riscv/musl/busybox"),
-                        alloc::string::String::from("sh"),
-                        alloc::string::String::from("/riscv/run-oj.sh"),
-                    ],
-                );
-
-                // 正常模式：交互式 shell，用于开发调试
-                #[cfg(not(feature = "autotest"))]
-                let (exec_path, argv) = (
-                    "/bin/busybox",
-                    alloc::vec![
-                        alloc::string::String::from("/bin/busybox"),
-                        alloc::string::String::from("sh"),
-                    ],
-                );
-
                 #[cfg(feature = "autotest")]
                 let envp = alloc::vec![
                     alloc::string::String::from("PATH=/riscv/musl:/riscv/glibc:/bin:/sbin"),
@@ -355,20 +332,63 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     alloc::string::String::from("HOME=/"),
                 ];
 
-                match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await {
-                    Ok((entry, sp)) => {
-                        {
-                            let mut tf = init_task2.trap_frame.lock();
-                            tf.sepc = entry;
-                            tf.x[2] = sp;
-                            tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                #[cfg(feature = "autotest")]
+                let launch_attempts = alloc::vec![
+                    (
+                        "/bin/initproc",
+                        alloc::vec![alloc::string::String::from("/bin/initproc")],
+                    ),
+                    (
+                        "/riscv/musl/busybox",
+                        alloc::vec![
+                            alloc::string::String::from("/riscv/musl/busybox"),
+                            alloc::string::String::from("sh"),
+                            alloc::string::String::from("/riscv/run-oj.sh"),
+                        ],
+                    ),
+                ];
+
+                #[cfg(not(feature = "autotest"))]
+                let launch_attempts = alloc::vec![
+                    (
+                        "/bin/initproc",
+                        alloc::vec![alloc::string::String::from("/bin/initproc")],
+                    ),
+                    (
+                        "/bin/init",
+                        alloc::vec![alloc::string::String::from("/bin/init")],
+                    ),
+                    (
+                        "/bin/busybox",
+                        alloc::vec![
+                            alloc::string::String::from("/bin/busybox"),
+                            alloc::string::String::from("sh"),
+                        ],
+                    ),
+                ];
+
+                let mut launched = false;
+                for (exec_path, argv) in launch_attempts {
+                    match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await {
+                        Ok((entry, sp)) => {
+                            {
+                                let mut tf = init_task2.trap_frame.lock();
+                                tf.sepc = entry;
+                                tf.x[2] = sp;
+                                tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                            }
+                            klog!(boot, info, "exec OK: {} entry={:#x} sp={:#x}", exec_path, entry, sp);
+                            executor::spawn_user_task(init_task2, init_cpu);
+                            launched = true;
+                            break;
                         }
-                        klog!(boot, info, "exec OK: entry={:#x} sp={:#x}", entry, sp);
-                        executor::spawn_user_task(init_task2, init_cpu);
+                        Err(e) => {
+                            klog!(boot, warn, "exec {} failed: {:?}", exec_path, e);
+                        }
                     }
-                    Err(e) => {
-                        klog!(boot, error, "exec {} failed: {:?}", exec_path, e);
-                    }
+                }
+                if !launched {
+                    klog!(boot, error, "no usable init program found");
                 }
             }, cpu0).detach();
         }

@@ -5,9 +5,8 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use crate::executor::user_task::{
-    copyin_argv, copyinstr, do_exit, fault_in_user_buffer, spawn_user_task,
-};
+use crate::executor::user_task::spawn_user_task;
+use crate::proc::user_copy::{copyin_argv, copyinstr, do_exit, fault_in_user_buffer};
 use crate::klog;
 use crate::proc::signal::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
 use crate::proc::task::Task;

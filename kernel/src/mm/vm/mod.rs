@@ -5,6 +5,7 @@
 //! page fault handler.
 
 pub mod fault;
+pub mod fault_async;
 pub mod vm_map;
 pub mod vm_object;
 

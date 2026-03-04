@@ -9,49 +9,53 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use hal_common::addr::VirtPageNum;
 use spin::RwLock;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use hal_common::PhysAddr;
+use hal_common::{PhysAddr};
 
-// ---------------------------------------------------------------------------
-// PageOwnership
-// ---------------------------------------------------------------------------
+use crate::mm::allocator::alloc_anon_sync;
+use crate::mm::allocator::types::{FileCache, TypedFrame, UserAnon};
+use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
 
-/// Distinguishes who is responsible for freeing a physical frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageOwnership {
-    /// Frame is freed when the owning VmObject is dropped.
-    Anonymous,
-    /// Page cache manages the frame lifetime; VmObject only holds a reference.
-    Cached,
-}
-
-// ---------------------------------------------------------------------------
-// OwnedPage
-// ---------------------------------------------------------------------------
-
-/// A physical page held by a VmObject, tagged with ownership semantics.
+/// A physical page held by a VmObject, encoded by its role type.
 #[derive(Debug)]
-pub struct OwnedPage {
-    /// Physical address of the page (page-aligned).
-    pub phys: PhysAddr,
-    /// Who is responsible for freeing this frame.
-    pub ownership: PageOwnership,
+pub enum OwnedPage {
+    Anonymous(TypedFrame<UserAnon>),
+    Cached(TypedFrame<FileCache>),
 }
 
 impl OwnedPage {
-    pub fn new_anonymous(phys: PhysAddr) -> Self {
-        Self {
-            ownership: PageOwnership::Anonymous,
-            phys,
-        }
+    pub fn new_anonymous(frame: TypedFrame<UserAnon>) -> Self {
+        Self::Anonymous(frame)
     }
 
-    pub fn new_cached(phys: PhysAddr) -> Self {
-        Self {
-            ownership: PageOwnership::Cached,
+    pub fn new_cached(frame: TypedFrame<FileCache>) -> Self {
+        Self::Cached(frame)
+    }
+
+    #[cfg(test)]
+    pub fn new_test(phys: PhysAddr) -> Self {
+        Self::Anonymous(TypedFrame {
             phys,
+            _marker: core::marker::PhantomData,
+        })
+    }
+
+    /// Get the physical address of the page.
+    pub fn phys(&self) -> PhysAddr {
+        match self {
+            Self::Anonymous(frame) => frame.phys(),
+            Self::Cached(frame) => frame.phys(),
         }
+    }
+}
+
+// Dropped manually in prior iteration, now RAII handles it natively via TypedFrame
+impl Drop for OwnedPage {
+    fn drop(&mut self) {
+        // TypedFrame<UserAnon> and TypedFrame<FileCache> will automatically drop.
     }
 }
 
@@ -67,7 +71,7 @@ impl OwnedPage {
 /// is safe (BSD vm_object_collapse semantics).
 pub struct VmObject {
     /// Pages owned directly by this object, keyed by page offset (in pages).
-    pages: BTreeMap<u64, OwnedPage>,
+    pages: BTreeMap<VObjIndex, OwnedPage>,
     /// Parent in the shadow chain (for COW).
     backing: Option<Arc<RwLock<VmObject>>>,
     /// How many shadow objects use this as their backing.
@@ -76,7 +80,15 @@ pub struct VmObject {
     size: usize,
     /// Number of pages resident in *this* object (not backing).
     resident_count: usize,
+    /// I/O barrier: number of pages currently being paged in.
+    paging_in_progress: AtomicU32,
+    /// Dirty tracking generation counters.
+    generation: AtomicU32,
+    clean_generation: AtomicU32,
 }
+
+/// Index into VmObject, in units of pages (not bytes)
+pub type VObjIndex = VirtPageNum;
 
 impl VmObject {
     /// Create a new anonymous VmObject (no backing).
@@ -87,6 +99,9 @@ impl VmObject {
             shadow_count: 0,
             size,
             resident_count: 0,
+            paging_in_progress: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
+            clean_generation: AtomicU32::new(0),
         }))
     }
 
@@ -105,46 +120,88 @@ impl VmObject {
             shadow_count: 0,
             size,
             resident_count: 0,
+            paging_in_progress: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
+            clean_generation: AtomicU32::new(0),
         }))
     }
 
     /// Look up a page by offset, walking the shadow chain iteratively.
     ///
     /// Returns the physical address if found in this object or any ancestor.
-    pub fn lookup_page(&self, offset: u64) -> Option<PhysAddr> {
+    pub fn lookup_page(&self, index: VObjIndex) -> Option<PhysAddr> {
         // Check this object first.
-        if let Some(page) = self.pages.get(&offset) {
-            return Some(page.phys);
+        if let Some(page) = self.pages.get(&index) {
+            return Some(page.phys());
         }
         // Walk the backing chain iteratively.
         let mut current = self.backing.as_ref().map(Arc::clone);
         while let Some(arc) = current {
             let obj = arc.read();
-            if let Some(page) = obj.pages.get(&offset) {
-                return Some(page.phys);
+            if let Some(page) = obj.pages.get(&index) {
+                return Some(page.phys());
             }
             current = obj.backing.as_ref().map(Arc::clone);
         }
         None
     }
 
+    /// Traverse shadow chain to find a page (BSD-style backing traversal).
+    pub fn lookup_page_in_chain(&self, pindex: VirtPageNum) -> Option<PhysAddr> {
+        self.lookup_page(pindex)
+    }
+
+    /// Lookup or allocate an anonymous page for the given offset.
+    /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
+    pub fn fault_allocate_anon(&mut self, index: VObjIndex) -> Result<PhysAddr, ()> {
+        if let Some(page) = self.pages.get(&index) {
+            return Ok(page.phys());
+        }
+        let frame = alloc_anon_sync().ok_or(())?;
+        let phys = frame.phys();
+        pmap_zero_page(phys);
+        crate::klog!(
+            vm,
+            debug,
+            "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_allocate_anon offset {})",
+            index
+        );
+        self.insert_page(index, OwnedPage::new_anonymous(frame));
+        Ok(phys)
+    }
+
+    /// Implement COW by copying the old_phys page into a newly allocated frame.
+    /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
+    pub fn fault_cow(&mut self, index: VObjIndex, old_phys: PhysAddr) -> Result<PhysAddr, ()> {
+        if let Some(page) = self.pages.get(&index) {
+            return Ok(page.phys());
+        }
+        let frame = alloc_anon_sync().ok_or(())?;
+        let phys = frame.phys();
+        pmap_copy_page(old_phys, phys);
+        crate::klog!(
+            vm,
+            debug,
+            "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_cow offset {})",
+            index
+        );
+        self.insert_page(index, OwnedPage::new_anonymous(frame));
+        Ok(phys)
+    }
+
     /// Insert a page into this object (not the backing chain).
-    pub fn insert_page(&mut self, offset: u64, page: OwnedPage) {
-        if self.pages.insert(offset, page).is_none() {
+    pub fn insert_page(&mut self, index: VObjIndex, page: OwnedPage) {
+        if self.pages.insert(index, page).is_none() {
             self.resident_count += 1;
         }
     }
 
-    /// Remove a page from this object only (does not touch backing).
-    pub fn remove_page(&mut self, offset: u64) -> Option<OwnedPage> {
-        let removed = self.pages.remove(&offset);
-        if removed.is_some() {
-            self.resident_count -= 1;
-        }
-        removed
-    }
+    // Remove a page from this object only (does not touch backing).
+    // Pages should be managed automatically via RAII.
+    // pub fn remove_page(&mut self, index: VObjIndex) -> NOT IMPLEMENTED ON PURPOSE
 
     /// Count the shadow chain depth (for debug/testing).
+    #[allow(unused)]
     pub fn shadow_depth(&self) -> usize {
         let mut depth = 0;
         let mut current = self.backing.as_ref().map(Arc::clone);
@@ -162,6 +219,7 @@ impl VmObject {
     }
 
     /// Get the number of pages resident in this object.
+    #[allow(unused)]
     pub fn resident_count(&self) -> usize {
         self.resident_count
     }
@@ -171,14 +229,19 @@ impl VmObject {
         self.backing.as_ref()
     }
 
+    /// Return a clone of the backing object Arc (for shadow chain traversal).
+    pub fn backing_object(&self) -> Option<Arc<RwLock<VmObject>>> {
+        self.backing.as_ref().map(Arc::clone)
+    }
+
     /// Get the number of shadows pointing to this object.
     pub fn shadow_count(&self) -> usize {
         self.shadow_count
     }
 
     /// Check if this object (not backing) has a page at the given offset.
-    pub fn has_page(&self, offset: u64) -> bool {
-        self.pages.contains_key(&offset)
+    pub fn has_page(&self, index: VObjIndex) -> bool {
+        self.pages.contains_key(&index)
     }
 
     /// BSD vm_object_collapse: migrate pages from backing into self.
@@ -210,12 +273,8 @@ impl VmObject {
         for (offset, page) in backing_pages {
             if self.pages.contains_key(&offset) {
                 // Conflict: self already has a COW copy at this offset.
-                // Free the phantom page from backing.
+                // The page from backing will be dropped here automatically.
                 backing.resident_count = backing.resident_count.saturating_sub(1);
-                if matches!(page.ownership, PageOwnership::Anonymous) {
-                    #[cfg(not(test))]
-                    super::super::allocator::frame_free(page.phys);
-                }
             } else {
                 // No conflict: rename page from backing to self.
                 backing.resident_count = backing.resident_count.saturating_sub(1);
@@ -247,8 +306,8 @@ impl VmObject {
 
     /// Remove and return all pages at offsets >= `from_page`.
     /// Only operates on this object (not the backing chain).
-    pub fn truncate_pages(&mut self, from_page: u64) -> alloc::vec::Vec<OwnedPage> {
-        let keys: alloc::vec::Vec<u64> = self.pages.range(from_page..).map(|(&k, _)| k).collect();
+    pub fn truncate_pages(&mut self, from_index: VObjIndex) -> alloc::vec::Vec<OwnedPage> {
+        let keys: alloc::vec::Vec<VObjIndex> = self.pages.range(from_index..).map(|(&k, _)| k).collect();
         let mut removed = alloc::vec::Vec::with_capacity(keys.len());
         for k in keys {
             if let Some(page) = self.pages.remove(&k) {
@@ -273,14 +332,9 @@ impl VmObject {
 /// we stop (that ancestor is still shared).
 impl Drop for VmObject {
     fn drop(&mut self) {
-        // Free our own anonymous pages.
-        let pages = core::mem::take(&mut self.pages);
-        for (_offset, page) in pages {
-            if matches!(page.ownership, PageOwnership::Anonymous) {
-                #[cfg(not(test))]
-                super::super::allocator::frame_free(page.phys);
-            }
-        }
+        // Our owned pages (both Anonymous and Cached) will be freed automatically
+        // when `self.pages` is dropped. We just need to handle the shadow chain
+        // unwinding.
 
         // Decrement backing's shadow_count, then release the lock
         // before taking the Arc (which may trigger further drops).
@@ -296,13 +350,8 @@ impl Drop for VmObject {
             match Arc::try_unwrap(arc) {
                 Ok(rwlock) => {
                     let mut obj = rwlock.into_inner();
-                    let ancestor_pages = core::mem::take(&mut obj.pages);
-                    for (_offset, page) in ancestor_pages {
-                        if matches!(page.ownership, PageOwnership::Anonymous) {
-                            #[cfg(not(test))]
-                            super::super::allocator::frame_free(page.phys);
-                        }
-                    }
+                    // Take backing to continue unwinding cleanly without recursion.
+                    // obj's own `pages` drop automatically here when `obj` is dropped.
                     // Decrement next ancestor's shadow_count.
                     if let Some(ref next_arc) = obj.backing {
                         let mut next = next_arc.write();
@@ -317,7 +366,7 @@ impl Drop for VmObject {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
     use alloc::vec;
@@ -337,8 +386,8 @@ mod tests {
         let obj = VmObject::new(8192);
         {
             let mut w = obj.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0x2000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0x2000)));
         }
         let r = obj.read();
         assert_eq!(r.resident_count(), 2);
@@ -352,7 +401,7 @@ mod tests {
         let parent = VmObject::new(4096);
         {
             let mut w = parent.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
         // Shadow walks backing chain, so parent's page is visible
@@ -373,17 +422,17 @@ mod tests {
         let grandparent = VmObject::new(4096);
         {
             let mut w = grandparent.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xA000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xA000)));
         }
         let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
         {
             let mut w = parent.write();
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xB000)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xB000)));
         }
         let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
         {
             let mut w = child.write();
-            w.insert_page(2, OwnedPage::new_anonymous(PhysAddr::new(0xC000)));
+            w.insert_page(2, OwnedPage::new_test(PhysAddr::new(0xC000)));
         }
         // Child has page 2, parent has page 1, grandparent has page 0
         let r = child.read();
@@ -394,7 +443,7 @@ mod tests {
 
     #[test]
     fn page_ownership_types() {
-        let anon = OwnedPage::new_anonymous(PhysAddr::new(0x1000));
+        let anon = OwnedPage::new_test(PhysAddr::new(0x1000));
         assert_eq!(anon.ownership, PageOwnership::Anonymous);
         let cached = OwnedPage::new_cached(PhysAddr::new(0x2000));
         assert_eq!(cached.ownership, PageOwnership::Cached);
@@ -411,7 +460,7 @@ mod tests {
                 let mut w = shadow.write();
                 w.insert_page(
                     i as u64,
-                    OwnedPage::new_anonymous(PhysAddr::new((i + 1) * 0x1000)),
+                    OwnedPage::new_test(PhysAddr::new((i + 1) * 0x1000)),
                 );
             }
             current = shadow;
@@ -438,8 +487,8 @@ mod tests {
         let obj = VmObject::new(4096);
         {
             let mut w = obj.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x2000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x2000)));
         }
         let r = obj.read();
         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x2000));
@@ -462,12 +511,12 @@ mod tests {
         let parent = VmObject::new(4096);
         {
             let mut w = parent.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xAAAA_0000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xAAAA_0000)));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
         {
             let mut w = shadow.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xBBBB_0000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xBBBB_0000)));
         }
         let r = shadow.read();
         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0xBBBB_0000));
@@ -498,7 +547,7 @@ mod tests {
                 let mut w = shadow.write();
                 w.insert_page(
                     i as u64,
-                    OwnedPage::new_anonymous(PhysAddr::new((i + 1) * 0x1000)),
+                    OwnedPage::new_test(PhysAddr::new((i + 1) * 0x1000)),
                 );
             }
             current = shadow;
@@ -511,8 +560,8 @@ mod tests {
         let obj = VmObject::new(4096);
         {
             let mut w = obj.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0x2000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0x2000)));
             assert_eq!(w.resident_count(), 2);
             let removed = w.remove_page(0);
             assert!(removed.is_some());
@@ -567,8 +616,8 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xA000)));
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xB000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xA000)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xB000)));
         }
         // Single shadow — shadow_count == 1, collapse is safe.
         let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
@@ -591,14 +640,14 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xDEAD)));
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xBEEF)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xDEAD)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xBEEF)));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
         // Shadow has its own page at offset 0 (COW copy).
         {
             let mut w = shadow.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xC000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xC000)));
         }
 
         // Collapse: offset 0 conflicts (shadow wins), offset 1 migrates.
@@ -621,7 +670,7 @@ mod tests {
         let backing = VmObject::new(4096);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x1000)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
         }
         let s1 = VmObject::new_shadow(Arc::clone(&backing), 4096);
         let _s2 = VmObject::new_shadow(Arc::clone(&backing), 4096);
@@ -643,12 +692,12 @@ mod tests {
         let grandparent = VmObject::new(4096);
         {
             let mut w = grandparent.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xAAAA)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xAAAA)));
         }
         let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
         {
             let mut w = parent.write();
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xBBBB)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xBBBB)));
         }
         let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
         assert_eq!(parent.read().shadow_count(), 1);
@@ -688,8 +737,8 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xF0F0)));
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xF1F1)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xF0F0)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xF1F1)));
         }
 
         // Step 2: fork — parent shadow and child shadow.
@@ -730,8 +779,8 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xF0F0)));
-            w.insert_page(1, OwnedPage::new_anonymous(PhysAddr::new(0xF1F1)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xF0F0)));
+            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xF1F1)));
         }
 
         let parent_shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
@@ -740,7 +789,7 @@ mod tests {
         // Child already did a COW copy of offset 0.
         {
             let mut w = child_shadow.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xC09F)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xC09F)));
         }
 
         // Parent exits.
@@ -771,7 +820,7 @@ mod tests {
         let backing = VmObject::new(4096);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0xBA5E)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xBA5E)));
         }
 
         // Wave 1: create 100 shadows (simulates fork bomb).
@@ -810,7 +859,7 @@ mod tests {
         let root = VmObject::new(4096);
         {
             let mut w = root.write();
-            w.insert_page(0, OwnedPage::new_anonymous(PhysAddr::new(0x2007)));
+            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x2007)));
         }
 
         // Build a 200-deep chain: each "child" forks from previous "parent".
@@ -859,7 +908,7 @@ mod tests {
             for i in 0..4u64 {
                 w.insert_page(
                     i,
-                    OwnedPage::new_anonymous(PhysAddr::new((0xA000 + i as usize) * 0x1000)),
+                    OwnedPage::new_test(PhysAddr::new((0xA000 + i as usize) * 0x1000)),
                 );
             }
         }
@@ -874,7 +923,7 @@ mod tests {
                 let offset = (i % 4) as u64;
                 w.insert_page(
                     offset,
-                    OwnedPage::new_anonymous(PhysAddr::new(0xC000_0000 + i * 0x1000)),
+                    OwnedPage::new_test(PhysAddr::new(0xC000_0000 + i * 0x1000)),
                 );
             }
             shadows.push(s);

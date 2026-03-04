@@ -4,7 +4,7 @@
 //! The walk is identity-mapped: PA is used directly as a pointer.
 //! A `phys_to_virt()` indirection will be added for higher-half kernel.
 
-use super::pte::{encode_pte, pte_pa, pte_is_valid, pte_is_leaf, PteFlags};
+use super::pte::{encode_pte, pte_is_leaf, pte_is_valid, pte_pa, PteFlags};
 
 /// Extract VPN index for a given level in an N-level page table.
 ///
@@ -30,7 +30,7 @@ pub unsafe fn walk<const LEVELS: usize>(
     root_pa: usize,
     va: usize,
     alloc: bool,
-    allocator: &mut dyn FnMut() -> Option<usize>,
+    allocator: &mut dyn FnMut(usize) -> Option<usize>,
 ) -> Option<*mut u64> {
     let mut table_pa = root_pa;
 
@@ -54,7 +54,7 @@ pub unsafe fn walk<const LEVELS: usize>(
             table_pa = pte_pa(pte);
         } else if alloc {
             // Invalid and alloc requested: allocate a new page table page.
-            let new_page = allocator()?;
+            let new_page = allocator(level)?;
             // Write non-leaf PTE (V bit only, no R/W/X).
             pte_ptr.write_volatile(encode_pte(new_page, PteFlags::V));
             table_pa = new_page;

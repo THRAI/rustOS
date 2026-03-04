@@ -5,9 +5,9 @@
 //! that send requests and await replies via oneshot channels.
 
 use alloc::collections::VecDeque;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
-use core::pin::Pin;
 
 /// FNV-1a hash of a path string, used as synthetic inode number.
 fn path_hash(path: &str) -> u32 {
@@ -17,7 +17,11 @@ fn path_hash(path: &str) -> u32 {
         h = h.wrapping_mul(0x0100_0193);
     }
     // Avoid 0 (invalid inode)
-    if h == 0 { 1 } else { h }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
 }
 use core::future::Future;
 use hal_common::IrqSafeSpinLock;
@@ -175,8 +179,7 @@ define_alloc_reply!(alloc_stat_reply, STAT_REPLIES, STAT_REPLY_IDX, Result<(u64,
 define_alloc_reply!(alloc_readpage_reply, READPAGE_REPLIES, READPAGE_REPLY_IDX, Result<usize, i32>);
 
 /// Bounded request channel.
-static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>> =
-    IrqSafeSpinLock::new(VecDeque::new());
+static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>> = IrqSafeSpinLock::new(VecDeque::new());
 static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DELEGATE_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
 
@@ -281,19 +284,20 @@ async fn delegate_task() {
             }
             FsRequest::ReadPage { path, path_len, offset, reply } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
-                match crate::mm::allocator::frame_alloc_sync() {
-                    Some(pa) => {
-                        let buf = unsafe {
-                            core::slice::from_raw_parts_mut(pa.as_usize() as *mut u8, 4096)
-                        };
+                match crate::mm::allocator::alloc_raw_frame_sync(
+                    crate::mm::allocator::PageRole::FileCache,
+                ) {
+                    Some(frame) => {
+                        //TODO: extract this as fill_with_zero for pages.
+                        let pa = frame.as_usize();
+                        let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
                         buf.fill(0);
-                        // Open, seek, read, close
                         match crate::fs::ext4::open(&mut tok, path_str, 0) {
                             Ok(mut file) => {
                                 let _ = file.file_seek(offset as i64, 0); // SEEK_SET
                                 let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
                                 let _ = crate::fs::ext4::close(&mut tok, &mut file);
-                                reply.complete(Ok(pa.as_usize()));
+                                reply.complete(Ok(pa));
                             }
                             Err(e) => {
                                 reply.complete(Err(e));

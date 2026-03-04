@@ -34,6 +34,7 @@ pub struct TimerWheel {
 
 impl TimerWheel {
     /// Create a new timer wheel with all slots empty.
+    //TODO: It's used only once, how can we mute the default-needed warning? lazy_static? is it thread safe?
     pub fn new() -> Self {
         let mut slots = Vec::with_capacity(SLOTS);
         for _ in 0..SLOTS {
@@ -50,7 +51,7 @@ impl TimerWheel {
     /// Returns a timer ID for cancellation.
     /// A delay of 0 expires on the next tick (minimum 1 tick).
     pub fn insert(&mut self, delay_ms: u64, waker: Waker) -> u64 {
-        let delay_ticks = core::cmp::max(1, (delay_ms + TICK_MS - 1) / TICK_MS);
+        let delay_ticks = core::cmp::max(1, delay_ms.div_ceil(TICK_MS));
         let deadline_tick = self.current_tick + delay_ticks;
         let slot = (deadline_tick as usize) % SLOTS;
         let id = self.next_id;

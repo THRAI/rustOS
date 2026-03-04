@@ -18,11 +18,10 @@ pub mod pmap;
 pub mod uio;
 pub mod vm;
 
-/// Module alias so that hardlinked source files using `crate::mm::*` paths
-/// (the kernel crate's module hierarchy) also resolve correctly in this crate.
 pub mod mm {
     pub use crate::allocator;
     pub use crate::pmap;
+    pub use crate::uio;
     pub use crate::vm;
 }
 

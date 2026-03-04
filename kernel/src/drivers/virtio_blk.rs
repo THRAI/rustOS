@@ -5,7 +5,7 @@
 //! synchronous read_sector/write_sector with adaptive polling.
 
 use crate::drivers::virtio_mmio::*;
-use crate::mm::allocator::frame_alloc_sync;
+use crate::mm::allocator::{alloc_raw_frame_sync, PageRole};
 use core::sync::atomic::{fence, Ordering};
 use hal_common::PAGE_SIZE;
 
@@ -25,12 +25,11 @@ const SPIN_ITERS: usize = 1000;
 
 /// QEMU virt machine VirtIO MMIO base addresses (8 devices, 0x10001000..0x10008000).
 const VIRTIO_MMIO_BASES: [usize; 8] = [
-    0x10008000, 0x10007000, 0x10006000, 0x10005000,
-    0x10004000, 0x10003000, 0x10002000, 0x10001000,
+    0x10008000, 0x10007000, 0x10006000, 0x10005000, 0x10004000, 0x10003000, 0x10002000, 0x10001000,
 ];
 
 /// VirtIO block request types.
-const VIRTIO_BLK_T_IN: u32 = 0;  // read
+const VIRTIO_BLK_T_IN: u32 = 0; // read
 const VIRTIO_BLK_T_OUT: u32 = 1; // write
 
 /// Virtqueue descriptor flags.
@@ -174,8 +173,8 @@ impl VirtioBlk {
 
         let num_pages = align_up(total_size, PAGE_SIZE) / PAGE_SIZE;
         let order = num_pages.next_power_of_two().trailing_zeros() as usize;
-        let base_frame = crate::mm::allocator::frame_alloc_contiguous(order)
-            .expect("virtio-blk: queue alloc");
+        let base_frame =
+            crate::mm::allocator::frame_alloc_contiguous(order).expect("virtio-blk: queue alloc");
         let base_pa = base_frame.as_usize();
 
         // Zero the entire region
@@ -201,7 +200,7 @@ impl VirtioBlk {
         let capacity = cap_lo | (cap_hi << 32);
 
         // Allocate a persistent request header + status byte page
-        let req_frame = frame_alloc_sync().expect("virtio-blk: req alloc");
+        let req_frame = alloc_raw_frame_sync(PageRole::FileCache).expect("virtio-blk: req alloc");
         let req_hdr_pa = req_frame.as_usize();
         // Status byte at offset 16 (after the 16-byte header)
         let status_pa = req_hdr_pa + 16;
@@ -233,7 +232,12 @@ impl VirtioBlk {
         if sector >= self.capacity {
             return Err(());
         }
-        self.do_request(VIRTIO_BLK_T_OUT, sector, buf.as_ptr() as *mut u8, SECTOR_SIZE)
+        self.do_request(
+            VIRTIO_BLK_T_OUT,
+            sector,
+            buf.as_ptr() as *mut u8,
+            SECTOR_SIZE,
+        )
     }
 
     /// Read multiple contiguous sectors into a buffer.
@@ -267,7 +271,9 @@ impl VirtioBlk {
         }
 
         // Clear status byte
-        unsafe { *(self.status_pa as *mut u8) = 0xFF; }
+        unsafe {
+            *(self.status_pa as *mut u8) = 0xFF;
+        }
 
         // Descriptor 0: request header (device-readable)
         unsafe {
@@ -306,9 +312,13 @@ impl VirtioBlk {
         let avail = self.avail_pa as *mut VringAvail;
         let avail_idx = unsafe { core::ptr::read_volatile(&(*avail).idx) };
         let ring_entry = self.avail_pa + 4 + (avail_idx % self.queue_size) as usize * 2;
-        unsafe { core::ptr::write_volatile(ring_entry as *mut u16, d0); }
+        unsafe {
+            core::ptr::write_volatile(ring_entry as *mut u16, d0);
+        }
         fence(Ordering::SeqCst);
-        unsafe { core::ptr::write_volatile(&mut (*avail).idx, avail_idx.wrapping_add(1)); }
+        unsafe {
+            core::ptr::write_volatile(&mut (*avail).idx, avail_idx.wrapping_add(1));
+        }
         fence(Ordering::SeqCst);
 
         // Notify device
@@ -327,11 +337,7 @@ impl VirtioBlk {
             // Brief SIE window: lets pending IRQs fire, which causes a vCPU exit
             // and gives QEMU's device model a chance to process the virtqueue.
             unsafe {
-                core::arch::asm!(
-                    "csrsi sstatus, 0x2",
-                    "nop",
-                    "csrci sstatus, 0x2",
-                );
+                core::arch::asm!("csrsi sstatus, 0x2", "nop", "csrci sstatus, 0x2",);
             }
             core::hint::spin_loop();
         }
@@ -358,7 +364,12 @@ impl VirtioBlk {
 pub fn init() {
     VIRTIO_BLK.call_once(|| {
         let blk = VirtioBlk::probe_and_init().expect("virtio-blk: no block device found");
-        klog!(driver, info, "initialized, capacity = {} sectors", blk.capacity());
+        klog!(
+            driver,
+            info,
+            "initialized, capacity = {} sectors",
+            blk.capacity()
+        );
         hal_common::SpinMutex::new(blk)
     });
 }

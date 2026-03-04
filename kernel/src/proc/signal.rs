@@ -9,6 +9,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use bitflags::bitflags;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use hal_common::SpinMutex as Mutex;
@@ -43,6 +44,7 @@ pub const MAX_SIG: u8 = 64;
 pub struct Signal(u8);
 
 impl Signal {
+    #[allow(unused)]
     pub const fn new(sig: u8) -> Option<Self> {
         if Self::is_legit(sig) {
             Some(Self(sig))
@@ -114,6 +116,7 @@ impl SigSet {
         self
     }
 
+    #[allow(unused)]
     pub fn remove(&mut self, sig: Signal) -> &mut Self {
         self.0 &= !sig.as_bit();
         self
@@ -123,6 +126,7 @@ impl SigSet {
         self.0 & sig.as_bit() != 0
     }
 
+    #[allow(unused)]
     pub const fn contains_bit(self, bits: u64) -> bool {
         self.0 & bits != 0
     }
@@ -172,6 +176,7 @@ impl AtomicSigSet {
         SigSet::from_u64(self.0.fetch_or(set.as_u64(), order))
     }
 
+    #[allow(unused)]
     pub fn fetch_intersect(&self, set: SigSet, order: Ordering) -> SigSet {
         SigSet::from_u64(self.0.fetch_and(set.as_u64(), order))
     }
@@ -206,12 +211,29 @@ pub fn default_action(sig: u8) -> SigDefault {
 // SA flags
 // ---------------------------------------------------------------------------
 
-//TODO: bitmask?
-pub const SA_SIGINFO: u64 = 4;
-pub const SA_RESTART: u64 = 0x1000_0000;
-pub const SA_NOCLDWAIT: u64 = 2;
-pub const SA_ONSTACK: u64 = 0x0800_0000;
-pub const SA_RESTORER: u64 = 0x0400_0000;
+bitflags! {
+    /// POSIX SigAction flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SAFlags: u64 {
+        const NOCLDSTOP = 1;
+        const NOCLDWAIT = 2;
+        const SIGINFO   = 4;
+        const ONSTACK   = 0x0800_0000;
+        const RESTART   = 0x1000_0000;
+        const NODEFER   = 0x4000_0000;
+        const RESETHAND = 0x8000_0000;
+        const RESTORER  = 0x0400_0000;
+    }
+}
+
+pub const SA_NOCLDSTOP: u64 = SAFlags::NOCLDSTOP.bits();
+pub const SA_NOCLDWAIT: u64 = SAFlags::NOCLDWAIT.bits();
+pub const SA_SIGINFO: u64 = SAFlags::SIGINFO.bits();
+pub const SA_ONSTACK: u64 = SAFlags::ONSTACK.bits();
+pub const SA_RESTART: u64 = SAFlags::RESTART.bits();
+pub const SA_NODEFER: u64 = SAFlags::NODEFER.bits();
+pub const SA_RESETHAND: u64 = SAFlags::RESETHAND.bits();
+pub const SA_RESTORER: u64 = SAFlags::RESTORER.bits();
 
 // ---------------------------------------------------------------------------
 // SigAction
@@ -278,6 +300,7 @@ impl SignalState {
     }
 
     /// Check if there are unmasked pending signals.
+    #[allow(unused)]
     pub fn has_unmasked_pending(&self) -> bool {
         let pending = self.pending.load(Ordering::Acquire);
         let blocked = self.blocked.load(Ordering::Relaxed);
@@ -286,7 +309,7 @@ impl SignalState {
             .add(Signal::new_unchecked(SIGKILL))
             .add(Signal::new_unchecked(SIGSTOP));
 
-        let deliverable = pending.intersect(blocked.union(unblockable).difference(blocked));
+        let deliverable = pending.difference(blocked.difference(unblockable));
         !deliverable.is_empty()
     }
 
@@ -300,7 +323,7 @@ impl SignalState {
             .add(Signal::new_unchecked(SIGKILL))
             .add(Signal::new_unchecked(SIGSTOP));
 
-        let deliverable = pending.intersect(blocked.union(unblockable).difference(blocked));
+        let deliverable = pending.difference(blocked.difference(unblockable));
         if deliverable.is_empty() {
             return false;
         }
@@ -332,7 +355,7 @@ impl SignalState {
             return false;
         }
         let actions = self.actions.lock();
-        actions[(sig - 1) as usize].flags & SA_RESTART != 0
+        actions[(sig - 1) as usize].flags & SAFlags::RESTART.bits() != 0
     }
 
     /// Dequeue the highest-priority unmasked pending signal. Returns None if none.
@@ -345,7 +368,7 @@ impl SignalState {
             unblockable
                 .add(Signal::new_unchecked(SIGKILL))
                 .add(Signal::new_unchecked(SIGSTOP));
-            let deliverable = pending.intersect(blocked.union(unblockable).difference(blocked));
+            let deliverable = pending.difference(blocked.difference(unblockable));
 
             if deliverable.is_empty() {
                 return None;
@@ -534,6 +557,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
         .fetch_union(SigSet::from_u64(block_mask), Ordering::Release);
 
     // Redirect trap frame to handler
+    //TODO: manually controlling trap frame is acceptable. make it a method.
     tf.sepc = action.handler;
     tf.x[10] = sig as usize; // a0 = signo
     tf.x[11] = siginfo_va; // a1 = siginfo (valid ptr if SA_SIGINFO, else NULL)
@@ -690,10 +714,11 @@ pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
 /// Map the sigcode trampoline page into the given pmap.
 /// Called during exec (and for init).
 pub fn map_sigcode_page(pmap: &mut crate::mm::pmap::Pmap) {
-    use crate::mm::allocator::frame_alloc_sync;
     use crate::mm::pmap::pmap_enter;
 
-    let frame = frame_alloc_sync().expect("sigcode page alloc failed");
+    let frame =
+        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::SigTrampoline)
+            .expect("sigcode page alloc failed");
     let page_data = build_sigcode_page();
 
     // Write sigcode to the physical frame
@@ -702,7 +727,6 @@ pub fn map_sigcode_page(pmap: &mut crate::mm::pmap::Pmap) {
     }
 
     // Map as read-only + user-accessible
-    // TODO: use constants like RXU or something similar from MapPerm. Update it there.
     let prot = crate::map_perm!(R, X, U);
     let _ = pmap_enter(pmap, VirtAddr::new(SIGCODE_VA), frame, prot, false);
 }

@@ -332,6 +332,11 @@ impl VmObject {
     pub fn pages_iter(&self) -> impl Iterator<Item = &OwnedPage> {
         self.pages.values()
     }
+
+    /// Iterate over (index, page) pairs for fork deep-copy.
+    pub fn pages_with_index(&self) -> impl Iterator<Item = (VObjIndex, &OwnedPage)> {
+        self.pages.iter().map(|(idx, page)| (*idx, page))
+    }
 }
 
 /// Iterative Drop: unwind the shadow chain without recursion.

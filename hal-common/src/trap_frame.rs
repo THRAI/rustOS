@@ -63,14 +63,14 @@ impl TrapFrame {
     /// Panics if n > 7.
     #[inline]
     pub fn arg(&self, n: usize) -> usize {
-        assert!(n < 8, "arg index out of range: {}", n);
+        assert!(n < 8, "arg index out of range: {n}");
         self.x[10 + n]
     }
 
     /// Set syscall/function argument by index (a0=x10 .. a7=x17).
     #[inline]
     pub fn set_arg(&mut self, n: usize, val: usize) {
-        assert!(n < 8, "set_arg index out of range: {}", n);
+        assert!(n < 8, "set_arg index out of range: {n}");
         self.x[10 + n] = val;
     }
 

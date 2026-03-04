@@ -211,7 +211,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             executor::spawn_kernel_task(
                 async {
                     executor::sleep(400).await;
-                    mm::vm::test_integration::test_frame_alloc_sync_works();
+                    mm::vm::test_integration::test_alloc_raw_frame_sync_works();
                 },
                 cpu0,
             )
@@ -699,7 +699,6 @@ async fn test_fork_exec_wait4() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_pipe_data_transfer() {
-    use alloc::sync::Arc;
     use fs::pipe::Pipe;
 
     let pipe = Pipe::new();
@@ -776,7 +775,7 @@ fn test_signal_pending_delivery() {
 
     // Test blocked signals: block SIGUSR1, post it, should not be unmasked-pending
     let mut new_blocked = proc::signal::SigSet::empty();
-    new_blocked.add(proc::signal::Signal::new_unchecked(SIGUSR1));
+    new_blocked.add(proc::signal::Signal::new(SIGUSR1).unwrap());
     task.signals
         .blocked
         .store(new_blocked, core::sync::atomic::Ordering::Release);

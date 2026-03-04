@@ -5,6 +5,7 @@
 
 use super::super::vm::vm_map::MapPerm;
 
+//TODO: use a macro to generate flags like MapPerm!(R, W, X, U, ...)
 bitflags::bitflags! {
     /// Sv39 page table entry flags (bits [9:0]).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,7 @@ const PTE_FLAGS_MASK: u64 = 0x3FF; // bits [9:0]
 
 /// Encode a PTE from a physical address and flags.
 /// PA must be page-aligned. PPN occupies bits [53:10].
+//TODO: use a macro to generate flags like MapPerm!(R, W, X, U, ...)
 #[inline]
 pub fn encode_pte(pa: usize, flags: PteFlags) -> u64 {
     ((pa as u64 >> 12) << PTE_PPN_SHIFT) | flags.bits()
@@ -61,6 +63,7 @@ pub fn pte_is_leaf(raw: u64) -> bool {
 
 /// Convert MI `MapPerm` to hardware `PteFlags`.
 /// Always sets V and A|D (avoid hardware A/D faults on non-Svadu implementations).
+//TODO: use a macro to generate flags like MapPerm!(R, W, X, U, ...)
 pub fn map_perm_to_pte_flags(perm: MapPerm) -> PteFlags {
     let mut f = PteFlags::V | PteFlags::A | PteFlags::D;
     if perm.contains(MapPerm::R) {

@@ -5,7 +5,7 @@
 
 use hal_common::{VirtAddr, PAGE_SIZE};
 
-use super::super::allocator::frame_alloc_sync;
+use super::super::allocator::{alloc_raw_frame_sync, PageRole};
 use super::{pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove};
 
 /// Tier 2.a: Verify pmap walk logic with real allocated frames.
@@ -15,7 +15,7 @@ pub fn test_pmap_extract_only() {
     let mut pmap = pmap_create();
 
     // 2. Allocate a backing frame
-    let frame = frame_alloc_sync().expect("OOM in pmap extract test");
+    let frame = alloc_raw_frame_sync(PageRole::PteL1).expect("OOM in pmap extract test");
 
     // 3. Enter mapping: VA 0x1_0000_0000 → frame, R|W
     let va = VirtAddr::new(0x1_0000_0000);
@@ -27,7 +27,7 @@ pub fn test_pmap_extract_only() {
 
     // 5. Second mapping at different VA
     let va2 = VirtAddr::new(0x1_0000_1000);
-    let frame2 = frame_alloc_sync().expect("OOM");
+    let frame2 = alloc_raw_frame_sync(PageRole::PteL1).expect("OOM");
     pmap_enter(&mut pmap, va2, frame2, crate::map_perm!(R, X), false).unwrap();
     assert_eq!(
         pmap_extract(&pmap, va2).unwrap().as_usize(),
@@ -61,7 +61,7 @@ pub fn test_pmap_satp_switch() {
     // root entry 2) and MMIO megapage, so no manual kernel mapping needed.
 
     // 2. Map a high VA to a fresh frame
-    let test_frame = frame_alloc_sync().expect("OOM in satp test");
+    let test_frame = alloc_raw_frame_sync(PageRole::PteL1).expect("OOM in satp test");
     let test_va = VirtAddr::new(0xDEAD_0000);
     pmap_enter(
         &mut pmap,

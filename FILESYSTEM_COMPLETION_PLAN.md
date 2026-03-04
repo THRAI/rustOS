@@ -14,8 +14,8 @@
 | L2 | `busybox_testcode.sh` 主要文件操作通过 | `touch/cat/echo>/>>/rm/mkdir/mv/rmdir/cp/find/ls/stat` 基本可用 |
 | L3 | `libc-test/LTP` 文件系统子集通过 | `fstatat/readlinkat/renameat2/faccessat/ftruncate/fsync/...` 语义趋近 Linux |
 
-当前状态判断：约在 **L2- ~ L2**。  
-目录能力、普通文件读写、`touch/echo/cat/ls` 主路径已可用，后续主要缺口转为挂载与运维类 syscall。
+当前状态判断：约在 **L2**。  
+目录能力、普通文件读写、`touch/echo/cat/ls` 主路径已可用；`basic-musl` 在 `mount` 之前的用例已全部通过，当前主要缺口转为 `mount` 阶段阻塞与运维类 syscall。
 
 ---
 
@@ -73,9 +73,9 @@
 | `getdents64` | 已实现（分页版） | 支持按 fd offset 连续分页读取（delegate 批大小 32） |
 | `mkdirat` | 已实现 | 已分发并走 `delegate -> ext4::mkdir` |
 | `unlinkat` | 已实现（基础版） | 支持 `AT_REMOVEDIR` 分支 |
-| `symlinkat` | 未实现 | 当前直接 `ENOSYS` |
+| `symlinkat` | 已实现（兼容版） | 以内存符号链接表实现，已可支撑 `ln -sf` 建链；暂未落盘到 ext4 |
 | `linkat` | 未实现 | 无 syscall 入口 |
-| `mount/umount2` | 未实现 | 启动阶段内核内部 mount，用户态 syscall 缺失 |
+| `mount/umount2` | 已实现（最小语义） | 支持挂载点登记/卸载流程，尚未切换真实后端 |
 | `rename/renameat2` | 未实现 | 无 syscall 入口 |
 | `readlinkat/faccessat/fsync/ftruncate` | 未实现 | 无 syscall 入口或语义缺失 |
 
@@ -91,7 +91,7 @@
 
 主要缺口：
 1. inode 语义仍为 synthetic：`lookup` 使用 path-hash，不是稳定真实 inode。
-2. 挂载与运维 syscall 缺失：`mount/umount2/linkat/rename/readlink` 尚未接入。
+2. 运维 syscall 仍不完整：`linkat/rename/readlink` 尚未接入。
 3. `fstatat/fcntl` 等语义仍有简化分支（flags 与行为完整性不足）。
 
 ---
@@ -136,7 +136,29 @@
 
 ### 阶段 C：挂载兼容与目录运维能力
 
-状态：**未开始**
+状态：**进行中（Step 1 完成，Step 3 部分完成）**
+
+已完成（Step 1）：
+1. `mount(40)/umount2(39)` 已接入 syscall 分发与最小语义。
+2. 已支持挂载点目录校验、挂载登记、卸载注销。
+3. 对现有单根 ext4 架构保持兼容（当前不做真实后端切换）。
+
+已完成（Step 3 部分）：
+1. `symlinkat(36)` 已接入 syscall 分发与最小实现（内存映射表）。
+2. `unlinkat` 已能删除内存符号链接项。
+3. `path::resolve` 已支持符号链接映射跟随（用于动态加载器路径解析）。
+4. `run-rv-basic.sh` 中 `ln -sf ...` 不再报 `Function not implemented`。
+
+待完成：
+1. `rename/renameat2` 最小子集（支撑 `mv` 主路径）。
+2. `linkat/readlinkat` 最小实现（补齐链接相关 syscall）。
+3. 将符号链接能力从“内存兼容层”下沉到 ext4 落盘语义。
+4. 处理当前 `mount` 阶段阻塞：`Testing mount` 时仍受 `fork/COW` 路径稳定性影响。
+
+最新验证（2026-03-04）：
+1. `basic-musl` 在 `mount` 前用例均通过：`fstat/gettimeofday/openat/getdents/mkdir/mmap/...`。
+2. 历史失败点已修复：`fstat ret: -9` -> `fstat ret: 0`，`gettimeofday unknown(169)/error` -> `gettimeofday success`。
+3. 运行在 `Testing mount` 处停止，当前问题面已收敛到挂载阶段。
 
 ### 阶段 D：元数据与兼容增强
 
@@ -146,14 +168,13 @@
 
 ## 6. 下一步应执行的阶段
 
-当前建议：**进入阶段 C（挂载兼容与目录运维能力）**。  
-原因：阶段 B 的语义收敛已完成，下一步瓶颈已转移到 `mount/umount/rename/link/readlink` 能力缺失。
+当前建议：**继续阶段 C（先解 mount 阻塞，再补目录运维能力）**。  
+原因：阶段 B 的语义收敛已完成，`mount` 前测试已通过，下一步瓶颈集中在 `mount` 阶段与运维 syscall 覆盖度。
 
-阶段 C 起步任务（优先级顺序）：
-1. 实现 `mount(40)/umount2(39)` 的最小可用语义（先对齐 `basic`/oscomp 返回行为）。
+阶段 C 下一步任务（优先级顺序）：
+1. 先定位并修复 `Testing mount` 阶段阻塞（优先检查 `fork/COW` 相关路径稳定性）。
 2. 增加 `rename/renameat2` 最小子集，打通 `mv` 主路径。
-3. 增加 `linkat/readlinkat` 最小实现，提升 busybox 与后续 LTP 兼容。
-4. 补一轮运维命令回归：`mv/rmdir/cp/find`。
+3. 增加 `linkat/readlinkat` 最小实现，并将 `symlinkat` 逐步下沉到 ext4 落盘语义。
 
 ---
 
@@ -168,6 +189,6 @@
 
 ## 8. 当前结论
 
-1. 当前文件系统实现已推进到 **L2- ~ L2**，阶段 B 已完成收尾。  
-2. 下一步应进入阶段 C，集中补齐挂载与目录运维 syscall。  
-3. 当前主要风险已从文件 I/O 语义转移到系统调用覆盖度与运维语义完整性。  
+1. 当前文件系统实现已推进到 **L2**，阶段 B 已完成收尾。  
+2. `basic-musl` 的 `mount` 前用例已通过，失败面已收敛到 `mount` 阶段。  
+3. 下一步应继续阶段 C，先解 `mount` 阻塞，再补齐目录运维 syscall（`rename/link/readlink`）。  

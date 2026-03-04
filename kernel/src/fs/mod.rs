@@ -10,3 +10,5 @@ pub mod fd_table;
 pub mod path;
 pub mod pipe;
 pub mod devfs;
+pub mod mount;
+pub mod symlink;

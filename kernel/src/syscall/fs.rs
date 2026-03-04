@@ -600,6 +600,65 @@ pub fn sys_getcwd(
     Ok(buf)
 }
 
+/// sys_mount: minimal mount lifecycle support for oscomp/basic.
+///
+/// Current model:
+/// 1. Validate userspace pointers/strings.
+/// 2. Resolve and validate mount target directory in current namespace.
+/// 3. Register target in a lightweight mount table.
+/// 4. Keep existing single-root ext4 backend unchanged.
+pub async fn sys_mount_async(
+    task: &Arc<Task>,
+    source_ptr: usize,
+    target_ptr: usize,
+    fstype_ptr: usize,
+    flags: usize,
+    data_ptr: usize,
+) -> Result<(), Errno> {
+    if source_ptr == 0 || target_ptr == 0 || fstype_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let source = copyinstr(task, source_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let raw_target = copyinstr(task, target_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let fstype = copyinstr(task, fstype_ptr, 64).await.ok_or(Errno::EFAULT)?;
+
+    if data_ptr != 0 {
+        let _ = copyinstr(task, data_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    }
+
+    let target = absolutize_path(task, AT_FDCWD, &raw_target)?;
+    crate::fs::mount::register_mount(&source, &target, &fstype, flags)
+}
+
+/// sys_umount2: minimal unmount support paired with `sys_mount_async`.
+pub async fn sys_umount2_async(
+    task: &Arc<Task>,
+    target_ptr: usize,
+    flags: usize,
+) -> Result<(), Errno> {
+    const MNT_FORCE: usize = 0x0001;
+    const MNT_DETACH: usize = 0x0002;
+    const MNT_EXPIRE: usize = 0x0004;
+    const UMOUNT_NOFOLLOW: usize = 0x0008;
+
+    if target_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let known = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
+    if (flags & !known) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MNT_EXPIRE) != 0 && ((flags & MNT_FORCE) != 0 || (flags & MNT_DETACH) != 0) {
+        return Err(Errno::EINVAL);
+    }
+
+    let raw_target = copyinstr(task, target_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let target = absolutize_path(task, AT_FDCWD, &raw_target)?;
+    crate::fs::mount::unregister_mount(&target)
+}
+
 /// sys_pipe2: create a pipe with optional flags.
 pub fn sys_pipe2(task: &Arc<Task>, pipefd_ptr: usize, flags: usize) -> Result<(), Errno> {
     use crate::fs::fd_table::{FdFlags, FileDescription, FileObject, OpenFlags};
@@ -1566,6 +1625,12 @@ pub async fn sys_unlinkat_async(
     }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
 
+    // In-memory symlink compatibility path.
+    if (flags & AT_REMOVEDIR) == 0 && crate::fs::symlink::remove(&path_str) {
+        crate::klog!(syscall, debug, "unlinkat: removed symlink {}", path_str);
+        return Ok(());
+    }
+
     // Check existence and type
     let (_, ftype, _) = delegate::fs_lookup(0, &path_str).await.map_err(|_| Errno::ENOENT)?;
     let is_dir = ftype == 2;
@@ -1590,6 +1655,61 @@ pub async fn sys_unlinkat_async(
     }
 
     crate::klog!(syscall, debug, "unlinkat: removed {}", path_str);
+    Ok(())
+}
+
+/// sys_symlinkat: create a symbolic link (compatibility in-memory mapping).
+pub async fn sys_symlinkat_async(
+    task: &Arc<Task>,
+    target_ptr: usize,
+    newdirfd: isize,
+    linkpath_ptr: usize,
+) -> Result<(), Errno> {
+    if target_ptr == 0 || linkpath_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let raw_target = copyinstr(task, target_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let raw_linkpath = copyinstr(task, linkpath_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    if raw_target.is_empty() || raw_linkpath.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+
+    let link_abs = absolutize_path(task, newdirfd, &raw_linkpath)?;
+    let parent = if let Some(pos) = link_abs.rfind('/') {
+        if pos == 0 {
+            "/"
+        } else {
+            &link_abs[..pos]
+        }
+    } else {
+        "/"
+    };
+
+    let parent_vnode = crate::fs::path::resolve(parent).await.map_err(|_| Errno::ENOENT)?;
+    if parent_vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+
+    let target_norm = if raw_target.starts_with('/') {
+        normalize_absolute_path(&raw_target)
+    } else {
+        let mut joined = String::from(parent);
+        if joined != "/" {
+            joined.push('/');
+        }
+        joined.push_str(&raw_target);
+        normalize_absolute_path(&joined)
+    };
+
+    crate::fs::symlink::create(&link_abs, &target_norm)?;
+    crate::klog!(
+        syscall,
+        debug,
+        "symlinkat: {} -> {}",
+        link_abs,
+        target_norm
+    );
     Ok(())
 }
 

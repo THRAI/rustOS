@@ -84,10 +84,13 @@ impl SyscallId {
     pub const MKDIRAT: Self = Self(34);
     pub const UNLINKAT: Self = Self(35);
     pub const SYMLINKAT: Self = Self(36);
+    pub const UMOUNT2: Self = Self(39);
+    pub const MOUNT: Self = Self(40);
     pub const PIPE2: Self = Self(59);
     pub const FCNTL: Self = Self(25);
     pub const PPOLL: Self = Self(73);
     pub const UMASK: Self = Self(166);
+    pub const GETTIMEOFDAY: Self = Self(169);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -144,10 +147,13 @@ impl core::fmt::Display for SyscallId {
             Self::MKDIRAT => "mkdirat",
             Self::UNLINKAT => "unlinkat",
             Self::SYMLINKAT => "symlinkat",
+            Self::UMOUNT2 => "umount2",
+            Self::MOUNT => "mount",
             Self::PIPE2 => "pipe2",
             Self::FCNTL => "fcntl",
             Self::PPOLL => "ppoll",
             Self::UMASK => "umask",
+            Self::GETTIMEOFDAY => "gettimeofday",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -201,7 +207,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
 
     let id = SyscallId(syscall_id);
     let [a0, a1, a2, a3, a4, a5] = args;
-    
+
     crate::klog!(
         syscall,
         debug,
@@ -307,7 +313,20 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         }
         SyscallId::SIGALTSTACK => SyscallAction::Return(0),
         SyscallId::CLOCK_GETTIME => {
+            if a1 != 0 {
+                fault_in_user_buffer(task, a1, 16, PageFaultAccessType::WRITE).await;
+            }
             let ret = match sync::sys_clock_gettime(task, a0 as u32, a1) {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::GETTIMEOFDAY => {
+            if a0 != 0 {
+                fault_in_user_buffer(task, a0, 16, PageFaultAccessType::WRITE).await;
+            }
+            let ret = match sync::sys_gettimeofday(task, a0, a1) {
                 Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };
@@ -468,6 +487,20 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             };
             SyscallAction::Return(ret)
         }
+        SyscallId::MOUNT => {
+            let ret = match fs::sys_mount_async(task, a0, a1, a2, a3, a4).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::UMOUNT2 => {
+            let ret = match fs::sys_umount2_async(task, a0, a1).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
         SyscallId::MKDIRAT => {
             let ret = match fs::sys_mkdirat_async(task, a0 as isize, a1, a2).await {
                 Ok(()) => 0,
@@ -490,8 +523,11 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         }
         SyscallId::SYMLINKAT => {
-            // Stub: symlinkat not yet implemented, return ENOSYS
-            SyscallAction::Return(errno_ret(Errno::ENOSYS))
+            let ret = match fs::sys_symlinkat_async(task, a0, a1 as isize, a2).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
         }
         SyscallId::UMASK => {
             // Stub: return previous umask (0o022), accept silently

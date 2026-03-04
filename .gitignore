@@ -1,4 +1,5 @@
 /target/
+/user/target/
 kernel-rv64.bin
 freebsd-src/
 chronix/

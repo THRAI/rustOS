@@ -17,6 +17,7 @@ mod ipc;
 mod libc_stubs;
 mod mm;
 mod proc;
+mod syscall;
 mod trap;
 
 // Include boot assembly
@@ -320,30 +321,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 // Wait for delegate mount to complete
                 executor::sleep(100).await;
 
-                // autotest 模式：赛题评测，磁盘布局与 Chronix testcase.tar.xz 一致：
-                //   /riscv/musl/busybox  /riscv/musl/*_testcode.sh
-                //   /riscv/glibc/busybox /riscv/glibc/*_testcode.sh
-                //   /riscv/run-oj.sh  （总控脚本，依次跑所有测试组后 exit）
-                #[cfg(feature = "autotest")]
-                let (exec_path, argv) = (
-                    "/riscv/musl/busybox",
-                    alloc::vec![
-                        alloc::string::String::from("/riscv/musl/busybox"),
-                        alloc::string::String::from("sh"),
-                        alloc::string::String::from("/riscv/run-oj.sh"),
-                    ],
-                );
-
-                // 正常模式：交互式 shell，用于开发调试
-                #[cfg(not(feature = "autotest"))]
-                let (exec_path, argv) = (
-                    "/bin/busybox",
-                    alloc::vec![
-                        alloc::string::String::from("/bin/busybox"),
-                        alloc::string::String::from("sh"),
-                    ],
-                );
-
                 #[cfg(feature = "autotest")]
                 let envp = alloc::vec![
                     alloc::string::String::from("PATH=/riscv/musl:/riscv/glibc:/bin:/sbin"),
@@ -355,20 +332,63 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     alloc::string::String::from("HOME=/"),
                 ];
 
-                match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await {
-                    Ok((entry, sp)) => {
-                        {
-                            let mut tf = init_task2.trap_frame.lock();
-                            tf.sepc = entry;
-                            tf.x[2] = sp;
-                            tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                #[cfg(feature = "autotest")]
+                let launch_attempts = alloc::vec![
+                    (
+                        "/bin/initproc",
+                        alloc::vec![alloc::string::String::from("/bin/initproc")],
+                    ),
+                    (
+                        "/riscv/musl/busybox",
+                        alloc::vec![
+                            alloc::string::String::from("/riscv/musl/busybox"),
+                            alloc::string::String::from("sh"),
+                            alloc::string::String::from("/riscv/run-oj.sh"),
+                        ],
+                    ),
+                ];
+
+                #[cfg(not(feature = "autotest"))]
+                let launch_attempts = alloc::vec![
+                    (
+                        "/bin/initproc",
+                        alloc::vec![alloc::string::String::from("/bin/initproc")],
+                    ),
+                    (
+                        "/bin/init",
+                        alloc::vec![alloc::string::String::from("/bin/init")],
+                    ),
+                    (
+                        "/bin/busybox",
+                        alloc::vec![
+                            alloc::string::String::from("/bin/busybox"),
+                            alloc::string::String::from("sh"),
+                        ],
+                    ),
+                ];
+
+                let mut launched = false;
+                for (exec_path, argv) in launch_attempts {
+                    match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await {
+                        Ok((entry, sp)) => {
+                            {
+                                let mut tf = init_task2.trap_frame.lock();
+                                tf.sepc = entry;
+                                tf.x[2] = sp;
+                                tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                            }
+                            klog!(boot, info, "exec OK: {} entry={:#x} sp={:#x}", exec_path, entry, sp);
+                            executor::spawn_user_task(init_task2, init_cpu);
+                            launched = true;
+                            break;
                         }
-                        klog!(boot, info, "exec OK: entry={:#x} sp={:#x}", entry, sp);
-                        executor::spawn_user_task(init_task2, init_cpu);
+                        Err(e) => {
+                            klog!(boot, warn, "exec {} failed: {:?}", exec_path, e);
+                        }
                     }
-                    Err(e) => {
-                        klog!(boot, error, "exec {} failed: {:?}", exec_path, e);
-                    }
+                }
+                if !launched {
+                    klog!(boot, error, "no usable init program found");
                 }
             }, cpu0).detach();
         }
@@ -584,21 +604,21 @@ async fn test_vfs_read() {
     let fd_table = hal_common::SpinMutex::new(FdTable::new());
 
     // First read: goes through delegate
-    match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
+    match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
         Ok(fd) => {
             let mut buf = [0u8; 64];
-            match fs::syscalls::sys_read(&fd_table, fd, &mut buf).await {
+            match syscall::fs::read(&fd_table, fd, &mut buf).await {
                 Ok(n) => {
                     let content = core::str::from_utf8(&buf[..n]).unwrap_or("<invalid utf8>");
                     if content.trim_end() == "hello from ext4" {
                         let mut buf2 = [0u8; 64];
                         // Reopen to reset offset
-                        let _ = fs::syscalls::sys_close(&fd_table, fd);
-                        match fs::syscalls::sys_open(&fd_table, "/hello.txt", OpenFlags::RDONLY)
+                        let _ = syscall::fs::close(&fd_table, fd);
+                        match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY)
                             .await
                         {
                             Ok(fd2) => {
-                                match fs::syscalls::sys_read(&fd_table, fd2, &mut buf2).await {
+                                match syscall::fs::read(&fd_table, fd2, &mut buf2).await {
                                     Ok(n2) => {
                                         let content2 = core::str::from_utf8(&buf2[..n2])
                                             .unwrap_or("<invalid utf8>");
@@ -613,7 +633,7 @@ async fn test_vfs_read() {
                                     }
                                     Err(_) => kprintln!("vfs read FAIL (cache read err)"),
                                 }
-                                let _ = fs::syscalls::sys_close(&fd_table, fd2);
+                                let _ = syscall::fs::close(&fd_table, fd2);
                             }
                             Err(_) => kprintln!("vfs read FAIL (reopen err)"),
                         }
@@ -756,7 +776,7 @@ fn test_signal_pending_delivery() {
 
     // Test blocked signals: block SIGUSR1, post it, should not be unmasked-pending
     let mut new_blocked = proc::signal::SigSet::empty();
-    new_blocked.add(proc::signal::Signal::try_from(SIGUSR1).unwrap());
+    new_blocked.add(proc::signal::Signal::new_unchecked(SIGUSR1));
     task.signals
         .blocked
         .store(new_blocked, core::sync::atomic::Ordering::Release);
@@ -826,7 +846,7 @@ fn test_mmap_munmap() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_device_nodes() {
-    use fs::fd_table::FdTable;
+    use fs::fd_table::{FdTable, OpenFlags};
 
     // Test /dev/null behavior directly via FileObject
     // Write to /dev/null: always succeeds (swallowed)
@@ -837,14 +857,14 @@ async fn test_device_nodes() {
     let fd_table = hal_common::SpinMutex::new(FdTable::new_with_stdio());
 
     // Open /dev/null
-    match fs::syscalls::sys_open(&fd_table, "/dev/null", OpenFlags::RDWR).await {
+    match syscall::fs::open(&fd_table, "/dev/null", OpenFlags::RDWR).await {
         Ok(fd) => {
             // Verify it opened (fd >= 3 since 0,1,2 are stdio)
             if fd < 3 {
                 kprintln!("device nodes FAIL (/dev/null fd={} too low)", fd);
                 return;
             }
-            let _ = fs::syscalls::sys_close(&fd_table, fd);
+            let _ = syscall::fs::close(&fd_table, fd);
         }
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/null open: {:?})", e);
@@ -853,9 +873,9 @@ async fn test_device_nodes() {
     }
 
     // Open /dev/zero
-    match fs::syscalls::sys_open(&fd_table, "/dev/zero", OpenFlags::RDONLY).await {
+    match syscall::fs::open(&fd_table, "/dev/zero", OpenFlags::RDONLY).await {
         Ok(fd) => {
-            let _ = fs::syscalls::sys_close(&fd_table, fd);
+            let _ = syscall::fs::close(&fd_table, fd);
         }
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/zero open: {:?})", e);
@@ -864,9 +884,9 @@ async fn test_device_nodes() {
     }
 
     // Open /dev/console
-    match fs::syscalls::sys_open(&fd_table, "/dev/console", OpenFlags::RDWR).await {
+    match syscall::fs::open(&fd_table, "/dev/console", OpenFlags::RDWR).await {
         Ok(fd) => {
-            let _ = fs::syscalls::sys_close(&fd_table, fd);
+            let _ = syscall::fs::close(&fd_table, fd);
         }
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/console open: {:?})", e);

@@ -1,0 +1,17 @@
+[package]
+name = "user"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "user_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "initproc"
+path = "src/bin/initproc.rs"
+
+[features]
+autotest = []
+
+[dependencies]

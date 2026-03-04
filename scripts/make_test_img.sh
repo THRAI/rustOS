@@ -5,7 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMG="$SCRIPT_DIR/test.img"
-MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
+MKE2FS="$(command -v mke2fs || echo /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)"
 
 if [ -f "$IMG" ]; then
     echo "test.img already exists, skipping"
@@ -30,6 +30,13 @@ if [ -f "$SCRIPT_DIR/busybox" ]; then
     mkdir -p "$STAGING/bin"
     cp "$SCRIPT_DIR/busybox" "$STAGING/bin/busybox"
     chmod 755 "$STAGING/bin/busybox"
+fi
+
+# Add /bin/initproc if the binary exists
+if [ -f "$SCRIPT_DIR/initproc" ]; then
+    mkdir -p "$STAGING/bin"
+    cp "$SCRIPT_DIR/initproc" "$STAGING/bin/initproc"
+    chmod 755 "$STAGING/bin/initproc"
 fi
 
 echo "Creating 32MB ext4 test image..."

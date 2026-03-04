@@ -1,5 +1,6 @@
 [workspace]
 members = ["kernel", "hal-common", "kernel-mm"]
+exclude = ["user"]
 resolver = "2"
 
 [workspace.dependencies]

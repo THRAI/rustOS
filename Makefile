@@ -3,6 +3,7 @@
 HOST_TARGET := $(shell rustc -vV | grep host | cut -d' ' -f2)
 TARGET_RV64 := riscv64gc-unknown-none-elf
 KERNEL_ELF_RV64 := target/$(TARGET_RV64)/release/kernel
+USER_ELF_RV64 := target/$(TARGET_RV64)/release/initproc
 KERNEL_BIN_RV64 := kernel-rv64.bin
 
 QEMU_RV64 := qemu-system-riscv64
@@ -49,7 +50,7 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
+.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
@@ -57,6 +58,14 @@ all: kernel-rv
 kernel-rv:
 	cargo build --release -p kernel --target $(TARGET_RV64) --features autotest,$(_LOG_LEVEL_FEATURE)
 	cp $(KERNEL_ELF_RV64) kernel-rv
+
+user-rv64:
+	cd user && CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-Tsrc/linker.ld" cargo build --release --target $(TARGET_RV64)
+	cp user/target/$(TARGET_RV64)/release/initproc scripts/initproc
+
+user-rv64-autotest:
+	cd user && CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-Tsrc/linker.ld" cargo build --release --target $(TARGET_RV64) --features autotest
+	cp user/target/$(TARGET_RV64)/release/initproc scripts/initproc
 
 kernel-rv64:
 	cargo build --release -p kernel --target $(TARGET_RV64) $(_CARGO_LOG)
@@ -71,11 +80,11 @@ kernel-rv64-autotest:
 	cargo build --release -p kernel --target $(TARGET_RV64) --features autotest,$(_LOG_LEVEL_FEATURE)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
 
-$(DISK_IMG): scripts/make_test_img.sh $(wildcard scripts/init)
+$(DISK_IMG): user-rv64 scripts/make_test_img.sh $(wildcard scripts/init)
 	rm -f $(DISK_IMG)
 	cd scripts && ./make_test_img.sh
 
-disk-img:
+disk-img: user-rv64
 	rm -f $(DISK_IMG)
 	cd scripts && ./make_test_img.sh
 
@@ -108,7 +117,7 @@ oscomp-basic: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-basic.sh
 oscomp-basic: sdcard-rv run-oscomp
 
 
-sdcard-rv:
+sdcard-rv: user-rv64-autotest
 	@test -d $(OSCOMP_TC) || (echo "missing $(OSCOMP_TC)"; exit 1)
 	@test -f $(OSCOMP_RUN) || (echo "missing $(OSCOMP_RUN)"; exit 1)
 	rm -f scripts/sdcard-rv.img
@@ -121,6 +130,8 @@ sdcard-rv:
 	sudo find scripts/mnt -type f -name "*.sh" -exec chmod +x {} \;
 	sudo chmod +x scripts/mnt/riscv/run-oj.sh
 	sudo mkdir -p scripts/mnt/bin scripts/mnt/lib scripts/mnt/lib64 scripts/mnt/etc
+	sudo cp scripts/initproc scripts/mnt/bin/initproc
+	sudo chmod +x scripts/mnt/bin/initproc
 	sudo umount scripts/mnt
 	rmdir scripts/mnt
 	@echo "=== scripts/sdcard-rv.img ready ==="

@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use hal_common::addr::VirtPageNum;
 use spin::RwLock;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::AtomicU32;
 
 use hal_common::{PhysAddr};
 

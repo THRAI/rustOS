@@ -11,7 +11,7 @@ pub mod spin_mutex;
 pub mod timer_wheel;
 pub mod trap_frame;
 
-pub use addr::{PhysAddr, VirtAddr, PAGE_SIZE};
+pub use addr::{PhysAddr, VirtAddr, VirtPageNum, PAGE_SIZE};
 pub use errno::Errno;
 pub use irq_lock::IrqSafeSpinLock;
 pub use once::Once;

@@ -14,7 +14,7 @@ use spin::RwLock;
 
 use hal_common::{PAGE_SIZE, VirtAddr};
 
-use crate::mm::vm::vm_object::{self, VObjIndex};
+use crate::mm::vm::vm_object::VObjIndex;
 
 use super::vm_object::VmObject;
 

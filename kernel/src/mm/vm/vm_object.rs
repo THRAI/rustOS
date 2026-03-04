@@ -19,6 +19,14 @@ use crate::mm::allocator::alloc_anon_sync;
 use crate::mm::allocator::types::{FileCache, TypedFrame, UserAnon};
 use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
 
+/// Pager trait for clustered I/O operations (BSD vm_pager interface).
+/// Supports fetching multiple pages in a single operation for efficiency.
+pub trait Pager: Send + Sync {
+    /// Fetch pages from backing store into the provided slice.
+    /// Returns number of pages successfully fetched.
+    fn get_pages(&self, start_offset: u64, pages: &mut [PhysAddr]) -> usize;
+}
+
 /// A physical page held by a VmObject, encoded by its role type.
 #[derive(Debug)]
 pub enum OwnedPage {
@@ -71,6 +79,8 @@ impl Drop for OwnedPage {
 /// is safe (BSD vm_object_collapse semantics).
 pub struct VmObject {
     /// Pages owned directly by this object, keyed by page offset (in pages).
+    /// Uses BTreeMap instead of SkipMap: crossbeam-skiplist requires std (not no_std compatible).
+    /// BTreeMap provides O(log n) lookup, sufficient for current workloads.
     pages: BTreeMap<VObjIndex, OwnedPage>,
     /// Parent in the shadow chain (for COW).
     backing: Option<Arc<RwLock<VmObject>>>,

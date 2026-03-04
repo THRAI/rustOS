@@ -14,8 +14,8 @@
 | L2 | `busybox_testcode.sh` 主要文件操作通过 | `touch/cat/echo>/>>/rm/mkdir/mv/rmdir/cp/find/ls/stat` 基本可用 |
 | L3 | `libc-test/LTP` 文件系统子集通过 | `fstatat/readlinkat/renameat2/faccessat/ftruncate/fsync/...` 语义趋近 Linux |
 
-当前状态判断：约在 **L1+ ~ L2-**。  
-目录能力、普通文件读写、`touch` 主路径已经打通，但 Linux 语义完整性和挂载相关 syscall 仍是主要缺口。
+当前状态判断：约在 **L2- ~ L2**。  
+目录能力、普通文件读写、`touch/echo/cat/ls` 主路径已可用，后续主要缺口转为挂载与运维类 syscall。
 
 ---
 
@@ -59,7 +59,7 @@
 |---|---|---|
 | `getcwd` | 已实现 | 可用 |
 | `chdir` | 已实现 | 可用 |
-| `openat` | 部分实现 | 路径解析与创建已可用，`O_EXCL/O_TRUNC` 语义未完整 |
+| `openat` | 已实现（阶段 B 收尾） | `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_DIRECTORY` 主路径可用 |
 | `close` | 已实现 | 可用 |
 | `read` | 已实现 | vnode/page cache + pipe/device 路径可用 |
 | `write` | 已实现（基础版） | vnode 写路径已接入 `delegate::fs_write_at` |
@@ -70,7 +70,7 @@
 | `pipe2` | 已实现 | 可用 |
 | `dup/dup3` | 已实现 | 可用 |
 | `fcntl` | 部分实现 | `F_SETFL/F_SETFD` 近似 stub |
-| `getdents64` | 已实现（基础版） | 可返回目录项，当前单批上限 32 |
+| `getdents64` | 已实现（分页版） | 支持按 fd offset 连续分页读取（delegate 批大小 32） |
 | `mkdirat` | 已实现 | 已分发并走 `delegate -> ext4::mkdir` |
 | `unlinkat` | 已实现（基础版） | 支持 `AT_REMOVEDIR` 分支 |
 | `symlinkat` | 未实现 | 当前直接 `ENOSYS` |
@@ -90,11 +90,9 @@
 6. 普通文件写链路可用（`sys_write_async` 的 `Vnode` 分支已打通）。
 
 主要缺口：
-1. `openat` 语义仍不完整：`O_EXCL` 仍是注释级处理，`O_TRUNC` 仍 TODO。
-2. 写后缓存一致性未闭环：page cache/dentry/vnode size 更新策略不完整。
-3. `getdents64` 大目录能力不足：`READDIR_BATCH=32`，分页与偏移一致性需补强。
-4. inode 语义仍为 synthetic：`lookup` 使用 path-hash，不是稳定真实 inode。
-5. 挂载与运维 syscall 缺失：`mount/umount2/linkat/rename/readlink` 尚未接入。
+1. inode 语义仍为 synthetic：`lookup` 使用 path-hash，不是稳定真实 inode。
+2. 挂载与运维 syscall 缺失：`mount/umount2/linkat/rename/readlink` 尚未接入。
+3. `fstatat/fcntl` 等语义仍有简化分支（flags 与行为完整性不足）。
 
 ---
 
@@ -126,16 +124,15 @@
 
 ### 阶段 B：普通文件创建/写入语义
 
-状态：**进行中（约 70%）**
+状态：**已完成（收尾完成）**
 
 已完成：
 1. `write` 的 `Vnode` 路径已打通。
 2. `touch` 关键链路已打通（`utimensat` 最小实现 + `O_CREAT` 兼容修正）。
-
-未完成：
-1. `openat` 的 `O_EXCL/O_TRUNC` 完整语义。
-2. 写后缓存一致性（page cache 失效、size 可见性）。
-3. 更完整的写语义回归（`append/lseek/truncate` 组合场景）。
+3. `openat` 的 `O_EXCL/O_TRUNC` 语义已落地。
+4. 写后缓存一致性已补齐：`page cache` 失效与 `vnode.size` 更新已接入。
+5. `getdents64` 大目录分页与 offset 连续性已补齐。
+6. 回归通过：`touch/echo >/>>/cat/ls` 主路径可用（含大目录 `ls`）。
 
 ### 阶段 C：挂载兼容与目录运维能力
 
@@ -149,18 +146,14 @@
 
 ## 6. 下一步应执行的阶段
 
-当前建议：**先完成阶段 B（收尾），再进入阶段 C**。  
-原因：如果不先收敛 `open/write` 语义一致性，后续 `mount/rename/cp` 的问题会混叠，回归成本更高。
+当前建议：**进入阶段 C（挂载兼容与目录运维能力）**。  
+原因：阶段 B 的语义收敛已完成，下一步瓶颈已转移到 `mount/umount/rename/link/readlink` 能力缺失。
 
-阶段 B 收尾任务（优先级顺序）：
-1. 完成 `openat` 的 `O_EXCL` 与 `O_TRUNC` 真实语义。
-2. 补写后一致性：至少对受影响页做 page cache 失效或更新，并确保 `vnode.size` 可见。
-3. 补 `getdents64` 大目录分批读取与 offset 连续性。
-4. 回归 `touch/echo >/>>/cat/stat/find` 组合场景。
-
-阶段 B 完成判据：
-1. `basic` 中 `openat/read/write/getdents` 稳定通过。
-2. `busybox` 中 `touch/cat/echo>/>>/ls/stat/rm/mkdir/rmdir` 稳定通过。
+阶段 C 起步任务（优先级顺序）：
+1. 实现 `mount(40)/umount2(39)` 的最小可用语义（先对齐 `basic`/oscomp 返回行为）。
+2. 增加 `rename/renameat2` 最小子集，打通 `mv` 主路径。
+3. 增加 `linkat/readlinkat` 最小实现，提升 busybox 与后续 LTP 兼容。
+4. 补一轮运维命令回归：`mv/rmdir/cp/find`。
 
 ---
 
@@ -175,6 +168,6 @@
 
 ## 8. 当前结论
 
-1. 当前文件系统实现已从文档原先的 L1- 推进到 **L1+ ~ L2-**。  
-2. 下一步不应直接跳到阶段 C；应先把 **阶段 B 收尾** 做完，避免语义不一致放大后续问题。  
-3. 阶段 B 收尾完成后，再进入阶段 C（挂载与目录运维）是最稳妥路径。  
+1. 当前文件系统实现已推进到 **L2- ~ L2**，阶段 B 已完成收尾。  
+2. 下一步应进入阶段 C，集中补齐挂载与目录运维 syscall。  
+3. 当前主要风险已从文件 I/O 语义转移到系统调用覆盖度与运维语义完整性。  

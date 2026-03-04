@@ -113,41 +113,51 @@ pub async fn open(
         return Ok(fd);
     }
 
-    // Try to resolve the path
-    let vnode_result = crate::fs::path::resolve(path_str).await;
+    let create = (raw_flags & O_CREAT) != 0;
+    let excl = (raw_flags & O_EXCL) != 0;
+    let trunc = (raw_flags & O_TRUNC) != 0;
 
-    // Handle O_CREAT: create file if it doesn't exist
-    if vnode_result.is_err() && (raw_flags & O_CREAT) != 0 {
-        // File doesn't exist and O_CREAT is set, create it
-        // Open with O_CREAT flag via delegate, then close
-        let create_flags = normalize_delegate_open_flags(raw_flags);
-        match delegate::fs_open_flags(path_str, create_flags).await {
-            Ok(handle) => {
-                // Close the handle immediately
-                let _ = delegate::fs_close(handle).await;
-            }
-            Err(_) => return Err(Errno::EIO),
-        }
-        // Now resolve the path again
+    // First resolve to distinguish "exists" from "create path".
+    let first_resolve = crate::fs::path::resolve(path_str).await;
+    if first_resolve.is_ok() && create && excl {
+        return Err(Errno::EEXIST);
     }
 
-    let vnode = crate::fs::path::resolve(path_str).await?;
+    let vnode = match first_resolve {
+        Ok(v) => v,
+        Err(e) => {
+            if !create {
+                return Err(e);
+            }
+            // Create by opening once with O_CREAT-compatible flags, then close.
+            let create_flags = normalize_delegate_open_flags(raw_flags);
+            let handle = delegate::fs_open_flags(path_str, create_flags)
+                .await
+                .map_err(|_| {
+                    if excl {
+                        Errno::EEXIST
+                    } else {
+                        Errno::EIO
+                    }
+                })?;
+            let _ = delegate::fs_close(handle).await;
+            crate::fs::path::resolve(path_str).await?
+        }
+    };
 
     // Handle O_DIRECTORY: verify it's a directory
     if (raw_flags & O_DIRECTORY) != 0 && vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
         return Err(Errno::ENOTDIR);
     }
 
-    // Handle O_EXCL with O_CREAT: fail if file exists
-    if (raw_flags & O_CREAT) != 0 && (raw_flags & O_EXCL) != 0 {
-        // If we got here and O_EXCL is set, the file already existed
-        // (we would have created it above if it didn't exist)
-        // This is a bit tricky - we need to check if we just created it
-        // For now, skip this check as it requires more state tracking
+    // Handle O_TRUNC for regular files.
+    if trunc && flags.write && vnode.vtype() == crate::fs::vnode::VnodeType::Regular {
+        delegate::fs_truncate(path_str, 0)
+            .await
+            .map_err(|_| Errno::EIO)?;
+        page_cache::invalidate_all(vnode.vnode_id());
+        vnode.set_size(0);
     }
-
-    // Handle O_TRUNC: truncate file to zero length
-    // TODO: implement truncate operation in delegate
 
     let desc = FileDescription::new(FileObject::Vnode(vnode), flags);
     let fd = fd_table.lock().insert(desc, FdFlags::empty())?;
@@ -914,7 +924,6 @@ pub async fn sys_write_async(
             path: String,
             offset: u64,
             append: bool,
-            size: u64,
         },
     }
 
@@ -935,7 +944,6 @@ pub async fn sys_write_async(
                 path: String::from(v.path()),
                 offset: d.offset.load(core::sync::atomic::Ordering::Relaxed),
                 append: d.flags.append,
-                size: v.size(),
             },
         };
         (tgt, Arc::clone(d))
@@ -990,11 +998,12 @@ pub async fn sys_write_async(
             path,
             mut offset,
             append,
-            size,
         } => {
             // Handle O_APPEND: write at end of file
             if append {
-                offset = size;
+                if let Ok((_, _, file_size)) = delegate::fs_lookup(0, &path).await {
+                    offset = file_size;
+                }
             }
 
             // Copy data from user space to kernel buffer
@@ -1017,6 +1026,12 @@ pub async fn sys_write_async(
                     // Update file offset
                     desc.offset
                         .store(offset + n as u64, core::sync::atomic::Ordering::Relaxed);
+                    if let FileObject::Vnode(v) = &desc.object {
+                        page_cache::invalidate_range(v.vnode_id(), offset, n);
+                        let old_size = v.size();
+                        let new_size = core::cmp::max(old_size, offset + n as u64);
+                        v.set_size(new_size);
+                    }
                     Ok(n)
                 }
                 Err(_) => Err(Errno::EIO),
@@ -1611,18 +1626,19 @@ pub async fn sys_getdents64_async(
     // Get current offset (used as entry index)
     let start_idx = desc.offset.load(Ordering::Relaxed) as usize;
 
-    // Read directory entries via delegate
-    let (entries, count) = delegate::fs_readdir(&dir_path).await.map_err(|_| Errno::EIO)?;
-
-    if start_idx >= count {
-        return Ok(0); // Already read all entries
+    // Read a page of directory entries from current logical offset.
+    let (entries, count) = delegate::fs_readdir(&dir_path, start_idx)
+        .await
+        .map_err(|_| Errno::EIO)?;
+    if count == 0 {
+        return Ok(0);
     }
 
     // Fault in user buffer
     fault_in_user_buffer(task, buf_ptr, buf_len, PageFaultAccessType::WRITE).await;
 
     let mut written: usize = 0;
-    let mut idx = start_idx;
+    let mut idx = 0usize;
 
     while idx < count {
         let entry = &entries[idx];
@@ -1647,7 +1663,7 @@ pub async fn sys_getdents64_async(
 
         let dirent = LinuxDirent64 {
             d_ino: entry.inode as u64,
-            d_off: (idx + 1) as i64,
+            d_off: (start_idx + idx + 1) as i64,
             d_reclen: rec_len as u16,
             d_type,
         };
@@ -1693,7 +1709,8 @@ pub async fn sys_getdents64_async(
     }
 
     // Update offset to track position
-    desc.offset.store(idx as u64, Ordering::Relaxed);
+    desc.offset
+        .store((start_idx + idx) as u64, Ordering::Relaxed);
 
     Ok(written)
 }

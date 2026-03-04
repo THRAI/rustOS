@@ -427,7 +427,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             crate::hal::rv64::sbi::shutdown();
             unreachable!()
         }
-        SyscallId::CLONE => SyscallAction::Return(process::sys_clone(task)),
+        SyscallId::CLONE => SyscallAction::Return(process::sys_clone(task, a1)),
         SyscallId::EXECVE => {
             match process::sys_execve_async(task, AT_FDCWD, a0, a1, a2).await {
                 Ok((entry, sp)) => {

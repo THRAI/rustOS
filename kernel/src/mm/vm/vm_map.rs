@@ -7,13 +7,17 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use hal_common::addr::VirtPageNum;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use spin::RwLock;
 
-use hal_common::VirtAddr;
+use hal_common::{PAGE_SIZE, VirtAddr};
+
+use crate::mm::vm::vm_object::{self, VObjIndex};
 
 use super::vm_object::VmObject;
+
 
 #[cfg(not(test))]
 // FIXME: dependency on fs
@@ -24,6 +28,7 @@ pub trait Vnode: Send + Sync {
 }
 
 /// Placeholder trait for test builds where the fs module is not available.
+//TODO: adhere to Mach Vnode interface!
 #[cfg(test)]
 pub trait Vnode: Send + Sync {
     fn vnode_id(&self) -> u64;
@@ -56,6 +61,22 @@ bitflags::bitflags! {
     //TODO: add flag packs like RW, RX, UW, etc.
 }
 
+// ---------------------------------------------------------------------------
+// EntryFlags — VmMapEntry state flags
+// ---------------------------------------------------------------------------
+
+bitflags::bitflags! {
+    /// VmMapEntry state flags for COW and concurrency control.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EntryFlags: u32 {
+        const COW            = 1 << 0;
+        const NEEDS_COPY     = 1 << 1;
+        const GROWS_DOWN     = 1 << 2;
+        const IN_TRANSITION  = 1 << 3;
+        const NEEDS_WAKEUP   = 1 << 4;
+    }
+}
+
 /// A declarative macro to combine MapPerm flags.
 /// Usage: `map_perm!(R, W, U)`
 #[macro_export]
@@ -74,7 +95,9 @@ macro_rules! map_perm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmAreaType {
     Anonymous,
+    SharedAnonymous,
     FileBacked,
+    FileBackedPrivate,
     Stack,
     Heap,
     Device,
@@ -101,6 +124,7 @@ pub enum VmError {
 
 /// A virtual memory area: a contiguous range of virtual addresses backed
 /// by a VmObject.
+//TODO: vmArea should be changed with pmap in vmMap.
 pub struct VmArea {
     /// Monotonic unique ID (for TOCTOU defense).
     pub id: u64,
@@ -111,15 +135,19 @@ pub struct VmArea {
     /// Backing VmObject.
     pub object: Arc<RwLock<VmObject>>,
     /// Offset into the VmObject where this mapping starts (in pages).
-    pub obj_offset: u64,
+    pub obj_offset: VirtPageNum,
     /// Type of this VMA.
     pub vma_type: VmAreaType,
+    /// Entry state flags (COW, IN_TRANSITION, etc.).
+    pub flags: EntryFlags,
+
+    //TODO: file-backed Should be a vmObject concept, handled by VmObject Pager.
     /// File-backed: vnode reference (None for anonymous).
     pub vnode: Option<Arc<dyn Vnode>>,
     /// File offset where this VMA's data starts.
-    pub file_offset: u64,
+    pub file_offset: usize,
     /// Number of bytes of file data in this VMA (rest is zero-fill).
-    pub file_size: u64,
+    pub file_size: usize,
 }
 
 impl VmArea {
@@ -128,7 +156,7 @@ impl VmArea {
         range: Range<VirtAddr>,
         prot: MapPerm,
         object: Arc<RwLock<VmObject>>,
-        obj_offset: u64,
+        obj_offset: VirtPageNum,
         vma_type: VmAreaType,
     ) -> Self {
         Self {
@@ -138,6 +166,7 @@ impl VmArea {
             object,
             obj_offset,
             vma_type,
+            flags: EntryFlags::empty(),
             vnode: None,
             file_offset: 0,
             file_size: 0,
@@ -145,15 +174,17 @@ impl VmArea {
     }
 
     /// Create a file-backed VmArea for demand-paged ELF loading.
+    //TODO: file-backed should be a vmObject concept, handled by VmObject Pager.
     pub fn new_file_backed(
         range: Range<VirtAddr>,
         prot: MapPerm,
         object: Arc<RwLock<VmObject>>,
-        obj_offset: u64,
+        obj_offset:VirtPageNum ,
         vnode: Arc<dyn Vnode>,
-        file_offset: u64,
-        file_size: u64,
+        file_offset: usize,
+        file_size: usize,
     ) -> Self {
+        kprintln!("TODO: file-backed vma concepts to VmObject layer");
         Self {
             id: next_vma_id(),
             range,
@@ -161,6 +192,7 @@ impl VmArea {
             object,
             obj_offset,
             vma_type: VmAreaType::FileBacked,
+            flags: EntryFlags::empty(),
             vnode: Some(vnode),
             file_offset,
             file_size,
@@ -171,6 +203,36 @@ impl VmArea {
     pub fn contains(&self, va: VirtAddr) -> bool {
         va >= self.range.start && va < self.range.end
     }
+
+    /// Calculate the offset into the VmObject for a given virtual address within this VMA.
+    pub fn translate_to_obj_index(&self, va: VirtAddr) ->  VObjIndex {
+        debug_assert!(self.contains(va));
+        let delta_in_pages = (va - self.range.start).div_ceil(PAGE_SIZE);
+        self.obj_offset + delta_in_pages
+    }
+
+    /// Coordinate transform: compute page index for a given virtual address.
+    pub fn pindex_for(&self, vaddr: VirtAddr) -> VirtPageNum {
+        debug_assert!(self.contains(vaddr));
+        let delta_in_pages = (vaddr - self.range.start).div_ceil(PAGE_SIZE);
+        self.obj_offset + delta_in_pages
+    }
+
+    /// Check if this entry is in transition (being modified by another thread).
+    pub fn is_in_transition(&self) -> bool {
+        self.flags.contains(EntryFlags::IN_TRANSITION)
+    }
+
+    /// Check if this entry needs copy-on-write materialization.
+    pub fn needs_copy(&self) -> bool {
+        self.flags.contains(EntryFlags::NEEDS_COPY)
+    }
+
+    /// Clear the NEEDS_COPY flag (requires write lock on VmMap).
+    pub fn clear_needs_copy(&mut self) {
+        self.flags.remove(EntryFlags::NEEDS_COPY);
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +249,8 @@ pub struct VmMap {
     areas: BTreeMap<VirtAddr, VmArea>,
     /// Root page table physical address (placeholder until PMAP, Plan 3).
     pub pmap_root: usize,
+    /// ABA defense timestamp (incremented on lock operations).
+    pub timestamp: AtomicU32,
 }
 
 impl VmMap {
@@ -195,7 +259,24 @@ impl VmMap {
         Self {
             areas: BTreeMap::new(),
             pmap_root: 0,
+            timestamp: AtomicU32::new(0),
         }
+    }
+
+    /// Try to upgrade read lock to write lock (stub - parking_lot RwLock doesn't support native upgrade).
+    /// Returns true if upgrade succeeded, false if caller must release and re-acquire.
+    /// NOTE: This is a no-op stub. Real implementation would require custom RwLock or external crate.
+    pub fn try_upgrade_read_to_write(&self) -> bool {
+        // parking_lot::RwLock doesn't support lock upgrade.
+        // Caller must release read lock and acquire write lock manually.
+        false
+    }
+
+    /// Downgrade write lock to read lock (stub - requires external lock handle).
+    /// NOTE: This is a no-op stub. Real implementation would operate on RwLockWriteGuard.
+    pub fn downgrade_write_to_read(&self) {
+        // parking_lot::RwLock supports downgrade via RwLockWriteGuard::downgrade(),
+        // but that requires the guard object. This stub documents the pattern.
     }
 
     /// Find the VMA containing `va`, if any.
@@ -269,7 +350,10 @@ impl VmMap {
         for (_, vma) in &self.areas {
             let needs_shadow = matches!(
                 vma.vma_type,
-                VmAreaType::Anonymous | VmAreaType::Heap | VmAreaType::Stack
+                VmAreaType::Anonymous
+                    | VmAreaType::FileBackedPrivate
+                    | VmAreaType::Heap
+                    | VmAreaType::Stack
             );
             let child_object = if needs_shadow {
                 // Create a shadow for the child, pointing to the current object.
@@ -291,6 +375,7 @@ impl VmMap {
                 object: child_object,
                 obj_offset: vma.obj_offset,
                 vma_type: vma.vma_type,
+                flags: vma.flags,
                 vnode: vma.vnode.clone(),
                 file_offset: vma.file_offset,
                 file_size: vma.file_size,
@@ -390,20 +475,18 @@ impl VmMap {
                     object: left_obj,
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: if vma.file_size > left_size as u64 {
-                        left_size as u64
-                    } else {
-                        vma.file_size
-                    },
+                    file_size:
+                        if vma.file_size > left_size { left_size } else { vma.file_size },
                 };
                 self.areas.insert(vma_start, left_vma);
 
                 // Right portion
                 let right_size = vma_end.as_usize() - right_start.as_usize();
                 let right_obj = VmObject::new(right_size);
-                let right_offset_delta = (right_start.as_usize() - vma_start.as_usize()) as u64;
+                let right_offset_delta = right_start.as_usize() - vma_start.as_usize();
                 let right_vma = VmArea {
                     id: next_vma_id(),
                     range: right_start..vma_end,
@@ -411,6 +494,7 @@ impl VmMap {
                     object: right_obj,
                     obj_offset: vma.obj_offset + right_offset_delta,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + right_offset_delta,
                     file_size: vma.file_size.saturating_sub(right_offset_delta),
@@ -430,13 +514,10 @@ impl VmMap {
                     object: truncated_obj,
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: if vma.file_size > keep_size as u64 {
-                        keep_size as u64
-                    } else {
-                        vma.file_size
-                    },
+                    file_size: if vma.file_size > keep_size { keep_size } else { vma.file_size },
                 };
                 self.areas.insert(vma_start, kept);
                 removed.push(vma);
@@ -445,7 +526,7 @@ impl VmMap {
                 let new_start = end;
                 let new_size = vma_end.as_usize() - new_start.as_usize();
                 let truncated_obj = VmObject::new(new_size);
-                let offset_delta = (new_start.as_usize() - vma_start.as_usize()) as u64;
+                let offset_delta = new_start.as_usize() - vma_start.as_usize();
                 let kept = VmArea {
                     id: next_vma_id(),
                     range: new_start..vma_end,
@@ -453,6 +534,7 @@ impl VmMap {
                     object: truncated_obj,
                     obj_offset: vma.obj_offset + offset_delta,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + offset_delta,
                     file_size: vma.file_size.saturating_sub(offset_delta),
@@ -500,14 +582,15 @@ impl VmMap {
                     object: VmObject::new(left_size),
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: core::cmp::min(vma.file_size, left_size as u64),
+                    file_size: core::cmp::min(vma.file_size, left_size),
                 };
                 self.areas.insert(vma_start, left);
 
                 let mid_size = end.as_usize() - start.as_usize();
-                let mid_offset = (start.as_usize() - vma_start.as_usize()) as u64;
+                let mid_offset = start.as_usize() - vma_start.as_usize();
                 let mid = VmArea {
                     id: next_vma_id(),
                     range: start..end,
@@ -515,18 +598,19 @@ impl VmMap {
                     object: VmObject::new(mid_size),
                     obj_offset: vma.obj_offset + mid_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + mid_offset,
                     file_size: vma
                         .file_size
                         .saturating_sub(mid_offset)
-                        .min(mid_size as u64),
+                        .min(mid_size),
                 };
                 self.areas.insert(start, mid);
 
                 let right_start = end;
                 let right_size = vma_end.as_usize() - right_start.as_usize();
-                let right_offset = (right_start.as_usize() - vma_start.as_usize()) as u64;
+                let right_offset = right_start.as_usize() - vma_start.as_usize();
                 let right = VmArea {
                     id: next_vma_id(),
                     range: right_start..vma_end,
@@ -534,6 +618,7 @@ impl VmMap {
                     object: VmObject::new(right_size),
                     obj_offset: vma.obj_offset + right_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + right_offset,
                     file_size: vma.file_size.saturating_sub(right_offset),
@@ -549,13 +634,14 @@ impl VmMap {
                     object: VmObject::new(left_size),
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: core::cmp::min(vma.file_size, left_size as u64),
+                    file_size: core::cmp::min(vma.file_size, left_size),
                 };
                 self.areas.insert(vma_start, left);
 
-                let right_offset = (start.as_usize() - vma_start.as_usize()) as u64;
+                let right_offset = start.as_usize() - vma_start.as_usize();
                 let right_size = vma_end.as_usize() - start.as_usize();
                 let right = VmArea {
                     id: next_vma_id(),
@@ -564,6 +650,7 @@ impl VmMap {
                     object: VmObject::new(right_size),
                     obj_offset: vma.obj_offset + right_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + right_offset,
                     file_size: vma.file_size.saturating_sub(right_offset),
@@ -579,13 +666,14 @@ impl VmMap {
                     object: VmObject::new(left_size),
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: core::cmp::min(vma.file_size, left_size as u64),
+                    file_size: core::cmp::min(vma.file_size, left_size),
                 };
                 self.areas.insert(vma_start, left);
 
-                let right_offset = (end.as_usize() - vma_start.as_usize()) as u64;
+                let right_offset = end.as_usize() - vma_start.as_usize();
                 let right_size = vma_end.as_usize() - end.as_usize();
                 let right = VmArea {
                     id: next_vma_id(),
@@ -594,6 +682,7 @@ impl VmMap {
                     object: VmObject::new(right_size),
                     obj_offset: vma.obj_offset + right_offset,
                     vma_type: vma.vma_type,
+                    flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + right_offset,
                     file_size: vma.file_size.saturating_sub(right_offset),
@@ -625,7 +714,7 @@ mod tests {
             VirtAddr::new(start)..VirtAddr::new(end),
             MapPerm::R | MapPerm::W,
             obj,
-            0,
+            VirtPageNum(0),
             VmAreaType::Anonymous,
         )
     }
@@ -703,17 +792,15 @@ mod tests {
         {
             let mut w = obj.write();
             w.insert_page(
-                0,
-                super::super::vm_object::OwnedPage::new_anonymous(hal_common::PhysAddr::new(
-                    0xA000,
-                )),
+                VirtPageNum(0),
+                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(0xA000)),
             );
         }
         let vma = VmArea::new(
             VirtAddr::new(0x1000)..VirtAddr::new(0x2000),
             MapPerm::R | MapPerm::W,
             obj,
-            0,
+            VirtPageNum(0),
             VmAreaType::Anonymous,
         );
         parent_map.insert(vma).unwrap();
@@ -757,14 +844,14 @@ mod tests {
         {
             let mut w = obj.write();
             w.insert_page(
-                0,
-                super::super::vm_object::OwnedPage::new_anonymous(hal_common::PhysAddr::new(
+                VirtPageNum(0),
+                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
                     0xDEAD_0000,
                 )),
             );
             w.insert_page(
-                1,
-                super::super::vm_object::OwnedPage::new_anonymous(hal_common::PhysAddr::new(
+                VirtPageNum(0),
+                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
                     0xBEEF_0000,
                 )),
             );
@@ -773,7 +860,7 @@ mod tests {
             VirtAddr::new(0x1000)..VirtAddr::new(0x3000),
             MapPerm::R | MapPerm::W,
             obj,
-            0,
+            VirtPageNum(0),
             VmAreaType::Anonymous,
         );
         parent_map.insert(vma).unwrap();
@@ -785,11 +872,11 @@ mod tests {
         assert_eq!(child_obj.shadow_depth(), 1);
         // Parent's pages visible through shadow chain
         assert_eq!(
-            child_obj.lookup_page(0).unwrap(),
+            child_obj.lookup_page(VirtPageNum(0)).unwrap(),
             hal_common::PhysAddr::new(0xDEAD_0000)
         );
         assert_eq!(
-            child_obj.lookup_page(1).unwrap(),
+            child_obj.lookup_page(VirtPageNum(1)).unwrap(),
             hal_common::PhysAddr::new(0xBEEF_0000)
         );
     }
@@ -813,7 +900,7 @@ mod tests {
             VirtAddr::new(0x2000)..VirtAddr::new(0x1000),
             MapPerm::R,
             obj,
-            0,
+            VirtPageNum(0),
             VmAreaType::Anonymous,
         );
         assert!(map.insert(vma).is_err());

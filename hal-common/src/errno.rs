@@ -22,6 +22,8 @@ pub enum Errno {
     ESRCH,
     ERANGE,
     ENOTDIR,
+    EISDIR,
+    ENOTEMPTY,
 }
 
 impl Errno {
@@ -49,6 +51,8 @@ impl Errno {
             Errno::ESRCH => 3,
             Errno::ERANGE => 34,
             Errno::ENOTDIR => 20,
+            Errno::EISDIR => 21,
+            Errno::ENOTEMPTY => 39,
         }
     }
 }

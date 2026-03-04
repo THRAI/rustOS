@@ -4,15 +4,19 @@ use crate::fs::delegate;
 use crate::fs::fd_table::{FdFlags, FdTable, FileDescription, FileObject, OpenFlags};
 use crate::fs::page_cache;
 use crate::fs::vnode::VnodeType;
-use hal_common::Errno;
+use crate::mm::uio::{uiomove, UioDir};
 use crate::mm::vm::fault::PageFaultAccessType;
+use crate::mm::vm::fault_async::{page_cache_fetch_by_id, resolve_user_fault};
 use crate::proc::task::Task;
 use crate::proc::user_copy::{copyinstr, fault_in_user_buffer};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hal_common::PhysAddr;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::Ordering;
+use core::task::{Context, Poll};
+use hal_common::{Errno, PhysAddr, VirtAddr};
 
 const AT_FDCWD: isize = -100;
 const PAGE_SIZE: usize = 4096;
@@ -597,4 +601,894 @@ pub fn absolutize_path(task: &Arc<Task>, dirfd: isize, raw_path: &str) -> Result
     }
 
     Err(Errno::EINVAL)
+}
+
+
+// ===== merged from syscall/io_async.rs =====
+
+/// sys_read_async: read from file descriptor.
+pub async fn sys_read_async(
+    task: &Arc<Task>,
+    fd: u32,
+    user_buf: usize,
+    len: usize,
+) -> Result<usize, Errno> {
+    use crate::fs::fd_table::{DeviceKind, FileObject};
+
+    if len == 0 {
+        return Ok(0);
+    }
+
+    enum ReadSource {
+        Vnode {
+            id: u64,
+            path: String,
+            size: u64,
+            offset: u64,
+        },
+        PipeRead(alloc::sync::Arc<crate::fs::pipe::Pipe>),
+        DevNull,
+        DevZero,
+        DevConsole,
+    }
+
+    let (source, desc) = {
+        let tab = task.fd_table.lock();
+        let d = tab.get(fd).ok_or(Errno::EBADF)?;
+        if !d.flags.read {
+            return Err(Errno::EPERM);
+        }
+        let src = match &d.object {
+            FileObject::Vnode(v) => ReadSource::Vnode {
+                id: v.vnode_id(),
+                path: String::from(v.path()),
+                size: v.size(),
+                offset: d.offset.load(core::sync::atomic::Ordering::Relaxed),
+            },
+            FileObject::PipeRead(p) => ReadSource::PipeRead(Arc::clone(p)),
+            FileObject::PipeWrite(_) => return Err(Errno::EBADF),
+            FileObject::Device(DeviceKind::Null) => ReadSource::DevNull,
+            FileObject::Device(DeviceKind::Zero) => ReadSource::DevZero,
+            FileObject::Device(DeviceKind::ConsoleRead) => ReadSource::DevConsole,
+            FileObject::Device(DeviceKind::ConsoleWrite) => return Err(Errno::EBADF),
+        };
+        (src, Arc::clone(d))
+    };
+
+    match source {
+        ReadSource::DevNull => Ok(0),
+        ReadSource::DevZero => {
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::WRITE).await;
+            let zeros = alloc::vec![0u8; len];
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(user_buf as *mut u8, zeros.as_ptr(), len)
+            };
+            if rc != 0 {
+                Err(Errno::EFAULT)
+            } else {
+                Ok(len)
+            }
+        }
+        ReadSource::DevConsole => {
+            ConsoleReadFuture {
+                task,
+                user_buf,
+                len,
+            }
+            .await
+        }
+        ReadSource::PipeRead(pipe) => {
+            PipeReadFuture {
+                pipe,
+                task,
+                user_buf,
+                len,
+            }
+            .await
+        }
+        ReadSource::Vnode {
+            id,
+            path,
+            size,
+            mut offset,
+        } => {
+            if offset >= size {
+                return Ok(0);
+            }
+            let to_read = core::cmp::min(len, (size - offset) as usize);
+            let mut total = 0usize;
+
+            while total < to_read {
+                let page_offset = offset / PAGE_SIZE as u64;
+                let offset_in_page = (offset % PAGE_SIZE as u64) as usize;
+                let chunk = core::cmp::min(PAGE_SIZE - offset_in_page, to_read - total);
+
+                let pa = page_cache_fetch_by_id(id, &path, page_offset * PAGE_SIZE as u64)
+                    .await
+                    .map_err(|_| Errno::EIO)?;
+
+                let kern = (pa.as_usize() + offset_in_page) as *mut u8;
+                let user = (user_buf + total) as *mut u8;
+
+                match uiomove(kern, user, chunk, UioDir::CopyOut) {
+                    Ok(result) => {
+                        total += result.done;
+                        offset += result.done as u64;
+                    }
+                    Err(Errno::EFAULT) => {
+                        resolve_user_fault(
+                            task,
+                            VirtAddr::new(user_buf + total),
+                            PageFaultAccessType::WRITE,
+                        )
+                        .await
+                        .map_err(|_| Errno::EFAULT)?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            desc.offset
+                .store(offset, core::sync::atomic::Ordering::Relaxed);
+            Ok(total)
+        }
+    }
+}
+
+/// sys_write_async: write to file descriptor.
+pub async fn sys_write_async(
+    task: &Arc<Task>,
+    fd: u32,
+    user_buf: usize,
+    len: usize,
+) -> Result<usize, Errno> {
+    use crate::fs::fd_table::{DeviceKind, FileObject};
+
+    if len == 0 {
+        return Ok(0);
+    }
+
+    enum WriteTarget {
+        DevNull,
+        DevConsole,
+        PipeWrite(alloc::sync::Arc<crate::fs::pipe::Pipe>),
+    }
+
+    let target = {
+        let tab = task.fd_table.lock();
+        let d = tab.get(fd).ok_or(Errno::EBADF)?;
+        if !d.flags.write {
+            return Err(Errno::EPERM);
+        }
+        match &d.object {
+            FileObject::Device(DeviceKind::Null) => WriteTarget::DevNull,
+            FileObject::Device(DeviceKind::Zero) => WriteTarget::DevNull,
+            FileObject::Device(DeviceKind::ConsoleWrite)
+            | FileObject::Device(DeviceKind::ConsoleRead) => WriteTarget::DevConsole,
+            FileObject::PipeWrite(p) => WriteTarget::PipeWrite(Arc::clone(p)),
+            FileObject::PipeRead(_) => return Err(Errno::EBADF),
+            FileObject::Vnode(_) => return Err(Errno::EPERM),
+        }
+    };
+
+    match target {
+        WriteTarget::DevNull => Ok(len),
+        WriteTarget::DevConsole => {
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
+            let mut kbuf = alloc::vec![0u8; len];
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    kbuf.as_mut_ptr(),
+                    user_buf as *const u8,
+                    len,
+                )
+            };
+            if rc != 0 {
+                return Err(Errno::EFAULT);
+            }
+            for &b in &kbuf {
+                crate::console::putchar(b);
+            }
+            Ok(len)
+        }
+        WriteTarget::PipeWrite(pipe) => {
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
+            let mut kbuf = alloc::vec![0u8; len];
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    kbuf.as_mut_ptr(),
+                    user_buf as *const u8,
+                    len,
+                )
+            };
+            if rc != 0 {
+                return Err(Errno::EFAULT);
+            }
+            let result = PipeWriteFuture {
+                pipe,
+                task,
+                data: kbuf,
+                written: 0,
+            }
+            .await;
+            if let Err(Errno::EPIPE) = &result {
+                task.signals.post_signal(crate::proc::signal::SIGPIPE);
+            }
+            result
+        }
+    }
+}
+
+/// sys_readv_async: read into multiple buffers.
+pub async fn sys_readv_async(
+    task: &Arc<Task>,
+    fd: u32,
+    iov_ptr: usize,
+    iovcnt: usize,
+) -> Result<usize, Errno> {
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+
+    let iov_size = iovcnt * 16;
+    fault_in_user_buffer(task, iov_ptr, iov_size, PageFaultAccessType::READ).await;
+    let mut iov_buf = alloc::vec![0u8; iov_size];
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            iov_buf.as_mut_ptr(),
+            iov_ptr as *const u8,
+            iov_size,
+        )
+    };
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let mut total_read = 0;
+    for i in 0..iovcnt {
+        let off = i * 16;
+        let base = usize::from_le_bytes(iov_buf[off..off + 8].try_into().unwrap());
+        let len = usize::from_le_bytes(iov_buf[off + 8..off + 16].try_into().unwrap());
+        if len == 0 {
+            continue;
+        }
+
+        match sys_read_async(task, fd, base, len).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total_read += n;
+                if n < len {
+                    break;
+                }
+            }
+            Err(e) => {
+                if total_read > 0 {
+                    return Ok(total_read);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(total_read)
+}
+
+/// sys_writev_async: write from multiple buffers.
+pub async fn sys_writev_async(
+    task: &Arc<Task>,
+    fd: u32,
+    iov_ptr: usize,
+    iovcnt: usize,
+) -> Result<usize, Errno> {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+
+    let iov_size = iovcnt * 16;
+    fault_in_user_buffer(task, iov_ptr, iov_size, PageFaultAccessType::READ).await;
+    let mut iov_buf = alloc::vec![0u8; iov_size];
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            iov_buf.as_mut_ptr(),
+            iov_ptr as *const u8,
+            iov_size,
+        )
+    };
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let mut total = 0usize;
+    for i in 0..iovcnt {
+        let off = i * 16;
+        let base = usize::from_le_bytes(iov_buf[off..off + 8].try_into().unwrap());
+        let len = usize::from_le_bytes(iov_buf[off + 8..off + 16].try_into().unwrap());
+        if len == 0 {
+            continue;
+        }
+        match sys_write_async(task, fd, base, len).await {
+            Ok(n) => {
+                total += n;
+                if n < len {
+                    break;
+                }
+            }
+            Err(e) => {
+                if total > 0 {
+                    return Ok(total);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// sys_ioctl_async: device control.
+pub async fn sys_ioctl_async(
+    task: &Arc<Task>,
+    fd: u32,
+    request: usize,
+    argp: usize,
+) -> Result<i32, Errno> {
+    use crate::fs::fd_table::{DeviceKind, FileObject};
+
+    let is_console = {
+        let tab = task.fd_table.lock();
+        let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+        matches!(
+            &desc.object,
+            FileObject::Device(DeviceKind::ConsoleRead)
+                | FileObject::Device(DeviceKind::ConsoleWrite)
+        )
+    };
+    if !is_console {
+        return Err(Errno::ENOTTY);
+    }
+
+    const TCGETS: usize = 0x5401;
+    const TCSETS: usize = 0x5402;
+    const TCSETSW: usize = 0x5403;
+    const TCSETSF: usize = 0x5404;
+    const TIOCGWINSZ: usize = 0x5413;
+    const FIONBIO: usize = 0x5421;
+
+    match request {
+        TCGETS => {
+            if argp != 0 {
+                fault_in_user_buffer(task, argp, 60, PageFaultAccessType::WRITE).await;
+                let mut termios = [0u32; 15];
+                termios[0] = 0;
+                termios[1] = 0;
+                termios[2] = 0o000017;
+                termios[3] = 0o000012;
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        argp as *mut u8,
+                        termios.as_ptr() as *const u8,
+                        60,
+                    )
+                };
+                if rc != 0 {
+                    return Err(Errno::EFAULT);
+                }
+            }
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            if argp != 0 {
+                fault_in_user_buffer(task, argp, 8, PageFaultAccessType::WRITE).await;
+                let winsize: [u16; 4] = [24, 80, 0, 0];
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        argp as *mut u8,
+                        winsize.as_ptr() as *const u8,
+                        8,
+                    )
+                };
+                if rc != 0 {
+                    return Err(Errno::EFAULT);
+                }
+            }
+            Ok(0)
+        }
+        TCSETS | TCSETSW | TCSETSF => Ok(0),
+        FIONBIO => Ok(0),
+        _ => Err(Errno::ENOTTY),
+    }
+}
+
+/// sys_ppoll_async: poll file descriptors with timeout.
+pub async fn sys_ppoll_async(
+    task: &Arc<Task>,
+    fds_ptr: usize,
+    nfds: usize,
+    timeout_ptr: usize,
+) -> Result<usize, Errno> {
+    use crate::fs::fd_table::{DeviceKind, FileObject};
+
+    if nfds > 256 {
+        return Err(Errno::EINVAL);
+    }
+
+    let poll_size = nfds * 8;
+    if nfds > 0 {
+        fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::READ).await;
+    }
+
+    let mut poll_buf = alloc::vec![0u8; poll_size];
+    if nfds > 0 {
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                poll_buf.as_mut_ptr(),
+                fds_ptr as *const u8,
+                poll_size,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+    }
+
+    let timeout_ms: Option<u64> = if timeout_ptr != 0 {
+        fault_in_user_buffer(task, timeout_ptr, 16, PageFaultAccessType::READ).await;
+        let mut ts_buf = [0u8; 16];
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                ts_buf.as_mut_ptr(),
+                timeout_ptr as *const u8,
+                16,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+        let sec = i64::from_le_bytes(ts_buf[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts_buf[8..16].try_into().unwrap());
+        if sec < 0 || nsec < 0 {
+            return Err(Errno::EINVAL);
+        }
+        Some(sec as u64 * 1000 + nsec as u64 / 1_000_000)
+    } else {
+        None
+    };
+
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    const POLLERR: i16 = 0x008;
+    const POLLHUP: i16 = 0x010;
+    const POLLNVAL: i16 = 0x020;
+
+    let deadline = timeout_ms.map(|ms| {
+        let now = crate::hal::rv64::timer::read_time_ms();
+        now + ms
+    });
+
+    loop {
+        let mut ready_count = 0usize;
+
+        for i in 0..nfds {
+            let off = i * 8;
+            let fd = i32::from_le_bytes(poll_buf[off..off + 4].try_into().unwrap());
+            let events = i16::from_le_bytes(poll_buf[off + 4..off + 6].try_into().unwrap());
+            let mut revents: i16 = 0;
+
+            if fd < 0 {
+                poll_buf[off + 6..off + 8].copy_from_slice(&0i16.to_le_bytes());
+                continue;
+            }
+
+            let tab = task.fd_table.lock();
+            match tab.get(fd as u32) {
+                None => {
+                    revents = POLLNVAL;
+                }
+                Some(desc) => match &desc.object {
+                    FileObject::Device(DeviceKind::ConsoleRead) => {
+                        if events & POLLIN != 0 {
+                            revents |= POLLIN;
+                        }
+                    }
+                    FileObject::Device(DeviceKind::ConsoleWrite) => {
+                        if events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        }
+                    }
+                    FileObject::Device(DeviceKind::Null) | FileObject::Device(DeviceKind::Zero) => {
+                        revents |= events & (POLLIN | POLLOUT);
+                    }
+                    FileObject::PipeRead(pipe) => {
+                        if pipe.readable_len() > 0 {
+                            revents |= POLLIN;
+                        }
+                        if pipe.is_writer_closed() {
+                            revents |= POLLHUP;
+                        }
+                    }
+                    FileObject::PipeWrite(pipe) => {
+                        if pipe.is_reader_closed() {
+                            revents |= POLLERR;
+                        } else if events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        }
+                    }
+                    FileObject::Vnode(_) => {
+                        revents |= events & (POLLIN | POLLOUT);
+                    }
+                },
+            }
+
+            poll_buf[off + 6..off + 8].copy_from_slice(&revents.to_le_bytes());
+            if revents != 0 {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 || matches!(timeout_ms, Some(0)) {
+            if nfds > 0 {
+                fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE).await;
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        fds_ptr as *mut u8,
+                        poll_buf.as_ptr(),
+                        poll_size,
+                    )
+                };
+                if rc != 0 {
+                    return Err(Errno::EFAULT);
+                }
+            }
+            return Ok(ready_count);
+        }
+
+        if let Some(dl) = deadline {
+            let now = crate::hal::rv64::timer::read_time_ms();
+            if now >= dl {
+                if nfds > 0 {
+                    fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE)
+                        .await;
+                    let rc = unsafe {
+                        crate::hal::rv64::copy_user::copy_user_chunk(
+                            fds_ptr as *mut u8,
+                            poll_buf.as_ptr(),
+                            poll_size,
+                        )
+                    };
+                    if rc != 0 {
+                        return Err(Errno::EFAULT);
+                    }
+                }
+                return Ok(0);
+            }
+        }
+
+        if task.signals.has_actionable_pending() {
+            return Err(Errno::EINTR);
+        }
+
+        crate::executor::sleep(10).await;
+    }
+}
+
+/// Future for async pipe read.
+pub struct PipeReadFuture<'a> {
+    pipe: alloc::sync::Arc<crate::fs::pipe::Pipe>,
+    task: &'a Arc<Task>,
+    user_buf: usize,
+    len: usize,
+}
+
+impl<'a> Future for PipeReadFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.task.signals.has_actionable_pending() {
+            return Poll::Ready(Err(Errno::EINTR));
+        }
+        let mut kbuf = alloc::vec![0u8; this.len];
+        match this.pipe.read(&mut kbuf) {
+            Ok(0) => Poll::Ready(Ok(0)),
+            Ok(n) => {
+                let rc = unsafe {
+                    crate::hal::rv64::copy_user::copy_user_chunk(
+                        this.user_buf as *mut u8,
+                        kbuf.as_ptr(),
+                        n,
+                    )
+                };
+                if rc != 0 {
+                    Poll::Ready(Err(Errno::EFAULT))
+                } else {
+                    Poll::Ready(Ok(n))
+                }
+            }
+            Err(Errno::EAGAIN) => {
+                this.pipe.register_reader_waker(cx.waker());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+/// Future for async console read.
+pub struct ConsoleReadFuture<'a> {
+    task: &'a Arc<Task>,
+    user_buf: usize,
+    len: usize,
+}
+
+impl<'a> Future for ConsoleReadFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.task.signals.has_actionable_pending() {
+            return Poll::Ready(Err(Errno::EINTR));
+        }
+        let mut kbuf = alloc::vec![0u8; this.len];
+        let n = crate::console::console_read(&mut kbuf);
+        if n > 0 {
+            let rc = unsafe {
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    this.user_buf as *mut u8,
+                    kbuf.as_ptr(),
+                    n,
+                )
+            };
+            if rc != 0 {
+                Poll::Ready(Err(Errno::EFAULT))
+            } else {
+                Poll::Ready(Ok(n))
+            }
+        } else {
+            crate::console::console_register_waker(cx.waker());
+            Poll::Pending
+        }
+    }
+}
+
+/// Future for async pipe write.
+pub struct PipeWriteFuture<'a> {
+    pipe: alloc::sync::Arc<crate::fs::pipe::Pipe>,
+    task: &'a Arc<Task>,
+    data: alloc::vec::Vec<u8>,
+    written: usize,
+}
+
+impl<'a> Future for PipeWriteFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.task.signals.has_actionable_pending() {
+            if this.written > 0 {
+                return Poll::Ready(Ok(this.written));
+            }
+            return Poll::Ready(Err(Errno::EINTR));
+        }
+        loop {
+            if this.written >= this.data.len() {
+                return Poll::Ready(Ok(this.written));
+            }
+            match this.pipe.write(&this.data[this.written..]) {
+                Ok(n) => {
+                    this.written += n;
+                    if this.written >= this.data.len() {
+                        return Poll::Ready(Ok(this.written));
+                    }
+                    this.pipe.register_writer_waker(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(Errno::EAGAIN) => {
+                    this.pipe.register_writer_waker(cx.waker());
+                    return Poll::Pending;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+// ── 阶段 A：目录功能系统调用 ────────────────────────────────────────
+
+/// Linux `struct linux_dirent64` layout for getdents64.
+#[repr(C)]
+struct LinuxDirent64 {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+    // d_name follows (variable length, null-terminated)
+}
+
+/// sys_mkdirat: create a directory relative to dirfd.
+pub async fn sys_mkdirat_async(
+    task: &Arc<Task>,
+    dirfd: isize,
+    pathname_ptr: usize,
+    _mode: usize,
+) -> Result<(), Errno> {
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path_str = absolutize_path(task, dirfd, &raw_path)?;
+
+    // Check if already exists
+    let exists = delegate::fs_lookup(0, &path_str).await;
+    if exists.is_ok() {
+        return Err(Errno::EEXIST);
+    }
+
+    delegate::fs_mkdir(&path_str).await.map_err(|_| Errno::EIO)?;
+
+    crate::klog!(syscall, debug, "mkdirat: created {}", path_str);
+    Ok(())
+}
+
+/// sys_unlinkat: remove a file or directory.
+pub async fn sys_unlinkat_async(
+    task: &Arc<Task>,
+    dirfd: isize,
+    pathname_ptr: usize,
+    flags: i32,
+) -> Result<(), Errno> {
+    const AT_REMOVEDIR: i32 = 0x200;
+
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    if raw_path == "." {
+        return Err(Errno::EINVAL);
+    }
+    let path_str = absolutize_path(task, dirfd, &raw_path)?;
+
+    // Check existence and type
+    let (_, ftype, _) = delegate::fs_lookup(0, &path_str).await.map_err(|_| Errno::ENOENT)?;
+    let is_dir = ftype == 2;
+
+    if (flags & AT_REMOVEDIR) != 0 && !is_dir {
+        return Err(Errno::ENOTDIR);
+    }
+    if (flags & AT_REMOVEDIR) == 0 && is_dir {
+        return Err(Errno::EISDIR);
+    }
+
+    delegate::fs_unlink(&path_str, is_dir).await.map_err(|_| Errno::EIO)?;
+
+    // Invalidate dentry cache for this entry
+    if let Some(last_slash) = path_str.rfind('/') {
+        let parent_path = if last_slash == 0 { "/" } else { &path_str[..last_slash] };
+        let child_name = &path_str[last_slash + 1..];
+        // Resolve parent vnode id for dentry invalidation
+        if let Ok(vnode) = crate::fs::path::resolve(parent_path).await {
+            crate::fs::dentry::invalidate(vnode.vnode_id(), child_name);
+        }
+    }
+
+    crate::klog!(syscall, debug, "unlinkat: removed {}", path_str);
+    Ok(())
+}
+
+/// sys_getdents64: read directory entries into user buffer.
+pub async fn sys_getdents64_async(
+    task: &Arc<Task>,
+    fd: u32,
+    buf_ptr: usize,
+    buf_len: usize,
+) -> Result<usize, Errno> {
+    const LEN_BEFORE_NAME: usize = 19; // sizeof(d_ino) + sizeof(d_off) + sizeof(d_reclen) + sizeof(d_type)
+
+    if buf_ptr == 0 || buf_len == 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    // Get the directory path from fd
+    let (dir_path, desc) = {
+        let tab = task.fd_table.lock();
+        let d = tab.get(fd).ok_or(Errno::EBADF)?;
+        match &d.object {
+            FileObject::Vnode(v) => {
+                if v.vtype() != VnodeType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+                (String::from(v.path()), Arc::clone(d))
+            }
+            _ => return Err(Errno::ENOTDIR),
+        }
+    };
+
+    let dir_path = if dir_path.is_empty() { String::from("/") } else { dir_path };
+
+    // Get current offset (used as entry index)
+    let start_idx = desc.offset.load(Ordering::Relaxed) as usize;
+
+    // Read directory entries via delegate
+    let (entries, count) = delegate::fs_readdir(&dir_path).await.map_err(|_| Errno::EIO)?;
+
+    if start_idx >= count {
+        return Ok(0); // Already read all entries
+    }
+
+    // Fault in user buffer
+    fault_in_user_buffer(task, buf_ptr, buf_len, PageFaultAccessType::WRITE).await;
+
+    let mut written: usize = 0;
+    let mut idx = start_idx;
+
+    while idx < count {
+        let entry = &entries[idx];
+        let name_len = entry.name_len as usize;
+        let name_bytes = &entry.name[..name_len];
+
+        // c_name_len includes null terminator
+        let c_name_len = name_len + 1;
+        let rec_len = (LEN_BEFORE_NAME + c_name_len + 7) & !0x7; // align to 8
+
+        if written + rec_len > buf_len {
+            break;
+        }
+
+        // Map lwext4 inode_type to Linux d_type
+        let d_type: u8 = match entry.inode_type {
+            2 => 4,  // EXT4_DE_DIR -> DT_DIR
+            1 => 8,  // EXT4_DE_REG_FILE -> DT_REG
+            7 => 10, // EXT4_DE_SYMLINK -> DT_LNK
+            _ => 0,  // DT_UNKNOWN
+        };
+
+        let dirent = LinuxDirent64 {
+            d_ino: entry.inode as u64,
+            d_off: (idx + 1) as i64,
+            d_reclen: rec_len as u16,
+            d_type,
+        };
+
+        // Write dirent header to user memory
+        let dst = (buf_ptr + written) as *mut u8;
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                dst,
+                &dirent as *const LinuxDirent64 as *const u8,
+                LEN_BEFORE_NAME,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+
+        // Write name + null terminator
+        let name_dst = (buf_ptr + written + LEN_BEFORE_NAME) as *mut u8;
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(name_dst, name_bytes.as_ptr(), name_len)
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+        // Null terminator + padding zeros
+        let pad_start = buf_ptr + written + LEN_BEFORE_NAME + name_len;
+        let pad_len = rec_len - LEN_BEFORE_NAME - name_len;
+        let zeros = [0u8; 8];
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                pad_start as *mut u8,
+                zeros.as_ptr(),
+                pad_len,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+
+        written += rec_len;
+        idx += 1;
+    }
+
+    // Update offset to track position
+    desc.offset.store(idx as u64, Ordering::Relaxed);
+
+    Ok(written)
 }

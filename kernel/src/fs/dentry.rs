@@ -36,3 +36,11 @@ pub fn insert(parent_id: VnodeId, name: &str, vnode: Arc<dyn Vnode>) {
         map.insert((parent_id, String::from(name)), vnode);
     }
 }
+
+/// Remove a dentry from the cache (used after unlink/rmdir).
+pub fn invalidate(parent_id: VnodeId, name: &str) {
+    let mut cache = DENTRY_CACHE.lock();
+    if let Some(map) = cache.as_mut() {
+        map.remove(&(parent_id, String::from(name)));
+    }
+}

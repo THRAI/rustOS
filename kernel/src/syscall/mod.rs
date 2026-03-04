@@ -11,7 +11,6 @@ use hal_common::Errno;
 use crate::proc::task::Task;
 
 pub mod fs;
-pub mod io_async;
 pub mod memory;
 pub mod misc;
 pub mod process;
@@ -81,9 +80,13 @@ impl SyscallId {
     pub const MMAP: Self = Self(222);
     pub const MPROTECT: Self = Self(226);
     pub const WAIT4: Self = Self(260);
+    pub const MKDIRAT: Self = Self(34);
+    pub const UNLINKAT: Self = Self(35);
+    pub const SYMLINKAT: Self = Self(36);
     pub const PIPE2: Self = Self(59);
     pub const FCNTL: Self = Self(25);
     pub const PPOLL: Self = Self(73);
+    pub const UMASK: Self = Self(166);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -136,9 +139,13 @@ impl core::fmt::Display for SyscallId {
             Self::MMAP => "mmap",
             Self::MPROTECT => "mprotect",
             Self::WAIT4 => "wait4",
+            Self::MKDIRAT => "mkdirat",
+            Self::UNLINKAT => "unlinkat",
+            Self::SYMLINKAT => "symlinkat",
             Self::PIPE2 => "pipe2",
             Self::FCNTL => "fcntl",
             Self::PPOLL => "ppoll",
+            Self::UMASK => "umask",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -320,7 +327,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         }
         SyscallId::IOCTL => {
-            let ret = match io_async::sys_ioctl_async(task, a0 as u32, a1, a2).await {
+            let ret = match fs::sys_ioctl_async(task, a0 as u32, a1, a2).await {
                 Ok(v) => v as usize,
                 Err(e) => errno_ret(e),
             };
@@ -341,35 +348,35 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         }
         SyscallId::WRITEV => {
-            match io_async::sys_writev_async(task, a0 as u32, a1, a2).await {
+            match fs::sys_writev_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
                 Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::PPOLL => {
-            match io_async::sys_ppoll_async(task, a0, a1, a2).await {
+            match fs::sys_ppoll_async(task, a0, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
                 Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::WRITE => {
-            match io_async::sys_write_async(task, a0 as u32, a1, a2).await {
+            match fs::sys_write_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
                 Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::READ => {
-            match io_async::sys_read_async(task, a0 as u32, a1, a2).await {
+            match fs::sys_read_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
                 Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::READV => {
-            match io_async::sys_readv_async(task, a0 as u32, a1, a2).await {
+            match fs::sys_readv_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
                 Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
@@ -451,6 +458,35 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                 Err(e) => errno_ret(e),
             };
             SyscallAction::Return(ret)
+        }
+        SyscallId::MKDIRAT => {
+            let ret = match fs::sys_mkdirat_async(task, a0 as isize, a1, a2).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::UNLINKAT => {
+            let ret = match fs::sys_unlinkat_async(task, a0 as isize, a1, a2 as i32).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::GETDENTS64 => {
+            let ret = match fs::sys_getdents64_async(task, a0 as u32, a1, a2).await {
+                Ok(n) => n,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::SYMLINKAT => {
+            // Stub: symlinkat not yet implemented, return ENOSYS
+            SyscallAction::Return(errno_ret(Errno::ENOSYS))
+        }
+        SyscallId::UMASK => {
+            // Stub: return previous umask (0o022), accept silently
+            SyscallAction::Return(0o022)
         }
         SyscallId::FSTATAT => {
             let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2).await {

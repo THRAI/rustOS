@@ -35,6 +35,18 @@ const CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FsFileHandle(pub u16);
 
+/// A directory entry returned by ReadDir.
+#[derive(Clone, Copy)]
+pub struct DirEntryRaw {
+    pub name: [u8; 255],
+    pub name_len: u8,
+    pub inode_type: u8,
+    pub inode: u32,
+}
+
+/// ReadDir result: up to 32 entries per batch.
+pub const READDIR_BATCH: usize = 32;
+
 /// Filesystem request sent to the delegate.
 pub enum FsRequest {
     Open {
@@ -73,6 +85,27 @@ pub enum FsRequest {
         path_len: usize,
         offset: u64,
         reply: ReplySlot<Result<usize, i32>>,
+    },
+    /// Create a directory at the given path.
+    Mkdir {
+        path: [u8; 256],
+        path_len: usize,
+        reply: ReplySlot<Result<(), i32>>,
+    },
+    /// Remove a file or directory at the given path.
+    /// `is_dir`: true for rmdir, false for unlink.
+    Unlink {
+        path: [u8; 256],
+        path_len: usize,
+        is_dir: bool,
+        reply: ReplySlot<Result<(), i32>>,
+    },
+    /// Read all directory entries from a directory path.
+    /// Returns (entries, count).
+    ReadDir {
+        path: [u8; 256],
+        path_len: usize,
+        reply: ReplySlot<Result<([DirEntryRaw; READDIR_BATCH], usize), i32>>,
     },
 }
 
@@ -146,6 +179,9 @@ define_reply_pool!(CLOSE_REPLIES, Result<(), i32>);
 define_reply_pool!(LOOKUP_REPLIES, Result<(u32, u8, u64), i32>);
 define_reply_pool!(STAT_REPLIES, Result<(u64, u8), i32>);
 define_reply_pool!(READPAGE_REPLIES, Result<usize, i32>);
+define_reply_pool!(MKDIR_REPLIES, Result<(), i32>);
+define_reply_pool!(UNLINK_REPLIES, Result<(), i32>);
+define_reply_pool!(READDIR_REPLIES, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
 
 static OPEN_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READ_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
@@ -153,6 +189,9 @@ static CLOSE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static LOOKUP_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static STAT_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READPAGE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static MKDIR_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static UNLINK_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static READDIR_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 
 macro_rules! define_alloc_reply {
     ($fn_name:ident, $pool:ident, $idx:ident, $T:ty) => {
@@ -173,6 +212,9 @@ define_alloc_reply!(alloc_close_reply, CLOSE_REPLIES, CLOSE_REPLY_IDX, Result<()
 define_alloc_reply!(alloc_lookup_reply, LOOKUP_REPLIES, LOOKUP_REPLY_IDX, Result<(u32, u8, u64), i32>);
 define_alloc_reply!(alloc_stat_reply, STAT_REPLIES, STAT_REPLY_IDX, Result<(u64, u8), i32>);
 define_alloc_reply!(alloc_readpage_reply, READPAGE_REPLIES, READPAGE_REPLY_IDX, Result<usize, i32>);
+define_alloc_reply!(alloc_mkdir_reply, MKDIR_REPLIES, MKDIR_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_unlink_reply, UNLINK_REPLIES, UNLINK_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_readdir_reply, READDIR_REPLIES, READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
 
 /// Bounded request channel.
 static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>> =
@@ -303,6 +345,51 @@ async fn delegate_task() {
                     None => reply.complete(Err(-12)), // ENOMEM
                 }
             }
+            FsRequest::Mkdir { path, path_len, reply } => {
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+                reply.complete(crate::fs::ext4::mkdir(&mut tok, path_str).map_err(|e| -(e.abs())));
+            }
+            FsRequest::Unlink { path, path_len, is_dir, reply } => {
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+                let result = if is_dir {
+                    // lwext4 dir_rm: use file_remove which handles dirs too
+                    crate::fs::ext4::unlink(&mut tok, path_str)
+                } else {
+                    crate::fs::ext4::unlink(&mut tok, path_str)
+                };
+                reply.complete(result.map_err(|e| -(e.abs())));
+            }
+            FsRequest::ReadDir { path, path_len, reply } => {
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+                match crate::fs::ext4::dir_open(&mut tok, path_str) {
+                    Ok(mut dir) => {
+                        let mut entries = [DirEntryRaw {
+                            name: [0u8; 255],
+                            name_len: 0,
+                            inode_type: 0,
+                            inode: 0,
+                        }; READDIR_BATCH];
+                        let mut count = 0usize;
+                        while count < READDIR_BATCH {
+                            match crate::fs::ext4::dir_next(&mut tok, &mut dir) {
+                                Some((name, name_len, itype, ino)) => {
+                                    entries[count] = DirEntryRaw {
+                                        name,
+                                        name_len,
+                                        inode_type: itype,
+                                        inode: ino,
+                                    };
+                                    count += 1;
+                                }
+                                None => break,
+                            }
+                        }
+                        let _ = crate::fs::ext4::dir_close(&mut tok, &mut dir);
+                        reply.complete(Ok((entries, count)));
+                    }
+                    Err(e) => reply.complete(Err(-(e.abs()))),
+                }
+            }
         }
 
         // Yield to let other tasks run
@@ -428,6 +515,56 @@ pub async fn fs_read_page(path: &str, offset: u64) -> Result<usize, i32> {
         path: path_buf,
         path_len: len,
         offset,
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Create a directory at the given path.
+pub async fn fs_mkdir(path: &str) -> Result<(), i32> {
+    let reply_inner = alloc_mkdir_reply();
+    let mut path_buf = [0u8; 256];
+    let len = path.len().min(256);
+    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+
+    send_request(FsRequest::Mkdir {
+        path: path_buf,
+        path_len: len,
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Remove a file or directory at the given path.
+pub async fn fs_unlink(path: &str, is_dir: bool) -> Result<(), i32> {
+    let reply_inner = alloc_unlink_reply();
+    let mut path_buf = [0u8; 256];
+    let len = path.len().min(256);
+    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+
+    send_request(FsRequest::Unlink {
+        path: path_buf,
+        path_len: len,
+        is_dir,
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Read all directory entries from a directory path.
+/// Returns (entries_array, count).
+pub async fn fs_readdir(path: &str) -> Result<([DirEntryRaw; READDIR_BATCH], usize), i32> {
+    let reply_inner = alloc_readdir_reply();
+    let mut path_buf = [0u8; 256];
+    let len = path.len().min(256);
+    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+
+    send_request(FsRequest::ReadDir {
+        path: path_buf,
+        path_len: len,
         reply: ReplySlot::new(reply_inner),
     });
 

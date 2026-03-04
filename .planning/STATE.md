@@ -152,9 +152,10 @@ None yet.
 | 1 | Add klog tracks (signal, exec, pipe, proc) + replenish existing modules | 2026-02-26 | b39fe04 | | [1-add-debugger-log-to-each-module-followin](./quick/1-add-debugger-log-to-each-module-followin/) |
 | 2 | Display impls for Signal and PageFaultAccessType in klog output | 2026-02-26 | 9920f31 | | [2-add-debug-trait-for-klog-arguments-follo](./quick/2-add-debug-trait-for-klog-arguments-follo/) |
 | 3 | Refactor kernel vm submodule based on ai/bsd_vm/vm_fault.md plans | 2026-03-04 | b749909 | Verified | [3-refactor-kernel-vm-submodule-based-on-ai](./quick/3-refactor-kernel-vm-submodule-based-on-ai/) |
+| 4 | Fix compilation errors from VM refactoring (VirtPageNum export + interface) | 2026-03-04 | 28ca95d | Complete | [4-use-refactored-vm-interface-to-refactor-](./quick/4-use-refactored-vm-interface-to-refactor-/) |
 
 ## Session Continuity
 
-Last activity: 2026-03-04 - Completed quick task 3: Refactor kernel vm submodule based on ai/bsd_vm/vm_fault.md plans
+Last activity: 2026-03-04 - Completed quick task 4: Fix compilation errors from VM refactoring
 Stopped at: Plan 04-02 complete, ready for 04-04 (integration/remaining syscalls)
 Resume file: None

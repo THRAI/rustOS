@@ -30,6 +30,15 @@ if [ -f "$SCRIPT_DIR/busybox" ]; then
     mkdir -p "$STAGING/bin"
     cp "$SCRIPT_DIR/busybox" "$STAGING/bin/busybox"
     chmod 755 "$STAGING/bin/busybox"
+
+    # Create common BusyBox applet hard links so plain commands resolve via PATH.
+    # Use hard links (not symlinks) to avoid symlink type checks in current open path.
+    for applet in \
+        sh ls cat mkdir rm rmdir mv cp touch pwd echo \
+        ln chmod chown uname ps kill grep find head tail wc sort sed awk
+    do
+        ln -f "$STAGING/bin/busybox" "$STAGING/bin/$applet"
+    done
 fi
 
 # Add /bin/initproc if the binary exists

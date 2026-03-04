@@ -98,6 +98,15 @@ pub fn write(_tok: &mut DelegateToken, file: &mut Ext4File, buf: &[u8]) -> Resul
     file.file_write(buf)
 }
 
+/// Truncate a file to `size` bytes.
+pub fn truncate(_tok: &mut DelegateToken, path: &str, size: u64) -> Result<(), i32> {
+    let mut file = Ext4File::new(path, InodeTypes::EXT4_DE_REG_FILE);
+    file.file_open(path, flags::O_RDWR)?;
+    file.file_truncate(size)?;
+    file.file_close()?;
+    Ok(())
+}
+
 /// Close an open file.
 pub fn close(_tok: &mut DelegateToken, file: &mut Ext4File) -> Result<(), i32> {
     file.file_close()?;

@@ -49,6 +49,7 @@ impl SyscallId {
     pub const SENDFILE: Self = Self(71);
     pub const FSTATAT: Self = Self(79);
     pub const FSTAT: Self = Self(80);
+    pub const UTIMENSAT: Self = Self(88);
     pub const EXIT: Self = Self(93);
     pub const EXIT_GROUP: Self = Self(94);
     pub const SET_TID_ADDRESS: Self = Self(96);
@@ -108,6 +109,7 @@ impl core::fmt::Display for SyscallId {
             Self::SENDFILE => "sendfile",
             Self::FSTATAT => "fstatat",
             Self::FSTAT => "fstat",
+            Self::UTIMENSAT => "utimensat",
             Self::EXIT => "exit",
             Self::EXIT_GROUP => "exit_group",
             Self::SET_TID_ADDRESS => "set_tid_address",
@@ -406,6 +408,13 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         }
         SyscallId::FSTAT => {
             let ret = match fs::sys_fstat(task, a0 as u32, a1) {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::UTIMENSAT => {
+            let ret = match fs::sys_utimensat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };

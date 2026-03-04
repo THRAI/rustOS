@@ -52,6 +52,56 @@ pub async fn open(
     flags: OpenFlags,
     raw_flags: u32,
 ) -> Result<u32, Errno> {
+    #[inline]
+    fn normalize_delegate_open_flags(raw_flags: u32) -> u32 {
+        // lwext4_rust::Ext4File::flags_to_cstring supports:
+        // 0, 2, 0x241, 0x441, 0x242, 0x442.
+        // Linux userspace may pass extra bits (e.g. O_NOCTTY/O_NONBLOCK/O_CLOEXEC),
+        // so we canonicalize to the subset that lwext4 understands.
+        const O_ACCMODE: u32 = 0x3;
+        const O_WRONLY: u32 = 0x1;
+        const O_RDWR: u32 = 0x2;
+        const O_CREAT: u32 = 0x40;
+        const O_TRUNC: u32 = 0x200;
+        const O_APPEND: u32 = 0x400;
+
+        let acc = raw_flags & O_ACCMODE;
+        let creat = (raw_flags & O_CREAT) != 0;
+        let trunc = (raw_flags & O_TRUNC) != 0;
+        let append = (raw_flags & O_APPEND) != 0;
+
+        if append {
+            return if acc == O_RDWR {
+                O_RDWR | O_CREAT | O_APPEND
+            } else {
+                O_WRONLY | O_CREAT | O_APPEND
+            };
+        }
+
+        if creat {
+            if trunc {
+                return if acc == O_RDWR {
+                    O_RDWR | O_CREAT | O_TRUNC
+                } else {
+                    O_WRONLY | O_CREAT | O_TRUNC
+                };
+            }
+            // For create-without-trunc, use append mode to create file without clobbering
+            // existing data. This matches `touch`-style behavior.
+            return if acc == O_RDWR {
+                O_RDWR | O_CREAT | O_APPEND
+            } else {
+                O_WRONLY | O_CREAT | O_APPEND
+            };
+        }
+
+        match acc {
+            O_RDWR => O_RDWR,
+            O_WRONLY => O_RDWR, // lwext4 wrapper lacks a pure write-only mode
+            _ => 0,             // O_RDONLY
+        }
+    }
+
     const O_CREAT: u32 = 0x40;
     const O_EXCL: u32 = 0x80;
     const O_TRUNC: u32 = 0x200;
@@ -70,7 +120,8 @@ pub async fn open(
     if vnode_result.is_err() && (raw_flags & O_CREAT) != 0 {
         // File doesn't exist and O_CREAT is set, create it
         // Open with O_CREAT flag via delegate, then close
-        match delegate::fs_open_flags(path_str, raw_flags).await {
+        let create_flags = normalize_delegate_open_flags(raw_flags);
+        match delegate::fs_open_flags(path_str, create_flags).await {
             Ok(handle) => {
                 // Close the handle immediately
                 let _ = delegate::fs_close(handle).await;
@@ -385,6 +436,56 @@ pub async fn sys_fstatat_async(
     if rc != 0 {
         return Err(Errno::EFAULT);
     }
+    Ok(())
+}
+
+/// sys_utimensat: update file timestamps.
+///
+/// Minimal behavior for userspace compatibility (e.g. BusyBox `touch`):
+/// - resolve and validate target path exists;
+/// - validate `timespec[2]` user pointer when non-null;
+/// - currently ignore actual timestamp update and accepted flags.
+pub async fn sys_utimensat_async(
+    task: &Arc<Task>,
+    dirfd: isize,
+    pathname_ptr: usize,
+    times_ptr: usize,
+    flags: usize,
+) -> Result<(), Errno> {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const TIMESPEC_PAIR_SIZE: usize = 32; // struct timespec[2] on rv64
+
+    // Accept only known flags for now.
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    // For now we only support pathname-based utimensat.
+    if pathname_ptr == 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path_str = absolutize_path(task, dirfd, &raw_path)?;
+    let _ = crate::fs::path::resolve(&path_str).await?;
+
+    // If user supplies timestamps, validate user memory accessibility.
+    if times_ptr != 0 {
+        fault_in_user_buffer(task, times_ptr, TIMESPEC_PAIR_SIZE, PageFaultAccessType::READ).await;
+        let mut ts_buf = [0u8; TIMESPEC_PAIR_SIZE];
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                ts_buf.as_mut_ptr(),
+                times_ptr as *const u8,
+                TIMESPEC_PAIR_SIZE,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::EFAULT);
+        }
+    }
+
     Ok(())
 }
 

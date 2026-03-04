@@ -386,6 +386,52 @@ impl VmMap {
         child
     }
 
+    /// Fork with independent VmObjects (deep copy, no shadows).
+    ///
+    /// Writable VMAs always get independent empty VmObjects -- `deep_copy_pages`
+    /// will populate them from the parent's pmap.
+    /// Read-only shared VMAs (FileBacked, Device, SharedAnonymous) get
+    /// Arc::clone of the parent's VmObject so demand-paged pages remain
+    /// accessible to the child.
+    pub fn fork_deep_copy(&self) -> VmMap {
+        let mut child = VmMap::new();
+        for (_, vma) in &self.areas {
+            // Any writable VMA needs its own VmObject (child will get copies
+            // of the parent's pages, not shared references).
+            // Read-only non-private VMAs can share the parent's VmObject.
+            let needs_independent_copy = vma.prot.contains(MapPerm::W)
+                || matches!(
+                    vma.vma_type,
+                    VmAreaType::Anonymous
+                        | VmAreaType::FileBackedPrivate
+                        | VmAreaType::Heap
+                        | VmAreaType::Stack
+                );
+            let child_object = if needs_independent_copy {
+                let size = vma.object.read().size();
+                VmObject::new(size)
+            } else {
+                // Shared reference: read-only file-backed, device, shared-anonymous.
+                // Pages already resident in the VmObject stay visible to child.
+                Arc::clone(&vma.object)
+            };
+            let child_vma = VmArea {
+                id: next_vma_id(),
+                range: vma.range.clone(),
+                prot: vma.prot,
+                object: child_object,
+                obj_offset: vma.obj_offset,
+                vma_type: vma.vma_type,
+                flags: vma.flags,
+                vnode: vma.vnode.clone(),
+                file_offset: vma.file_offset,
+                file_size: vma.file_size,
+            };
+            let _ = child.areas.insert(child_vma.range.start, child_vma);
+        }
+        child
+    }
+
     /// MMAP region: top-down allocation below stack.
     const MMAP_BASE: usize = 0x0000_003F_FFF0_0000; // just below USER_STACK_TOP
     const MMAP_MIN: usize = 0x0000_0020_0000_0000; // floor

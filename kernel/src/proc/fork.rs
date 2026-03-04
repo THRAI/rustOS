@@ -20,25 +20,24 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
         child.pid
     );
 
-    // 1. Fork VmMap structure (shadow objects for anon, shared for file-backed)
-    // 2. Deep-copy all pages the parent has mapped in its pmap
-    //TODO: fixme when implementing COW
+    // Deep-copy strategy: create independent VmObjects (not shadows)
     {
         let parent_vm = parent.vm_map.lock();
-        let child_vm = parent_vm.fork();
+        let child_vm = parent_vm.fork_deep_copy();
         *child.vm_map.lock() = child_vm;
     }
 
-    // Deep-copy: walk parent's pmap, copy mapped pages into child
-    //TODO: fixme when implementing COW
+    // Deep-copy: copy all pages from parent's VmObjects into child
     deep_copy_pages(parent, &child);
 
-    //TODO: fixme when implementing COW
-    // Map sigcode trampoline page in child (not in vm_map, so deep_copy misses it)
+    // Share sigcode trampoline page from parent (read-only, not in vm_map)
     {
-        crate::kprintln!("fork: FIXME when using COW");
-        let mut child_pmap = child.pmap.lock();
-        super::signal::map_sigcode_page(&mut child_pmap);
+        let parent_pmap = parent.pmap.lock();
+        if let Some(sigcode_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(super::signal::SIGCODE_VA)) {
+            let mut child_pmap = child.pmap.lock();
+            let prot = crate::map_perm!(R, X, U);
+            let _ = pmap::pmap_enter(&mut child_pmap, VirtAddr::new(super::signal::SIGCODE_VA), sigcode_pa, prot, false);
+        }
     }
 
     // Fork fd table (Arc-shared OpenFile entries per POSIX)
@@ -97,56 +96,58 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     child
 }
 
-/// Deep-copy all pages mapped in the parent's pmap into the child.
+/// Deep-copy all pages from parent into child.
 ///
-/// For writable VMAs: allocate new frame, memcpy, map in child pmap + insert
-/// into child VmObject.
-/// For read-only VMAs: share the same physical page (map directly).
+/// For writable VMAs: walk the parent's **pmap** (not VmObject) to find every
+/// mapped page, allocate a fresh frame, copy the data, insert into the child's
+/// VmObject, and map in the child's pmap.  We scan the pmap because
+/// `fault_in_page_async` maps file-backed pages into the pmap without inserting
+/// them into the VmObject -- so the VmObject may be empty even though pages
+/// are actually mapped.
+///
+/// For read-only VMAs: share physical pages via pmap (VmObject already
+/// Arc::clone'd by fork_deep_copy, so demand faults will find pages there).
 fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
     let parent_vm = parent.vm_map.lock();
-    let parent_pmap = parent.pmap.lock();
     let child_vm = child.vm_map.lock();
     let mut child_pmap = child.pmap.lock();
+    let parent_pmap = parent.pmap.lock();
 
     for vma in parent_vm.iter() {
-        let mut va = vma.range.start.as_usize();
-        let end = vma.range.end.as_usize();
+        let is_writable = vma.prot.contains(MapPerm::W);
 
-        while va < end {
-            let va_virt = VirtAddr::new(va);
-            if let Some(parent_pa) = pmap::pmap_extract(&parent_pmap, va_virt) {
-                let is_writable = vma.prot.contains(MapPerm::W);
-
-                if is_writable {
-                    // Deep copy: new frame + memcpy
-                    if let Some(new_frame) = crate::mm::allocator::frame_alloc_sync() {
+        if is_writable {
+            // Walk every page in the VMA range via parent's pmap to find
+            // all mapped pages (both VmObject-backed and pmap-only).
+            let mut va = vma.range.start.as_usize();
+            while va < vma.range.end.as_usize() {
+                if let Some(src_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
+                    if let Some(mut new_frame) = crate::mm::allocator::alloc_anon_sync() {
                         unsafe {
-                            new_frame
-                                .as_mut_slice()
-                                .copy_from_slice(parent_pa.as_slice());
+                            new_frame.as_bytes_mut().copy_from_slice(src_pa.page_align_down().as_slice());
                         }
-                        // Insert into child's VmObject
-                        if let Some(child_vma) = child_vm.find_area(va_virt) {
-                            let obj_offset = hal_common::addr::VirtPageNum(
-                                (va - child_vma.range.start.as_usize()) / PAGE_SIZE
-                                    + child_vma.obj_offset.as_usize(),
-                            );
-                            let mut obj = child_vma.object.write();
-                            let typed_frame = crate::mm::allocator::TypedFrame {
-                                phys: new_frame,
-                                _marker: core::marker::PhantomData::<crate::mm::allocator::UserAnon>,
-                            };
-                            obj.insert_page(obj_offset, OwnedPage::new_anonymous(typed_frame));
+                        if let Some(child_vma) = child_vm.find_area(VirtAddr::new(va)) {
+                            let new_phys = new_frame.phys();
+                            let obj_idx = child_vma.pindex_for(VirtAddr::new(va));
+                            let mut child_obj = child_vma.object.write();
+                            child_obj.insert_page(obj_idx, OwnedPage::new_anonymous(new_frame));
+                            let _ = pmap::pmap_enter(&mut child_pmap, VirtAddr::new(va), new_phys, child_vma.prot, false);
                         }
-                        let _ =
-                            pmap::pmap_enter(&mut child_pmap, va_virt, new_frame, vma.prot, false);
                     }
-                } else {
-                    // Read-only: share physical page
-                    let _ = pmap::pmap_enter(&mut child_pmap, va_virt, parent_pa, vma.prot, false);
                 }
+                va += PAGE_SIZE;
             }
-            va += PAGE_SIZE;
+        } else {
+            // Read-only: share pages currently in pmap.
+            // The VmObject is already Arc::clone'd by fork_deep_copy, so
+            // demand faults will find pages in the shared object.
+            let mut va = vma.range.start.as_usize();
+            while va < vma.range.end.as_usize() {
+                if let Some(pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
+                    let _ = pmap::pmap_enter(&mut child_pmap, VirtAddr::new(va), pa, vma.prot, false);
+                }
+                va += PAGE_SIZE;
+            }
         }
     }
 }

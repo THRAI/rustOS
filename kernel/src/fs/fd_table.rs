@@ -31,20 +31,24 @@ bitflags::bitflags! {
 pub struct OpenFlags {
     pub read: bool,
     pub write: bool,
+    pub append: bool,
 }
 
 impl OpenFlags {
     pub const RDONLY: Self = Self {
         read: true,
         write: false,
+        append: false,
     };
     pub const WRONLY: Self = Self {
         read: false,
         write: true,
+        append: false,
     };
     pub const RDWR: Self = Self {
         read: true,
         write: true,
+        append: false,
     };
 }
 

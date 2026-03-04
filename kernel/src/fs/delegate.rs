@@ -61,6 +61,12 @@ pub enum FsRequest {
         len: usize,
         reply: ReplySlot<Result<usize, i32>>,
     },
+    Write {
+        handle: FsFileHandle,
+        buf_ptr: usize,
+        len: usize,
+        reply: ReplySlot<Result<usize, i32>>,
+    },
     Close {
         handle: FsFileHandle,
         reply: ReplySlot<Result<(), i32>>,
@@ -84,6 +90,16 @@ pub enum FsRequest {
         path: [u8; 256],
         path_len: usize,
         offset: u64,
+        reply: ReplySlot<Result<usize, i32>>,
+    },
+    /// Write data to a file at the given byte offset.
+    /// Opens file, seeks, writes, closes. Returns bytes written.
+    WriteAt {
+        path: [u8; 256],
+        path_len: usize,
+        offset: u64,
+        data_ptr: usize,
+        data_len: usize,
         reply: ReplySlot<Result<usize, i32>>,
     },
     /// Create a directory at the given path.
@@ -175,20 +191,24 @@ macro_rules! define_reply_pool {
 
 define_reply_pool!(OPEN_REPLIES, Result<FsFileHandle, i32>);
 define_reply_pool!(READ_REPLIES, Result<usize, i32>);
+define_reply_pool!(WRITE_REPLIES, Result<usize, i32>);
 define_reply_pool!(CLOSE_REPLIES, Result<(), i32>);
 define_reply_pool!(LOOKUP_REPLIES, Result<(u32, u8, u64), i32>);
 define_reply_pool!(STAT_REPLIES, Result<(u64, u8), i32>);
 define_reply_pool!(READPAGE_REPLIES, Result<usize, i32>);
+define_reply_pool!(WRITEAT_REPLIES, Result<usize, i32>);
 define_reply_pool!(MKDIR_REPLIES, Result<(), i32>);
 define_reply_pool!(UNLINK_REPLIES, Result<(), i32>);
 define_reply_pool!(READDIR_REPLIES, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
 
 static OPEN_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READ_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static WRITE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static CLOSE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static LOOKUP_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static STAT_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READPAGE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static WRITEAT_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static MKDIR_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static UNLINK_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READDIR_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
@@ -208,10 +228,12 @@ macro_rules! define_alloc_reply {
 
 define_alloc_reply!(alloc_open_reply, OPEN_REPLIES, OPEN_REPLY_IDX, Result<FsFileHandle, i32>);
 define_alloc_reply!(alloc_read_reply, READ_REPLIES, READ_REPLY_IDX, Result<usize, i32>);
+define_alloc_reply!(alloc_write_reply, WRITE_REPLIES, WRITE_REPLY_IDX, Result<usize, i32>);
 define_alloc_reply!(alloc_close_reply, CLOSE_REPLIES, CLOSE_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_lookup_reply, LOOKUP_REPLIES, LOOKUP_REPLY_IDX, Result<(u32, u8, u64), i32>);
 define_alloc_reply!(alloc_stat_reply, STAT_REPLIES, STAT_REPLY_IDX, Result<(u64, u8), i32>);
 define_alloc_reply!(alloc_readpage_reply, READPAGE_REPLIES, READPAGE_REPLY_IDX, Result<usize, i32>);
+define_alloc_reply!(alloc_writeat_reply, WRITEAT_REPLIES, WRITEAT_REPLY_IDX, Result<usize, i32>);
 define_alloc_reply!(alloc_mkdir_reply, MKDIR_REPLIES, MKDIR_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_unlink_reply, UNLINK_REPLIES, UNLINK_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_readdir_reply, READDIR_REPLIES, READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
@@ -293,6 +315,20 @@ async fn delegate_task() {
                     Err(e) => reply.complete(Err(e)),
                 }
             }
+            FsRequest::Write { handle, buf_ptr, len, reply } => {
+                let idx = handle.0 as usize;
+                if idx >= MAX_OPEN_FILES || open_files[idx].is_none() {
+                    reply.complete(Err(-9)); // EBADF
+                    crate::executor::yield_now().await;
+                    continue;
+                }
+                let file = &mut open_files[idx].as_mut().unwrap().0;
+                let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+                match crate::fs::ext4::write(&mut tok, file, buf) {
+                    Ok(n) => reply.complete(Ok(n)),
+                    Err(e) => reply.complete(Err(e)),
+                }
+            }
             FsRequest::Close { handle, reply } => {
                 let idx = handle.0 as usize;
                 if idx < MAX_OPEN_FILES {
@@ -343,6 +379,27 @@ async fn delegate_task() {
                         }
                     }
                     None => reply.complete(Err(-12)), // ENOMEM
+                }
+            }
+            FsRequest::WriteAt { path, path_len, offset, data_ptr, data_len, reply } => {
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+                let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+                // Open with write flags, seek, write, close
+                match crate::fs::ext4::open(&mut tok, path_str, 0x0002) {
+                    Ok(mut file) => {
+                        let _ = file.file_seek(offset as i64, 0); // SEEK_SET
+                        match crate::fs::ext4::write(&mut tok, &mut file, data) {
+                            Ok(n) => {
+                                let _ = crate::fs::ext4::close(&mut tok, &mut file);
+                                reply.complete(Ok(n));
+                            }
+                            Err(e) => {
+                                let _ = crate::fs::ext4::close(&mut tok, &mut file);
+                                reply.complete(Err(e));
+                            }
+                        }
+                    }
+                    Err(e) => reply.complete(Err(e)),
                 }
             }
             FsRequest::Mkdir { path, path_len, reply } => {
@@ -462,6 +519,20 @@ pub async fn fs_read(handle: FsFileHandle, buf: &mut [u8]) -> Result<usize, i32>
     ReplyFuture { inner: reply_inner }.await
 }
 
+/// Write to an open file from buf. Returns bytes written.
+pub async fn fs_write(handle: FsFileHandle, buf: &[u8]) -> Result<usize, i32> {
+    let reply_inner = alloc_write_reply();
+
+    send_request(FsRequest::Write {
+        handle,
+        buf_ptr: buf.as_ptr() as usize,
+        len: buf.len(),
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
 /// Close an open file handle.
 pub async fn fs_close(handle: FsFileHandle) -> Result<(), i32> {
     let reply_inner = alloc_close_reply();
@@ -515,6 +586,26 @@ pub async fn fs_read_page(path: &str, offset: u64) -> Result<usize, i32> {
         path: path_buf,
         path_len: len,
         offset,
+        reply: ReplySlot::new(reply_inner),
+    });
+
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Write data to a file at the given byte offset.
+/// Opens file, seeks, writes, closes. Returns bytes written.
+pub async fn fs_write_at(path: &str, offset: u64, data: &[u8]) -> Result<usize, i32> {
+    let reply_inner = alloc_writeat_reply();
+    let mut path_buf = [0u8; 256];
+    let len = path.len().min(256);
+    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+
+    send_request(FsRequest::WriteAt {
+        path: path_buf,
+        path_len: len,
+        offset,
+        data_ptr: data.as_ptr() as usize,
+        data_len: data.len(),
         reply: ReplySlot::new(reply_inner),
     });
 

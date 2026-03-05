@@ -150,7 +150,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
                     if let Some(existing) = obj.lookup_page(obj_offset) {
                         // Another core won — use their page, free ours.
                         drop(obj);
-                        crate::mm::allocator::frame_free(frame);
+                        crate::mm::allocator::free_raw_frame(frame);
                         let mut pmap = task.pmap.lock();
                         if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
                             let _ = crate::mm::pmap::pmap_enter(
@@ -253,7 +253,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             if vma_page_byte_offset >= file_size
                 || vma_page_byte_offset + PAGE_SIZE > file_size
             {
-                crate::mm::allocator::frame_free(pa);
+                crate::mm::allocator::free_raw_frame(pa);
             }
             return Ok(());
         }

@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use hal_common::addr::VirtPageNum;
 use hal_common::{VirtAddr, PAGE_SIZE};
 
-use super::super::allocator::{frame_alloc_sync, frame_free};
+use super::super::allocator::{frame_alloc_sync, free_raw_frame};
 use super::super::pmap;
 use super::vm_map::{VmArea, VmAreaType, VmMap};
 use super::vm_object::{OwnedPage, VmObject};
@@ -137,11 +137,11 @@ pub fn test_frame_alloc_sync_works() {
     match frame1 {
         Some(f1) => {
             // Free and re-alloc to verify the round-trip
-            frame_free(f1);
+            free_raw_frame(f1);
             let frame2 = frame_alloc_sync();
             match frame2 {
                 Some(f2) => {
-                    frame_free(f2);
+                    free_raw_frame(f2);
                     crate::kprintln!("vm frame_alloc_sync PASS");
                 }
                 None => {

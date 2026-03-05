@@ -1,4 +1,4 @@
-use core::{fmt::Display, ops::{Add, AddAssign, Sub, SubAssign}};
+use core::{fmt::Display, ops::{Add, AddAssign, Sub}};
 
 /// Page size constant
 pub const PAGE_SIZE: usize = 4096;
@@ -46,10 +46,16 @@ pub struct VirtAddr(pub usize);
 pub struct PhysPageNum(pub usize);
 
 /// Virtual page number
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtPageNum(pub usize);
 
 impl VirtPageNum {
+    pub const fn new(n: usize) -> Self {
+        Self(n)
+    }
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
     pub const fn from_usize_unaligned(addr: usize) -> Self {
         Self(addr / PAGE_SIZE)
     }
@@ -57,7 +63,13 @@ impl VirtPageNum {
 
 impl Display for VirtPageNum {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "VPN No.{:x}", self.0)
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<usize> for VirtPageNum {
+    fn from(val: usize) -> Self {
+        VirtPageNum(val)
     }
 }
 
@@ -154,60 +166,6 @@ impl VirtAddr {
 
     pub const fn is_page_aligned(self) -> bool {
         self.page_offset() == 0
-    }
-
-    /// Alias for `page_align_down` — returns the start of the page containing this address.
-    pub const fn current_page_head(self) -> Self {
-        self.page_align_down()
-    }
-}
-
-impl core::ops::Sub for VirtAddr {
-    type Output = usize;
-    fn sub(self, rhs: VirtAddr) -> usize {
-        self.0 - rhs.0
-    }
-}
-
-/// Virtual page number — an index in units of pages, not bytes.
-///
-/// Used as the offset key into `VmObject` page maps (`VObjIndex`).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VirtPageNum(pub usize);
-
-impl VirtPageNum {
-    pub const fn new(n: usize) -> Self {
-        Self(n)
-    }
-
-    pub const fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl core::ops::Add<usize> for VirtPageNum {
-    type Output = VirtPageNum;
-    fn add(self, rhs: usize) -> Self::Output {
-        VirtPageNum(self.0 + rhs)
-    }
-}
-
-impl core::ops::Sub<VirtPageNum> for VirtPageNum {
-    type Output = usize;
-    fn sub(self, rhs: VirtPageNum) -> Self::Output {
-        self.0 - rhs.0
-    }
-}
-
-impl core::fmt::Display for VirtPageNum {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<usize> for VirtPageNum {
-    fn from(val: usize) -> Self {
-        VirtPageNum(val)
     }
 }
 

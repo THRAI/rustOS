@@ -47,11 +47,14 @@ pub fn sys_gettid(task: &Arc<Task>) -> usize {
 // ---------------------------------------------------------------------------
 
 // TODO: handle flags
-pub fn sys_clone(task: &Arc<Task>) -> usize {
-    // Basic fork (flags ignored for now)
+pub fn sys_clone(task: &Arc<Task>, child_stack: usize) -> usize {
     let child = crate::proc::fork::fork(task);
+    // If caller supplied a child stack, override sp in the child's trap frame.
+    // musl __clone stores fn/arg on this stack before ecall; child reads them via sp.
+    if child_stack != 0 {
+        child.trap_frame.lock().x[2] = child_stack;
+    }
     let child_pid = child.pid;
-    // Spawn child on same CPU
     let cpu = crate::executor::per_cpu::current().cpu_id;
     spawn_user_task(child, cpu);
     child_pid as usize

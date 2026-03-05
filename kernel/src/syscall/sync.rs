@@ -28,12 +28,40 @@ pub fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(
 
     let ticks = read_rdtime();
     let secs = ticks / TIMER_FREQ;
-    let nsecs = (ticks % TIMER_FREQ) * (1_000_000_000 / TIMER_FREQ);
+    let nsecs = (ticks % TIMER_FREQ) * 1_000_000_000 / TIMER_FREQ;
 
     // struct timespec { time_t tv_sec; long tv_nsec; } — 16 bytes on rv64
     let ts: [u64; 2] = [secs, nsecs];
     let rc = unsafe {
         crate::hal::rv64::copy_user::copy_user_chunk(tp as *mut u8, ts.as_ptr() as *const u8, 16)
+    };
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
+    Ok(())
+}
+
+/// sys_gettimeofday: return wall-clock time as timeval {sec, usec}.
+///
+/// The second argument (timezone) is ignored for compatibility.
+pub fn sys_gettimeofday(task: &Arc<Task>, tv: usize, _tz: usize) -> Result<(), Errno> {
+    let _ = task;
+    if tv == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let ticks = read_rdtime();
+    let secs = ticks / TIMER_FREQ;
+    let usecs = (ticks % TIMER_FREQ) * 1_000_000 / TIMER_FREQ;
+
+    // struct timeval { long tv_sec; long tv_usec; } on rv64 => 16 bytes
+    let tv_out: [u64; 2] = [secs, usecs];
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            tv as *mut u8,
+            tv_out.as_ptr() as *const u8,
+            16,
+        )
     };
     if rc != 0 {
         return Err(Errno::EFAULT);

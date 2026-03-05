@@ -46,10 +46,16 @@ pub struct VirtAddr(pub usize);
 pub struct PhysPageNum(pub usize);
 
 /// Virtual page number
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtPageNum(pub usize);
 
 impl VirtPageNum {
+    pub const fn new(n: usize) -> Self {
+        Self(n)
+    }
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
     pub const fn from_usize_unaligned(addr: usize) -> Self {
         Self(addr / PAGE_SIZE)
     }
@@ -57,7 +63,13 @@ impl VirtPageNum {
 
 impl Display for VirtPageNum {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "VPN No.{:x}", self.0)
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<usize> for VirtPageNum {
+    fn from(val: usize) -> Self {
+        VirtPageNum(val)
     }
 }
 
@@ -154,26 +166,6 @@ impl VirtAddr {
 
     pub const fn is_page_aligned(self) -> bool {
         self.page_offset() == 0
-    }
-
-}
-
-/// Virtual page number — an index in units of pages, not bytes.
-///
-/// Used as the offset key into `VmObject` page maps (`VObjIndex`).
-impl VirtPageNum {
-    pub const fn new(n: usize) -> Self {
-        Self(n)
-    }
-
-    pub const fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl From<usize> for VirtPageNum {
-    fn from(val: usize) -> Self {
-        VirtPageNum(val)
     }
 }
 

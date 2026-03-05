@@ -50,7 +50,7 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
+.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
@@ -110,11 +110,15 @@ OSCOMP_RUN := $(OSCOMP_SRC)/run-rv-oj.sh
 # 便捷目标：一条命令完成构建镜像 + 运行
 # make oscomp        → 全量测试
 # make oscomp-basic  → 仅跑 basic 测试
+# make oscomp-basic-all → 跑 basic-musl + basic-glibc
 oscomp: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-oj.sh
 oscomp: sdcard-rv run-oscomp
 
 oscomp-basic: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-basic.sh
 oscomp-basic: sdcard-rv run-oscomp
+
+oscomp-basic-all: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-basic-all.sh
+oscomp-basic-all: sdcard-rv run-oscomp
 
 
 sdcard-rv: user-rv64-autotest

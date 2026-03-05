@@ -253,7 +253,9 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         if let Some(_existing_pa) = crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned) {
             // Free the frame we just allocated (BSS/partial paths) to avoid leak.
             // For the FILE path, `pa` came from the page cache — don't free it.
-            if vma_page_byte_offset >= file_size || vma_page_byte_offset + PAGE_SIZE > file_size {
+            if vma_page_byte_offset >= file_size
+                || vma_page_byte_offset + PAGE_SIZE > file_size
+            {
                 crate::mm::allocator::free_raw_frame(pa);
             }
             return Ok(());

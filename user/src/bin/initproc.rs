@@ -72,6 +72,12 @@ fn main() -> i32 {
                 child,
                 status
             );
+            #[cfg(feature = "autotest")]
+            {
+                println!("[initproc] autotest finished, shutting down");
+                let _ = user_lib::shutdown();
+                return 0;
+            }
         } else {
             let _ = yield_();
         }

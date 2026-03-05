@@ -160,6 +160,14 @@ pub fn alloc_raw_frame_sync(role: crate::mm::allocator::types::PageRole) -> Opti
     None
 }
 
+/// Convenience wrapper: allocate a single user-anonymous physical frame
+/// synchronously (no async context required).
+///
+/// Equivalent to `alloc_raw_frame_sync(PageRole::UserAnon)`.
+pub fn frame_alloc_sync() -> Option<PhysAddr> {
+    alloc_raw_frame_sync(crate::mm::allocator::types::PageRole::UserAnon)
+}
+
 /// Async frame allocation. Can yield to cooperate with page daemon.
 ///
 /// Fallback chain: magazine -> buddy -> (wake page daemon + yield) -> emergency_reclaim -> None

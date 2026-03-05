@@ -15,7 +15,7 @@
 | L3 | `libc-test/LTP` 文件系统子集通过 | `fstatat/readlinkat/renameat2/faccessat/ftruncate/fsync/...` 语义趋近 Linux |
 
 当前状态判断：稳定在 **L2**，并完成 `basic-musl + basic-glibc` 双栈基础回归。  
-目录能力、普通文件读写、`touch/echo/cat/ls` 主路径可用；`mount/umount` 已通过 basic 回归。当前主要缺口转为运维类 syscall 覆盖度与语义完整性（`rename/link/readlink/ftruncate/fsync/...`）。
+目录能力、普通文件读写、`touch/echo/cat/ls` 主路径可用；`mount/umount` 已通过 basic 回归。已补齐 `linkat/renameat2/readlinkat/faccessat/ftruncate/fsync/fdatasync/sync` 的 syscall 接入与基础实现；当前主要缺口转为“真实多挂载命名空间 + 高强度一致性回归”。
 
 ---
 
@@ -64,20 +64,20 @@
 | `read` | 已实现 | vnode/page cache + pipe/device 路径可用 |
 | `write` | 已实现（基础版） | vnode 写路径已接入 `delegate::fs_write_at` |
 | `fstat` | 已实现 | 基本字段可返回 |
-| `fstatat` | 已实现（简化） | flags 语义缺失 |
+| `fstatat` | 已实现（简化） | 主要字段可用，flags 语义仍待补齐 |
 | `utimensat` | 已实现（最小版） | 主要为 `touch` 兼容，尚未真实更新时间戳 |
 | `lseek` | 已实现 | 基本可用 |
 | `pipe2` | 已实现 | 可用 |
 | `dup/dup3` | 已实现 | 可用 |
-| `fcntl` | 部分实现 | `F_SETFL/F_SETFD` 近似 stub |
+| `fcntl` | 部分实现 | `F_DUPFD/F_SETFD` 已补，`F_SETFL` 仍为最小语义 |
 | `getdents64` | 已实现（分页版） | 支持按 fd offset 连续分页读取（delegate 批大小 32） |
 | `mkdirat` | 已实现 | 已分发并走 `delegate -> ext4::mkdir` |
 | `unlinkat` | 已实现（基础版） | 支持 `AT_REMOVEDIR` 分支 |
-| `symlinkat` | 已实现（兼容版） | 以内存符号链接表实现，已可支撑 `ln -sf` 建链；暂未落盘到 ext4 |
-| `linkat` | 未实现 | 无 syscall 入口 |
+| `symlinkat` | 已实现（ext4 落盘） | 通过 delegate 调用 lwext4 `ext4_fsymlink` |
+| `linkat` | 已实现 | delegate 调用 lwext4 `ext4_flink` |
 | `mount/umount2` | 已实现（最小语义） | 支持挂载点登记/卸载流程，尚未切换真实后端 |
-| `rename/renameat2` | 未实现 | 无 syscall 入口 |
-| `readlinkat/faccessat/fsync/ftruncate` | 未实现 | 无 syscall 入口或语义缺失 |
+| `rename/renameat2` | 已实现（最小子集） | `flags=0` 主路径可用 |
+| `readlinkat/faccessat/fsync/ftruncate` | 已实现（最小语义） | 满足 busybox/basic 主路径；细节语义待增强 |
 
 ### 3.2 FS 子系统现状
 
@@ -90,9 +90,9 @@
 6. 普通文件写链路可用（`sys_write_async` 的 `Vnode` 分支已打通）。
 
 主要缺口：
-1. inode 语义仍为 synthetic：`lookup` 使用 path-hash，不是稳定真实 inode。
-2. 运维 syscall 仍不完整：`linkat/rename/readlink` 尚未接入。
-3. `fstatat/fcntl` 等语义仍有简化分支（flags 与行为完整性不足）。
+1. `mount/umount2` 仍是轻量挂载表模型，未实现真实多设备命名空间切换。
+2. `fstatat/fcntl/faccessat` 等接口仍有简化分支（flags 与权限语义未完全 Linux 对齐）。
+3. 压力与一致性回归（并发 open/unlink、崩溃恢复）尚未系统化自动化。
 
 ---
 
@@ -136,24 +136,24 @@
 
 ### 阶段 C：挂载兼容与目录运维能力
 
-状态：**进行中（Step 1 完成，Step 3 部分完成，basic 双栈回归通过）**
+状态：**进行中（Step 1 完成，Step 3/4 已推进，basic 双栈回归通过）**
 
 已完成（Step 1）：
 1. `mount(40)/umount2(39)` 已接入 syscall 分发与最小语义。
 2. 已支持挂载点目录校验、挂载登记、卸载注销。
 3. 对现有单根 ext4 架构保持兼容（当前不做真实后端切换）。
 
-已完成（Step 3 部分）：
-1. `symlinkat(36)` 已接入 syscall 分发与最小实现（内存映射表）。
-2. `unlinkat` 已能删除内存符号链接项。
-3. `path::resolve` 已支持符号链接映射跟随（用于动态加载器路径解析）。
-4. `run-rv-basic.sh` 中 `ln -sf ...` 不再报 `Function not implemented`。
+已完成（Step 3/4）：
+1. `linkat(37)` 已接入 syscall 分发与 delegate/ext4 实现。
+2. `renameat/renameat2` 已接入最小子集（`flags=0`），支撑 `mv` 主路径。
+3. `symlinkat/readlinkat` 已改为 ext4 落盘语义，不再依赖内存映射表。
+4. `faccessat/ftruncate/fsync/fdatasync/sync` 已提供最小可用实现。
+5. `lookup` 已改为透传 ext4 原生 inode，不再使用 path-hash synthetic inode。
 
 待完成：
-1. `rename/renameat2` 最小子集（支撑 `mv` 主路径）。
-2. `linkat/readlinkat` 最小实现（补齐链接相关 syscall）。
-3. 将符号链接能力从“内存兼容层”下沉到 ext4 落盘语义。
-4. 提升 `fstatat/fcntl/utimensat` 等“已实现但简化”接口的语义完整性。
+1. `mount/umount2` 从挂载表升级到真实多设备命名空间。
+2. 提升 `fstatat/fcntl/faccessat/utimensat` 等“已实现但简化”接口的语义完整性。
+3. 增加压力/一致性回归：大目录分页、并发 `open/unlink`、写后读一致性、崩溃恢复。
 
 最新验证（2026-03-05）：
 1. `oscomp-basic-all` 下 `basic-musl` 与 `basic-glibc` 两组均完整跑到 `TEST GROUP END`。
@@ -173,17 +173,17 @@
 原因：`basic-musl/glibc` 已通过，短板已从“阻塞点修复”转为“语义完整性与长尾 syscall”。
 
 阶段 C 下一步任务（优先级顺序）：
-1. 增加 `rename/renameat2` 最小子集，打通 `mv` 主路径。
-2. 增加 `linkat/readlinkat` 最小实现，并将 `symlinkat` 逐步下沉到 ext4 落盘语义。
-3. 清理误导性日志级别（如 `SIGCHLD` 打印为 `ERROR`）并补充测试判定文档。
+1. 实现真实挂载命名空间与跨 mountpoint 路径解析。
+2. 清理误导性日志级别（如 `SIGCHLD` 打印为 `ERROR`）并补充测试判定文档。
+3. 建立文件系统压力测试与回归自动化脚本。
 
 ---
 
 ## 7. 阶段 D 预告（C 能力补齐后进入）
 
 目标：
-1. 完善元数据与状态 syscall 语义：`fstatat/faccessat/ftruncate/fsync/utimensat`。
-2. 对齐 inode 与目录项稳定性语义，减少 synthetic inode 带来的兼容偏差。
+1. 完善元数据与状态 syscall 语义：`fstatat/faccessat/fcntl/utimensat`。
+2. 对齐 mount namespace 与目录项一致性语义。
 3. 用 libc-test/LTP 文件系统子集做回归，建立 L3 量化指标。
 
 ---
@@ -192,4 +192,4 @@
 
 1. 当前文件系统实现已稳定在 **L2**，并完成 `basic-musl + basic-glibc` 基础回归。  
 2. `mount/umount` 已通过，basic 阶段核心链路已闭环。  
-3. 下一步应继续阶段 C/D，重点补齐目录运维与元数据语义（`rename/link/readlink/ftruncate/fsync/...`）。  
+3. 下一步应继续阶段 C/D，重点补齐挂载命名空间与高强度一致性验证。  

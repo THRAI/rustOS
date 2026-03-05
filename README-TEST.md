@@ -40,6 +40,24 @@ make oscomp-basic-all  # basic-musl + basic-glibc
 2. 如果内核 panic 或 QEMU 不退出，可用 `--timeout` 缩短等待时间，例如：`--timeout 60`。
 3. 评分输出形如 `[basic-musl] checks: 89/102`，表示通过断言数/总断言数。
 
+## 方法三：固定基线并做对照表
+
+建议每次文件系统改动后固定跑一遍：
+
+```bash
+./judge/batch_judge.sh --target oscomp-basic-all | tee /tmp/oscomp-basic-all.log
+./judge/basic/make_baseline_row.py --log /tmp/oscomp-basic-all.log --repo .
+```
+
+第二条命令会输出一行 Markdown，可直接粘到你的对照表中。
+
+推荐基线表头：
+
+```markdown
+| Date | Commit | basic-musl | basic-glibc | Note |
+|---|---|---|---|---|
+```
+
 ## 结果判定说明
 
 1. `oscomp-basic` 只会打印 `basic-musl` 组。

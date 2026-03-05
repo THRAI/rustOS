@@ -8,21 +8,6 @@ use alloc::collections::VecDeque;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
-
-/// FNV-1a hash of a path string, used as synthetic inode number.
-fn path_hash(path: &str) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in path.bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    // Avoid 0 (invalid inode)
-    if h == 0 {
-        1
-    } else {
-        h
-    }
-}
 use core::future::Future;
 use hal_common::IrqSafeSpinLock;
 use lwext4_rust::Ext4File;
@@ -76,7 +61,7 @@ pub enum FsRequest {
         reply: ReplySlot<Result<(), i32>>,
     },
     /// Look up a child entry in a directory by parent path + name.
-    /// Returns (child_ino_unused, file_type, file_size).
+    /// Returns (child_ino, file_type, file_size).
     Lookup {
         parent_ino: u32,
         name: [u8; 256],
@@ -125,6 +110,42 @@ pub enum FsRequest {
         path: [u8; 256],
         path_len: usize,
         is_dir: bool,
+        reply: ReplySlot<Result<(), i32>>,
+    },
+    /// Create hard link: `new_path` links to `old_path`.
+    Link {
+        old_path: [u8; 256],
+        old_len: usize,
+        new_path: [u8; 256],
+        new_len: usize,
+        reply: ReplySlot<Result<(), i32>>,
+    },
+    /// Rename/move path.
+    Rename {
+        old_path: [u8; 256],
+        old_len: usize,
+        new_path: [u8; 256],
+        new_len: usize,
+        reply: ReplySlot<Result<(), i32>>,
+    },
+    /// Create symlink: `path` -> `target`.
+    Symlink {
+        target: [u8; 256],
+        target_len: usize,
+        path: [u8; 256],
+        path_len: usize,
+        reply: ReplySlot<Result<(), i32>>,
+    },
+    /// Read symlink target by path.
+    ReadLink {
+        path: [u8; 256],
+        path_len: usize,
+        reply: ReplySlot<Result<(usize, [u8; 256]), i32>>,
+    },
+    /// Flush cache by path (mount point dispatch is done in lwext4).
+    CacheFlush {
+        path: [u8; 256],
+        path_len: usize,
         reply: ReplySlot<Result<(), i32>>,
     },
     /// Read all directory entries from a directory path.
@@ -212,6 +233,11 @@ define_reply_pool!(WRITEAT_REPLIES, Result<usize, i32>);
 define_reply_pool!(TRUNCATE_REPLIES, Result<(), i32>);
 define_reply_pool!(MKDIR_REPLIES, Result<(), i32>);
 define_reply_pool!(UNLINK_REPLIES, Result<(), i32>);
+define_reply_pool!(LINK_REPLIES, Result<(), i32>);
+define_reply_pool!(RENAME_REPLIES, Result<(), i32>);
+define_reply_pool!(SYMLINK_REPLIES, Result<(), i32>);
+define_reply_pool!(READLINK_REPLIES, Result<(usize, [u8; 256]), i32>);
+define_reply_pool!(CACHEFLUSH_REPLIES, Result<(), i32>);
 define_reply_pool!(READDIR_REPLIES, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
 
 static OPEN_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
@@ -225,6 +251,11 @@ static WRITEAT_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static TRUNCATE_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static MKDIR_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static UNLINK_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static LINK_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static RENAME_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static SYMLINK_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static READLINK_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
+static CACHEFLUSH_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READDIR_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 
 macro_rules! define_alloc_reply {
@@ -251,6 +282,21 @@ define_alloc_reply!(alloc_writeat_reply, WRITEAT_REPLIES, WRITEAT_REPLY_IDX, Res
 define_alloc_reply!(alloc_truncate_reply, TRUNCATE_REPLIES, TRUNCATE_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_mkdir_reply, MKDIR_REPLIES, MKDIR_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_unlink_reply, UNLINK_REPLIES, UNLINK_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_link_reply, LINK_REPLIES, LINK_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_rename_reply, RENAME_REPLIES, RENAME_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_symlink_reply, SYMLINK_REPLIES, SYMLINK_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(
+    alloc_readlink_reply,
+    READLINK_REPLIES,
+    READLINK_REPLY_IDX,
+    Result<(usize, [u8; 256]), i32>
+);
+define_alloc_reply!(
+    alloc_cacheflush_reply,
+    CACHEFLUSH_REPLIES,
+    CACHEFLUSH_REPLY_IDX,
+    Result<(), i32>
+);
 define_alloc_reply!(alloc_readdir_reply, READDIR_REPLIES, READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
 
 /// Bounded request channel.
@@ -358,9 +404,7 @@ async fn delegate_task() {
                 let full_path = core::str::from_utf8(&name[..name_len]).unwrap_or("");
                 klog!(fs, debug, "lookup: {:?}", full_path);
                 match crate::fs::ext4::stat(&mut tok, full_path) {
-                    Ok((size, ftype)) => {
-                        // lwext4 doesn't expose raw inodes; use path hash as synthetic ino.
-                        let ino = path_hash(full_path);
+                    Ok((ino, size, ftype)) => {
                         reply.complete(Ok((ino, ftype, size)));
                     }
                     Err(_) => reply.complete(Err(-2)), // ENOENT
@@ -434,6 +478,68 @@ async fn delegate_task() {
                     crate::fs::ext4::unlink(&mut tok, path_str)
                 };
                 reply.complete(result.map_err(|e| -(e.abs())));
+            }
+            FsRequest::Link {
+                old_path,
+                old_len,
+                new_path,
+                new_len,
+                reply,
+            } => {
+                let old_path_str = core::str::from_utf8(&old_path[..old_len]).unwrap_or("");
+                let new_path_str = core::str::from_utf8(&new_path[..new_len]).unwrap_or("");
+                reply.complete(
+                    crate::fs::ext4::link(&mut tok, old_path_str, new_path_str)
+                        .map_err(|e| -(e.abs())),
+                );
+            }
+            FsRequest::Rename {
+                old_path,
+                old_len,
+                new_path,
+                new_len,
+                reply,
+            } => {
+                let old_path_str = core::str::from_utf8(&old_path[..old_len]).unwrap_or("");
+                let new_path_str = core::str::from_utf8(&new_path[..new_len]).unwrap_or("");
+                reply.complete(
+                    crate::fs::ext4::rename(&mut tok, old_path_str, new_path_str)
+                        .map_err(|e| -(e.abs())),
+                );
+            }
+            FsRequest::Symlink {
+                target,
+                target_len,
+                path,
+                path_len,
+                reply,
+            } => {
+                let target_str = core::str::from_utf8(&target[..target_len]).unwrap_or("");
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+                reply.complete(
+                    crate::fs::ext4::symlink(&mut tok, target_str, path_str)
+                        .map_err(|e| -(e.abs())),
+                );
+            }
+            FsRequest::ReadLink {
+                path,
+                path_len,
+                reply,
+            } => {
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+                let mut out = [0u8; 256];
+                match crate::fs::ext4::readlink(&mut tok, path_str, &mut out) {
+                    Ok(n) => reply.complete(Ok((n, out))),
+                    Err(e) => reply.complete(Err(-(e.abs()))),
+                }
+            }
+            FsRequest::CacheFlush {
+                path,
+                path_len,
+                reply,
+            } => {
+                let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+                reply.complete(crate::fs::ext4::cache_flush(&mut tok, path_str).map_err(|e| -(e.abs())));
             }
             FsRequest::ReadDir { path, path_len, start_idx, reply } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
@@ -685,6 +791,91 @@ pub async fn fs_unlink(path: &str, is_dir: bool) -> Result<(), i32> {
         reply: ReplySlot::new(reply_inner),
     });
 
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Create hard link `new_path` -> `old_path`.
+pub async fn fs_link(old_path: &str, new_path: &str) -> Result<(), i32> {
+    let reply_inner = alloc_link_reply();
+    let mut old_buf = [0u8; 256];
+    let mut new_buf = [0u8; 256];
+    let old_len = old_path.len().min(256);
+    let new_len = new_path.len().min(256);
+    old_buf[..old_len].copy_from_slice(&old_path.as_bytes()[..old_len]);
+    new_buf[..new_len].copy_from_slice(&new_path.as_bytes()[..new_len]);
+    send_request(FsRequest::Link {
+        old_path: old_buf,
+        old_len,
+        new_path: new_buf,
+        new_len,
+        reply: ReplySlot::new(reply_inner),
+    });
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Rename/move path.
+pub async fn fs_rename(old_path: &str, new_path: &str) -> Result<(), i32> {
+    let reply_inner = alloc_rename_reply();
+    let mut old_buf = [0u8; 256];
+    let mut new_buf = [0u8; 256];
+    let old_len = old_path.len().min(256);
+    let new_len = new_path.len().min(256);
+    old_buf[..old_len].copy_from_slice(&old_path.as_bytes()[..old_len]);
+    new_buf[..new_len].copy_from_slice(&new_path.as_bytes()[..new_len]);
+    send_request(FsRequest::Rename {
+        old_path: old_buf,
+        old_len,
+        new_path: new_buf,
+        new_len,
+        reply: ReplySlot::new(reply_inner),
+    });
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Create symbolic link `path` -> `target`.
+pub async fn fs_symlink(target: &str, path: &str) -> Result<(), i32> {
+    let reply_inner = alloc_symlink_reply();
+    let mut target_buf = [0u8; 256];
+    let mut path_buf = [0u8; 256];
+    let target_len = target.len().min(256);
+    let path_len = path.len().min(256);
+    target_buf[..target_len].copy_from_slice(&target.as_bytes()[..target_len]);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    send_request(FsRequest::Symlink {
+        target: target_buf,
+        target_len,
+        path: path_buf,
+        path_len,
+        reply: ReplySlot::new(reply_inner),
+    });
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Read symbolic link content.
+pub async fn fs_readlink(path: &str) -> Result<(usize, [u8; 256]), i32> {
+    let reply_inner = alloc_readlink_reply();
+    let mut path_buf = [0u8; 256];
+    let path_len = path.len().min(256);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    send_request(FsRequest::ReadLink {
+        path: path_buf,
+        path_len,
+        reply: ReplySlot::new(reply_inner),
+    });
+    ReplyFuture { inner: reply_inner }.await
+}
+
+/// Flush cache for the filesystem containing `path`.
+pub async fn fs_cache_flush(path: &str) -> Result<(), i32> {
+    let reply_inner = alloc_cacheflush_reply();
+    let mut path_buf = [0u8; 256];
+    let path_len = path.len().min(256);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    send_request(FsRequest::CacheFlush {
+        path: path_buf,
+        path_len,
+        reply: ReplySlot::new(reply_inner),
+    });
     ReplyFuture { inner: reply_inner }.await
 }
 

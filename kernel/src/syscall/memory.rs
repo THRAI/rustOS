@@ -7,17 +7,11 @@ use hal_common::{Errno, VirtAddr, PAGE_SIZE};
 
 use crate::proc::task::Task;
 
-/// Free anonymous frames from removed VMAs.
+/// Free frames from removed VMAs.
+/// Pages are freed automatically via RAII (TypedFrame Drop) when the
+/// VmArea and its VmObject are dropped.
 fn free_removed_frames(removed: alloc::vec::Vec<crate::mm::vm::vm_map::VmArea>) {
-    use crate::mm::vm::vm_object::PageOwnership;
-    for vma in removed {
-        let obj = vma.object.read();
-        for page in obj.pages_iter() {
-            if matches!(page.ownership, PageOwnership::Anonymous) {
-                crate::mm::allocator::frame_free(page.phys);
-            }
-        }
-    }
+    drop(removed);
 }
 
 /// sys_mmap: real mmap with top-down allocation and MAP_FIXED.
@@ -99,7 +93,7 @@ pub fn sys_mmap(
         VirtAddr::new(base)..VirtAddr::new(base + aligned_len),
         perm,
         obj,
-        0,
+        hal_common::addr::VirtPageNum(0),
         VmAreaType::Anonymous,
     );
     match vm.insert(vma) {
@@ -158,8 +152,8 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
 /// sys_brk: change program break (heap end).
 pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
     use crate::mm::vm::vm_map::{VmArea, VmAreaType};
-    use crate::mm::vm::vm_object::PageOwnership;
     use crate::mm::vm::vm_object::VmObject;
+    use hal_common::addr::VirtPageNum;
 
     let current_brk = task.brk.load(core::sync::atomic::Ordering::Relaxed);
     if addr == 0 {
@@ -188,7 +182,7 @@ pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
                 VirtAddr::new(old_brk)..VirtAddr::new(new_brk),
                 crate::map_perm!(R, W, U),
                 obj,
-                0,
+                hal_common::addr::VirtPageNum(0),
                 VmAreaType::Heap,
             );
             if vm.insert(vma).is_err() {
@@ -212,19 +206,14 @@ pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
         if let Some(heap_vma) = vm.find_area_mut(VirtAddr::new(old_brk - 1)) {
             if heap_vma.vma_type == VmAreaType::Heap {
                 let vma_start = heap_vma.range.start.as_usize();
-                let from_page = ((new_brk - vma_start) / PAGE_SIZE) as u64;
-                // Truncate pages from VmObject (top-level only — COW safe)
-                let freed = {
+                let from_page = VirtPageNum((new_brk - vma_start) / PAGE_SIZE);
+                // Truncate pages from VmObject (top-level only — COW safe).
+                // Pages are freed automatically via RAII (TypedFrame Drop).
+                {
                     let mut obj = heap_vma.object.write();
-                    let pages = obj.truncate_pages(from_page);
+                    let _freed = obj.truncate_pages(from_page);
                     obj.set_size(new_brk.saturating_sub(vma_start));
-                    pages
-                };
-                // Free anonymous frames
-                for page in freed {
-                    if matches!(page.ownership, PageOwnership::Anonymous) {
-                        crate::mm::allocator::frame_free(page.phys);
-                    }
+                    // _freed drops here, freeing frames via TypedFrame RAII
                 }
                 // Slide VMA end down (or remove if fully shrunk)
                 if new_brk <= vma_start {

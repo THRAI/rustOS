@@ -10,6 +10,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
+use hal_common::addr::VirtPageNum;
 
 use crate::mm::vm::fault::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
 use crate::proc::task::Task;
@@ -115,9 +116,10 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             None => {
                 // Anonymous VMA (stack, heap, BSS): allocate zeroed frame and map.
                 let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-                let obj_offset = ((fault_va_aligned.as_usize() - vma.range.start.as_usize())
-                    / PAGE_SIZE) as u64
-                    + vma.obj_offset;
+                let obj_offset = VirtPageNum(
+                    (fault_va_aligned.as_usize() - vma.range.start.as_usize()) / PAGE_SIZE
+                        + vma.obj_offset.as_usize(),
+                );
                 let prot = vma.prot;
 
                 // TOCTOU: another core may have already resolved this fault.
@@ -161,9 +163,13 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
                         }
                         return Ok(());
                     }
+                    let typed_frame = crate::mm::allocator::TypedFrame {
+                        phys: frame,
+                        _marker: core::marker::PhantomData::<crate::mm::allocator::UserAnon>,
+                    };
                     obj.insert_page(
                         obj_offset,
-                        crate::mm::vm::vm_object::OwnedPage::new_anonymous(frame),
+                        crate::mm::vm::vm_object::OwnedPage::new_anonymous(typed_frame),
                     );
                 }
 
@@ -181,7 +187,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             }
         };
         let page_idx = (fault_va.as_usize() - vma.range.start.as_usize()) / PAGE_SIZE;
-        let file_offset = vma.file_offset + (page_idx * PAGE_SIZE) as u64;
+        let file_offset = vma.file_offset + page_idx * PAGE_SIZE;
         // Debug: log file-backed fault details
         crate::klog!(vm, trace, "fault_in_page_async pid={} va={:#x} vnode={} path={} file_offset={:#x} file_size={:#x} vma_start={:#x} page_idx={}",
             task.pid, fault_va.as_usize(), vnode.vnode_id(), vnode.path(), file_offset, vma.file_size, vma.range.start.as_usize(), page_idx);
@@ -197,7 +203,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
     // Compute how far into the VMA this page starts (in bytes)
     let fault_va_aligned = fault_va.as_usize() & !(PAGE_SIZE - 1);
-    let vma_page_byte_offset = (fault_va_aligned - vma_start) as u64;
+    let vma_page_byte_offset = fault_va_aligned - vma_start;
 
     let pa = if vma_page_byte_offset >= file_size {
         // Entirely beyond file data — pure BSS zero page
@@ -206,12 +212,12 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             core::ptr::write_bytes(frame.as_usize() as *mut u8, 0, PAGE_SIZE);
         }
         frame
-    } else if vma_page_byte_offset + PAGE_SIZE as u64 > file_size {
+    } else if vma_page_byte_offset + PAGE_SIZE > file_size {
         // Partial page: file data + zero fill for the rest
-        let fetched = page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset).await?;
+        let fetched = page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset as u64).await?;
         // Copy file portion to a new frame and zero the tail
         let frame = crate::mm::allocator::frame_alloc_sync().ok_or(FaultError::OutOfMemory)?;
-        let file_bytes = (file_size - vma_page_byte_offset) as usize;
+        let file_bytes = file_size - vma_page_byte_offset;
         unsafe {
             let src_slice = fetched.as_slice();
             let dst_slice = frame.as_mut_slice();
@@ -221,7 +227,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         frame
     } else {
         // Fully within file data — use page cache directly
-        page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset).await?
+        page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset as u64).await?
     };
 
     // Time-of-use: re-validate VMA under lock before mapping
@@ -229,7 +235,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let map = task.vm_map.lock();
         let vma = map.find_area(fault_va).ok_or(FaultError::NotMapped)?;
         let expected_offset = vma.file_offset
-            + ((fault_va.as_usize() - vma.range.start.as_usize()) & !(PAGE_SIZE - 1)) as u64;
+            + ((fault_va.as_usize() - vma.range.start.as_usize()) & !(PAGE_SIZE - 1));
         let current_id = vma.vnode.as_ref().map(|v| v.vnode_id());
         if current_id != Some(vnode_id) || expected_offset != file_offset {
             return Err(FaultError::InvalidAccess);
@@ -245,7 +251,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             // Free the frame we just allocated (BSS/partial paths) to avoid leak.
             // For the FILE path, `pa` came from the page cache — don't free it.
             if vma_page_byte_offset >= file_size
-                || vma_page_byte_offset + PAGE_SIZE as u64 > file_size
+                || vma_page_byte_offset + PAGE_SIZE > file_size
             {
                 crate::mm::allocator::frame_free(pa);
             }

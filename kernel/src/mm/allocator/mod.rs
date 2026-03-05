@@ -3,9 +3,13 @@
 //! - `buddy`: Buddy system frame allocator with split/coalesce
 //! - `magazine`: Per-CPU magazine cache for lock-free order-0 fast path
 //! - `frame_allocator`: Dual API (async + sync) frame allocation
+//! - `types`: Strongly-typed frame wrappers (`TypedFrame`, `UserAnon`, `FileCache`)
 
 pub mod buddy;
 pub mod magazine;
+pub mod types;
+
+pub use types::{TypedFrame, FileCache, UserAnon};
 
 #[cfg(not(test))]
 pub mod frame_allocator;
@@ -15,6 +19,18 @@ pub use frame_allocator::{
     frame_alloc_contiguous, frame_alloc_sync, frame_free, frame_free_contiguous,
     init_frame_allocator,
 };
+
+/// Allocate an anonymous user page, wrapped in a `TypedFrame<UserAnon>`.
+///
+/// Uses `frame_alloc_sync` internally and returns a typed frame that
+/// will automatically free the frame on Drop.
+pub fn alloc_anon_sync() -> Option<types::TypedFrame<types::UserAnon>> {
+    let phys = frame_alloc_sync()?;
+    Some(types::TypedFrame {
+        phys,
+        _marker: core::marker::PhantomData,
+    })
+}
 
 /// Test-only stub: frame_alloc_sync backed by a simple atomic counter.
 /// Returns fake PhysAddr values for unit testing fault handler logic.

@@ -6,12 +6,22 @@
 use crate::mm::vm::vm_map::MapPerm;
 use alloc::sync::Arc;
 
+use hal_common::addr::VirtPageNum;
 use hal_common::{VirtAddr, PAGE_SIZE};
 
 use super::super::allocator::{frame_alloc_sync, frame_free};
 use super::super::pmap;
 use super::vm_map::{VmArea, VmAreaType, VmMap};
 use super::vm_object::{OwnedPage, VmObject};
+
+/// Helper: wrap a PhysAddr into an OwnedPage::Anonymous via TypedFrame.
+fn make_anon_page(phys: hal_common::PhysAddr) -> OwnedPage {
+    use crate::mm::allocator::types::{TypedFrame, UserAnon};
+    OwnedPage::new_anonymous(TypedFrame {
+        phys,
+        _marker: core::marker::PhantomData::<UserAnon>,
+    })
+}
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
 pub fn test_anonymous_page_fault() {
@@ -20,7 +30,7 @@ pub fn test_anonymous_page_fault() {
         VirtAddr::new(0x1000_0000)..VirtAddr::new(0x1000_0000 + PAGE_SIZE),
         crate::map_perm!(R, W),
         obj,
-        0,
+        VirtPageNum(0),
         VmAreaType::Anonymous,
     );
     let mut map = VmMap::new();
@@ -39,7 +49,7 @@ pub fn test_anonymous_page_fault() {
             let vma = map.find_area(VirtAddr::new(0x1000_0000)).unwrap();
             let obj = vma.object.read();
             assert!(
-                obj.lookup_page(0).is_some(),
+                obj.lookup_page(VirtPageNum(0)).is_some(),
                 "page not inserted after fault"
             );
             crate::kprintln!("vm anonymous fault PASS");
@@ -63,7 +73,7 @@ pub fn test_cow_fault() {
     let parent_obj = VmObject::new(PAGE_SIZE);
     {
         let mut w = parent_obj.write();
-        w.insert_page(0, OwnedPage::new_anonymous(parent_frame));
+        w.insert_page(VirtPageNum(0), make_anon_page(parent_frame));
     }
 
     // Create shadow (simulates fork)
@@ -75,7 +85,7 @@ pub fn test_cow_fault() {
         VirtAddr::new(0x2000_0000)..VirtAddr::new(0x2000_0000 + PAGE_SIZE),
         crate::map_perm!(R, W),
         shadow,
-        0,
+        VirtPageNum(0),
         VmAreaType::Anonymous,
     );
     let mut map = VmMap::new();
@@ -92,12 +102,12 @@ pub fn test_cow_fault() {
         super::fault::FaultResult::Resolved => {
             let vma = map.find_area(VirtAddr::new(0x2000_0000)).unwrap();
             let obj = vma.object.read();
-            let _new_phys = obj.lookup_page(0).expect("COW page not inserted");
+            let _new_phys = obj.lookup_page(VirtPageNum(0)).expect("COW page not inserted");
             // COW may either:
             // - copy to a new frame (shared backing, no collapse possible), or
             // - rename the page in-place via collapse (sole shadow, zero-copy)
             // Both are correct. Verify the page is accessible in the top-level object.
-            if obj.has_page(0) {
+            if obj.has_page(VirtPageNum(0)) {
                 crate::kprintln!("vm cow fault PASS");
             } else {
                 crate::kprintln!("vm cow fault FAIL: page not in top-level object");
@@ -145,7 +155,7 @@ pub fn test_frame_alloc_sync_works() {
     }
 }
 
-/// Test: fork bomb stress — rapid shadow chain fan-out and teardown.
+/// Test: fork bomb stress -- rapid shadow chain fan-out and teardown.
 ///
 /// Simulates a fork bomb: one root object with N children, each child
 /// forks again creating grandchildren. Then tear down in various orders
@@ -170,10 +180,10 @@ pub fn test_fork_bomb_stress() {
             core::ptr::write_bytes(ptr, (i + 1) as u8, PAGE_SIZE);
         }
         let mut w = root.write();
-        w.insert_page(i as u64, OwnedPage::new_anonymous(frame));
+        w.insert_page(VirtPageNum(i), make_anon_page(frame));
     }
 
-    // Phase 1: Fork bomb — create N children, each shadowing root.
+    // Phase 1: Fork bomb -- create N children, each shadowing root.
     let mut children: Vec<Arc<spin::RwLock<VmObject>>> = Vec::new();
     for _ in 0..NUM_CHILDREN {
         children.push(VmObject::new_shadow(
@@ -205,26 +215,15 @@ pub fn test_fork_bomb_stress() {
     }
 
     // Phase 3: Kill all children (simulates parent exits, child inherits).
-    // After dropping all children, each child's backing (root) still has
-    // grandchildren holding indirect refs via the child shadows.
     drop(children);
 
-    // Root's shadow_count should be 0 now — children are gone.
-    // But root is still alive because grandchildren -> (dead children) -> root
-    // Actually: grandchildren each hold an Arc to their parent (child).
-    // Children were dropped from our Vec, but grandchild's backing Arc keeps them alive.
-    // So root's shadow_count should still be NUM_CHILDREN.
-    // Wait — no. We dropped the Vec's Arcs, but each grandchild's backing
-    // (the child) still holds an Arc to root. So root.shadow_count == NUM_CHILDREN.
-
-    // Phase 4: Drop grandchildren one by one. As each grandchild drops,
-    // its backing (child) may become sole owner and get unwound.
+    // Phase 4: Drop grandchildren one by one.
     for (_i, gc) in grandchildren.into_iter().enumerate() {
         // Before dropping, verify grandchild can still see root's pages.
         {
             let r = gc.read();
             for p in 0..PAGES_PER_OBJ {
-                if r.lookup_page(p as u64).is_none() {
+                if r.lookup_page(VirtPageNum(p)).is_none() {
                     crate::kprintln!("vm fork bomb FAIL: gc[{}] can't see page {}", _i, p);
                     return;
                 }
@@ -249,22 +248,15 @@ pub fn test_fork_bomb_stress() {
     {
         let r = root.read();
         for p in 0..PAGES_PER_OBJ {
-            if r.lookup_page(p as u64).is_none() {
+            if r.lookup_page(VirtPageNum(p)).is_none() {
                 crate::kprintln!("vm fork bomb FAIL: root page {} missing after teardown", p);
                 return;
             }
         }
     }
 
-    // Clean up: free root's frames.
-    {
-        let mut w = root.write();
-        for p in 0..PAGES_PER_OBJ {
-            if let Some(page) = w.remove_page(p as u64) {
-                frame_free(page.phys);
-            }
-        }
-    }
+    // Clean up: drop root object (frames freed via RAII).
+    drop(root);
 
     crate::kprintln!("vm fork bomb PASS");
 }

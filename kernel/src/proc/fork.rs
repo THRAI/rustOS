@@ -127,11 +127,16 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                         }
                         // Insert into child's VmObject
                         if let Some(child_vma) = child_vm.find_area(va_virt) {
-                            let obj_offset = ((va - child_vma.range.start.as_usize()) / PAGE_SIZE)
-                                as u64
-                                + child_vma.obj_offset;
+                            let obj_offset = hal_common::addr::VirtPageNum(
+                                (va - child_vma.range.start.as_usize()) / PAGE_SIZE
+                                    + child_vma.obj_offset.as_usize(),
+                            );
                             let mut obj = child_vma.object.write();
-                            obj.insert_page(obj_offset, OwnedPage::new_anonymous(new_frame));
+                            let typed_frame = crate::mm::allocator::TypedFrame {
+                                phys: new_frame,
+                                _marker: core::marker::PhantomData::<crate::mm::allocator::UserAnon>,
+                            };
+                            obj.insert_page(obj_offset, OwnedPage::new_anonymous(typed_frame));
                         }
                         let _ =
                             pmap::pmap_enter(&mut child_pmap, va_virt, new_frame, vma.prot, false);

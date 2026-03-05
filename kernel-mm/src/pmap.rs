@@ -34,3 +34,9 @@ pub fn pmap_enter(
 
 /// No-op: record that permissions were changed.
 pub fn pmap_protect(_pmap: &mut Pmap, _va_start: VirtAddr, _va_end: VirtAddr, _prot: MapPerm) {}
+
+/// No-op: zero a physical page (stub for host tests).
+pub fn pmap_zero_page(_pa: PhysAddr) {}
+
+/// No-op: copy a physical page (stub for host tests).
+pub fn pmap_copy_page(_src: PhysAddr, _dst: PhysAddr) {}

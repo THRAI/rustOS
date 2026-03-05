@@ -8,9 +8,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE};
+use hal_common::addr::VirtPageNum;
 
 use crate::fs::path;
-use crate::fs::vnode::{Vnode, VnodeType};
+use crate::fs::vnode::{VnodeType};
 use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType, VmError, VmMap};
 use crate::mm::vm::vm_object::VmObject;
 
@@ -274,10 +275,10 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             VirtAddr::new(va_start)..VirtAddr::new(va_end),
             prot,
             obj,
-            0,
+            hal_common::addr::VirtPageNum(0),
             Arc::new(VnodeWrapper(Arc::clone(&vnode))),
-            file_offset_page_aligned as u64,
-            file_size_in_vma,
+            file_offset_page_aligned,
+            file_size_in_vma as usize,
         );
 
         let mut vm = task.vm_map.lock();
@@ -318,7 +319,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         VirtAddr::new(stack_bottom)..VirtAddr::new(USER_STACK_TOP),
         crate::map_perm!(R, W, U),
         stack_obj,
-        0,
+        hal_common::addr::VirtPageNum(0),
         VmAreaType::Stack,
     );
     {
@@ -407,10 +408,10 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
             VirtAddr::new(va_start)..VirtAddr::new(va_end),
             prot,
             obj,
-            0,
+            hal_common::addr::VirtPageNum(0),
             Arc::new(VnodeWrapper(Arc::clone(&vnode))),
-            file_offset_page_aligned as u64,
-            file_size_in_vma,
+            file_offset_page_aligned,
+            file_size_in_vma as usize,
         );
 
         let mut vm = task.vm_map.lock();
@@ -473,12 +474,18 @@ pub async fn exec_with_args(
         let vma = vm
             .find_area(VirtAddr::new(stack_page_va))
             .ok_or(Errno::ENOMEM)?;
-        let page_idx =
-            ((stack_page_va - vma.range.start.as_usize()) / PAGE_SIZE) as u64 + vma.obj_offset;
+        let page_idx = VirtPageNum(
+            (stack_page_va - vma.range.start.as_usize()) / PAGE_SIZE
+                + vma.obj_offset.as_usize(),
+        );
         let mut obj = vma.object.write();
+        let typed_frame = crate::mm::allocator::TypedFrame {
+            phys: frame,
+            _marker: core::marker::PhantomData::<crate::mm::allocator::UserAnon>,
+        };
         obj.insert_page(
             page_idx,
-            crate::mm::vm::vm_object::OwnedPage::new_anonymous(frame), //TODO: reimport
+            crate::mm::vm::vm_object::OwnedPage::new_anonymous(typed_frame),
         );
     }
 

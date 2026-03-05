@@ -386,7 +386,7 @@ pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
         };
         zero_page(frame.phys());
 
-        let obj_offset = vma.translate_to_obj_page_offset(fault_va_aligned);
+        let obj_offset = vma.pindex_for(fault_va_aligned);
         let mut obj = vma.object.write();
         obj.insert_page(
             obj_offset,
@@ -416,7 +416,7 @@ pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
         PAGE_SIZE
     };
 
-    let obj_offset = vma.translate_to_obj_page_offset(fault_va_aligned);
+    let obj_offset = vma.pindex_for(fault_va_aligned);
 
     if bytes_from_file_in_page < PAGE_SIZE {
         // Boundary page: anonymize — allocate fresh frame, copy file portion, zero tail

@@ -9,8 +9,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 use hal_common::addr::VirtPageNum;
+use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use crate::mm::vm::fault::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
 use crate::proc::task::Task;
@@ -140,8 +140,10 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
                     }
                 }
 
-                let frame =
-                    crate::mm::allocator::frame_alloc_sync().ok_or(FaultError::OutOfMemory)?;
+                let frame = crate::mm::allocator::alloc_raw_frame_sync(
+                    crate::mm::allocator::PageRole::UserAnon,
+                )
+                .ok_or(FaultError::OutOfMemory)?;
                 crate::mm::pmap::pmap_zero_page(frame);
 
                 {
@@ -150,7 +152,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
                     if let Some(existing) = obj.lookup_page(obj_offset) {
                         // Another core won — use their page, free ours.
                         drop(obj);
-                        crate::mm::allocator::frame_free(frame);
+                        crate::mm::allocator::free_raw_frame(frame);
                         let mut pmap = task.pmap.lock();
                         if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
                             let _ = crate::mm::pmap::pmap_enter(
@@ -163,13 +165,10 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
                         }
                         return Ok(());
                     }
-                    let typed_frame = crate::mm::allocator::TypedFrame {
-                        phys: frame,
-                        _marker: core::marker::PhantomData::<crate::mm::allocator::UserAnon>,
-                    };
+                    let vm_page = crate::mm::allocator::types::get_frame_meta(frame).unwrap();
                     obj.insert_page(
                         obj_offset,
-                        crate::mm::vm::vm_object::OwnedPage::new_anonymous(typed_frame),
+                        crate::mm::vm::vm_object::OwnedPage::new_anonymous(vm_page),
                     );
                 }
 
@@ -207,7 +206,9 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
     let pa = if vma_page_byte_offset >= file_size {
         // Entirely beyond file data — pure BSS zero page
-        let frame = crate::mm::allocator::frame_alloc_sync().ok_or(FaultError::OutOfMemory)?;
+        let frame =
+            crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::UserAnon)
+                .ok_or(FaultError::OutOfMemory)?;
         unsafe {
             core::ptr::write_bytes(frame.as_usize() as *mut u8, 0, PAGE_SIZE);
         }
@@ -216,7 +217,9 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         // Partial page: file data + zero fill for the rest
         let fetched = page_cache_fetch_by_id(vnode_id, &vnode_path, file_offset as u64).await?;
         // Copy file portion to a new frame and zero the tail
-        let frame = crate::mm::allocator::frame_alloc_sync().ok_or(FaultError::OutOfMemory)?;
+        let frame =
+            crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::UserAnon)
+                .ok_or(FaultError::OutOfMemory)?;
         let file_bytes = file_size - vma_page_byte_offset;
         unsafe {
             let src_slice = fetched.as_slice();
@@ -250,10 +253,8 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         if let Some(_existing_pa) = crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned) {
             // Free the frame we just allocated (BSS/partial paths) to avoid leak.
             // For the FILE path, `pa` came from the page cache — don't free it.
-            if vma_page_byte_offset >= file_size
-                || vma_page_byte_offset + PAGE_SIZE > file_size
-            {
-                crate::mm::allocator::frame_free(pa);
+            if vma_page_byte_offset >= file_size || vma_page_byte_offset + PAGE_SIZE > file_size {
+                crate::mm::allocator::free_raw_frame(pa);
             }
             return Ok(());
         }

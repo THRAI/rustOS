@@ -55,8 +55,8 @@ pub struct PageFaultAccessType {
 #[derive(Debug, Clone, Copy)]
 pub enum BusyState {
     Unbusied,
-    ExclusiveBusy,  // exBusy - I/O in progress, identity unstable
-    SharedBusy,     // sBusy - stable snapshot for pmap
+    ExclusiveBusy, // exBusy - I/O in progress, identity unstable
+    SharedBusy,    // sBusy - stable snapshot for pmap
 }
 
 impl PageFaultAccessType {
@@ -326,7 +326,7 @@ fn zero_page(phys: PhysAddr) {
 
 /// Test stub: no-op zero_page (host cannot write to fake PhysAddr).
 #[inline]
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 fn zero_page(_phys: PhysAddr) {}
 
 /// Copy PAGE_SIZE bytes from one physical page to another.
@@ -340,7 +340,7 @@ fn copy_page(src: PhysAddr, dst: PhysAddr) {
 
 /// Test stub: no-op copy_page (host cannot write to fake PhysAddr).
 #[inline]
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 fn copy_page(_src: PhysAddr, _dst: PhysAddr) {}
 
 // ---------------------------------------------------------------------------
@@ -360,8 +360,6 @@ fn copy_page(_src: PhysAddr, _dst: PhysAddr) {}
 #[cfg(not(test))]
 pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
     use crate::mm::allocator::alloc_anon_sync;
-    use crate::mm::allocator::FileCache;
-    use crate::mm::allocator::TypedFrame;
     let fault_va_aligned = VirtAddr(fault_va.0 & !(PAGE_SIZE - 1));
 
     let vma = match vm_map.find_area(fault_va) {
@@ -420,7 +418,7 @@ pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
 
     if bytes_from_file_in_page < PAGE_SIZE {
         // Boundary page: anonymize — allocate fresh frame, copy file portion, zero tail
-        let mut frame = match alloc_anon_sync() {
+        let frame = match alloc_anon_sync() {
             Some(f) => f,
             None => return FaultResult::Error(FaultError::OutOfMemory),
         };
@@ -441,20 +439,14 @@ pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
     } else {
         // Full page from cache: map read-only (COW on write fault)
         let mut obj = vma.object.write();
-        let cache_frame = TypedFrame::<FileCache> {
-            phys: cached_pa,
-            _marker: core::marker::PhantomData,
-        };
-        obj.insert_page(
-            obj_offset,
-            super::vm_object::OwnedPage::new_cached(cache_frame),
-        );
+        let vm_page = crate::mm::allocator::types::get_frame_meta(cached_pa).unwrap();
+        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_cached(vm_page));
     }
 
     FaultResult::Resolved
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 mod tests {
     use super::super::super::pmap::Pmap;
     use super::super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};

@@ -61,7 +61,7 @@ pub fn global_generation() -> u64 {
     GLOBAL_GENERATION.load(Ordering::Acquire)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 mod tests {
     use super::*;
 

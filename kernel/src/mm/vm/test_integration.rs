@@ -9,18 +9,14 @@ use alloc::sync::Arc;
 use hal_common::addr::VirtPageNum;
 use hal_common::{VirtAddr, PAGE_SIZE};
 
-use super::super::allocator::{frame_alloc_sync, frame_free};
+use super::super::allocator::{alloc_anon_sync, free_raw_frame};
 use super::super::pmap;
 use super::vm_map::{VmArea, VmAreaType, VmMap};
 use super::vm_object::{OwnedPage, VmObject};
 
-/// Helper: wrap a PhysAddr into an OwnedPage::Anonymous via TypedFrame.
-fn make_anon_page(phys: hal_common::PhysAddr) -> OwnedPage {
-    use crate::mm::allocator::types::{TypedFrame, UserAnon};
-    OwnedPage::new_anonymous(TypedFrame {
-        phys,
-        _marker: core::marker::PhantomData::<UserAnon>,
-    })
+/// Helper: wrap a borrowed VmPage into an OwnedPage::Anonymous.
+fn make_anon_page(page: &'static mut crate::mm::vm::page::VmPage) -> OwnedPage {
+    OwnedPage::new_anonymous(page)
 }
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
@@ -63,17 +59,17 @@ pub fn test_anonymous_page_fault() {
 /// Test: COW fault allocates a private copy.
 pub fn test_cow_fault() {
     // Allocate a real frame and insert into parent object
-    let parent_frame = frame_alloc_sync().expect("OOM in COW test");
+    let parent_page = alloc_anon_sync().expect("OOM in COW test");
     // Zero the frame (identity-mapped in bare mode)
     unsafe {
-        let ptr = parent_frame.as_usize() as *mut u8;
+        let ptr = parent_page.phys().as_usize() as *mut u8;
         core::ptr::write_bytes(ptr, 0x42, PAGE_SIZE);
     }
 
     let parent_obj = VmObject::new(PAGE_SIZE);
     {
         let mut w = parent_obj.write();
-        w.insert_page(VirtPageNum(0), make_anon_page(parent_frame));
+        w.insert_page(VirtPageNum(0), make_anon_page(parent_page));
     }
 
     // Create shadow (simulates fork)
@@ -102,7 +98,9 @@ pub fn test_cow_fault() {
         super::fault::FaultResult::Resolved => {
             let vma = map.find_area(VirtAddr::new(0x2000_0000)).unwrap();
             let obj = vma.object.read();
-            let _new_phys = obj.lookup_page(VirtPageNum(0)).expect("COW page not inserted");
+            let _new_phys = obj
+                .lookup_page(VirtPageNum(0))
+                .expect("COW page not inserted");
             // COW may either:
             // - copy to a new frame (shared backing, no collapse possible), or
             // - rename the page in-place via collapse (sole shadow, zero-copy)
@@ -133,15 +131,16 @@ pub fn test_iterative_drop_500() {
 
 /// Test: frame_alloc_sync works in synchronous (non-async) context.
 pub fn test_frame_alloc_sync_works() {
-    let frame1 = frame_alloc_sync();
+    let frame1 = alloc_anon_sync();
     match frame1 {
         Some(f1) => {
+            let p1 = f1.phys();
             // Free and re-alloc to verify the round-trip
-            frame_free(f1);
-            let frame2 = frame_alloc_sync();
+            free_raw_frame(p1);
+            let frame2 = alloc_anon_sync();
             match frame2 {
                 Some(f2) => {
-                    frame_free(f2);
+                    free_raw_frame(f2.phys());
                     crate::kprintln!("vm frame_alloc_sync PASS");
                 }
                 None => {
@@ -174,13 +173,13 @@ pub fn test_fork_bomb_stress() {
     // Root object with some pages (simulates a process heap).
     let root = VmObject::new(PAGES_PER_OBJ * PAGE_SIZE);
     for i in 0..PAGES_PER_OBJ {
-        let frame = frame_alloc_sync().expect("OOM in fork bomb root");
+        let page = alloc_anon_sync().expect("OOM in fork bomb root");
         unsafe {
-            let ptr = frame.as_usize() as *mut u8;
+            let ptr = page.phys().as_usize() as *mut u8;
             core::ptr::write_bytes(ptr, (i + 1) as u8, PAGE_SIZE);
         }
         let mut w = root.write();
-        w.insert_page(VirtPageNum(i), make_anon_page(frame));
+        w.insert_page(VirtPageNum(i as usize), make_anon_page(page));
     }
 
     // Phase 1: Fork bomb -- create N children, each shadowing root.

@@ -37,10 +37,22 @@ static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine>; 8] = [
 /// Initialize the buddy allocator with the given physical memory range.
 /// Called once during boot after the early bump allocator has reserved its region.
 pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
+    // Initialize the global FRAME_META array
+    // We need one VmPage per physical page in the system (up to `end` address)
+    // To be safe and cover all possible PFNs up to the max address:
+    let max_pfn = end.as_usize() / PAGE_SIZE;
+    let meta_size_bytes = max_pfn * core::mem::size_of::<crate::mm::vm::page::VmPage>();
+    let meta_pages = (meta_size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // Steal memory for metadata array before giving the rest to the buddy allocator
+    let meta_ptr = start;
+    let next_start_addr = start.as_usize() + meta_pages * PAGE_SIZE;
+    let buddy_start = PhysAddr::new(next_start_addr);
+
     crate::klog!(boot, info, "frame: Box::new(BuddyAllocator::new())...");
     let mut buddy = alloc::boxed::Box::new(BuddyAllocator::new());
     crate::klog!(boot, info, "frame: box created, calling init...");
-    buddy.init(start, end);
+    buddy.init(buddy_start, end);
     crate::klog!(
         boot,
         info,
@@ -49,29 +61,20 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
         buddy.available_pages()
     );
 
-    // Initialize the global FRAME_META array
-    // We need one FrameMeta per physical page in the system (up to `end` address)
-    // To be safe and cover all possible PFNs up to the max address:
-    let max_pfn = end.as_usize() / PAGE_SIZE;
-    let meta_size_bytes = max_pfn * core::mem::size_of::<crate::mm::allocator::types::FrameMeta>();
-    let meta_pages = (meta_size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    // Allocate contiguous pages for the metadata array directly from the buddy allocator we just initialized
-    // finding the order required
-    let mut order = 0;
-    while (1 << order) < meta_pages {
-        order += 1;
-    }
-
-    let meta_ptr = buddy
-        .alloc(order)
-        .expect("Failed to allocate FRAME_META array");
-
     // Zero out the allocated metadata memory
     unsafe {
-        core::ptr::write_bytes(meta_ptr.as_usize() as *mut u8, 0, (1 << order) * PAGE_SIZE);
-        crate::mm::allocator::types::FRAME_META =
-            meta_ptr.as_usize() as *mut crate::mm::allocator::types::FrameMeta;
+        let meta_array = core::slice::from_raw_parts_mut(
+            meta_ptr.as_usize() as *mut crate::mm::vm::page::VmPage,
+            max_pfn,
+        );
+
+        // Initialize each VmPage correctly, particularly its physical address link
+        for pfn in 0..max_pfn {
+            meta_array[pfn] = crate::mm::vm::page::VmPage::new();
+            meta_array[pfn].phys_addr = PhysAddr::new(pfn * PAGE_SIZE);
+        }
+
+        crate::mm::allocator::types::FRAME_META = meta_array.as_mut_ptr();
         crate::mm::allocator::types::FRAME_META_LEN = max_pfn;
     }
 
@@ -102,7 +105,6 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
         );
     }
 }
-
 /// Get the current CPU's magazine index.
 /// Uses tp-based per_cpu in kernel context.
 fn current_cpu_id() -> usize {
@@ -119,7 +121,7 @@ fn finalize_alloc(addr: PhysAddr, role: crate::mm::allocator::types::PageRole) -
     if let Some(meta) = crate::mm::allocator::types::get_frame_meta(addr) {
         meta.set_role(role);
         // Note: new allocations start with refcount 0 by default, so we bump to 1.
-        // Wait, atomic inc_ref returns the old value, so if it's 0, it becomes 1.
+        // Wait, atomic inc_ref returns the *new* value, well in `types::VmPage` it returns *old* fetch_add value
         let old = meta.inc_ref();
         debug_assert_eq!(old, 0, "Allocated frame has non-zero refcount!");
     }
@@ -206,58 +208,43 @@ pub async fn alloc_raw_frame(role: crate::mm::allocator::types::PageRole) -> Opt
 // Strongly Typed Allocator Wrappers
 // ---------------------------------------------------------------------------
 
-use crate::mm::allocator::types::{
-    FileCache, KernelStack, PageRole, PipeBuffer, PteL0, PteL1, PteL2, SigTrampoline, TypedFrame,
-    UserAnon, UserExec, UserStack,
-};
-use core::marker::PhantomData;
+use crate::mm::allocator::types::PageRole;
 
 macro_rules! define_alloc_wrapper {
-    ($name:ident, $name_sync:ident, $role_variant:ident, $type_token:ty) => {
-        pub async fn $name() -> Option<TypedFrame<$type_token>> {
+    ($name:ident, $name_sync:ident, $role_variant:ident) => {
+        pub async fn $name() -> Option<&'static mut crate::mm::vm::page::VmPage> {
             alloc_raw_frame(PageRole::$role_variant)
                 .await
-                .map(|phys| TypedFrame {
-                    phys,
-                    _marker: PhantomData,
-                })
+                .map(|phys| crate::mm::allocator::types::get_frame_meta(phys).unwrap())
         }
 
-        pub fn $name_sync() -> Option<TypedFrame<$type_token>> {
-            alloc_raw_frame_sync(PageRole::$role_variant).map(|phys| TypedFrame {
-                phys,
-                _marker: PhantomData,
-            })
+        pub fn $name_sync() -> Option<&'static mut crate::mm::vm::page::VmPage> {
+            alloc_raw_frame_sync(PageRole::$role_variant)
+                .map(|phys| crate::mm::allocator::types::get_frame_meta(phys).unwrap())
         }
     };
 }
 
-define_alloc_wrapper!(alloc_anon, alloc_anon_sync, UserAnon, UserAnon);
-define_alloc_wrapper!(alloc_pte_l0, alloc_pte_l0_sync, PteL0, PteL0);
-define_alloc_wrapper!(alloc_pte_l1, alloc_pte_l1_sync, PteL1, PteL1);
-define_alloc_wrapper!(alloc_pte_l2, alloc_pte_l2_sync, PteL2, PteL2);
-define_alloc_wrapper!(alloc_kstack, alloc_kstack_sync, KernelStack, KernelStack);
-define_alloc_wrapper!(alloc_ustack, alloc_ustack_sync, UserStack, UserStack);
-define_alloc_wrapper!(
-    alloc_file_cache,
-    alloc_file_cache_sync,
-    FileCache,
-    FileCache
-);
-define_alloc_wrapper!(alloc_user_exec, alloc_user_exec_sync, UserExec, UserExec);
-define_alloc_wrapper!(alloc_pipe, alloc_pipe_sync, PipeBuffer, PipeBuffer);
+define_alloc_wrapper!(alloc_anon, alloc_anon_sync, UserAnon);
+define_alloc_wrapper!(alloc_pte_l0, alloc_pte_l0_sync, PteL0);
+define_alloc_wrapper!(alloc_pte_l1, alloc_pte_l1_sync, PteL1);
+define_alloc_wrapper!(alloc_pte_l2, alloc_pte_l2_sync, PteL2);
+define_alloc_wrapper!(alloc_kstack, alloc_kstack_sync, KernelStack);
+define_alloc_wrapper!(alloc_ustack, alloc_ustack_sync, UserStack);
+define_alloc_wrapper!(alloc_file_cache, alloc_file_cache_sync, FileCache);
+define_alloc_wrapper!(alloc_user_exec, alloc_user_exec_sync, UserExec);
+define_alloc_wrapper!(alloc_pipe, alloc_pipe_sync, PipeBuffer);
 define_alloc_wrapper!(
     alloc_sig_trampoline,
     alloc_sig_trampoline_sync,
-    SigTrampoline,
     SigTrampoline
 );
 
-/// Free a single strongly-typed frame (order-0).
+/// Free a VmPage usage reference previously returned by an allocator wrapper.
 ///
 /// Refcount is decremented. If it hits 0, the frame is returned to the pool.
-pub fn frame_free<R>(frame: TypedFrame<R>) {
-    let addr = frame.phys();
+pub fn frame_free(frame: &'static mut crate::mm::vm::page::VmPage) {
+    let addr = frame.phys_addr;
 
     // Check and decrement refcount
     if let Some(meta) = crate::mm::allocator::types::get_frame_meta(addr) {
@@ -280,7 +267,7 @@ pub fn frame_free<R>(frame: TypedFrame<R>) {
 }
 
 /// Alias for `frame_free` to represent dropping a usage reference.
-pub fn frame_free_usage<R>(frame: TypedFrame<R>) {
+pub fn frame_free_usage(frame: &'static mut crate::mm::vm::page::VmPage) {
     frame_free(frame);
 }
 

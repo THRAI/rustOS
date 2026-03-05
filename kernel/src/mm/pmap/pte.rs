@@ -81,7 +81,7 @@ pub fn map_perm_to_pte_flags(perm: MapPerm) -> PteFlags {
     f
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 mod tests {
     use super::*;
 

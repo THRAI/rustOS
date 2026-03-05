@@ -27,7 +27,7 @@ const MAX_CPUS: usize = 8;
 /// Sv39: 3-level page table.
 const SV39_LEVELS: usize = 3;
 
-use crate::mm::allocator::types::{PteL0, PteL1, PteL2, TypedFrame};
+use crate::mm::vm::page::VmPage;
 
 /// Pmap statistics.
 #[derive(Debug, Default)]
@@ -39,11 +39,11 @@ pub struct PmapStats {
 /// Per-address-space page table state.
 pub struct Pmap {
     /// Level-0 page tables (leaf PTEs)
-    l0_tables: Vec<TypedFrame<PteL0>>,
+    l0_tables: Vec<&'static mut VmPage>,
     /// Level-1 page tables (megapage directories)
-    l1_directories: Vec<TypedFrame<PteL1>>,
+    l1_directories: Vec<&'static mut VmPage>,
     /// Root page table physical address (page-aligned).
-    root: TypedFrame<PteL2>,
+    root: &'static mut VmPage,
     /// Current ASID.
     asid: u16,
     /// ASID generation (for lazy revalidation).
@@ -60,16 +60,17 @@ unsafe impl Send for Pmap {}
 
 impl Pmap {
     /// Create a dummy Pmap for unit tests (no real page table).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "qemu-test"))]
     pub fn dummy() -> Self {
         const ATOMIC_FALSE: AtomicBool = AtomicBool::new(false);
+        // Note: For dummy test objects without allocators, we conjure static VmPages here loosely,
+        // but for safety in tests we should use properly allocated pages if needed. Just return uninit for now.
+        // Using a leaked zeroed page as a placeholder since tests don't touch page tables.
+        let dummy_root = Box::leak(Box::new(VmPage::new()));
         Pmap {
             l0_tables: Vec::new(),
             l1_directories: Vec::new(),
-            root: TypedFrame {
-                phys: PhysAddr::new(0),
-                _marker: core::marker::PhantomData,
-            },
+            root: dummy_root,
             asid: 0,
             generation: 0,
             active: [ATOMIC_FALSE; MAX_CPUS],
@@ -192,16 +193,11 @@ pub fn pmap_create() -> Pmap {
         (frame, l1_frame)
     };
     #[cfg(not(target_arch = "riscv64"))]
-    let (root_frame, l1_frame) = (
-        TypedFrame {
-            phys: PhysAddr::new(0),
-            _marker: core::marker::PhantomData,
-        },
-        TypedFrame {
-            phys: PhysAddr::new(0),
-            _marker: core::marker::PhantomData,
-        },
-    );
+    let (root_frame, l1_frame) = {
+        let dummy_root = Box::leak(Box::new(VmPage::new()));
+        let dummy_l1 = Box::leak(Box::new(VmPage::new()));
+        (dummy_root, dummy_l1)
+    };
 
     let (asid, generation) = asid::alloc_asid();
 
@@ -225,13 +221,36 @@ pub fn pmap_create() -> Pmap {
 
 /// Free all page table pages and release the ASID.
 pub fn pmap_destroy(pmap: &mut Pmap) {
-    // RAII via TypedFrame automatically frees `l0_tables`, `l1_directories`, and `root`.
-    // We only need to clear the arrays to enact drops explicitly now,
-    // or let the Pmap Drop trait handle it entirely.
-    pmap.l0_tables.clear();
-    pmap.l1_directories.clear();
+    for frame in pmap.l0_tables.drain(..) {
+        crate::mm::allocator::frame_free(frame);
+    }
+    for frame in pmap.l1_directories.drain(..) {
+        crate::mm::allocator::frame_free(frame);
+    }
+    // Note: root is dropped explicitly. To ensure we don't double drop it if pmap is used,
+    // we would need it wrapped in Option. However, pmap_destroy is typically only called right before Pmap is dropped natively.
     pmap.stats.resident_count = 0;
     pmap.stats.wired_count = 0;
+}
+
+impl Drop for Pmap {
+    fn drop(&mut self) {
+        let l0s = core::mem::take(&mut self.l0_tables);
+        for frame in l0s {
+            crate::mm::allocator::frame_free(frame);
+        }
+        let l1s = core::mem::take(&mut self.l1_directories);
+        for frame in l1s {
+            crate::mm::allocator::frame_free(frame);
+        }
+        // Since root is &'static mut, we can't nicely "take" it without Option or unsafe.
+        // We will just fetch its phys address and free it directly to buddy allocator.
+        // However, dummy objects might cause issues here if they were Box::leaked!
+        // We should skip dummy objects if they have PA == 0.
+        if self.root.phys_addr.as_usize() != 0 {
+            crate::mm::allocator::free_raw_frame(self.root.phys_addr);
+        }
+    }
 }
 
 /// Insert or update a mapping: va → pa with given protection.
@@ -252,7 +271,7 @@ pub fn pmap_enter(
 
     unsafe {
         let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.phys.as_usize(),
+            pmap.root.phys().as_usize(),
             va.as_usize(),
             true,
             &mut |level| pmap.alloc_pt_page(level),
@@ -303,7 +322,7 @@ pub fn pmap_remove(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr) {
     while va < va_end.as_usize() {
         unsafe {
             if let Some(pte_ptr) =
-                walk::walk::<SV39_LEVELS>(pmap.root.phys.as_usize(), va, false, &mut |_| None)
+                walk::walk::<SV39_LEVELS>(pmap.root.phys().as_usize(), va, false, &mut |_| None)
             {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) {
@@ -339,7 +358,7 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
     while va < va_end.as_usize() {
         unsafe {
             if let Some(pte_ptr) =
-                walk::walk::<SV39_LEVELS>(pmap.root.phys.as_usize(), va, false, &mut |_| None)
+                walk::walk::<SV39_LEVELS>(pmap.root.phys().as_usize(), va, false, &mut |_| None)
             {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) && pte_is_leaf(old) {
@@ -370,7 +389,7 @@ pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
     unsafe {
         let mut no_alloc = |_| None;
         let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.phys.as_usize(),
+            pmap.root.phys().as_usize(),
             va.as_usize(),
             false,
             &mut no_alloc,
@@ -389,7 +408,7 @@ pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
 pub fn pmap_extract_with_flags(pmap: &Pmap, va: VirtAddr) -> Option<(PhysAddr, PteFlags)> {
     unsafe {
         let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.phys.as_usize(),
+            pmap.root.phys().as_usize(),
             va.as_usize(),
             false,
             &mut |_| None,
@@ -422,7 +441,7 @@ pub fn pmap_activate(pmap: &mut Pmap) {
     pmap.active[cpu_id].store(true, Ordering::Release);
 
     let satp: usize =
-        (8usize << 60) | ((pmap.asid as usize) << 44) | (pmap.root.phys.as_usize() >> 12);
+        (8usize << 60) | ((pmap.asid as usize) << 44) | (pmap.root.phys().as_usize() >> 12);
 
     unsafe {
         core::arch::asm!(
@@ -445,7 +464,7 @@ pub fn pmap_deactivate(pmap: &mut Pmap) {
 pub fn pmap_fault(pmap: &Pmap, va: VirtAddr, write: bool) -> bool {
     unsafe {
         let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.phys.as_usize(),
+            pmap.root.phys().as_usize(),
             va.as_usize(),
             false,
             &mut |_| None,
@@ -531,7 +550,7 @@ pub fn pmap_enter_range(pmap: &mut Pmap, pa_start: usize, pa_end: usize, prot: M
 fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
     unsafe {
         let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.phys.as_usize(),
+            pmap.root.phys().as_usize(),
             va.as_usize(),
             false,
             &mut |_| None,
@@ -547,7 +566,7 @@ fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
 fn pte_bit_clear(pmap: &mut Pmap, va: VirtAddr, bit: PteFlags) {
     unsafe {
         let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.phys.as_usize(),
+            pmap.root.phys().as_usize(),
             va.as_usize(),
             false,
             &mut |_| None,

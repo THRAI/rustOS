@@ -329,7 +329,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     ];
                     #[cfg(not(feature = "autotest"))]
                     let envp = alloc::vec![
-                        alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
+                        alloc::string::String::from("PATH=/bin/busybox:/bin:/sbin:/usr/bin:/usr/sbin"),
                         alloc::string::String::from("HOME=/"),
                     ];
 

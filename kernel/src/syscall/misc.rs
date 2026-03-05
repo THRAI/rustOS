@@ -23,7 +23,7 @@ pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
         // already zero-filled, NUL terminator is implicit
     }
 
-    write_field(&mut utsname, FIELD_LEN * 0, b"FreeBSD"); // sysname
+    write_field(&mut utsname, 0, b"FreeBSD"); // sysname
     write_field(&mut utsname, FIELD_LEN * 1, b"chronix"); // nodename
     write_field(&mut utsname, FIELD_LEN * 2, b"0.1.0"); // release
     write_field(&mut utsname, FIELD_LEN * 3, b"chronix 0.1.0"); // version
@@ -31,7 +31,11 @@ pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
     write_field(&mut utsname, FIELD_LEN * 5, b"(none)"); // domainname
 
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(buf as *mut u8, utsname.as_ptr(), utsname.len())
+        crate::hal::rv64::copy_user::copy_user_chunk(
+            buf as *mut u8,
+            utsname.as_ptr(),
+            utsname.len(),
+        )
     };
     if rc != 0 {
         return Err(Errno::EFAULT);

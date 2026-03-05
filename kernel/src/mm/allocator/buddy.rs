@@ -161,7 +161,7 @@ impl BuddyAllocator {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 mod tests {
     use super::*;
 

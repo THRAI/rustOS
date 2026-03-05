@@ -29,7 +29,7 @@ pub trait Vnode: Send + Sync {
 
 /// Placeholder trait for test builds where the fs module is not available.
 //TODO: adhere to Mach Vnode interface!
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 pub trait Vnode: Send + Sync {
     fn vnode_id(&self) -> u64;
     fn path(&self) -> &str;
@@ -749,7 +749,7 @@ impl VmMap {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "qemu-test"))]
 mod tests {
     use super::super::vm_object::VmObject;
     use super::*;

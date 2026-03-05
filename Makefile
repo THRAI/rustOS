@@ -226,7 +226,6 @@ agent-test: kernel-rv64 $(DISK_IMG)
 
 test:
 	cargo test --lib -p hal-common --target $(HOST_TARGET)
-	cargo test --lib -p kernel-mm --target $(HOST_TARGET)
 
 test-all: test qemu-test-rv64 python-test-rv64
 

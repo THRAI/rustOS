@@ -71,7 +71,11 @@ pub async fn sys_read_async(
             fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::WRITE).await;
             let zeros = alloc::vec![0u8; len];
             let rc = unsafe {
-                crate::hal::rv64::copy_user::copy_user_chunk(user_buf as *mut u8, zeros.as_ptr(), len)
+                crate::hal::rv64::copy_user::copy_user_chunk(
+                    user_buf as *mut u8,
+                    zeros.as_ptr(),
+                    len,
+                )
             };
             if rc != 0 {
                 Err(Errno::EFAULT)
@@ -684,25 +688,23 @@ impl<'a> Future for PipeWriteFuture<'a> {
             }
             return Poll::Ready(Err(Errno::EINTR));
         }
-        loop {
-            if this.written >= this.data.len() {
-                return Poll::Ready(Ok(this.written));
-            }
-            match this.pipe.write(&this.data[this.written..]) {
-                Ok(n) => {
-                    this.written += n;
-                    if this.written >= this.data.len() {
-                        return Poll::Ready(Ok(this.written));
-                    }
-                    this.pipe.register_writer_waker(cx.waker());
-                    return Poll::Pending;
+        if this.written >= this.data.len() {
+            return Poll::Ready(Ok(this.written));
+        }
+        match this.pipe.write(&this.data[this.written..]) {
+            Ok(n) => {
+                this.written += n;
+                if this.written >= this.data.len() {
+                    return Poll::Ready(Ok(this.written));
                 }
-                Err(Errno::EAGAIN) => {
-                    this.pipe.register_writer_waker(cx.waker());
-                    return Poll::Pending;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
+                this.pipe.register_writer_waker(cx.waker());
+                return Poll::Pending;
             }
+            Err(Errno::EAGAIN) => {
+                this.pipe.register_writer_waker(cx.waker());
+                return Poll::Pending;
+            }
+            Err(e) => return Poll::Ready(Err(e)),
         }
     }
 }

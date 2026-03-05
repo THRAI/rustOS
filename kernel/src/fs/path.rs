@@ -24,7 +24,8 @@ pub fn root_vnode() -> Arc<dyn Vnode> {
 /// Path must be absolute (starts with '/').
 /// Each component is looked up via dentry cache first, then delegate.
 pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
-    let path = path.trim_start_matches('/');
+    let resolved_path = crate::fs::symlink::resolve(path);
+    let path = resolved_path.trim_start_matches('/');
     if path.is_empty() {
         return Ok(root_vnode());
     }

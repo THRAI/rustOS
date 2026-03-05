@@ -30,13 +30,23 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     // Deep-copy: copy all pages from parent's VmObjects into child
     deep_copy_pages(parent, &child);
 
-    // Share sigcode trampoline page from parent (read-only, not in vm_map)
+    // Ensure child has sigcode trampoline page (not tracked in vm_map).
+    // Prefer sharing parent's mapped page; fallback to creating a new one.
     {
         let parent_pmap = parent.pmap.lock();
-        if let Some(sigcode_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(super::signal::SIGCODE_VA)) {
-            let mut child_pmap = child.pmap.lock();
+        let mut child_pmap = child.pmap.lock();
+        if let Some(sigcode_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(super::signal::SIGCODE_VA))
+        {
             let prot = crate::map_perm!(R, X, U);
-            let _ = pmap::pmap_enter(&mut child_pmap, VirtAddr::new(super::signal::SIGCODE_VA), sigcode_pa, prot, false);
+            let _ = pmap::pmap_enter(
+                &mut child_pmap,
+                VirtAddr::new(super::signal::SIGCODE_VA),
+                sigcode_pa,
+                prot,
+                false,
+            );
+        } else {
+            super::signal::map_sigcode_page(&mut child_pmap);
         }
     }
 

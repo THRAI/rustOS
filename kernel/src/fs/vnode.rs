@@ -40,6 +40,7 @@ pub trait Vnode: Send + Sync {
     fn vtype(&self) -> VnodeType;
     fn size(&self) -> u64;
     fn path(&self) -> &str;
+    fn set_size(&self, size: u64);
 }
 
 /// Ext4 vnode: holds inode number, file type, cached size, and path.
@@ -85,5 +86,9 @@ impl Vnode for Ext4Vnode {
 
     fn path(&self) -> &str {
         &self.path
+    }
+
+    fn set_size(&self, size: u64) {
+        self.file_size.store(size, Ordering::Relaxed);
     }
 }

@@ -90,3 +90,49 @@ pub fn probe(vnode_id: VnodeId, page_offset: u64) -> Option<PhysAddr> {
         _ => None,
     }
 }
+
+/// Invalidate cached pages in the byte range [offset, offset + len).
+/// Fetching pages are left intact to avoid dropping waiter lists.
+pub fn invalidate_range(vnode_id: VnodeId, offset: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let start_page = offset / 4096;
+    let end_page = (offset + len as u64 - 1) / 4096;
+
+    let mut cache = PAGE_CACHE.lock();
+    let map = match cache.as_mut() {
+        Some(m) => m,
+        None => return,
+    };
+
+    let mut to_remove = alloc::vec::Vec::new();
+    for page in start_page..=end_page {
+        let key = (vnode_id, page);
+        if matches!(map.get(&key), Some(PageState::Cached(_))) {
+            to_remove.push(key);
+        }
+    }
+    for key in to_remove {
+        map.remove(&key);
+    }
+}
+
+/// Invalidate all cached pages for a vnode.
+pub fn invalidate_all(vnode_id: VnodeId) {
+    let mut cache = PAGE_CACHE.lock();
+    let map = match cache.as_mut() {
+        Some(m) => m,
+        None => return,
+    };
+
+    let mut to_remove = alloc::vec::Vec::new();
+    for (&(vid, page), state) in map.iter() {
+        if vid == vnode_id && matches!(state, PageState::Cached(_)) {
+            to_remove.push((vid, page));
+        }
+    }
+    for key in to_remove {
+        map.remove(&key);
+    }
+}

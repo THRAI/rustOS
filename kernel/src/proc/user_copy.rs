@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hal_common::{PAGE_SIZE, VirtAddr};
 
-use crate::mm::vm::fault::{PageFaultAccessType, FaultError};
+use crate::mm::vm::fault::PageFaultAccessType;
 use crate::proc::task::Task;
 
 /// Pre-fault all user pages covering [user_ptr, user_ptr+len).
@@ -41,27 +41,36 @@ pub async fn copyinstr(task: &Arc<Task>, user_ptr: usize, max_len: usize) -> Opt
     if user_ptr == 0 {
         return None;
     }
-    // Pre-fault the first page; for short strings (pathnames) this is enough.
-    // For strings that may span a page boundary we fault the second page too.
-    let first_page_remaining = PAGE_SIZE - (user_ptr & (PAGE_SIZE - 1));
-    let prefault_len = max_len.min(first_page_remaining + PAGE_SIZE);
-    fault_in_user_buffer(task, user_ptr, prefault_len, PageFaultAccessType::READ).await;
+    let mut out = Vec::new();
+    let mut cur_page = usize::MAX;
 
-    let mut buf = alloc::vec![0u8; max_len];
-    let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            buf.as_mut_ptr(),
-            user_ptr as *const u8,
-            max_len,
-        )
-    };
-    if rc != 0 {
-        return None; // EFAULT
+    for i in 0..max_len {
+        let src = user_ptr + i;
+        let page = src & !(PAGE_SIZE - 1);
+        if page != cur_page {
+            // Fault in one byte on each newly touched page.
+            fault_in_user_buffer(task, src, 1, PageFaultAccessType::READ).await;
+            cur_page = page;
+        }
+
+        let mut ch = 0u8;
+        let rc = unsafe {
+            crate::hal::rv64::copy_user::copy_user_chunk(
+                &mut ch as *mut u8,
+                src as *const u8,
+                1,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        if ch == 0 {
+            return Some(unsafe { String::from_utf8_unchecked(out) });
+        }
+        out.push(ch);
     }
-    // Find NUL terminator
-    let nul_pos = buf.iter().position(|&b| b == 0)?;
-    buf.truncate(nul_pos);
-    Some(unsafe { String::from_utf8_unchecked(buf) })
+
+    None
 }
 
 /// Read a NULL-terminated array of string pointers from user memory.

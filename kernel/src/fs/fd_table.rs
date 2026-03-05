@@ -6,7 +6,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hal_common::Errno;
 
 use super::vnode::Vnode;
@@ -94,15 +94,37 @@ pub struct FileDescription {
     pub object: FileObject,
     pub offset: AtomicU64,
     pub flags: OpenFlags,
+    /// fcntl(F_SETFL) managed status bits (shared by duplicated fds).
+    pub status_flags: AtomicU32,
 }
 
 impl FileDescription {
+    pub const O_APPEND: u32 = 0x0000_0400;
+    pub const O_NONBLOCK: u32 = 0x0000_0800;
+
     pub fn new(object: FileObject, flags: OpenFlags) -> Arc<Self> {
+        let mut status = 0u32;
+        if flags.append {
+            status |= Self::O_APPEND;
+        }
         Arc::new(Self {
             object,
             offset: AtomicU64::new(0),
             flags,
+            status_flags: AtomicU32::new(status),
         })
+    }
+
+    pub fn get_status_flags(&self) -> u32 {
+        self.status_flags.load(Ordering::Relaxed)
+    }
+
+    pub fn set_status_flags(&self, flags: u32) {
+        self.status_flags.store(flags, Ordering::Relaxed);
+    }
+
+    pub fn is_append(&self) -> bool {
+        (self.get_status_flags() & Self::O_APPEND) != 0
     }
 }
 

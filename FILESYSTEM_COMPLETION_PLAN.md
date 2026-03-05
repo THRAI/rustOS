@@ -59,17 +59,17 @@
 |---|---|---|
 | `getcwd` | 已实现 | 可用 |
 | `chdir` | 已实现 | 可用 |
-| `openat` | 已实现（阶段 B 收尾） | `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_DIRECTORY` 主路径可用 |
+| `openat` | 已实现（语义增强） | `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_CLOEXEC` 主路径可用，含访问模式合法性校验 |
 | `close` | 已实现 | 可用 |
 | `read` | 已实现 | vnode/page cache + pipe/device 路径可用 |
 | `write` | 已实现（基础版） | vnode 写路径已接入 `delegate::fs_write_at` |
 | `fstat` | 已实现 | 基本字段可返回 |
-| `fstatat` | 已实现（简化） | 主要字段可用，flags 语义仍待补齐 |
+| `fstatat` | 已实现（语义增强） | 已接入 flags（含 `AT_EMPTY_PATH`），字段生成与 `fstat` 对齐 |
 | `utimensat` | 已实现（最小版） | 主要为 `touch` 兼容，尚未真实更新时间戳 |
 | `lseek` | 已实现 | 基本可用 |
 | `pipe2` | 已实现 | 可用 |
 | `dup/dup3` | 已实现 | 可用 |
-| `fcntl` | 部分实现 | `F_DUPFD/F_SETFD` 已补，`F_SETFL` 仍为最小语义 |
+| `fcntl` | 部分实现（语义增强） | `F_DUPFD/F_SETFD/F_GETFL/F_SETFL` 已可用，`O_APPEND/O_NONBLOCK` 状态可读写 |
 | `getdents64` | 已实现（分页版） | 支持按 fd offset 连续分页读取（delegate 批大小 32） |
 | `mkdirat` | 已实现 | 已分发并走 `delegate -> ext4::mkdir` |
 | `unlinkat` | 已实现（基础版） | 支持 `AT_REMOVEDIR` 分支 |
@@ -77,7 +77,7 @@
 | `linkat` | 已实现 | delegate 调用 lwext4 `ext4_flink` |
 | `mount/umount2` | 已实现（增强版） | 支持挂载表 + 最长前缀路径翻译（namespace -> backend），仍未实现完整多设备命名空间 |
 | `rename/renameat2` | 已实现（最小子集） | `flags=0` 主路径可用 |
-| `readlinkat/faccessat/fsync/ftruncate` | 已实现（最小语义） | 满足 busybox/basic 主路径；细节语义待增强 |
+| `readlinkat/faccessat/fsync/ftruncate` | 已实现（语义增强） | `faccessat` 已改为路径查找与 flags 校验；其余细节仍待 Linux 级权限语义 |
 
 ### 3.2 FS 子系统现状
 
@@ -91,7 +91,7 @@
 
 主要缺口：
 1. `mount/umount2` 已支持路径翻译与挂载域判定，但仍未实现完整多设备命名空间切换（含独立 superblock/root vnode 树）。
-2. `fstatat/fcntl/faccessat` 等接口仍有简化分支（flags 与权限语义未完全 Linux 对齐）。
+2. `fstatat/fcntl/faccessat` 已完成一轮语义收敛，但权限模型/符号链接跟随等 Linux 细节仍未完全对齐。
 3. 压力与一致性回归（并发 open/unlink、崩溃恢复）尚未系统化自动化。
 
 ---

@@ -615,7 +615,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(0o022)
         }
         SyscallId::FSTATAT => {
-            let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2).await {
+            let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };

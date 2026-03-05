@@ -45,12 +45,22 @@ struct LinuxStat {
     __unused: [i32; 2],
 }
 
+#[inline]
+fn stat_mode_from_type(file_type: u8) -> u32 {
+    match file_type {
+        2 => 0o040755, // directory
+        7 => 0o120777, // symlink
+        _ => 0o100644, // regular
+    }
+}
+
 /// Resolve path, create `FileDescription`, and insert into fd table.
 pub async fn open(
     fd_table: &hal_common::SpinMutex<FdTable>,
     path_str: &str,
     flags: OpenFlags,
     raw_flags: u32,
+    fd_flags: FdFlags,
 ) -> Result<u32, Errno> {
     #[inline]
     fn normalize_delegate_open_flags(raw_flags: u32) -> u32 {
@@ -109,7 +119,7 @@ pub async fn open(
 
     if let Some(dev_name) = path_str.strip_prefix("/dev/") {
         let desc = crate::fs::devfs::open_device(dev_name, flags)?;
-        let fd = fd_table.lock().insert(desc, FdFlags::empty())?;
+        let fd = fd_table.lock().insert(desc, fd_flags)?;
         return Ok(fd);
     }
 
@@ -160,7 +170,7 @@ pub async fn open(
     }
 
     let desc = FileDescription::new(FileObject::Vnode(vnode), flags);
-    let fd = fd_table.lock().insert(desc, FdFlags::empty())?;
+    let fd = fd_table.lock().insert(desc, fd_flags)?;
     Ok(fd)
 }
 
@@ -371,12 +381,12 @@ pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno>
             st.st_size = size as i64;
             st.st_blocks = ((size + 511) / 512) as i64;
             st.st_ino = v.vnode_id();
-            // S_IFREG=0o100000 or S_IFDIR=0o040000
             use crate::fs::vnode::VnodeType;
-            st.st_mode = match v.vtype() {
-                VnodeType::Regular => 0o100644,
-                VnodeType::Directory => 0o040755,
+            let ftype = match v.vtype() {
+                VnodeType::Regular => 1u8,
+                VnodeType::Directory => 2u8,
             };
+            st.st_mode = stat_mode_from_type(ftype);
         }
         FileObject::PipeRead(_) | FileObject::PipeWrite(_) => {
             st.st_mode = 0o010600; // S_IFIFO | rw
@@ -412,16 +422,41 @@ pub async fn sys_fstatat_async(
     dirfd: isize,
     pathname_ptr: usize,
     statbuf: usize,
+    flags: usize,
 ) -> Result<(), Errno> {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+
     if statbuf == 0 {
         return Err(Errno::EFAULT);
     }
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT)) != 0 {
+        return Err(Errno::EINVAL);
+    }
 
+    // AT_EMPTY_PATH: stat by fd when pathname is NULL/empty.
+    if pathname_ptr == 0 && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return Err(Errno::EBADF);
+        }
+        return sys_fstat(task, dirfd as u32, statbuf);
+    }
+    if pathname_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
     let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return Err(Errno::EBADF);
+        }
+        return sys_fstat(task, dirfd as u32, statbuf);
+    }
+    if raw_path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
-
-    // Resolve the path to a vnode
-    let vnode = crate::fs::path::resolve(&path_str).await?;
+    let (ino, ftype, size) = delegate::fs_lookup(0, &path_str).await.map_err(map_delegate_errno)?;
 
     let mut st = LinuxStat {
         st_dev: 0,
@@ -445,14 +480,10 @@ pub async fn sys_fstatat_async(
         __unused: [0; 2],
     };
 
-    st.st_ino = vnode.vnode_id();
-    st.st_size = vnode.size() as i64;
-    st.st_blocks = ((vnode.size() + 511) / 512) as i64;
-    use crate::fs::vnode::VnodeType;
-    st.st_mode = match vnode.vtype() {
-        VnodeType::Regular => 0o100644,
-        VnodeType::Directory => 0o040755,
-    };
+    st.st_ino = ino as u64;
+    st.st_size = size as i64;
+    st.st_blocks = ((size + 511) / 512) as i64;
+    st.st_mode = stat_mode_from_type(ftype);
 
     fault_in_user_buffer(
         task,
@@ -532,6 +563,8 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
     const F_GETFL: u32 = 3;
     const F_SETFL: u32 = 4;
     const F_DUPFD_CLOEXEC: u32 = 1030;
+    const O_APPEND: usize = 0x0000_0400;
+    const O_NONBLOCK: usize = 0x0000_0800;
 
     use crate::fs::fd_table::FdFlags;
 
@@ -578,12 +611,17 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
                 fl = 1; // O_WRONLY
             }
             // O_RDONLY = 0
+            let status = desc.get_status_flags() as usize;
+            fl |= status & (O_APPEND | O_NONBLOCK);
             Ok(fl)
         }
         F_SETFL => {
-            // Accept silently for now — status flags are modeled minimally in FileDescription.
             let tab = task.fd_table.lock();
-            let _ = tab.get(fd).ok_or(Errno::EBADF)?;
+            let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+            let settable_mask = (O_APPEND | O_NONBLOCK) as u32;
+            let cur = desc.get_status_flags();
+            let next = (cur & !settable_mask) | ((arg as u32) & settable_mask);
+            desc.set_status_flags(next);
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
@@ -801,9 +839,17 @@ pub async fn sys_faccessat_async(
         return Err(Errno::EINVAL);
     }
 
+    if pathname_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
     let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    if raw_path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
     let path = absolutize_path(task, dirfd, &raw_path)?;
-    let _ = crate::fs::path::resolve(&path).await?;
+    let _ = delegate::fs_lookup(0, &path)
+        .await
+        .map_err(map_delegate_errno)?;
     Ok(())
 }
 
@@ -919,11 +965,9 @@ pub async fn sys_openat_async(
     const O_RDONLY: usize = 0;
     const O_WRONLY: usize = 1;
     const O_RDWR: usize = 2;
-    const O_CREAT: usize = 0x40;
-    const O_EXCL: usize = 0x80;
     const O_TRUNC: usize = 0x200;
     const O_APPEND: usize = 0x400;
-    const O_DIRECTORY: usize = 0x10000;
+    const O_CLOEXEC: usize = 0x80000;
 
     // Read pathname from user memory using fault-safe copyinstr.
     let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
@@ -934,16 +978,24 @@ pub async fn sys_openat_async(
     if access_mode > O_RDWR {
         return Err(Errno::EINVAL);
     }
+    if (flags & O_TRUNC) != 0 && access_mode == O_RDONLY {
+        return Err(Errno::EINVAL);
+    }
     let open_flags = OpenFlags {
         read: access_mode == O_RDONLY || access_mode == O_RDWR,
         write: access_mode == O_WRONLY || access_mode == O_RDWR,
         append: (flags & O_APPEND) != 0,
     };
+    let fd_flags = if (flags & O_CLOEXEC) != 0 {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
 
     // Pass full flags to delegate for O_CREAT/O_TRUNC handling
     let delegate_flags = flags as u32;
 
-    open(&task.fd_table, &path_str, open_flags, delegate_flags).await
+    open(&task.fd_table, &path_str, open_flags, delegate_flags, fd_flags).await
 }
 
 /// sys_close: close a file descriptor.
@@ -1206,7 +1258,7 @@ pub async fn sys_write_async(
             FileObject::Vnode(v) => WriteTarget::Vnode {
                 path: String::from(v.path()),
                 offset: d.offset.load(core::sync::atomic::Ordering::Relaxed),
-                append: d.flags.append,
+                append: d.is_append(),
             },
         };
         (tgt, Arc::clone(d))

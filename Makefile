@@ -1,6 +1,7 @@
 # BSD-Async Rust OS Kernel -- Top-level Makefile
 
 HOST_TARGET := $(shell rustc -vV | grep host | cut -d' ' -f2)
+UNAME_S := $(shell uname -s)
 TARGET_RV64 := riscv64gc-unknown-none-elf
 KERNEL_ELF_RV64 := target/$(TARGET_RV64)/release/kernel
 USER_ELF_RV64 := target/$(TARGET_RV64)/release/initproc
@@ -107,6 +108,7 @@ OSCOMP_SRC := $(CURDIR)/scripts/oscomp
 OSCOMP_TC := $(CURDIR)/testcase
 OSCOMP_RUN := $(OSCOMP_SRC)/run-rv-oj.sh
 
+
 # 便捷目标：一条命令完成构建镜像 + 运行
 # make oscomp        → 全量测试
 # make oscomp-basic  → 仅跑 basic 测试
@@ -122,6 +124,11 @@ oscomp-basic-all: sdcard-rv run-oscomp
 
 
 sdcard-rv: user-rv64-autotest
+ifneq ($(UNAME_S),Linux)
+	@echo "ERROR: sdcard-rv target requires Linux for ext4 filesystem operations"
+	@echo "Please run this target on a Linux machine or use Docker with Linux container"
+	@exit 1
+endif
 	@test -d $(OSCOMP_TC) || (echo "missing $(OSCOMP_TC)"; exit 1)
 	@test -f $(OSCOMP_RUN) || (echo "missing $(OSCOMP_RUN)"; exit 1)
 	rm -f scripts/sdcard-rv.img
@@ -211,7 +218,11 @@ AGENT_TEST_PATTERNS := \
 agent-test: kernel-rv64 $(DISK_IMG)
 	@echo "=== Agent smoke test (timeout=$(AGENT_TEST_TIMEOUT)s) ==="
 	@TMPOUT=$$(mktemp); \
-	timeout $(AGENT_TEST_TIMEOUT) $(QEMU_RV64) $(QEMU_RV64_FLAGS) > $$TMPOUT 2>&1 || true; \
+	$(QEMU_RV64) $(QEMU_RV64_FLAGS) > $$TMPOUT 2>&1 & \
+	QPID=$$!; \
+	( sleep $(AGENT_TEST_TIMEOUT); kill $$QPID 2>/dev/null ) & WATCHDOG=$$!; \
+	wait $$QPID 2>/dev/null; \
+	kill $$WATCHDOG 2>/dev/null; wait $$WATCHDOG 2>/dev/null; \
 	PASS=0; FAIL=0; \
 	for pat in $(AGENT_TEST_PATTERNS); do \
 		if grep -q "$$pat" $$TMPOUT; then \

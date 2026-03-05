@@ -75,7 +75,7 @@
 | `unlinkat` | 已实现（基础版） | 支持 `AT_REMOVEDIR` 分支 |
 | `symlinkat` | 已实现（ext4 落盘） | 通过 delegate 调用 lwext4 `ext4_fsymlink` |
 | `linkat` | 已实现 | delegate 调用 lwext4 `ext4_flink` |
-| `mount/umount2` | 已实现（最小语义） | 支持挂载点登记/卸载流程，尚未切换真实后端 |
+| `mount/umount2` | 已实现（增强版） | 支持挂载表 + 最长前缀路径翻译（namespace -> backend），仍未实现完整多设备命名空间 |
 | `rename/renameat2` | 已实现（最小子集） | `flags=0` 主路径可用 |
 | `readlinkat/faccessat/fsync/ftruncate` | 已实现（最小语义） | 满足 busybox/basic 主路径；细节语义待增强 |
 
@@ -90,7 +90,7 @@
 6. 普通文件写链路可用（`sys_write_async` 的 `Vnode` 分支已打通）。
 
 主要缺口：
-1. `mount/umount2` 仍是轻量挂载表模型，未实现真实多设备命名空间切换。
+1. `mount/umount2` 已支持路径翻译与挂载域判定，但仍未实现完整多设备命名空间切换（含独立 superblock/root vnode 树）。
 2. `fstatat/fcntl/faccessat` 等接口仍有简化分支（flags 与权限语义未完全 Linux 对齐）。
 3. 压力与一致性回归（并发 open/unlink、崩溃恢复）尚未系统化自动化。
 
@@ -141,7 +141,9 @@
 已完成（Step 1）：
 1. `mount(40)/umount2(39)` 已接入 syscall 分发与最小语义。
 2. 已支持挂载点目录校验、挂载登记、卸载注销。
-3. 对现有单根 ext4 架构保持兼容（当前不做真实后端切换）。
+3. 已支持基于最长前缀匹配的路径翻译（`/mnt/... -> source_root/...`）并接入 delegate 实际访问路径。
+4. `link/rename` 已增加挂载域一致性检查，避免跨挂载域直接操作。
+5. 对现有单根 ext4 架构保持兼容（当前不做真实后端切换）。
 
 已完成（Step 3/4）：
 1. `linkat(37)` 已接入 syscall 分发与 delegate/ext4 实现。
@@ -151,7 +153,7 @@
 5. `lookup` 已改为透传 ext4 原生 inode，不再使用 path-hash synthetic inode。
 
 待完成：
-1. `mount/umount2` 从挂载表升级到真实多设备命名空间。
+1. `mount/umount2` 从“路径翻译模型”升级到真实多设备命名空间（独立挂载树 + 跨 mountpoint vnode）。
 2. 提升 `fstatat/fcntl/faccessat/utimensat` 等“已实现但简化”接口的语义完整性。
 3. 增加压力/一致性回归：大目录分页、并发 `open/unlink`、写后读一致性、崩溃恢复。
 

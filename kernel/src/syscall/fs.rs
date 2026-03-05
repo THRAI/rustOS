@@ -657,6 +657,10 @@ pub async fn sys_mount_async(
     }
 
     let target = absolutize_path(task, AT_FDCWD, &raw_target)?;
+    let target_vnode = crate::fs::path::resolve(&target).await.map_err(|_| Errno::ENOENT)?;
+    if target_vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
     crate::fs::mount::register_mount(&source, &target, &fstype, flags)
 }
 
@@ -685,6 +689,9 @@ pub async fn sys_umount2_async(
 
     let raw_target = copyinstr(task, target_ptr, 256).await.ok_or(Errno::EFAULT)?;
     let target = absolutize_path(task, AT_FDCWD, &raw_target)?;
+    if target == "/" {
+        return Err(Errno::EINVAL);
+    }
     crate::fs::mount::unregister_mount(&target)
 }
 
@@ -705,6 +712,10 @@ pub async fn sys_linkat_async(
     let new_raw = copyinstr(task, newpath_ptr, 256).await.ok_or(Errno::EFAULT)?;
     let old_path = absolutize_path(task, olddirfd, &old_raw)?;
     let new_path = absolutize_path(task, newdirfd, &new_raw)?;
+    // Minimal cross-mount guard. Linux reports EXDEV; use EINVAL until EXDEV exists.
+    if !crate::fs::mount::same_mount_domain(&old_path, &new_path) {
+        return Err(Errno::EINVAL);
+    }
     delegate::fs_link(&old_path, &new_path)
         .await
         .map_err(map_delegate_errno)?;
@@ -728,6 +739,10 @@ pub async fn sys_renameat2_async(
     let new_raw = copyinstr(task, newpath_ptr, 256).await.ok_or(Errno::EFAULT)?;
     let old_path = absolutize_path(task, olddirfd, &old_raw)?;
     let new_path = absolutize_path(task, newdirfd, &new_raw)?;
+    // Minimal cross-mount guard. Linux reports EXDEV; use EINVAL until EXDEV exists.
+    if !crate::fs::mount::same_mount_domain(&old_path, &new_path) {
+        return Err(Errno::EINVAL);
+    }
     delegate::fs_rename(&old_path, &new_path)
         .await
         .map_err(map_delegate_errno)?;

@@ -211,7 +211,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             executor::spawn_kernel_task(
                 async {
                     executor::sleep(400).await;
-                    mm::vm::test_integration::test_alloc_raw_frame_sync_works();
+                    mm::vm::test_integration::test_frame_alloc_sync_works();
                 },
                 cpu0,
             )
@@ -317,80 +317,90 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             let init_task = proc::task::Task::new_init();
             let init_task2 = init_task.clone();
             let init_cpu = cpu0;
-            executor::spawn_kernel_task(async move {
-                // Wait for delegate mount to complete
-                executor::sleep(100).await;
+            executor::spawn_kernel_task(
+                async move {
+                    // Wait for delegate mount to complete
+                    executor::sleep(100).await;
 
-                #[cfg(feature = "autotest")]
-                let envp = alloc::vec![
-                    alloc::string::String::from("PATH=/riscv/musl:/riscv/glibc:/bin:/sbin"),
-                    alloc::string::String::from("HOME=/"),
-                ];
-                #[cfg(not(feature = "autotest"))]
-                let envp = alloc::vec![
-                    alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
-                    alloc::string::String::from("HOME=/"),
-                ];
+                    #[cfg(feature = "autotest")]
+                    let envp = alloc::vec![
+                        alloc::string::String::from("PATH=/riscv/musl:/riscv/glibc:/bin:/sbin"),
+                        alloc::string::String::from("HOME=/"),
+                    ];
+                    #[cfg(not(feature = "autotest"))]
+                    let envp = alloc::vec![
+                        alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
+                        alloc::string::String::from("HOME=/"),
+                    ];
 
-                #[cfg(feature = "autotest")]
-                let launch_attempts = alloc::vec![
-                    (
-                        "/bin/initproc",
-                        alloc::vec![alloc::string::String::from("/bin/initproc")],
-                    ),
-                    (
-                        "/riscv/musl/busybox",
-                        alloc::vec![
-                            alloc::string::String::from("/riscv/musl/busybox"),
-                            alloc::string::String::from("sh"),
-                            alloc::string::String::from("/riscv/run-oj.sh"),
-                        ],
-                    ),
-                ];
+                    #[cfg(feature = "autotest")]
+                    let launch_attempts = alloc::vec![
+                        (
+                            "/bin/initproc",
+                            alloc::vec![alloc::string::String::from("/bin/initproc")],
+                        ),
+                        (
+                            "/riscv/musl/busybox",
+                            alloc::vec![
+                                alloc::string::String::from("/riscv/musl/busybox"),
+                                alloc::string::String::from("sh"),
+                                alloc::string::String::from("/riscv/run-oj.sh"),
+                            ],
+                        ),
+                    ];
 
-                #[cfg(not(feature = "autotest"))]
-                let launch_attempts = alloc::vec![
-                    (
-                        "/bin/initproc",
-                        alloc::vec![alloc::string::String::from("/bin/initproc")],
-                    ),
-                    (
-                        "/bin/init",
-                        alloc::vec![alloc::string::String::from("/bin/init")],
-                    ),
-                    (
-                        "/bin/busybox",
-                        alloc::vec![
-                            alloc::string::String::from("/bin/busybox"),
-                            alloc::string::String::from("sh"),
-                        ],
-                    ),
-                ];
+                    #[cfg(not(feature = "autotest"))]
+                    let launch_attempts = alloc::vec![
+                        (
+                            "/bin/initproc",
+                            alloc::vec![alloc::string::String::from("/bin/initproc")],
+                        ),
+                        (
+                            "/bin/init",
+                            alloc::vec![alloc::string::String::from("/bin/init")],
+                        ),
+                        (
+                            "/bin/busybox",
+                            alloc::vec![
+                                alloc::string::String::from("/bin/busybox"),
+                                alloc::string::String::from("sh"),
+                            ],
+                        ),
+                    ];
 
-                let mut launched = false;
-                for (exec_path, argv) in launch_attempts {
-                    match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await {
-                        Ok((entry, sp)) => {
-                            {
-                                let mut tf = init_task2.trap_frame.lock();
-                                tf.sepc = entry;
-                                tf.x[2] = sp;
-                                tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                    let mut launched = false;
+                    for (exec_path, argv) in launch_attempts {
+                        match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await
+                        {
+                            Ok((entry, sp)) => {
+                                {
+                                    let mut tf = init_task2.trap_frame.lock();
+                                    tf.sepc = entry;
+                                    tf.x[2] = sp;
+                                    tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                                }
+                                kprintln!(
+                                    "exec OK: {} entry={:#x} sp={:#x}",
+                                    exec_path,
+                                    entry,
+                                    sp
+                                );
+                                executor::spawn_user_task(init_task2, init_cpu);
+                                launched = true;
+                                break;
                             }
-                            klog!(boot, info, "exec OK: {} entry={:#x} sp={:#x}", exec_path, entry, sp);
-                            executor::spawn_user_task(init_task2, init_cpu);
-                            launched = true;
-                            break;
-                        }
-                        Err(e) => {
-                            klog!(boot, warn, "exec {} failed: {:?}", exec_path, e);
+                            Err(e) => {
+                                klog!(boot, warn, "exec {} failed: {:?}", exec_path, e);
+                            }
                         }
                     }
-                }
-                if !launched {
-                    klog!(boot, error, "no usable init program found");
-                }
-            }, cpu0).detach();
+                    if !launched {
+                        klog!(boot, error, "no usable init program found");
+                    }
+                },
+                cpu0,
+            )
+            .detach();
         }
 
         // Enable global interrupts
@@ -614,9 +624,7 @@ async fn test_vfs_read() {
                         let mut buf2 = [0u8; 64];
                         // Reopen to reset offset
                         let _ = syscall::fs::close(&fd_table, fd);
-                        match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY)
-                            .await
-                        {
+                        match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
                             Ok(fd2) => {
                                 match syscall::fs::read(&fd_table, fd2, &mut buf2).await {
                                     Ok(n2) => {
@@ -815,7 +823,7 @@ fn test_mmap_munmap() {
         base..VirtAddr::new(base.as_usize() + len),
         crate::map_perm!(R, W, U),
         obj,
-        0,
+        hal_common::VirtPageNum(0),
         VmAreaType::Anonymous,
     );
     {

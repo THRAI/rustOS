@@ -9,14 +9,13 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use core::sync::atomic::AtomicU32;
 use hal_common::addr::VirtPageNum;
 use spin::RwLock;
-use core::sync::atomic::AtomicU32;
 
-use hal_common::{PhysAddr};
+use hal_common::PhysAddr;
 
 use crate::mm::allocator::alloc_anon_sync;
-use crate::mm::allocator::types::{FileCache, TypedFrame, UserAnon};
 use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
 
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
@@ -27,43 +26,57 @@ pub trait Pager: Send + Sync {
     fn get_pages(&self, start_offset: u64, pages: &mut [PhysAddr]) -> usize;
 }
 
+use crate::mm::vm::page::VmPage;
+
 /// A physical page held by a VmObject, encoded by its role type.
 #[derive(Debug)]
 pub enum OwnedPage {
-    Anonymous(TypedFrame<UserAnon>),
-    Cached(TypedFrame<FileCache>),
+    Anonymous(&'static mut VmPage),
+    Cached(&'static mut VmPage),
 }
 
 impl OwnedPage {
-    pub fn new_anonymous(frame: TypedFrame<UserAnon>) -> Self {
+    pub fn new_anonymous(frame: &'static mut VmPage) -> Self {
         Self::Anonymous(frame)
     }
 
-    pub fn new_cached(frame: TypedFrame<FileCache>) -> Self {
+    pub fn new_cached(frame: &'static mut VmPage) -> Self {
         Self::Cached(frame)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "qemu-test"))]
     pub fn new_test(phys: PhysAddr) -> Self {
-        Self::Anonymous(TypedFrame {
-            phys,
-            _marker: core::marker::PhantomData,
-        })
+        // Mock a VmPage for testing
+        // Note: For real tests, allocating a real frame via frame allocator is better
+        // For now, this is a placeholder
+        unimplemented!("new_test requires frame allocator in VmPage refactor")
     }
 
     /// Get the physical address of the page.
     pub fn phys(&self) -> PhysAddr {
         match self {
-            Self::Anonymous(frame) => frame.phys(),
-            Self::Cached(frame) => frame.phys(),
+            Self::Anonymous(frame) => frame.phys_addr,
+            Self::Cached(frame) => frame.phys_addr,
         }
     }
 }
 
 // Dropped manually in prior iteration, now RAII handles it natively via TypedFrame
+// But with VmPage, it's a &'static mut VmPage.
+// We should perhaps implement Drop for OwnedPage to free the page frame, or handle it in VmObject.
 impl Drop for OwnedPage {
     fn drop(&mut self) {
-        // TypedFrame<UserAnon> and TypedFrame<FileCache> will automatically drop.
+        use crate::mm::allocator::frame_free;
+        // SAFETY: We're in Drop, so this value will never be used again.
+        // We need to take ownership of the inner &'static mut VmPage to pass to frame_free.
+        let page = unsafe {
+            match self {
+                OwnedPage::Anonymous(page) | OwnedPage::Cached(page) => {
+                    core::ptr::read(page as *const &'static mut _)
+                }
+            }
+        };
+        frame_free(page);
     }
 }
 
@@ -317,7 +330,8 @@ impl VmObject {
     /// Remove and return all pages at offsets >= `from_page`.
     /// Only operates on this object (not the backing chain).
     pub fn truncate_pages(&mut self, from_index: VObjIndex) -> alloc::vec::Vec<OwnedPage> {
-        let keys: alloc::vec::Vec<VObjIndex> = self.pages.range(from_index..).map(|(&k, _)| k).collect();
+        let keys: alloc::vec::Vec<VObjIndex> =
+            self.pages.range(from_index..).map(|(&k, _)| k).collect();
         let mut removed = alloc::vec::Vec::with_capacity(keys.len());
         for k in keys {
             if let Some(page) = self.pages.remove(&k) {

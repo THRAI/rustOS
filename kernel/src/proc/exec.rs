@@ -7,11 +7,11 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE};
 use hal_common::addr::VirtPageNum;
+use hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE};
 
 use crate::fs::path;
-use crate::fs::vnode::{VnodeType};
+use crate::fs::vnode::VnodeType;
 use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType, VmError, VmMap};
 use crate::mm::vm::vm_object::VmObject;
 
@@ -41,8 +41,12 @@ const USER_STACK_SIZE: usize = 64 * 1024;
 /// Bridges `fs::vnode::Vnode` → `mm::vm::vm_map::Vnode` (two separate traits).
 struct VnodeWrapper(Arc<dyn crate::fs::vnode::Vnode>);
 impl crate::mm::vm::vm_map::Vnode for VnodeWrapper {
-    fn vnode_id(&self) -> u64 { self.0.vnode_id() }
-    fn path(&self) -> &str { self.0.path() }
+    fn vnode_id(&self) -> u64 {
+        self.0.vnode_id()
+    }
+    fn path(&self) -> &str {
+        self.0.path()
+    }
 }
 /// User stack top address (just below kernel space).
 const USER_STACK_TOP: usize = 0x0000_003F_FFFF_F000;
@@ -297,14 +301,33 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 
     // 4b. 如果有动态链接器 (PT_INTERP)，加载它并以其 entry 为入口
     let final_entry = if let Some(ref ipath) = interp_path {
-        klog!(exec, debug, "exec pid={} loading interp={}", task.pid, ipath);
+        klog!(
+            exec,
+            debug,
+            "exec pid={} loading interp={}",
+            task.pid,
+            ipath
+        );
         match load_interp(task, ipath, DL_INTERP_OFFSET).await {
             Ok(interp_entry) => {
-                klog!(exec, debug, "exec pid={} interp entry={:#x}", task.pid, interp_entry);
+                klog!(
+                    exec,
+                    debug,
+                    "exec pid={} interp entry={:#x}",
+                    task.pid,
+                    interp_entry
+                );
                 interp_entry
             }
             Err(e) => {
-                klog!(exec, error, "exec pid={} failed to load interp {}: {:?}", task.pid, ipath, e);
+                klog!(
+                    exec,
+                    error,
+                    "exec pid={} failed to load interp {}: {:?}",
+                    task.pid,
+                    ipath,
+                    e
+                );
                 return Err(e);
             }
         }
@@ -350,12 +373,25 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         }
     }
     // Clear pending signals on exec
-    task.signals.pending.store(super::signal::SigSet(0), core::sync::atomic::Ordering::Relaxed);
+    task.signals.pending.store(
+        super::signal::SigSet(0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     // Clear blocked signal mask on exec (POSIX: signal mask preserved, but
     // synchronous signals like SIGSEGV must be deliverable)
-    task.signals.blocked.store(super::signal::SigSet(0), core::sync::atomic::Ordering::Relaxed);
+    task.signals.blocked.store(
+        super::signal::SigSet(0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 
-    klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, final_entry, USER_STACK_TOP);
+    klog!(
+        exec,
+        debug,
+        "exec pid={} entry={:#x} sp={:#x}",
+        task.pid,
+        final_entry,
+        USER_STACK_TOP
+    );
     Ok((final_entry, USER_STACK_TOP))
 }
 
@@ -377,9 +413,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         Err(_) => return Err(Errno::ENOEXEC),
     };
 
-    let hdr_buf = unsafe {
-        core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE)
-    };
+    let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
     let interp_entry = elf_hdr.e_entry as usize + offset;
@@ -465,8 +499,9 @@ pub async fn exec_with_args(
 
     // Eagerly allocate and map the top stack page so we can write to it.
     let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-    let frame = crate::mm::allocator::frame_alloc_sync().ok_or(Errno::ENOMEM)?;
-    crate::mm::pmap::pmap_zero_page(frame);
+    let vm_page = crate::mm::allocator::alloc_anon_sync().expect("OOM when allocating user stack");
+    let phys = vm_page.phys();
+    crate::mm::pmap::pmap_zero_page(phys);
 
     // Insert page into the stack VMA's VmObject
     {
@@ -475,17 +510,12 @@ pub async fn exec_with_args(
             .find_area(VirtAddr::new(stack_page_va))
             .ok_or(Errno::ENOMEM)?;
         let page_idx = VirtPageNum(
-            (stack_page_va - vma.range.start.as_usize()) / PAGE_SIZE
-                + vma.obj_offset.as_usize(),
+            (stack_page_va - vma.range.start.as_usize()) / PAGE_SIZE + vma.obj_offset.as_usize(),
         );
         let mut obj = vma.object.write();
-        let typed_frame = crate::mm::allocator::TypedFrame {
-            phys: frame,
-            _marker: core::marker::PhantomData::<crate::mm::allocator::UserAnon>,
-        };
         obj.insert_page(
             page_idx,
-            crate::mm::vm::vm_object::OwnedPage::new_anonymous(typed_frame),
+            crate::mm::vm::vm_object::OwnedPage::new_anonymous(vm_page),
         );
     }
 
@@ -495,14 +525,14 @@ pub async fn exec_with_args(
         let _ = crate::mm::pmap::pmap_enter(
             &mut pmap,
             VirtAddr::new(stack_page_va),
-            frame,
+            phys,
             crate::map_perm!(R, W, U),
             false,
         );
     }
 
     // Now write the stack layout into the physical frame (identity-mapped).
-    let mut cursor = hal_common::addr::PageCursor::new(frame, PAGE_SIZE).unwrap();
+    let mut cursor = hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
     let stack_page_vbase = VirtAddr::new(stack_page_va);
 
     // Push 16 random bytes for AT_RANDOM

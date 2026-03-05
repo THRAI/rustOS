@@ -36,7 +36,7 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     //TODO: fixme when implementing COW
     // Map sigcode trampoline page in child (not in vm_map, so deep_copy misses it)
     {
-        crate::kprintln!("fork: FIXME when using COW");
+        //crate::kprintln!("fork: FIXME when using COW");
         let mut child_pmap = child.pmap.lock();
         super::signal::map_sigcode_page(&mut child_pmap);
     }

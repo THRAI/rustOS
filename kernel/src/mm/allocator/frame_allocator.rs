@@ -42,7 +42,7 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     // To be safe and cover all possible PFNs up to the max address:
     let max_pfn = end.as_usize() / PAGE_SIZE;
     let meta_size_bytes = max_pfn * core::mem::size_of::<crate::mm::vm::page::VmPage>();
-    let meta_pages = (meta_size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    let meta_pages = meta_size_bytes.div_ceil(PAGE_SIZE);
 
     // Steal memory for metadata array before giving the rest to the buddy allocator
     let meta_ptr = start;

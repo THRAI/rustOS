@@ -1,6 +1,6 @@
 # rustOS 文件系统能力评估与补全计划
 
-更新时间：2026-03-04  
+更新时间：2026-03-05  
 范围：`testsuits-for-oskernel` 文件系统相关需求、`test/rustOS` 当前实现、`jiagou` 架构一致性检查
 
 ---
@@ -14,8 +14,8 @@
 | L2 | `busybox_testcode.sh` 主要文件操作通过 | `touch/cat/echo>/>>/rm/mkdir/mv/rmdir/cp/find/ls/stat` 基本可用 |
 | L3 | `libc-test/LTP` 文件系统子集通过 | `fstatat/readlinkat/renameat2/faccessat/ftruncate/fsync/...` 语义趋近 Linux |
 
-当前状态判断：约在 **L2**。  
-目录能力、普通文件读写、`touch/echo/cat/ls` 主路径已可用；`basic-musl` 在 `mount` 之前的用例已全部通过，当前主要缺口转为 `mount` 阶段阻塞与运维类 syscall。
+当前状态判断：稳定在 **L2**，并完成 `basic-musl + basic-glibc` 双栈基础回归。  
+目录能力、普通文件读写、`touch/echo/cat/ls` 主路径可用；`mount/umount` 已通过 basic 回归。当前主要缺口转为运维类 syscall 覆盖度与语义完整性（`rename/link/readlink/ftruncate/fsync/...`）。
 
 ---
 
@@ -111,7 +111,7 @@
 2. vnode trait object 路径与文档中的 enum dispatch 不一致。
 3. 高阶语义（真实 inode、rename/link、mount）尚未闭环。
 
-结论：架构方向正确，功能已从“目录可用”推进到“基础文件可写”，但语义完整性仍不足以稳定冲击 L2/L3。
+结论：架构方向正确，已形成 L2 稳态能力；后续关键在于把运维与元数据语义补齐，向 L3 推进。
 
 ---
 
@@ -136,7 +136,7 @@
 
 ### 阶段 C：挂载兼容与目录运维能力
 
-状态：**进行中（Step 1 完成，Step 3 部分完成）**
+状态：**进行中（Step 1 完成，Step 3 部分完成，basic 双栈回归通过）**
 
 已完成（Step 1）：
 1. `mount(40)/umount2(39)` 已接入 syscall 分发与最小语义。
@@ -153,12 +153,13 @@
 1. `rename/renameat2` 最小子集（支撑 `mv` 主路径）。
 2. `linkat/readlinkat` 最小实现（补齐链接相关 syscall）。
 3. 将符号链接能力从“内存兼容层”下沉到 ext4 落盘语义。
-4. 处理当前 `mount` 阶段阻塞：`Testing mount` 时仍受 `fork/COW` 路径稳定性影响。
+4. 提升 `fstatat/fcntl/utimensat` 等“已实现但简化”接口的语义完整性。
 
-最新验证（2026-03-04）：
-1. `basic-musl` 在 `mount` 前用例均通过：`fstat/gettimeofday/openat/getdents/mkdir/mmap/...`。
-2. 历史失败点已修复：`fstat ret: -9` -> `fstat ret: 0`，`gettimeofday unknown(169)/error` -> `gettimeofday success`。
-3. 运行在 `Testing mount` 处停止，当前问题面已收敛到挂载阶段。
+最新验证（2026-03-05）：
+1. `oscomp-basic-all` 下 `basic-musl` 与 `basic-glibc` 两组均完整跑到 `TEST GROUP END`。
+2. `mount/umount` 用例已通过，`openat/getdents/mkdir/mmap/pipe/wait*` 等主路径稳定。
+3. `initproc` 在 `autotest` 模式下已增加测试完成后 `shutdown`，避免测试结束后常驻等待。
+4. 现存日志噪声：`[signal] ERROR: check_pending ... SIGCHLD(17)` 与 `TODO: file-backed vma ...`，当前不作为 basic 失败判据。
 
 ### 阶段 D：元数据与兼容增强
 
@@ -168,27 +169,27 @@
 
 ## 6. 下一步应执行的阶段
 
-当前建议：**继续阶段 C（先解 mount 阻塞，再补目录运维能力）**。  
-原因：阶段 B 的语义收敛已完成，`mount` 前测试已通过，下一步瓶颈集中在 `mount` 阶段与运维 syscall 覆盖度。
+当前建议：**继续阶段 C（补目录运维能力）并并行推进阶段 D（语义对齐）**。  
+原因：`basic-musl/glibc` 已通过，短板已从“阻塞点修复”转为“语义完整性与长尾 syscall”。
 
 阶段 C 下一步任务（优先级顺序）：
-1. 先定位并修复 `Testing mount` 阶段阻塞（优先检查 `fork/COW` 相关路径稳定性）。
-2. 增加 `rename/renameat2` 最小子集，打通 `mv` 主路径。
-3. 增加 `linkat/readlinkat` 最小实现，并将 `symlinkat` 逐步下沉到 ext4 落盘语义。
+1. 增加 `rename/renameat2` 最小子集，打通 `mv` 主路径。
+2. 增加 `linkat/readlinkat` 最小实现，并将 `symlinkat` 逐步下沉到 ext4 落盘语义。
+3. 清理误导性日志级别（如 `SIGCHLD` 打印为 `ERROR`）并补充测试判定文档。
 
 ---
 
-## 7. 阶段 C 预告（B 完成后立即进入）
+## 7. 阶段 D 预告（C 能力补齐后进入）
 
 目标：
-1. 实现 `mount(40)/umount2(39)` 最小可用语义（满足测试返回与基本行为）。
-2. 增加 `rename`（建议 `renameat2` 最小子集）以支撑 `mv`。
-3. 增加 `linkat/readlinkat`，提升工具链兼容。
+1. 完善元数据与状态 syscall 语义：`fstatat/faccessat/ftruncate/fsync/utimensat`。
+2. 对齐 inode 与目录项稳定性语义，减少 synthetic inode 带来的兼容偏差。
+3. 用 libc-test/LTP 文件系统子集做回归，建立 L3 量化指标。
 
 ---
 
 ## 8. 当前结论
 
-1. 当前文件系统实现已推进到 **L2**，阶段 B 已完成收尾。  
-2. `basic-musl` 的 `mount` 前用例已通过，失败面已收敛到 `mount` 阶段。  
-3. 下一步应继续阶段 C，先解 `mount` 阻塞，再补齐目录运维 syscall（`rename/link/readlink`）。  
+1. 当前文件系统实现已稳定在 **L2**，并完成 `basic-musl + basic-glibc` 基础回归。  
+2. `mount/umount` 已通过，basic 阶段核心链路已闭环。  
+3. 下一步应继续阶段 C/D，重点补齐目录运维与元数据语义（`rename/link/readlink/ftruncate/fsync/...`）。  

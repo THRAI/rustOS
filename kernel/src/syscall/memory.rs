@@ -21,8 +21,8 @@ pub fn sys_mmap(
     len: usize,
     prot_bits: usize,
     flags: usize,
-    _fd: u32,
-    _offset: u64,
+    fd: u32,
+    offset: u64,
 ) -> usize {
     use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType};
     use crate::mm::vm::vm_object::VmObject;
@@ -33,7 +33,7 @@ pub fn sys_mmap(
     }
 
     let map_fixed = flags & 0x10 != 0; // MAP_FIXED
-    let _map_anon = flags & 0x20 != 0; // MAP_ANONYMOUS
+    let map_anon = flags & 0x20 != 0; // MAP_ANONYMOUS
     let _map_private = flags & 0x02 != 0; // MAP_PRIVATE
 
     let mut vm = task.vm_map.lock();
@@ -161,25 +161,28 @@ pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
         return current_brk;
     }
 
-    let new_brk = (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let old_brk = current_brk;
-    
-    if new_brk > old_brk {
+    // Save user's requested address (byte-level precision)
+    let requested_brk = addr;
+    // Use page-aligned addresses for internal memory management
+    let new_brk_aligned = (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let old_brk_aligned = (current_brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    if new_brk_aligned > old_brk_aligned {
         // --- Expand ---
         let mut vm = task.vm_map.lock();
         if let Some(heap_vma) =
-            vm.find_area_ending_at_mut(VirtAddr::new(old_brk), VmAreaType::Heap)
+            vm.find_area_ending_at_mut(VirtAddr::new(old_brk_aligned), VmAreaType::Heap)
         {
             // In-place extension: slide end, grow VmObject
-            heap_vma.range.end = VirtAddr::new(new_brk);
+            heap_vma.range.end = VirtAddr::new(new_brk_aligned);
             let mut obj = heap_vma.object.write();
-            obj.set_size(new_brk - heap_vma.range.start.as_usize());
+            obj.set_size(new_brk_aligned - heap_vma.range.start.as_usize());
         } else {
             // First brk or no adjacent heap VMA — create new
-            let size = new_brk - old_brk;
+            let size = new_brk_aligned - old_brk_aligned;
             let obj = VmObject::new(size);
             let vma = VmArea::new(
-                VirtAddr::new(old_brk)..VirtAddr::new(new_brk),
+                VirtAddr::new(old_brk_aligned)..VirtAddr::new(new_brk_aligned),
                 crate::map_perm!(R, W, U),
                 obj,
                 hal_common::addr::VirtPageNum(0),
@@ -189,45 +192,46 @@ pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
                 return current_brk;
             }
         }
-    } else if new_brk < old_brk {
+    } else if new_brk_aligned < old_brk_aligned {
         // --- Shrink ---
         // 1. Tear down hardware PTEs + TLB shootdown
         {
             let mut pmap = task.pmap.lock();
             crate::mm::pmap::pmap_remove(
                 &mut pmap,
-                VirtAddr::new(new_brk),
-                VirtAddr::new(old_brk),
+                VirtAddr::new(new_brk_aligned),
+                VirtAddr::new(old_brk_aligned),
             );
         }
         // 2. Truncate VmObject pages and free anonymous frames
         let mut vm = task.vm_map.lock();
-        // Find the heap VMA that contains old_brk - 1
-        if let Some(heap_vma) = vm.find_area_mut(VirtAddr::new(old_brk - 1)) {
+        // Find the heap VMA that contains old_brk_aligned - 1
+        if let Some(heap_vma) = vm.find_area_mut(VirtAddr::new(old_brk_aligned - 1)) {
             if heap_vma.vma_type == VmAreaType::Heap {
                 let vma_start = heap_vma.range.start.as_usize();
-                let from_page = VirtPageNum((new_brk - vma_start) / PAGE_SIZE);
+                let from_page = VirtPageNum((new_brk_aligned - vma_start) / PAGE_SIZE);
                 // Truncate pages from VmObject (top-level only — COW safe).
                 // Pages are freed automatically via RAII (TypedFrame Drop).
                 {
                     let mut obj = heap_vma.object.write();
                     let _freed = obj.truncate_pages(from_page);
-                    obj.set_size(new_brk.saturating_sub(vma_start));
+                    obj.set_size(new_brk_aligned.saturating_sub(vma_start));
                     // _freed drops here, freeing frames via TypedFrame RAII
                 }
                 // Slide VMA end down (or remove if fully shrunk)
-                if new_brk <= vma_start {
+                if new_brk_aligned <= vma_start {
                     vm.remove(VirtAddr::new(vma_start));
                 } else {
                     // Re-lookup since we dropped the borrow for frame_free
                     if let Some(vma) = vm.find_area_mut(VirtAddr::new(vma_start)) {
-                        vma.range.end = VirtAddr::new(new_brk);
+                        vma.range.end = VirtAddr::new(new_brk_aligned);
                     }
                 }
             }
         }
     }
-    
-    task.brk.store(new_brk, core::sync::atomic::Ordering::Relaxed);
-    new_brk
+
+    // Store and return the user's requested address (byte-level precision)
+    task.brk.store(requested_brk, core::sync::atomic::Ordering::Relaxed);
+    requested_brk
 }

@@ -1279,9 +1279,8 @@ pub async fn sys_write_async(
             if rc != 0 {
                 return Err(Errno::EFAULT);
             }
-            for &b in &kbuf {
-                crate::console::putchar(b);
-            }
+            // Use atomic batch write to prevent output interleaving
+            crate::console::putchars(&kbuf);
             Ok(len)
         }
         WriteTarget::PipeWrite(pipe) => {

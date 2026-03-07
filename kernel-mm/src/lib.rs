@@ -1,5 +1,4 @@
 #![cfg_attr(not(test), no_std)]
-
 extern crate alloc;
 
 /// Real macros injected by the kernel or dummy implementations for mm testing
@@ -25,5 +24,5 @@ pub mod mm {
     pub use crate::vm;
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod pmap_tests;

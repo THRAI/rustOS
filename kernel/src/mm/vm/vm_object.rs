@@ -1170,7 +1170,7 @@ mod tests {
             for i in 0..4u64 {
                 w.insert_page(i, {
                     let mut p = super::super::page::VmPage::new();
-                    p.phys_addr = crate::hal_common::PhysAddr::new((0xA000 + i as usize) * 0x1000);
+                    p.phys_addr = hal_common::PhysAddr::new((0xA000 + i as usize) * 0x1000);
                     Arc::new(p)
                 });
             }
@@ -1186,7 +1186,7 @@ mod tests {
                 let offset = (i % 4) as u64;
                 w.insert_page(offset, {
                     let mut p = super::super::page::VmPage::new();
-                    p.phys_addr = crate::hal_common::PhysAddr::new(0xC000_0000 + i * 0x1000);
+                    p.phys_addr = hal_common::PhysAddr::new(0xC000_0000 + i * 0x1000);
                     Arc::new(p)
                 });
             }

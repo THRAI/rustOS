@@ -818,7 +818,7 @@ mod tests {
             let mut w = obj.write();
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(crate::hal_common::PhysAddr::new(0xA000)),
+                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(0xA000)),
             );
         }
         let vma = VmArea::new(
@@ -870,13 +870,13 @@ mod tests {
             let mut w = obj.write();
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(crate::hal_common::PhysAddr::new(
+                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
                     0xDEAD_0000,
                 )),
             );
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(crate::hal_common::PhysAddr::new(
+                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
                     0xBEEF_0000,
                 )),
             );
@@ -898,11 +898,11 @@ mod tests {
         // Parent's pages visible through shadow chain
         assert_eq!(
             child_obj.lookup_page(VirtPageNum(0)).unwrap(),
-            crate::hal_common::PhysAddr::new(0xDEAD_0000)
+            hal_common::PhysAddr::new(0xDEAD_0000)
         );
         assert_eq!(
             child_obj.lookup_page(VirtPageNum(1)).unwrap(),
-            crate::hal_common::PhysAddr::new(0xBEEF_0000)
+            hal_common::PhysAddr::new(0xBEEF_0000)
         );
     }
 

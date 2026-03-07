@@ -43,17 +43,37 @@ pub fn sys_exit(task: &Arc<Task>, status: WaitStatus) -> SyscallResult {
 
     // Wake parent's WaitChildFuture if registered, and post SIGCHLD
     if let Some(parent) = task.parent.upgrade() {
-        // Post SIGCHLD to parent
-        parent.signals.post_signal(super::signal::SIGCHLD);
+        // Check SA_NOCLDWAIT flag on parent's SIGCHLD action
+        let nocldwait = {
+            let actions = parent.signals.actions.lock();
+            actions[(super::signal::SIGCHLD - 1) as usize].flags
+                & super::signal::SA_NOCLDWAIT
+                != 0
+        };
 
-        let waker = parent.parent_waker.lock().take();
-        if let Some(w) = waker {
-            w.wake();
-        }
-        // Also wake parent's top-level waker for signal delivery
-        let tlw = parent.top_level_waker.lock().take();
-        if let Some(w) = tlw {
-            w.wake();
+        if nocldwait {
+            // Auto-reap: skip zombie state, remove from parent's children list immediately
+            klog!(
+                proc,
+                debug,
+                "exit pid={} auto-reap (SA_NOCLDWAIT)",
+                task.pid
+            );
+            parent.children.lock().retain(|c| c.pid != task.pid);
+            // Don't post SIGCHLD when SA_NOCLDWAIT is set
+        } else {
+            // Normal path: post SIGCHLD and wake parent
+            parent.signals.post_signal(super::signal::SIGCHLD);
+
+            let waker = parent.parent_waker.lock().take();
+            if let Some(w) = waker {
+                w.wake();
+            }
+            // Also wake parent's top-level waker for signal delivery
+            let tlw = parent.top_level_waker.lock().take();
+            if let Some(w) = tlw {
+                w.wake();
+            }
         }
     }
 

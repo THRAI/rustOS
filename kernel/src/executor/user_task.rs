@@ -49,10 +49,12 @@ enum TrapResult {
 async fn run_tasks(task: Arc<Task>) {
     klog!(sched, debug, "run_tasks: starting pid={}", task.pid);
 
-    // Capture top-level waker for async signal injection.
-    SignalWakeHelper(&task).await;
-
     loop {
+        // Capture top-level waker for async signal injection at the start of each iteration.
+        // This ensures kill() → post_signal() → top_level_waker.wake() can re-enqueue
+        // the task even if it's parked in a blocking syscall.
+        SignalWakeHelper(&task).await;
+
         // Activate per-process page table before signal delivery and returning to user mode.
         // sendsig writes the signal frame to the user stack via copy_user_chunk,
         // which requires the task's pmap to be active.

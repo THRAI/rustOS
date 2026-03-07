@@ -240,7 +240,8 @@ agent-test: kernel-rv64 $(DISK_IMG)
 	[ $$FAIL -eq 0 ]
 
 test:
-	cargo test --lib -p kernel-mm --target $(HOST_TARGET)
+	@echo "=== No host unit tests (kernel is binary-only) ==="
+	@echo "Run 'make qemu-test-rv64' for integration tests"
 
 test-all: test qemu-test-rv64 python-test-rv64
 

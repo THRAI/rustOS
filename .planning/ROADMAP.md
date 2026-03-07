@@ -123,13 +123,17 @@ Plans:
   3. LA64 kernel boots on QEMU to UART output with trap handling, timer IRQ, and SMP functional
   4. LA64 PMAP correctly encodes PTEs with negative permission logic (NR/NX) -- verified by exhaustive unit tests covering all permission combinations
   5. libc-test suite is active on rv64 with meaningful pass rate; LA64 passes the same testsuits-for-oskernel basic suite as rv64
-**Plans**: TBD
+**Plans**: 8 plans
 
 Plans:
-- [ ] 05-01: TBD
-- [ ] 05-02: TBD
-- [ ] 05-03: TBD
-
+- [ ] 05-01-PLAN.md — Density-aware shadow collapse (VM-15)
+- [ ] 05-02-PLAN.md — Page daemon with clock scan (DMN-01)
+- [ ] 05-03-PLAN.md — Writeback daemon for dirty pages (DMN-02)
+- [ ] 05-04-PLAN.md — LA64 boot + trap + timer HAL (LA64-01)
+- [ ] 05-05-PLAN.md — LA64 PMAP with 4-level page tables (LA64-02, LA64-03)
+- [ ] 05-06-PLAN.md — LA64 ASID allocator + copy_user_chunk (LA64-04, LA64-05)
+- [ ] 05-07-PLAN.md — LA64 interrupt controller (LA64-06)
+- [ ] 05-08-PLAN.md — Activate libc-test suite (TEST-05)
 ### Phase 6: Network + Sockets
 **Goal**: TCP networking works end-to-end -- VirtIO-net driver, smoltcp stack, socket syscalls, and kqueue event notification are functional for git clone over TCP
 **Depends on**: Phase 5
@@ -175,6 +179,6 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | 3. Exception Fixup + VFS + Disk + Process | 5/5 | Complete | 2026-02-23 |
 | 3.1 Verification Bookkeeping + User Memory Safety | 0/1 | Not started | - |
 | 4. Pipes + Signals + Full Syscalls | 0/3 | Complete    | 2026-02-25 |
-| 5. Page Reclamation + LA64 Port | 0/3 | Not started | - |
+| 5. Page Reclamation + LA64 Port | 0/8 | Not started | - |
 | 6. Network + Sockets | 0/3 | Not started | - |
 | 7. Apps + Physical Hardware + Tuning | 0/2 | Not started | - |

@@ -59,8 +59,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Pre-initialize PerCpu for ALL discovered harts.
         // Must happen before trap/timer init because the timer IRQ handler
         // accesses per-CPU data via tp register.
-        for i in 0..num_cpus {
-            let hid = hartids[i];
+        for (i, &hid) in hartids.iter().enumerate().take(num_cpus) {
             let cid = hal::rv64::fdt::hart_to_cpu(hid).unwrap_or(i);
             klog!(boot, info, "init_per_cpu({}, {}) start", cid, hid);
             executor::init_per_cpu(cid, hid);
@@ -89,7 +88,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             extern "C" {
                 static ekernel: u8;
             }
-            let mem_start = crate::hal_common::PhysAddr::new(unsafe { &ekernel as *const u8 as usize });
+            let mem_start =
+                crate::hal_common::PhysAddr::new(unsafe { &ekernel as *const u8 as usize });
             let mem_end = crate::hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
             klog!(
                 boot,
@@ -330,7 +330,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     ];
                     #[cfg(not(feature = "autotest"))]
                     let envp = alloc::vec![
-                        alloc::string::String::from("PATH=/bin/busybox:/bin:/sbin:/usr/bin:/usr/sbin"),
+                        alloc::string::String::from(
+                            "PATH=/bin/busybox:/bin:/sbin:/usr/bin:/usr/sbin"
+                        ),
                         alloc::string::String::from("HOME=/"),
                     ];
 
@@ -380,12 +382,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                                     tf.x[2] = sp;
                                     tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                                 }
-                                kprintln!(
-                                    "exec OK: {} entry={:#x} sp={:#x}",
-                                    exec_path,
-                                    entry,
-                                    sp
-                                );
+                                kprintln!("exec OK: {} entry={:#x} sp={:#x}", exec_path, entry, sp);
                                 executor::spawn_user_task(init_task2, init_cpu);
                                 launched = true;
                                 break;
@@ -451,7 +448,7 @@ fn test_uiomove_short_read() {
 
     // Calculate bytes to end of this page
     let page_offset = user_ptr & 0xFFF;
-    let first_chunk = 4096 - page_offset;
+    let _first_chunk = 4096 - page_offset;
 
     // Request first_chunk + 1 more byte — the extra byte is on the next page
     // which may or may not be mapped. Instead, let's use a known-bad second page.
@@ -492,7 +489,7 @@ fn test_uiomove_short_read() {
         UioDir::CopyIn,
     );
     match r {
-        Err(crate::hal_common::Errno::EFAULT) => {}
+        Err(crate::hal_common::Errno::Efault) => {}
         other => {
             kprintln!("uiomove short-read FAIL (efault: {:?})", other);
             return;
@@ -615,7 +612,7 @@ async fn test_vfs_read() {
     let fd_table = crate::hal_common::SpinMutex::new(FdTable::new());
 
     // First read: goes through delegate
-    match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
+    match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY, 0).await {
         Ok(fd) => {
             let mut buf = [0u8; 64];
             match syscall::fs::read(&fd_table, fd, &mut buf).await {
@@ -625,7 +622,8 @@ async fn test_vfs_read() {
                         let mut buf2 = [0u8; 64];
                         // Reopen to reset offset
                         let _ = syscall::fs::close(&fd_table, fd);
-                        match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
+                        match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY, 0).await
+                        {
                             Ok(fd2) => {
                                 match syscall::fs::read(&fd_table, fd2, &mut buf2).await {
                                     Ok(n2) => {
@@ -674,7 +672,7 @@ async fn test_fork_exec_wait4() {
     // Try exec on the child — use /hello.txt which is NOT an ELF
     // This should fail with ENOEXEC, proving the ELF validation works
     match proc::exec::exec(&child, "/hello.txt").await {
-        Err(crate::hal_common::Errno::ENOEXEC) => {
+        Err(crate::hal_common::Errno::Enoexec) => {
             // Expected: hello.txt is not an ELF binary
         }
         Ok(_) => {
@@ -730,22 +728,40 @@ async fn test_pipe_data_transfer() {
                 // Test EOF: close writer, read should return 0
                 pipe.close_write();
                 match pipe.read(&mut buf) {
-                    Ok(0) => kprintln!("pipe data transfer PASS"),
-                    other => kprintln!("pipe data transfer FAIL (eof: {:?})", other),
+                    Ok(0) => {}
+                    other => {
+                        kprintln!("pipe data transfer FAIL (eof: {:?})", other);
+                        return;
+                    }
                 }
             } else {
                 kprintln!("pipe data transfer FAIL (data mismatch)");
+                return;
             }
         }
         other => {
             kprintln!("pipe data transfer FAIL (read: {:?})", other);
+            return;
         }
     }
+
+    // Test EPIPE: close reader, write should return EPIPE
+    let pipe2 = Pipe::new();
+    pipe2.close_read();
+    match pipe2.write(b"test") {
+        Err(crate::hal_common::Errno::Epipe) => {}
+        other => {
+            kprintln!("pipe data transfer FAIL (epipe: {:?})", other);
+            return;
+        }
+    }
+
+    kprintln!("pipe data transfer PASS");
 }
 
 #[cfg(feature = "qemu-test")]
 fn test_signal_pending_delivery() {
-    use proc::signal::{SA_RESTART, SIGUSR1};
+    use proc::signal::{SA_NOCLDWAIT, SA_RESTART, SIGCHLD, SIGUSR1};
     use proc::task::Task;
 
     let task = Task::new_init();
@@ -805,13 +821,26 @@ fn test_signal_pending_delivery() {
     // Clean up
     let _ = task.signals.dequeue_signal();
 
+    // Test SA_NOCLDWAIT flag
+    {
+        let mut actions = task.signals.actions.lock();
+        actions[(SIGCHLD - 1) as usize].flags = SA_NOCLDWAIT;
+    }
+    {
+        let actions = task.signals.actions.lock();
+        if actions[(SIGCHLD - 1) as usize].flags & SA_NOCLDWAIT == 0 {
+            kprintln!("signal pending delivery FAIL (SA_NOCLDWAIT not set)");
+            return;
+        }
+    }
+
     kprintln!("signal pending delivery PASS");
 }
 
 #[cfg(feature = "qemu-test")]
 fn test_mmap_munmap() {
     use crate::hal_common::{VirtAddr, PAGE_SIZE};
-    use mm::vm::vm_map::{VmArea, VmAreaType};
+    use mm::vm::vm_map::VmMap;
     use mm::vm::vm_object::VmObject;
 
     let task = proc::task::Task::new_init();
@@ -819,17 +848,21 @@ fn test_mmap_munmap() {
     // Insert an anonymous VMA
     let base = VirtAddr::new(0x1000_0000);
     let len = PAGE_SIZE;
-    let obj = VmObject::new(1);
-    let vma = VmArea::new(
-        base..VirtAddr::new(base.as_usize() + len),
+    use crate::mm::vm::map::entry::{BackingStore, EntryFlags, VmMapEntry};
+    let obj = VmObject::new_anon(1);
+    let vma = VmMapEntry::new(
+        base.as_usize() as u64,
+        (base.as_usize() + len) as u64,
+        BackingStore::Object {
+            object: obj,
+            offset: 0,
+        },
+        EntryFlags::empty(),
         crate::map_perm!(R, W, U),
-        obj,
-        crate::hal_common::VirtPageNum(0),
-        VmAreaType::Anonymous,
     );
     {
         let mut vm = task.vm_map.lock();
-        match vm.insert(vma) {
+        match vm.insert_entry(vma) {
             Ok(()) => {}
             Err(_) => {
                 kprintln!("mmap munmap FAIL (insert)");
@@ -837,13 +870,13 @@ fn test_mmap_munmap() {
             }
         }
         // Verify VMA exists
-        if vm.find_area(base).is_none() {
+        if vm.lookup(base.as_usize() as u64).is_none() {
             kprintln!("mmap munmap FAIL (find after insert)");
             return;
         }
         // Remove it
-        vm.remove(base);
-        if vm.find_area(base).is_some() {
+        vm.remove_range(base, VirtAddr::new(base.as_usize() + len));
+        if vm.lookup(base.as_usize() as u64).is_some() {
             kprintln!("mmap munmap FAIL (still present after remove)");
             return;
         }
@@ -865,7 +898,7 @@ async fn test_device_nodes() {
     let fd_table = crate::hal_common::SpinMutex::new(FdTable::new_with_stdio());
 
     // Open /dev/null
-    match syscall::fs::open(&fd_table, "/dev/null", OpenFlags::RDWR).await {
+    match syscall::fs::open(&fd_table, "/dev/null", OpenFlags::RDWR, 0).await {
         Ok(fd) => {
             // Verify it opened (fd >= 3 since 0,1,2 are stdio)
             if fd < 3 {
@@ -881,7 +914,7 @@ async fn test_device_nodes() {
     }
 
     // Open /dev/zero
-    match syscall::fs::open(&fd_table, "/dev/zero", OpenFlags::RDONLY).await {
+    match syscall::fs::open(&fd_table, "/dev/zero", OpenFlags::RDONLY, 0).await {
         Ok(fd) => {
             let _ = syscall::fs::close(&fd_table, fd);
         }
@@ -892,7 +925,7 @@ async fn test_device_nodes() {
     }
 
     // Open /dev/console
-    match syscall::fs::open(&fd_table, "/dev/console", OpenFlags::RDWR).await {
+    match syscall::fs::open(&fd_table, "/dev/console", OpenFlags::RDWR, 0).await {
         Ok(fd) => {
             let _ = syscall::fs::close(&fd_table, fd);
         }

@@ -154,9 +154,10 @@ None yet.
 | 3 | Refactor kernel vm submodule based on ai/bsd_vm/vm_fault.md plans | 2026-03-04 | b749909 | Verified | [3-refactor-kernel-vm-submodule-based-on-ai](./quick/3-refactor-kernel-vm-submodule-based-on-ai/) |
 | 4 | Fix compilation errors from VM refactoring (VirtPageNum export + interface) | 2026-03-04 | 28ca95d | Complete | [4-use-refactored-vm-interface-to-refactor-](./quick/4-use-refactored-vm-interface-to-refactor-/) |
 | 6 | Make Makefile OS-agnostic for macOS and Linux portability | 2026-03-05 | 4f20792 | Complete | [6-modify-the-makefile-so-it-s-os-agnostic-](./quick/6-modify-the-makefile-so-it-s-os-agnostic-/) |
+| 7 | Move hal-common into kernel as internal module | 2026-03-07 | 8f39ebd | Complete | [7-move-hal-common-and-kernel-mm-into-kerne](./quick/7-move-hal-common-and-kernel-mm-into-kerne/) |
 
 ## Session Continuity
 
-Last activity: 2026-03-05 - Completed quick task 6: Make Makefile OS-agnostic
+Last activity: 2026-03-07 - Completed quick task 7: Move hal-common into kernel
 Stopped at: Plan 04-02 complete, ready for 04-04 (integration/remaining syscalls)
 Resume file: None

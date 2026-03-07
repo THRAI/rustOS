@@ -27,12 +27,12 @@ OSCOMP_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_RV64
 
 OBJCOPY := rust-objcopy
 
-# Kernel log control: LOG=all | LOG=boot,fs,driver | (empty = quiet)
+# Kernel log control: LOG=all | LOG=boot,fs,driver | (empty = all modules)
 # Available modules: boot syscall trap vm sched fs driver smp signal pipe exec proc
 comma := ,
 space := $(subst ,, )
-LOG ?=
-LEVEL ?= trace
+LOG ?= all
+LEVEL ?= error
 ifdef LOG
   ifeq ($(LOG),all)
     _LOG_FEATURES := log-all
@@ -240,7 +240,7 @@ agent-test: kernel-rv64 $(DISK_IMG)
 	[ $$FAIL -eq 0 ]
 
 test:
-	cargo test --lib -p hal-common --target $(HOST_TARGET)
+	cargo test --lib -p kernel-mm --target $(HOST_TARGET)
 
 test-all: test qemu-test-rv64 python-test-rv64
 

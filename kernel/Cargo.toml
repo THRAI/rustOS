@@ -31,9 +31,12 @@ log-level-debug = ["log-level-info"]
 log-level-trace = ["log-level-debug"]
 log-level-all   = ["log-level-trace"]
 [dependencies]
-hal-common = { path = "../hal-common" }
 async-task = { version = "4.7", default-features = false }
 bitflags = { workspace = true }
-spin = "0.9"
+spin = "0.10.0"
 linked_list_allocator = { version = "0.10", default-features = false }
 lwext4_rust = { workspace = true }
+goblin = { version = "0.10.5", default-features = false, features = ["elf64", "elf32", "endian_fd"] }
+
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+loom = "0.7.2"

@@ -1,9 +1,10 @@
 [workspace]
-members = ["kernel", "hal-common", "kernel-mm"]
+members = ["kernel", "kernel-mm"]
 exclude = ["user"]
 resolver = "2"
 
 [workspace.dependencies]
 bitflags = "2"
-log = "0.4"
 lwext4_rust = { git = "https://github.com/PACTHEMAN123/ext4fs.git", default-features = false, branch = "main" }
+log = { version = "0.4", default-features = false }
+lazy_static = { version = "1.4", default-features = false, features = ["spin_no_std"] }

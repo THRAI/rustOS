@@ -24,7 +24,7 @@ fn path_hash(path: &str) -> u32 {
     }
 }
 use core::future::Future;
-use hal_common::IrqSafeSpinLock;
+use crate::hal_common::IrqSafeSpinLock;
 use lwext4_rust::Ext4File;
 
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
@@ -88,13 +88,13 @@ pub enum FsRequest {
         ino: u32,
         reply: ReplySlot<Result<(u64, u8), i32>>,
     },
-    /// Read one page of file data at the given byte offset.
-    /// Delegate allocates a frame, reads data into it, returns PhysAddr as usize.
+    /// Read one page of file data into the given pa physical address, at the given byte offset.
     ReadPage {
         path: [u8; 256],
         path_len: usize,
         offset: u64,
-        reply: ReplySlot<Result<usize, i32>>,
+        pa: usize,
+        reply: ReplySlot<Result<(), i32>>,
     },
     /// Write data to a file at the given byte offset.
     /// Opens file, seeks, writes, closes. Returns bytes written.
@@ -207,7 +207,7 @@ define_reply_pool!(WRITE_REPLIES, Result<usize, i32>);
 define_reply_pool!(CLOSE_REPLIES, Result<(), i32>);
 define_reply_pool!(LOOKUP_REPLIES, Result<(u32, u8, u64), i32>);
 define_reply_pool!(STAT_REPLIES, Result<(u64, u8), i32>);
-define_reply_pool!(READPAGE_REPLIES, Result<usize, i32>);
+define_reply_pool!(READPAGE_REPLIES, Result<(), i32>);
 define_reply_pool!(WRITEAT_REPLIES, Result<usize, i32>);
 define_reply_pool!(TRUNCATE_REPLIES, Result<(), i32>);
 define_reply_pool!(MKDIR_REPLIES, Result<(), i32>);
@@ -246,7 +246,7 @@ define_alloc_reply!(alloc_write_reply, WRITE_REPLIES, WRITE_REPLY_IDX, Result<us
 define_alloc_reply!(alloc_close_reply, CLOSE_REPLIES, CLOSE_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_lookup_reply, LOOKUP_REPLIES, LOOKUP_REPLY_IDX, Result<(u32, u8, u64), i32>);
 define_alloc_reply!(alloc_stat_reply, STAT_REPLIES, STAT_REPLY_IDX, Result<(u64, u8), i32>);
-define_alloc_reply!(alloc_readpage_reply, READPAGE_REPLIES, READPAGE_REPLY_IDX, Result<usize, i32>);
+define_alloc_reply!(alloc_readpage_reply, READPAGE_REPLIES, READPAGE_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_writeat_reply, WRITEAT_REPLIES, WRITEAT_REPLY_IDX, Result<usize, i32>);
 define_alloc_reply!(alloc_truncate_reply, TRUNCATE_REPLIES, TRUNCATE_REPLY_IDX, Result<(), i32>);
 define_alloc_reply!(alloc_mkdir_reply, MKDIR_REPLIES, MKDIR_REPLY_IDX, Result<(), i32>);
@@ -290,10 +290,22 @@ async fn delegate_task() {
 
     // Process requests forever
     loop {
+        crate::klog!(
+            fs,
+            debug,
+            "delegate_task: awaiting request. queue={}",
+            REQUEST_COUNT.load(Ordering::Acquire)
+        );
         let req = DelegateRecvFuture.await;
 
+        crate::klog!(fs, debug, "delegate_task: received request (enum variant)");
         match req {
-            FsRequest::Open { path, path_len, flags, reply } => {
+            FsRequest::Open {
+                path,
+                path_len,
+                flags,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 match crate::fs::ext4::open(&mut tok, path_str, flags) {
                     Ok(file) => {
@@ -315,7 +327,12 @@ async fn delegate_task() {
                     Err(e) => reply.complete(Err(e)),
                 }
             }
-            FsRequest::Read { handle, buf_ptr, len, reply } => {
+            FsRequest::Read {
+                handle,
+                buf_ptr,
+                len,
+                reply,
+            } => {
                 let idx = handle.0 as usize;
                 if idx >= MAX_OPEN_FILES || open_files[idx].is_none() {
                     reply.complete(Err(-9)); // EBADF
@@ -329,7 +346,12 @@ async fn delegate_task() {
                     Err(e) => reply.complete(Err(e)),
                 }
             }
-            FsRequest::Write { handle, buf_ptr, len, reply } => {
+            FsRequest::Write {
+                handle,
+                buf_ptr,
+                len,
+                reply,
+            } => {
                 let idx = handle.0 as usize;
                 if idx >= MAX_OPEN_FILES || open_files[idx].is_none() {
                     reply.complete(Err(-9)); // EBADF
@@ -353,7 +375,12 @@ async fn delegate_task() {
                 }
                 reply.complete(Ok(()));
             }
-            FsRequest::Lookup { parent_ino: _, name, name_len, reply } => {
+            FsRequest::Lookup {
+                parent_ino: _,
+                name,
+                name_len,
+                reply,
+            } => {
                 // name is already a full path (e.g. "/bin/init")
                 let full_path = core::str::from_utf8(&name[..name_len]).unwrap_or("");
                 klog!(fs, debug, "lookup: {:?}", full_path);
@@ -371,32 +398,34 @@ async fn delegate_task() {
                 // Callers should use Lookup which returns size+type.
                 reply.complete(Err(-38)); // ENOSYS
             }
-            FsRequest::ReadPage { path, path_len, offset, reply } => {
+            FsRequest::ReadPage {
+                path,
+                path_len,
+                offset,
+                pa,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
-                match crate::mm::allocator::alloc_raw_frame_sync(
-                    crate::mm::allocator::PageRole::FileCache,
-                ) {
-                    Some(frame) => {
-                        //TODO: extract this as fill_with_zero for pages.
-                        let pa = frame.as_usize();
-                        let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
-                        buf.fill(0);
-                        match crate::fs::ext4::open(&mut tok, path_str, 0) {
-                            Ok(mut file) => {
-                                let _ = file.file_seek(offset as i64, 0); // SEEK_SET
-                                let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
-                                let _ = crate::fs::ext4::close(&mut tok, &mut file);
-                                reply.complete(Ok(pa));
-                            }
-                            Err(e) => {
-                                reply.complete(Err(e));
-                            }
-                        }
+                let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
+                buf.fill(0);
+                match crate::fs::ext4::open(&mut tok, path_str, 0) {
+                    Ok(mut file) => {
+                        let _ = file.file_seek(offset as i64, 0); // SEEK_SET
+                        let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
+                        let _ = crate::fs::ext4::close(&mut tok, &mut file);
+                        reply.complete(Ok(()));
                     }
-                    None => reply.complete(Err(-12)), // ENOMEM
+                    Err(e) => reply.complete(Err(e)),
                 }
             }
-            FsRequest::WriteAt { path, path_len, offset, data_ptr, data_len, reply } => {
+            FsRequest::WriteAt {
+                path,
+                path_len,
+                offset,
+                data_ptr,
+                data_len,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_len) };
                 // Open with write flags, seek, write, close
@@ -417,15 +446,29 @@ async fn delegate_task() {
                     Err(e) => reply.complete(Err(e)),
                 }
             }
-            FsRequest::Truncate { path, path_len, size, reply } => {
+            FsRequest::Truncate {
+                path,
+                path_len,
+                size,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 reply.complete(crate::fs::ext4::truncate(&mut tok, path_str, size));
             }
-            FsRequest::Mkdir { path, path_len, reply } => {
+            FsRequest::Mkdir {
+                path,
+                path_len,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 reply.complete(crate::fs::ext4::mkdir(&mut tok, path_str).map_err(|e| -(e.abs())));
             }
-            FsRequest::Unlink { path, path_len, is_dir, reply } => {
+            FsRequest::Unlink {
+                path,
+                path_len,
+                is_dir,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let result = if is_dir {
                     // lwext4 dir_rm: use file_remove which handles dirs too
@@ -435,7 +478,12 @@ async fn delegate_task() {
                 };
                 reply.complete(result.map_err(|e| -(e.abs())));
             }
-            FsRequest::ReadDir { path, path_len, start_idx, reply } => {
+            FsRequest::ReadDir {
+                path,
+                path_len,
+                start_idx,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 match crate::fs::ext4::dir_open(&mut tok, path_str) {
                     Ok(mut dir) => {
@@ -600,9 +648,16 @@ pub async fn fs_stat(ino: u32) -> Result<(u64, u8), i32> {
     ReplyFuture { inner: reply_inner }.await
 }
 
-/// Read one page of file data at the given byte offset.
-/// Delegate allocates a frame, reads data into it, returns PhysAddr as usize.
-pub async fn fs_read_page(path: &str, offset: u64) -> Result<usize, i32> {
+/// Read one page of file data into the given pa physical address, at the given byte offset.
+pub async fn fs_read_page(path: &str, offset: u64, pa: usize) -> Result<(), i32> {
+    crate::klog!(
+        fs,
+        debug,
+        "fs_read_page: path={}, offset={}, pa={:#x}",
+        path,
+        offset,
+        pa
+    );
     let reply_inner = alloc_readpage_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);
@@ -612,6 +667,7 @@ pub async fn fs_read_page(path: &str, offset: u64) -> Result<usize, i32> {
         path: path_buf,
         path_len: len,
         offset,
+        pa,
         reply: ReplySlot::new(reply_inner),
     });
 

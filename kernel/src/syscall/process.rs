@@ -8,7 +8,7 @@ use crate::klog;
 use crate::proc::signal::Signal;
 use crate::proc::task::Task;
 use crate::proc::user_copy::{copyin_argv, copyinstr, do_exit, fault_in_user_buffer};
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 // ---------------------------------------------------------------------------
 // Basic Info Syscalls

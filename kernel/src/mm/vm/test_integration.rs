@@ -3,36 +3,36 @@
 //! These tests run on real hardware (QEMU rv64) with the actual frame
 //! allocator, verifying fault handler, COW, iterative drop, and
 //! frame_alloc_sync behavior under real kernel conditions.
-use crate::mm::vm::vm_map::MapPerm;
 use alloc::sync::Arc;
 
-use hal_common::addr::VirtPageNum;
-use hal_common::{VirtAddr, PAGE_SIZE};
+use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
 use super::super::allocator::{alloc_anon_sync, frame_free};
 use super::super::pmap;
-use super::vm_map::{VmArea, VmAreaType, VmMap};
-use super::vm_object::{OwnedPage, VmObject};
-
-/// Helper: wrap a borrowed VmPage into an OwnedPage::Anonymous.
-fn make_anon_page(page: &'static mut crate::mm::vm::page::VmPage) -> OwnedPage {
-    OwnedPage::new_anonymous(page)
-}
+use super::map::entry::{BackingStore, VmMapEntry};
+use super::map::map::VmMap;
+use super::page::VmPage;
+use super::vm_object::VmObject;
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
 pub fn test_anonymous_page_fault() {
-    let obj = VmObject::new(PAGE_SIZE);
-    let vma = VmArea::new(
-        VirtAddr::new(0x1000_0000)..VirtAddr::new(0x1000_0000 + PAGE_SIZE),
+    let obj = VmObject::new_anon(PAGE_SIZE);
+    let vma = VmMapEntry::new(
+        0x1000_0000,
+        0x1000_0000 + PAGE_SIZE as u64,
+        BackingStore::Object {
+            object: obj,
+            offset: 0,
+        },
+        crate::mm::vm::map::entry::EntryFlags::empty(),
         crate::map_perm!(R, W),
-        obj,
-        VirtPageNum(0),
-        VmAreaType::Anonymous,
     );
-    let mut map = VmMap::new();
-    map.insert(vma).unwrap();
+    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(pmap::pmap_create()));
+    let mut map = VmMap::new(Arc::clone(&pmap_arc));
+    map.insert_entry(vma).unwrap();
 
-    let mut test_pmap = pmap::pmap_create();
+    let mut test_pmap = pmap_arc.lock();
     let result = super::fault::sync_fault_handler(
         &map,
         &mut test_pmap,
@@ -42,8 +42,11 @@ pub fn test_anonymous_page_fault() {
     match result {
         super::fault::FaultResult::Resolved => {
             // Verify a page was inserted into the VmObject
-            let vma = map.find_area(VirtAddr::new(0x1000_0000)).unwrap();
-            let obj = vma.object.read();
+            let vma = map.lookup_readonly(0x1000_0000).unwrap();
+            let obj = match &vma.store {
+                BackingStore::Object { object, .. } => object.read(),
+                _ => panic!("Expected Object store"),
+            };
             assert!(
                 obj.lookup_page(VirtPageNum(0)).is_some(),
                 "page not inserted after fault"
@@ -66,10 +69,12 @@ pub fn test_cow_fault() {
         core::ptr::write_bytes(ptr, 0x42, PAGE_SIZE);
     }
 
-    let parent_obj = VmObject::new(PAGE_SIZE);
+    let parent_obj = VmObject::new_anon(PAGE_SIZE);
     {
         let mut w = parent_obj.write();
-        w.insert_page(VirtPageNum(0), make_anon_page(parent_page));
+        let mut p = VmPage::new();
+        p.phys_addr = parent_page.phys();
+        w.insert_page(VirtPageNum(0), Arc::new(p));
     }
 
     // Create shadow (simulates fork)
@@ -77,17 +82,21 @@ pub fn test_cow_fault() {
     // Hold sibling ref to force refcount > 1 (triggers COW path)
     let _sibling = Arc::clone(&shadow);
 
-    let vma = VmArea::new(
-        VirtAddr::new(0x2000_0000)..VirtAddr::new(0x2000_0000 + PAGE_SIZE),
+    let vma = VmMapEntry::new(
+        0x2000_0000,
+        0x2000_0000 + PAGE_SIZE as u64,
+        BackingStore::Object {
+            object: shadow,
+            offset: 0,
+        },
+        crate::mm::vm::map::entry::EntryFlags::empty(),
         crate::map_perm!(R, W),
-        shadow,
-        VirtPageNum(0),
-        VmAreaType::Anonymous,
     );
-    let mut map = VmMap::new();
-    map.insert(vma).unwrap();
+    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(pmap::pmap_create()));
+    let mut map = VmMap::new(Arc::clone(&pmap_arc));
+    map.insert_entry(vma).unwrap();
 
-    let mut test_pmap = pmap::pmap_create();
+    let mut test_pmap = pmap_arc.lock();
     let result = super::fault::sync_fault_handler(
         &map,
         &mut test_pmap,
@@ -96,8 +105,11 @@ pub fn test_cow_fault() {
     );
     match result {
         super::fault::FaultResult::Resolved => {
-            let vma = map.find_area(VirtAddr::new(0x2000_0000)).unwrap();
-            let obj = vma.object.read();
+            let vma = map.lookup_readonly(0x2000_0000).unwrap();
+            let obj = match &vma.store {
+                BackingStore::Object { object, .. } => object.read(),
+                _ => panic!("Expected Object store"),
+            };
             let _new_phys = obj
                 .lookup_page(VirtPageNum(0))
                 .expect("COW page not inserted");
@@ -120,7 +132,7 @@ pub fn test_cow_fault() {
 /// Test: deep shadow chain drops without stack overflow.
 /// Uses 200-deep chain on QEMU (host tests cover 500+ and 1000+).
 pub fn test_iterative_drop_500() {
-    let mut current = VmObject::new(PAGE_SIZE);
+    let mut current = VmObject::new_anon(PAGE_SIZE);
     for _ in 0..200 {
         current = VmObject::new_shadow(Arc::clone(&current), PAGE_SIZE);
     }
@@ -170,7 +182,7 @@ pub fn test_fork_bomb_stress() {
     const PAGES_PER_OBJ: usize = 4;
 
     // Root object with some pages (simulates a process heap).
-    let root = VmObject::new(PAGES_PER_OBJ * PAGE_SIZE);
+    let root = VmObject::new_anon(PAGES_PER_OBJ * PAGE_SIZE);
     for i in 0..PAGES_PER_OBJ {
         let page = alloc_anon_sync().expect("OOM in fork bomb root");
         unsafe {
@@ -178,7 +190,9 @@ pub fn test_fork_bomb_stress() {
             core::ptr::write_bytes(ptr, (i + 1) as u8, PAGE_SIZE);
         }
         let mut w = root.write();
-        w.insert_page(VirtPageNum(i as usize), make_anon_page(page));
+        let mut p = VmPage::new();
+        p.phys_addr = page.phys();
+        w.insert_page(VirtPageNum(i as usize), Arc::new(p));
     }
 
     // Phase 1: Fork bomb -- create N children, each shadowing root.

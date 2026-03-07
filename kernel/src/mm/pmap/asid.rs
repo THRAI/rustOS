@@ -5,7 +5,7 @@
 //! exhausted, the generation increments and all CPUs flush their TLBs.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use hal_common::IrqSafeSpinLock;
+use crate::hal_common::IrqSafeSpinLock;
 
 /// Maximum ASID value. Sv39/Sv48 on RV64 supports 16-bit ASIDs.
 /// ASID 0 is reserved for the kernel.

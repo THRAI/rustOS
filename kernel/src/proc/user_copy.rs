@@ -6,7 +6,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hal_common::{PAGE_SIZE, VirtAddr};
+use crate::hal_common::{PAGE_SIZE, VirtAddr};
 
 use crate::mm::vm::fault::PageFaultAccessType;
 use crate::proc::task::Task;

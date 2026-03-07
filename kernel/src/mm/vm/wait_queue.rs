@@ -7,7 +7,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::task::Waker;
-use hal_common::IrqSafeSpinLock;
+use crate::hal_common::IrqSafeSpinLock;
 
 /// Global wait queue hash table.
 static WAIT_QUEUES: IrqSafeSpinLock<BTreeMap<usize, Vec<Waker>>> =

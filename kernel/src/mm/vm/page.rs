@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use crate::mm::allocator::types::PageRole;
 use crate::mm::vm::vm_object::VmObject;
 use crate::mm::vm::wait_queue;
-use hal_common::addr::PhysAddr;
+use crate::hal_common::addr::PhysAddr;
 
 bitflags! {
     /// Readers-Writer Busy Lock state.
@@ -251,14 +251,14 @@ impl VmPage {
 
     /// Access the underlying page as a byte slice.
     #[inline]
-    pub fn as_bytes(&self) -> &[u8; hal_common::addr::PAGE_SIZE] {
-        unsafe { &*(self.phys_addr.as_usize() as *const [u8; hal_common::addr::PAGE_SIZE]) }
+    pub fn as_bytes(&self) -> &[u8; crate::hal_common::addr::PAGE_SIZE] {
+        unsafe { &*(self.phys_addr.as_usize() as *const [u8; crate::hal_common::addr::PAGE_SIZE]) }
     }
 
     /// Access the underlying page as a mutable byte slice.
     #[inline]
-    pub fn as_bytes_mut(&mut self) -> &mut [u8; hal_common::addr::PAGE_SIZE] {
-        unsafe { &mut *(self.phys_addr.as_usize() as *mut [u8; hal_common::addr::PAGE_SIZE]) }
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; crate::hal_common::addr::PAGE_SIZE] {
+        unsafe { &mut *(self.phys_addr.as_usize() as *mut [u8; crate::hal_common::addr::PAGE_SIZE]) }
     }
 
     /// Access the underlying page as a slice of 512 u64 page table entries.

@@ -1,7 +1,7 @@
 //! rv64 trap setup and dispatch.
 
 use core::sync::atomic::Ordering;
-use hal_common::TrapFrame;
+use crate::hal_common::TrapFrame;
 
 // Interrupt bit in scause (bit 63 on rv64)
 const SCAUSE_INTERRUPT: usize = 1 << 63;

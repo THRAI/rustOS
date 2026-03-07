@@ -7,8 +7,8 @@
 
 use super::buddy::BuddyAllocator;
 use super::magazine::Magazine;
-use hal_common::addr::{PhysAddr, PAGE_SIZE};
-use hal_common::IrqSafeSpinLock;
+use crate::hal_common::addr::{PhysAddr, PAGE_SIZE};
+use crate::hal_common::IrqSafeSpinLock;
 
 /// Debug-build poison pattern: written to every u64 in a freed frame.
 #[cfg(debug_assertions)]

@@ -12,3 +12,4 @@ pub mod pipe;
 pub mod devfs;
 pub mod mount;
 pub mod symlink;
+pub use vnode::Vnode;

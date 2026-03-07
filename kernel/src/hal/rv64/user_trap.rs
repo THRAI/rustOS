@@ -11,7 +11,7 @@
 //! sscratch points to it while in user mode.
 
 use alloc::sync::Arc;
-use hal_common::TrapFrame;
+use crate::hal_common::TrapFrame;
 
 use crate::proc::task::Task;
 

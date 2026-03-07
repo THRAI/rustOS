@@ -5,7 +5,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use hal_common::{Errno, SpinMutex};
+use crate::hal_common::{Errno, SpinMutex};
 
 const MAX_MOUNTS: usize = 64;
 

@@ -1,7 +1,7 @@
 //! Static device node lookup for /dev/null, /dev/zero, /dev/console.
 
 use alloc::sync::Arc;
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 use super::fd_table::{DeviceKind, FileDescription, FileObject, OpenFlags};
 

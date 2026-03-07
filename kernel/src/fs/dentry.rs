@@ -6,7 +6,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use hal_common::IrqSafeSpinLock;
+use crate::hal_common::IrqSafeSpinLock;
 
 use super::vnode::{Vnode, VnodeId};
 

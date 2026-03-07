@@ -5,7 +5,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 use super::dentry;
 use super::delegate;

@@ -4,15 +4,16 @@
 //! demand-paged VMAs with vnode + file_offset + file_size. No physical
 //! frames are allocated at exec time — the fault handler does the rest.
 
+use crate::fs::vnode::Vnode;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hal_common::addr::VirtPageNum;
-use hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE};
+use crate::hal_common::{Errno, PAGE_SIZE, VirtAddr, VirtPageNum};
 
 use crate::fs::path;
 use crate::fs::vnode::VnodeType;
-use crate::mm::vm::vm_map::{MapPerm, VmArea, VmAreaType, VmError, VmMap};
+use crate::mm::vm::map::entry::{BackingStore, MapPerm, VmMapEntry};
+use crate::mm::vm::map::map::{VmError, VmMap};
 use crate::mm::vm::vm_object::VmObject;
 
 use super::task::Task;
@@ -38,16 +39,6 @@ const DL_INTERP_OFFSET: usize = 0x20_0000_0000;
 
 /// User stack size: 64KB.
 const USER_STACK_SIZE: usize = 64 * 1024;
-/// Bridges `fs::vnode::Vnode` → `mm::vm::vm_map::Vnode` (two separate traits).
-struct VnodeWrapper(Arc<dyn crate::fs::vnode::Vnode>);
-impl crate::mm::vm::vm_map::Vnode for VnodeWrapper {
-    fn vnode_id(&self) -> u64 {
-        self.0.vnode_id()
-    }
-    fn path(&self) -> &str {
-        self.0.path()
-    }
-}
 /// User stack top address (just below kernel space).
 const USER_STACK_TOP: usize = 0x0000_003F_FFFF_F000;
 
@@ -139,30 +130,36 @@ fn elf_flags_to_prot(flags: u32) -> MapPerm {
 
 /// Insert a file-backed VMA, merging exact same-page overlaps produced by
 /// ELF PT_LOAD headers that split permissions inside one page.
-fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmArea) -> Result<(), VmError> {
-    if new_vma.vma_type == VmAreaType::FileBacked {
-        if let Some(existing) = vm.find_area_mut(new_vma.range.start) {
-            let same_range = existing.range.start == new_vma.range.start
-                && existing.range.end == new_vma.range.end;
-            let same_file = match (existing.vnode.as_ref(), new_vma.vnode.as_ref()) {
-                (Some(a), Some(b)) => a.vnode_id() == b.vnode_id(),
-                _ => false,
-            };
-            let same_backing = existing.vma_type == VmAreaType::FileBacked
-                && new_vma.vma_type == VmAreaType::FileBacked
-                && existing.file_offset == new_vma.file_offset
-                && existing.obj_offset == new_vma.obj_offset;
-
-            if same_range && same_file && same_backing {
-                // Merge segment perms (e.g. RX + R -> RX), and preserve the
-                // longest file-visible byte span for partial last-page zeroing.
-                existing.prot |= new_vma.prot;
-                existing.file_size = core::cmp::max(existing.file_size, new_vma.file_size);
-                return Ok(());
+///
+/// During exec each PT_LOAD creates a fresh VmObject, so we cannot rely on
+/// Arc identity (Arc::ptr_eq) to detect same-file overlaps.  Instead we
+/// match on identical file offset — sufficient because this function is
+/// only called during exec where all segments originate from the same
+/// vnode.
+fn insert_or_merge_file_vma(vm: &mut VmMap, mut new_vma: VmMapEntry) -> Result<(), VmError> {
+    if let BackingStore::Object { .. } = new_vma.store {
+        if let Some(existing) = vm.lookup_mut(new_vma.start) {
+            if existing.start == new_vma.start && existing.end == new_vma.end {
+                let same_backing = match (&existing.store, &new_vma.store) {
+                    (
+                        BackingStore::Object {
+                            offset: f1, ..
+                        },
+                        BackingStore::Object {
+                            offset: f2, ..
+                        },
+                    ) => f1 == f2,
+                    _ => false,
+                };
+                if same_backing {
+                    // Merge segment perms (e.g. text R|X|U + rodata R|U = R|X|U)
+                    existing.protection |= new_vma.protection;
+                    return Ok(());
+                }
             }
         }
     }
-    vm.insert(new_vma)
+    vm.insert_entry(new_vma)
 }
 
 fn map_insert_err(err: VmError) -> Errno {
@@ -196,14 +193,20 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     }
 
     // Read first page via delegate to get headers
-    let hdr_pa = match crate::fs::delegate::fs_read_page(vnode.path(), 0).await {
-        Ok(pa) => {
-            let pa = PhysAddr::new(pa);
-            crate::fs::page_cache::complete(vnode.vnode_id(), 0, pa);
-            pa
-        }
-        Err(_) => return Err(Errno::ENOEXEC),
-    };
+    let hdr_frame =
+        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
+            .ok_or(Errno::ENOMEM)?;
+    let hdr_pa =
+        match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
+            Ok(()) => {
+                crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
+                hdr_frame
+            }
+            Err(_) => {
+                crate::mm::allocator::free_raw_frame(hdr_frame);
+                return Err(Errno::ENOEXEC);
+            }
+        };
 
     // Parse from the physical page (identity-mapped in kernel)
     let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
@@ -236,9 +239,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     {
         let mut vm = task.vm_map.lock();
         vm.clear();
-    }
-    {
-        let mut pmap = task.pmap.lock();
+        let mut pmap = vm.pmap_lock();
         // Create the new pmap BEFORE destroying the old one.  We must switch
         // satp to the new root page table before freeing the old root,
         // otherwise any TLB miss would walk freed memory (use-after-free on
@@ -265,28 +266,27 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         // file_offset is the page-aligned offset into the file
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
         // Adjustment for non-page-aligned p_vaddr
-        let va_adjust = phdr.p_vaddr as usize - va_start;
-        let file_size_in_vma = if phdr.p_filesz > 0 {
-            phdr.p_filesz as u64 + va_adjust as u64
-        } else {
-            0
-        };
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new(obj_size);
+        let obj = VmObject::new_anon(obj_size);
+        obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
+            vnode_id: vnode.vnode_id() as usize,
+            path: alloc::string::String::from(vnode.path()),
+        }));
 
-        let vma = VmArea::new_file_backed(
-            VirtAddr::new(va_start)..VirtAddr::new(va_end),
+        let vma = VmMapEntry::new(
+            va_start as u64,
+            va_end as u64,
+            BackingStore::Object {
+                object: obj,
+                offset: file_offset_page_aligned as u64,
+            },
+            crate::mm::vm::map::entry::EntryFlags::empty(),
             prot,
-            obj,
-            hal_common::addr::VirtPageNum(0),
-            Arc::new(VnodeWrapper(Arc::clone(&vnode))),
-            file_offset_page_aligned,
-            file_size_in_vma as usize,
         );
 
         let mut vm = task.vm_map.lock();
-        if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
+        if let Err(e) = insert_or_merge_file_vma(&mut *vm, vma) {
             return Err(map_insert_err(e));
         }
 
@@ -337,17 +337,20 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 
     // 5. Create user stack VMA (anonymous, RW)
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
-    let stack_obj = VmObject::new(USER_STACK_SIZE / PAGE_SIZE);
-    let stack_vma = VmArea::new(
-        VirtAddr::new(stack_bottom)..VirtAddr::new(USER_STACK_TOP),
+    let stack_obj = VmObject::new_anon(USER_STACK_SIZE / PAGE_SIZE);
+    let stack_vma = VmMapEntry::new(
+        stack_bottom as u64,
+        USER_STACK_TOP as u64,
+        BackingStore::Object {
+            object: stack_obj,
+            offset: 0,
+        },
+        crate::mm::vm::map::entry::EntryFlags::empty(),
         crate::map_perm!(R, W, U),
-        stack_obj,
-        hal_common::addr::VirtPageNum(0),
-        VmAreaType::Stack,
     );
     {
         let mut vm = task.vm_map.lock();
-        if vm.insert(stack_vma).is_err() {
+        if vm.insert_entry(stack_vma).is_err() {
             return Err(Errno::ENOMEM);
         }
     }
@@ -357,7 +360,8 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 
     // 7. Map sigcode trampoline page for signal delivery
     {
-        let mut pmap = task.pmap.lock();
+        let vm_map = task.vm_map.lock();
+        let mut pmap = vm_map.pmap_lock();
         super::signal::map_sigcode_page(&mut pmap);
     }
 
@@ -404,14 +408,20 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         return Err(Errno::ENOEXEC);
     }
 
-    let hdr_pa = match crate::fs::delegate::fs_read_page(vnode.path(), 0).await {
-        Ok(pa) => {
-            let pa = PhysAddr::new(pa);
-            crate::fs::page_cache::complete(vnode.vnode_id(), 0, pa);
-            pa
-        }
-        Err(_) => return Err(Errno::ENOEXEC),
-    };
+    let hdr_frame =
+        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
+            .ok_or(Errno::ENOMEM)?;
+    let hdr_pa =
+        match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
+            Ok(()) => {
+                crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
+                hdr_frame
+            }
+            Err(_) => {
+                crate::mm::allocator::free_raw_frame(hdr_frame);
+                return Err(Errno::ENOEXEC);
+            }
+        };
 
     let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
     let elf_hdr = parse_elf_header(hdr_buf)?;
@@ -429,27 +439,26 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
 
         let prot = elf_flags_to_prot(phdr.p_flags);
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
-        let va_adjust = (phdr.p_vaddr as usize + offset) - va_start;
-        let file_size_in_vma = if phdr.p_filesz > 0 {
-            phdr.p_filesz as u64 + va_adjust as u64
-        } else {
-            0
-        };
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new(obj_size);
-        let vma = VmArea::new_file_backed(
-            VirtAddr::new(va_start)..VirtAddr::new(va_end),
+        let obj = VmObject::new_anon(obj_size);
+        obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
+            vnode_id: vnode.vnode_id() as usize,
+            path: alloc::string::String::from(vnode.path()),
+        }));
+        let vma = VmMapEntry::new(
+            va_start as u64,
+            va_end as u64,
+            BackingStore::Object {
+                object: obj,
+                offset: file_offset_page_aligned as u64,
+            },
+            crate::mm::vm::map::entry::EntryFlags::empty(),
             prot,
-            obj,
-            hal_common::addr::VirtPageNum(0),
-            Arc::new(VnodeWrapper(Arc::clone(&vnode))),
-            file_offset_page_aligned,
-            file_size_in_vma as usize,
         );
 
         let mut vm = task.vm_map.lock();
-        if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
+        if let Err(e) = insert_or_merge_file_vma(&mut *vm, vma) {
             return Err(map_insert_err(e));
         }
     }
@@ -505,23 +514,29 @@ pub async fn exec_with_args(
 
     // Insert page into the stack VMA's VmObject
     {
-        let vm = task.vm_map.lock();
-        let vma = vm
-            .find_area(VirtAddr::new(stack_page_va))
-            .ok_or(Errno::ENOMEM)?;
-        let page_idx = VirtPageNum(
-            (stack_page_va - vma.range.start.as_usize()) / PAGE_SIZE + vma.obj_offset.as_usize(),
-        );
-        let mut obj = vma.object.write();
-        obj.insert_page(
-            page_idx,
-            crate::mm::vm::vm_object::OwnedPage::new_anonymous(vm_page),
-        );
-    }
+        let mut vm = task.vm_map.lock();
+        if let Some(vma) = vm.lookup_mut(stack_page_va as u64) {
+            let page_idx = crate::hal_common::addr::VirtPageNum(
+                (stack_page_va - vma.start as usize) / PAGE_SIZE
+                    + match &vma.store {
+                        crate::mm::vm::map::entry::BackingStore::Object { offset, .. } => {
+                            *offset as usize / PAGE_SIZE
+                        }
+                        _ => 0,
+                    },
+            );
+            if let crate::mm::vm::map::entry::BackingStore::Object { object, .. } = &vma.store {
+                let mut obj = object.write();
+                let mut page = crate::mm::vm::page::VmPage::new();
+                page.phys_addr = phys;
+                obj.insert_page(page_idx, Arc::new(page));
+            }
+        } else {
+            return Err(Errno::ENOMEM);
+        }
 
-    // Map in pmap
-    {
-        let mut pmap = task.pmap.lock();
+        // Map in pmap
+        let mut pmap = vm.pmap_lock();
         let _ = crate::mm::pmap::pmap_enter(
             &mut pmap,
             VirtAddr::new(stack_page_va),
@@ -532,7 +547,7 @@ pub async fn exec_with_args(
     }
 
     // Now write the stack layout into the physical frame (identity-mapped).
-    let mut cursor = hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
+    let mut cursor = crate::hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
     let stack_page_vbase = VirtAddr::new(stack_page_va);
 
     // Push 16 random bytes for AT_RANDOM
@@ -623,4 +638,18 @@ pub async fn exec_with_args(
     }
 
     Ok((entry, sp_va))
+}
+
+/// do_exec: Merge exec and exec_with_args
+pub async fn do_execve(
+    task: &Arc<Task>,
+    elf_path: &str,
+    argv: &[String],
+    envp: &[String],
+) -> Result<(usize, usize), Errno> {
+    klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
+    // 1. Resolve path to vnode
+
+
+    unimplemented!()
 }

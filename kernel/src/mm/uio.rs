@@ -4,7 +4,7 @@
 //! at a time. Each chunk never crosses a page boundary, so a fault on one page
 //! doesn't prevent reporting bytes already copied from previous pages.
 
-use hal_common::{Errno, PAGE_SIZE};
+use crate::hal_common::{Errno, PAGE_SIZE};
 
 /// Direction of the copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

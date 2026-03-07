@@ -151,7 +151,7 @@ pub fn ipi_broadcast_flush_all() {
 /// Adaptive TLB flush: per-page if small range, full ASID flush otherwise.
 #[cfg(target_arch = "riscv64")]
 fn adaptive_flush(va_start: usize, va_end: usize, asid: usize) {
-    let npages = (va_end.saturating_sub(va_start)) / hal_common::PAGE_SIZE;
+    let npages = (va_end.saturating_sub(va_start)) / crate::hal_common::PAGE_SIZE;
     if npages <= SHOOTDOWN_PAGE_THRESHOLD {
         let mut va = va_start;
         while va < va_end {
@@ -159,7 +159,7 @@ fn adaptive_flush(va_start: usize, va_end: usize, asid: usize) {
             unsafe {
                 core::arch::asm!("sfence.vma {}, {}", in(reg) va, in(reg) asid);
             }
-            va += hal_common::PAGE_SIZE;
+            va += crate::hal_common::PAGE_SIZE;
         }
     } else {
         crate::hal::rv64::tlb::flush_asid(asid);

@@ -17,7 +17,7 @@ struct SendSyncBW(Ext4BlockWrapper<Disk>);
 unsafe impl Send for SendSyncBW {}
 unsafe impl Sync for SendSyncBW {}
 
-static EXT4_BW: hal_common::Once<hal_common::SpinMutex<SendSyncBW>> = hal_common::Once::new();
+static EXT4_BW: crate::hal_common::Once<crate::hal_common::SpinMutex<SendSyncBW>> = crate::hal_common::Once::new();
 
 // ── DelegateToken (Phase 2) ─────────────────────────────────────────
 
@@ -69,7 +69,7 @@ pub fn mount() -> Result<(), i32> {
         klog!(fs, error, "ext4 mount failed: {}", e);
         -5
     })?;
-    EXT4_BW.call_once(|| hal_common::SpinMutex::new(SendSyncBW(bw)));
+    EXT4_BW.call_once(|| crate::hal_common::SpinMutex::new(SendSyncBW(bw)));
     crate::kprintln!("lwext4 mounted at /");
     Ok(())
 }

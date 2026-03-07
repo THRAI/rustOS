@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering;
 use crate::klog;
 use crate::proc::signal::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
 use crate::proc::task::Task;
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     klog!(signal, debug, "sigreturn pid={}", task.pid);

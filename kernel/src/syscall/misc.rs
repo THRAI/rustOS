@@ -3,7 +3,7 @@
 //! Implements uname and other utility syscalls.
 
 use alloc::sync::Arc;
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 use crate::proc::task::Task;
 

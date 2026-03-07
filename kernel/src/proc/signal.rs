@@ -12,8 +12,8 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use hal_common::SpinMutex as Mutex;
-use hal_common::{TrapFrame, VirtAddr, PAGE_SIZE};
+use crate::hal_common::SpinMutex as Mutex;
+use crate::hal_common::{TrapFrame, VirtAddr, PAGE_SIZE};
 
 use super::task::Task;
 
@@ -665,7 +665,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
 // sys_kill + global task registry
 // ---------------------------------------------------------------------------
 
-use hal_common::SpinMutex;
+use crate::hal_common::SpinMutex;
 
 /// Global task registry for kill() iteration.
 static TASK_REGISTRY: SpinMutex<Vec<Arc<Task>>> = SpinMutex::new(Vec::new());
@@ -723,7 +723,8 @@ pub fn map_sigcode_page(pmap: &mut crate::mm::pmap::Pmap) {
 
     // Write sigcode to the physical frame
     unsafe {
-        frame.as_mut_slice().copy_from_slice(&page_data);
+        let va = frame.into_kernel_vaddr();
+        core::ptr::copy_nonoverlapping(page_data.as_ptr(), va.as_mut_ptr(), PAGE_SIZE);
     }
 
     // Map as read-only + user-accessible

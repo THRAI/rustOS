@@ -7,7 +7,7 @@
 use crate::drivers::virtio_mmio::*;
 use crate::mm::allocator::{alloc_raw_frame_sync, PageRole};
 use core::sync::atomic::{fence, Ordering};
-use hal_common::PAGE_SIZE;
+use crate::hal_common::PAGE_SIZE;
 
 /// Align `val` up to `align` (must be power of 2).
 const fn align_up(val: usize, align: usize) -> usize {
@@ -101,7 +101,7 @@ pub struct VirtioBlk {
 }
 
 /// Global driver instance.
-static VIRTIO_BLK: hal_common::Once<hal_common::SpinMutex<VirtioBlk>> = hal_common::Once::new();
+static VIRTIO_BLK: crate::hal_common::Once<crate::hal_common::SpinMutex<VirtioBlk>> = crate::hal_common::Once::new();
 
 impl VirtioBlk {
     /// Probe MMIO addresses and initialize the first block device found.
@@ -328,12 +328,39 @@ impl VirtioBlk {
         // allowing QEMU to process the MMIO notification on the device model thread.
         let used = self.used_pa as *mut VringUsed;
 
+        crate::klog!(
+            sched,
+            debug,
+            "do_request: sector {} waiting for used.idx. cur={}, expected={}",
+            sector,
+            unsafe { (*used).idx },
+            self.last_used_idx
+        );
+        let mut spins = 0;
+
         loop {
             fence(Ordering::SeqCst);
             let cur = unsafe { core::ptr::read_volatile(&(*used).idx) };
             if cur != self.last_used_idx {
+                crate::klog!(
+                    sched,
+                    debug,
+                    "do_request: sector {} DONE after {} spins",
+                    sector,
+                    spins
+                );
                 break;
             }
+            if spins % 1000000 == 0 && spins > 0 {
+                crate::klog!(
+                    sched,
+                    debug,
+                    "do_request: STILL SPINNING sector {} spins={}",
+                    sector,
+                    spins
+                );
+            }
+            spins += 1;
             // Brief SIE window: lets pending IRQs fire, which causes a vCPU exit
             // and gives QEMU's device model a chance to process the virtqueue.
             unsafe {
@@ -370,11 +397,11 @@ pub fn init() {
             "initialized, capacity = {} sectors",
             blk.capacity()
         );
-        hal_common::SpinMutex::new(blk)
+        crate::hal_common::SpinMutex::new(blk)
     });
 }
 
 /// Get a reference to the global VirtIO-blk driver.
-pub fn get() -> &'static hal_common::SpinMutex<VirtioBlk> {
+pub fn get() -> &'static crate::hal_common::SpinMutex<VirtioBlk> {
     VIRTIO_BLK.get().expect("virtio-blk not initialized")
 }

@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 use super::vnode::Vnode;
 

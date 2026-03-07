@@ -13,6 +13,7 @@ mod drivers;
 mod executor;
 mod fs;
 mod hal;
+mod hal_common;
 mod ipc;
 mod libc_stubs;
 mod mm;
@@ -88,8 +89,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             extern "C" {
                 static ekernel: u8;
             }
-            let mem_start = hal_common::PhysAddr::new(unsafe { &ekernel as *const u8 as usize });
-            let mem_end = hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
+            let mem_start = crate::hal_common::PhysAddr::new(unsafe { &ekernel as *const u8 as usize });
+            let mem_end = crate::hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
             klog!(
                 boot,
                 info,
@@ -491,7 +492,7 @@ fn test_uiomove_short_read() {
         UioDir::CopyIn,
     );
     match r {
-        Err(hal_common::Errno::EFAULT) => {}
+        Err(crate::hal_common::Errno::EFAULT) => {}
         other => {
             kprintln!("uiomove short-read FAIL (efault: {:?})", other);
             return;
@@ -611,7 +612,7 @@ async fn test_delegate_read() {
 #[cfg(feature = "qemu-test")]
 async fn test_vfs_read() {
     use fs::fd_table::{FdTable, OpenFlags};
-    let fd_table = hal_common::SpinMutex::new(FdTable::new());
+    let fd_table = crate::hal_common::SpinMutex::new(FdTable::new());
 
     // First read: goes through delegate
     match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY).await {
@@ -673,7 +674,7 @@ async fn test_fork_exec_wait4() {
     // Try exec on the child — use /hello.txt which is NOT an ELF
     // This should fail with ENOEXEC, proving the ELF validation works
     match proc::exec::exec(&child, "/hello.txt").await {
-        Err(hal_common::Errno::ENOEXEC) => {
+        Err(crate::hal_common::Errno::ENOEXEC) => {
             // Expected: hello.txt is not an ELF binary
         }
         Ok(_) => {
@@ -809,7 +810,7 @@ fn test_signal_pending_delivery() {
 
 #[cfg(feature = "qemu-test")]
 fn test_mmap_munmap() {
-    use hal_common::{VirtAddr, PAGE_SIZE};
+    use crate::hal_common::{VirtAddr, PAGE_SIZE};
     use mm::vm::vm_map::{VmArea, VmAreaType};
     use mm::vm::vm_object::VmObject;
 
@@ -823,7 +824,7 @@ fn test_mmap_munmap() {
         base..VirtAddr::new(base.as_usize() + len),
         crate::map_perm!(R, W, U),
         obj,
-        hal_common::VirtPageNum(0),
+        crate::hal_common::VirtPageNum(0),
         VmAreaType::Anonymous,
     );
     {
@@ -861,7 +862,7 @@ async fn test_device_nodes() {
 
     // Test /dev/zero behavior: read returns zeros
     // We test via the device open path
-    let fd_table = hal_common::SpinMutex::new(FdTable::new_with_stdio());
+    let fd_table = crate::hal_common::SpinMutex::new(FdTable::new_with_stdio());
 
     // Open /dev/null
     match syscall::fs::open(&fd_table, "/dev/null", OpenFlags::RDWR).await {
@@ -906,7 +907,7 @@ async fn test_device_nodes() {
 
 #[cfg(feature = "qemu-test")]
 fn test_futex_wake() {
-    use hal_common::PhysAddr;
+    use crate::hal_common::PhysAddr;
     use ipc::futex;
 
     // futex_wake on a key with no waiters should return 0

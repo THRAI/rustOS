@@ -6,7 +6,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
-use hal_common::{Errno, SpinMutex};
+use crate::hal_common::{Errno, SpinMutex};
 
 /// Pipe buffer size (also PIPE_BUF for atomic write guarantee).
 const PIPE_BUF: usize = 4096;

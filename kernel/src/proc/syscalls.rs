@@ -14,7 +14,7 @@ use crate::proc::exit_wait::WaitStatus;
 use crate::proc::fork::fork;
 use crate::proc::signal::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
 use crate::proc::task::Task;
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 // ---------------------------------------------------------------------------
 // Basic Info Syscalls

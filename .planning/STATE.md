@@ -153,9 +153,10 @@ None yet.
 | 2 | Display impls for Signal and PageFaultAccessType in klog output | 2026-02-26 | 9920f31 | | [2-add-debug-trait-for-klog-arguments-follo](./quick/2-add-debug-trait-for-klog-arguments-follo/) |
 | 3 | Refactor kernel vm submodule based on ai/bsd_vm/vm_fault.md plans | 2026-03-04 | b749909 | Verified | [3-refactor-kernel-vm-submodule-based-on-ai](./quick/3-refactor-kernel-vm-submodule-based-on-ai/) |
 | 4 | Fix compilation errors from VM refactoring (VirtPageNum export + interface) | 2026-03-04 | 28ca95d | Complete | [4-use-refactored-vm-interface-to-refactor-](./quick/4-use-refactored-vm-interface-to-refactor-/) |
+| 6 | Make Makefile OS-agnostic for macOS and Linux portability | 2026-03-05 | 4f20792 | Complete | [6-modify-the-makefile-so-it-s-os-agnostic-](./quick/6-modify-the-makefile-so-it-s-os-agnostic-/) |
 
 ## Session Continuity
 
-Last activity: 2026-03-04 - Completed quick task 4: Fix compilation errors from VM refactoring
+Last activity: 2026-03-05 - Completed quick task 6: Make Makefile OS-agnostic
 Stopped at: Plan 04-02 complete, ready for 04-04 (integration/remaining syscalls)
 Resume file: None

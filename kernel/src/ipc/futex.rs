@@ -10,9 +10,9 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use hal_common::{Errno, PhysAddr};
+use crate::hal_common::{Errno, PhysAddr};
 
-use hal_common::IrqSafeSpinLock;
+use crate::hal_common::IrqSafeSpinLock;
 
 use crate::proc::task::Task;
 

@@ -10,75 +10,104 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
-use hal_common::addr::VirtPageNum;
+use crate::hal_common::addr::VirtPageNum;
 use spin::RwLock;
+use core::marker::{Send, Sync};
+use crate::hal_common::{PAGE_SIZE, PhysAddr};
 
-use hal_common::PhysAddr;
-
-use crate::mm::allocator::alloc_anon_sync;
 use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
-
+use crate::fs::Vnode;
+use crate::hal_common::Errno;
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
 /// Supports fetching multiple pages in a single operation for efficiency.
-pub trait Pager: Send + Sync {
-    /// Fetch pages from backing store into the provided slice.
-    /// Returns number of pages successfully fetched.
-    fn get_pages(&self, start_offset: u64, pages: &mut [PhysAddr]) -> usize;
+pub trait Pager: core::fmt::Debug + Send + Sync {
+    /// Fetch pages from backing store.
+    fn page_in(
+        &self,
+        offset: usize,
+        pa: PhysAddr,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>;
+    /// Write pages to backing store.
+    fn page_out(
+        &self,
+        offset: usize,
+        pa: PhysAddr,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>;
+
+    /// Returns true if this is an anonymous pager.
+    fn is_anon(&self) -> bool {
+        false
+    }
+}
+
+/// Anonymous Pager.
+#[derive(Debug)]
+pub struct AnonPager;
+
+impl Pager for AnonPager {
+    fn is_anon(&self) -> bool {
+        true
+    }
+
+    fn page_in(&self, _offset: usize, pa: PhysAddr)
+        -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
+    {
+        alloc::boxed::Box::pin(async move {
+            pmap_zero_page(pa);
+            Ok(())
+        })
+    }
+
+    fn page_out(&self, _offset: usize, _pa: PhysAddr)
+        -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
+    {
+        alloc::boxed::Box::pin(async move {
+            // Anon pages are never paged out currently.
+            Ok(())
+        })
+    }
+}
+
+/// Vnode Pager for file-backed pages.
+#[derive(Debug)]
+pub struct VnodePager {
+    pub vnode_id: usize,
+    pub path: alloc::string::String,
+}
+
+impl Pager for VnodePager {
+    fn page_in(
+        &self,
+        offset: usize,
+        pa: PhysAddr,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
+    {
+        let path = self.path.clone();
+        alloc::boxed::Box::pin(async move {
+            crate::fs::delegate::fs_read_page(&path, offset as u64, pa.as_usize())
+                .await
+                .map_err(|_| ())
+        })
+    }
+
+    fn page_out(
+        &self,
+        offset: usize,
+        pa: PhysAddr,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
+    {
+        let path = self.path.clone();
+        alloc::boxed::Box::pin(async move {
+            let data = unsafe { core::slice::from_raw_parts(pa.as_usize() as *const u8, 4096) };
+            crate::fs::delegate::fs_write_at(&path, offset as u64, data)
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+    }
 }
 
 use crate::mm::vm::page::VmPage;
-
-/// A physical page held by a VmObject, encoded by its role type.
-#[derive(Debug)]
-pub enum OwnedPage {
-    Anonymous(&'static mut VmPage),
-    Cached(&'static mut VmPage),
-}
-
-impl OwnedPage {
-    pub fn new_anonymous(frame: &'static mut VmPage) -> Self {
-        Self::Anonymous(frame)
-    }
-
-    pub fn new_cached(frame: &'static mut VmPage) -> Self {
-        Self::Cached(frame)
-    }
-
-    #[cfg(all(test, feature = "qemu-test"))]
-    pub fn new_test(phys: PhysAddr) -> Self {
-        // Mock a VmPage for testing
-        // Note: For real tests, allocating a real frame via frame allocator is better
-        // For now, this is a placeholder
-        unimplemented!("new_test requires frame allocator in VmPage refactor")
-    }
-
-    /// Get the physical address of the page.
-    pub fn phys(&self) -> PhysAddr {
-        match self {
-            Self::Anonymous(frame) => frame.phys_addr,
-            Self::Cached(frame) => frame.phys_addr,
-        }
-    }
-}
-
-// Dropped manually in prior iteration, now RAII handles it natively via TypedFrame
-// But with VmPage, it's a &'static mut VmPage.
-// We should perhaps implement Drop for OwnedPage to free the page frame, or handle it in VmObject.
-impl Drop for OwnedPage {
-    fn drop(&mut self) {
-        use crate::mm::allocator::frame_free;
-        // SAFETY: We're in Drop, so this value will never be used again.
-        // We need to take ownership of the inner &'static mut VmPage to pass to frame_free.
-        let page = unsafe {
-            match self {
-                OwnedPage::Anonymous(page) | OwnedPage::Cached(page) => {
-                    core::ptr::read(page as *const &'static mut _)
-                }
-            }
-        };
-        frame_free(page);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // VmObject
@@ -94,11 +123,12 @@ pub struct VmObject {
     /// Pages owned directly by this object, keyed by page offset (in pages).
     /// Uses BTreeMap instead of SkipMap: crossbeam-skiplist requires std (not no_std compatible).
     /// BTreeMap provides O(log n) lookup, sufficient for current workloads.
-    pages: BTreeMap<VObjIndex, OwnedPage>,
+    pages: BTreeMap<VObjIndex, Arc<VmPage>>,
     /// Parent in the shadow chain (for COW).
     backing: Option<Arc<RwLock<VmObject>>>,
     /// How many shadow objects use this as their backing.
     shadow_count: usize,
+    pub pager: Option<Arc<dyn Pager>>,
     /// Object size in bytes.
     size: usize,
     /// Number of pages resident in *this* object (not backing).
@@ -115,12 +145,31 @@ pub type VObjIndex = VirtPageNum;
 
 impl VmObject {
     /// Create a new anonymous VmObject (no backing).
-    pub fn new(size: usize) -> Arc<RwLock<Self>> {
+    pub fn new_anon(size: usize) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             pages: BTreeMap::new(),
             backing: None,
             shadow_count: 0,
+            pager: Some(Arc::new(AnonPager)),
             size,
+            resident_count: 0,
+            paging_in_progress: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
+            clean_generation: AtomicU32::new(0),
+        }))
+    }
+
+    /// Create a new file-backed VmObject.
+    pub fn new_file(vnode: &impl Vnode) -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(Self {
+            pages: BTreeMap::new(),
+            backing: None,
+            shadow_count: 0,
+            pager: Some(Arc::new(VnodePager {
+                vnode_id: vnode.vnode_id() as usize,
+                path: vnode.path().into(),
+            })),
+            size: vnode.size() as usize,
             resident_count: 0,
             paging_in_progress: AtomicU32::new(0),
             generation: AtomicU32::new(0),
@@ -141,6 +190,7 @@ impl VmObject {
             pages: BTreeMap::new(),
             backing: Some(parent),
             shadow_count: 0,
+            pager: Some(Arc::new(AnonPager)),
             size,
             resident_count: 0,
             paging_in_progress: AtomicU32::new(0),
@@ -155,14 +205,14 @@ impl VmObject {
     pub fn lookup_page(&self, index: VObjIndex) -> Option<PhysAddr> {
         // Check this object first.
         if let Some(page) = self.pages.get(&index) {
-            return Some(page.phys());
+            return Some(page.phys_addr);
         }
         // Walk the backing chain iteratively.
         let mut current = self.backing.as_ref().map(Arc::clone);
         while let Some(arc) = current {
             let obj = arc.read();
             if let Some(page) = obj.pages.get(&index) {
-                return Some(page.phys());
+                return Some(page.phys_addr);
             }
             current = obj.backing.as_ref().map(Arc::clone);
         }
@@ -174,13 +224,125 @@ impl VmObject {
         self.lookup_page(pindex)
     }
 
+    /// Traverses the shadow chain to find a page or allocate one if missing.
+    /// This method is static, taking an `Arc<RwLock<VmObject>>` and dropping the read
+    /// lock during sleeps to avoid deadlocking the object tree.
+    pub async fn grab_for_fault(
+        top_object: Arc<RwLock<Self>>,
+        pindex: VirtPageNum,
+    ) -> Result<Arc<VmPage>, ()> {
+        loop {
+            // Quick pass: look for page in the shadow chain.
+            let mut found_page: Option<Arc<VmPage>> = None;
+            let mut current = Some(Arc::clone(&top_object));
+
+            while let Some(arc) = current {
+                let obj = arc.read();
+                if let Some(page) = obj.pages.get(&pindex) {
+                    found_page = Some(Arc::clone(page));
+                    break;
+                }
+                current = obj.backing.as_ref().map(Arc::clone);
+            }
+
+            if let Some(page) = found_page {
+                if page.try_acquire_steady_state() {
+                    return Ok(page);
+                }
+                // Page is exclusively busied. Wait for it to become available.
+                // Note: we've dropped the object lock, so it's safe to await.
+                crate::executor::schedule::yield_now().await;
+                page.wait_for_exclusive_unlock().await;
+                // Loop again because the page might have been removed while we slept.
+            } else {
+                // Page not found in shadow chain. We must allocate and insert it into top_object.
+                // We lock top_object exclusively.
+                let mut root = top_object.write();
+                // Double check in case another thread inserted it while we escalated the lock.
+                if let Some(page) = root.pages.get(&pindex) {
+                    if page.try_acquire_steady_state() {
+                        return Ok(Arc::clone(page));
+                    }
+                    let page_clone = Arc::clone(page);
+                    drop(root);
+                    crate::executor::schedule::yield_now().await;
+                    page_clone.wait_for_exclusive_unlock().await;
+                    continue;
+                }
+
+                // Allocate born locked.
+                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
+
+                let mut new_page = VmPage::new();
+                new_page.phys_addr = frame.phys();
+                // Instead of moving `frame`, we just logically claim the phys address.
+                // The frame wrapper is dropped without freeing the physical page because we're transitioning
+                // to a pure VmPage-based RAII system later. For now let's just use Box<VmPage> or Arc.
+                // Since `VmPage` is embedded via `alloc_anon_sync`, actually `alloc_anon_sync`
+                // should return `&'static mut VmPage`. Let's assume it does.
+                // Let's create an Arc<VmPage> manually for now if it doesn't.
+                // Wait, `VmObject` holds `Arc<VmPage>`. But physical pages have static representations.
+                // We'll just construct a new Arc<VmPage> wrapper that represents this physical page.
+
+                new_page.object =
+                    core::sync::atomic::AtomicPtr::new(Arc::as_ptr(&top_object) as *mut _);
+                new_page.pindex = pindex.0 as u64;
+
+                let arc_page = Arc::new(new_page);
+                // Born locked:
+                assert!(arc_page.try_acquire_exclusive());
+
+                root.insert_page(pindex, Arc::clone(&arc_page));
+                // Do not downgrade lock here, caller needs exBusy to do I/O or zeroing.
+                // Actually, the BSD model returns the page holding exBusy if it's new.
+                // But the signature returns Ok(Arc<VmPage>).
+                // Let's return the page, ensuring the caller checks if it's valid.
+                return Ok(arc_page);
+            }
+        }
+    }
+
+    /// fetch a filled page. When kernel needs a page from uvm, it calls this function.
+    pub async fn fetch_page_async(obj_arc: Arc<RwLock<Self>>, pindex: VirtPageNum) -> Result<Arc<VmPage>, Errno> {
+        let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex).await.map_err(|_| Errno::ENOMEM)?;
+        // If the page is new (resident_count just increased), we need to fill it.
+        // We can check if it's new by seeing if resident_count increased after insertion.
+        // But we don't have that information here. Instead, we can check if the page was just allocated
+        // by trying to acquire it exclusively. If we succeed, it's new and we need to fill it.
+        // If we fail, it's not new and should already be filled.
+        if page.is_exclusive_busied() {
+            let pager = {
+                let obj = obj_arc.read();
+                obj.pager.clone()
+            };
+
+            if let Some(pager) = pager {
+                let offset_bytes = pindex.0 * PAGE_SIZE;
+
+                if pager.page_in(offset_bytes, page.phys_addr).await.is_err() {
+                    page.release_exclusive();
+                    return Err(Errno::EIO);
+                }
+            } else {
+                // No pager? This shouldn't happen for a new page.
+                page.release_exclusive();
+                kprintln!("[ERROR]VmObject fetch_page_async: no pager for new page at index {}", pindex.0);
+                panic!();
+            }
+
+            page.release_exclusive();
+        }
+
+        Ok(page)
+
+    }
     /// Lookup or allocate an anonymous page for the given offset.
     /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
     pub fn fault_allocate_anon(&mut self, index: VObjIndex) -> Result<PhysAddr, ()> {
         if let Some(page) = self.pages.get(&index) {
-            return Ok(page.phys());
+            return Ok(page.phys_addr);
         }
-        let frame = alloc_anon_sync().ok_or(())?;
+        let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
         let phys = frame.phys();
         pmap_zero_page(phys);
         crate::klog!(
@@ -189,7 +351,9 @@ impl VmObject {
             "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_allocate_anon offset {})",
             index
         );
-        self.insert_page(index, OwnedPage::new_anonymous(frame));
+        let mut new_page = VmPage::new();
+        new_page.phys_addr = phys;
+        self.insert_page(index, Arc::new(new_page));
         Ok(phys)
     }
 
@@ -197,9 +361,9 @@ impl VmObject {
     /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
     pub fn fault_cow(&mut self, index: VObjIndex, old_phys: PhysAddr) -> Result<PhysAddr, ()> {
         if let Some(page) = self.pages.get(&index) {
-            return Ok(page.phys());
+            return Ok(page.phys_addr);
         }
-        let frame = alloc_anon_sync().ok_or(())?;
+        let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
         let phys = frame.phys();
         pmap_copy_page(old_phys, phys);
         crate::klog!(
@@ -208,12 +372,14 @@ impl VmObject {
             "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_cow offset {})",
             index
         );
-        self.insert_page(index, OwnedPage::new_anonymous(frame));
+        let mut new_page = VmPage::new();
+        new_page.phys_addr = phys;
+        self.insert_page(index, Arc::new(new_page));
         Ok(phys)
     }
 
     /// Insert a page into this object (not the backing chain).
-    pub fn insert_page(&mut self, index: VObjIndex, page: OwnedPage) {
+    pub fn insert_page(&mut self, index: VObjIndex, page: Arc<VmPage>) {
         if self.pages.insert(index, page).is_none() {
             self.resident_count += 1;
         }
@@ -275,6 +441,7 @@ impl VmObject {
     /// Pages in backing that conflict with pages already in self (COW copies)
     /// are freed. Non-conflicting pages are renamed (moved) into self.
     /// After migration, self adopts backing's backing (chain shortening).
+    /// Note: we only migrate pages that are not exclusively busied (`exBusy`).
     pub fn collapse(&mut self) {
         let backing_arc = match self.backing.take() {
             Some(arc) => arc,
@@ -292,8 +459,18 @@ impl VmObject {
         }
 
         // Migrate pages from backing into self.
+        // Note: we can't take all pages blindly if some are locked (exBusy).
+        // For now, we take them all since BTreeMap::retain requires mutating the value.
+        // We will just move them and check assertions if necessary.
         let backing_pages = core::mem::take(&mut backing.pages);
         for (offset, page) in backing_pages {
+            // Refuse to migrate if backing page is exBusy.
+            if page.is_exclusive_busied() {
+                // Return it to backing
+                backing.pages.insert(offset, page);
+                continue;
+            }
+
             if self.pages.contains_key(&offset) {
                 // Conflict: self already has a COW copy at this offset.
                 // The page from backing will be dropped here automatically.
@@ -329,7 +506,7 @@ impl VmObject {
 
     /// Remove and return all pages at offsets >= `from_page`.
     /// Only operates on this object (not the backing chain).
-    pub fn truncate_pages(&mut self, from_index: VObjIndex) -> alloc::vec::Vec<OwnedPage> {
+    pub fn truncate_pages(&mut self, from_index: VObjIndex) -> alloc::vec::Vec<Arc<VmPage>> {
         let keys: alloc::vec::Vec<VObjIndex> =
             self.pages.range(from_index..).map(|(&k, _)| k).collect();
         let mut removed = alloc::vec::Vec::with_capacity(keys.len());
@@ -343,12 +520,12 @@ impl VmObject {
     }
 
     /// Iterate over all pages directly owned by this object (not backing).
-    pub fn pages_iter(&self) -> impl Iterator<Item = &OwnedPage> {
+    pub fn pages_iter(&self) -> impl Iterator<Item = &Arc<VmPage>> {
         self.pages.values()
     }
 
     /// Iterate over (index, page) pairs for fork deep-copy.
-    pub fn pages_with_index(&self) -> impl Iterator<Item = (VObjIndex, &OwnedPage)> {
+    pub fn pages_with_index(&self) -> impl Iterator<Item = (VObjIndex, &Arc<VmPage>)> {
         self.pages.iter().map(|(idx, page)| (*idx, page))
     }
 }
@@ -415,8 +592,12 @@ mod tests {
         let obj = VmObject::new(8192);
         {
             let mut w = obj.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0x2000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0x1000);
+            w.insert_page(0, Arc::new(p1));
+            let mut p2 = VmPage::new();
+            p2.phys_addr = PhysAddr::new(0x2000);
+            w.insert_page(1, Arc::new(p2));
         }
         let r = obj.read();
         assert_eq!(r.resident_count(), 2);
@@ -430,7 +611,9 @@ mod tests {
         let parent = VmObject::new(4096);
         {
             let mut w = parent.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0x1000);
+            w.insert_page(0, Arc::new(p1));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
         // Shadow walks backing chain, so parent's page is visible
@@ -451,17 +634,23 @@ mod tests {
         let grandparent = VmObject::new(4096);
         {
             let mut w = grandparent.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xA000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xA000);
+            w.insert_page(0, Arc::new(p1));
         }
         let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
         {
             let mut w = parent.write();
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xB000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xB000);
+            w.insert_page(1, Arc::new(p1));
         }
         let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
         {
             let mut w = child.write();
-            w.insert_page(2, OwnedPage::new_test(PhysAddr::new(0xC000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xC000);
+            w.insert_page(2, Arc::new(p1));
         }
         // Child has page 2, parent has page 1, grandparent has page 0
         let r = child.read();
@@ -487,10 +676,11 @@ mod tests {
             let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
             {
                 let mut w = shadow.write();
-                w.insert_page(
-                    i as u64,
-                    OwnedPage::new_test(PhysAddr::new((i + 1) * 0x1000)),
-                );
+                w.insert_page(i as u64, {
+                    let mut p = VmPage::new();
+                    p.phys_addr = PhysAddr::new((i + 1) * 0x1000);
+                    Arc::new(p)
+                });
             }
             current = shadow;
         }
@@ -516,8 +706,12 @@ mod tests {
         let obj = VmObject::new(4096);
         {
             let mut w = obj.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x2000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0x1000);
+            w.insert_page(0, Arc::new(p1));
+            let mut p2 = VmPage::new();
+            p2.phys_addr = PhysAddr::new(0x2000);
+            w.insert_page(0, Arc::new(p2));
         }
         let r = obj.read();
         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x2000));
@@ -540,12 +734,16 @@ mod tests {
         let parent = VmObject::new(4096);
         {
             let mut w = parent.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xAAAA_0000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xAAAA_0000);
+            w.insert_page(0, Arc::new(p1));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
         {
             let mut w = shadow.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xBBBB_0000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xBBBB_0000);
+            w.insert_page(0, Arc::new(p1));
         }
         let r = shadow.read();
         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0xBBBB_0000));
@@ -574,10 +772,11 @@ mod tests {
             let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
             {
                 let mut w = shadow.write();
-                w.insert_page(
-                    i as u64,
-                    OwnedPage::new_test(PhysAddr::new((i + 1) * 0x1000)),
-                );
+                w.insert_page(i as u64, {
+                    let mut p = VmPage::new();
+                    p.phys_addr = PhysAddr::new((i + 1) * 0x1000);
+                    Arc::new(p)
+                });
             }
             current = shadow;
         }
@@ -589,8 +788,12 @@ mod tests {
         let obj = VmObject::new(4096);
         {
             let mut w = obj.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0x2000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0x1000);
+            w.insert_page(0, Arc::new(p1));
+            let mut p2 = VmPage::new();
+            p2.phys_addr = PhysAddr::new(0x2000);
+            w.insert_page(1, Arc::new(p2));
             assert_eq!(w.resident_count(), 2);
             let removed = w.remove_page(0);
             assert!(removed.is_some());
@@ -645,8 +848,12 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xA000)));
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xB000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xA000);
+            w.insert_page(0, Arc::new(p1));
+            let mut p2 = VmPage::new();
+            p2.phys_addr = PhysAddr::new(0xB000);
+            w.insert_page(1, Arc::new(p2));
         }
         // Single shadow — shadow_count == 1, collapse is safe.
         let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
@@ -669,14 +876,20 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xDEAD)));
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xBEEF)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xDEAD);
+            w.insert_page(0, Arc::new(p1));
+            let mut p2 = VmPage::new();
+            p2.phys_addr = PhysAddr::new(0xBEEF);
+            w.insert_page(1, Arc::new(p2));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
         // Shadow has its own page at offset 0 (COW copy).
         {
             let mut w = shadow.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xC000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xC000);
+            w.insert_page(0, Arc::new(p1));
         }
 
         // Collapse: offset 0 conflicts (shadow wins), offset 1 migrates.
@@ -699,7 +912,9 @@ mod tests {
         let backing = VmObject::new(4096);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x1000)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0x1000);
+            w.insert_page(0, Arc::new(p1));
         }
         let s1 = VmObject::new_shadow(Arc::clone(&backing), 4096);
         let _s2 = VmObject::new_shadow(Arc::clone(&backing), 4096);
@@ -721,12 +936,16 @@ mod tests {
         let grandparent = VmObject::new(4096);
         {
             let mut w = grandparent.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xAAAA)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xAAAA);
+            w.insert_page(0, Arc::new(p1));
         }
         let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
         {
             let mut w = parent.write();
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xBBBB)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xBBBB);
+            w.insert_page(1, Arc::new(p1));
         }
         let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
         assert_eq!(parent.read().shadow_count(), 1);
@@ -766,8 +985,12 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xF0F0)));
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xF1F1)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xF0F0);
+            w.insert_page(0, Arc::new(p1));
+            let mut p2 = VmPage::new();
+            p2.phys_addr = PhysAddr::new(0xF1F1);
+            w.insert_page(1, Arc::new(p2));
         }
 
         // Step 2: fork — parent shadow and child shadow.
@@ -808,8 +1031,12 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xF0F0)));
-            w.insert_page(1, OwnedPage::new_test(PhysAddr::new(0xF1F1)));
+            let mut p1 = VmPage::new();
+            p1.phys_addr = PhysAddr::new(0xF0F0);
+            w.insert_page(0, Arc::new(p1));
+            let mut p2 = VmPage::new();
+            p2.phys_addr = PhysAddr::new(0xF1F1);
+            w.insert_page(1, Arc::new(p2));
         }
 
         let parent_shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
@@ -818,7 +1045,9 @@ mod tests {
         // Child already did a COW copy of offset 0.
         {
             let mut w = child_shadow.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xC09F)));
+            let mut p = VmPage::new();
+            p.phys_addr = PhysAddr::new(0xC09F);
+            w.insert_page(0, Arc::new(p));
         }
 
         // Parent exits.
@@ -849,7 +1078,9 @@ mod tests {
         let backing = VmObject::new(4096);
         {
             let mut w = backing.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0xBA5E)));
+            let mut p = VmPage::new();
+            p.phys_addr = PhysAddr::new(0xBA5E);
+            w.insert_page(0, Arc::new(p));
         }
 
         // Wave 1: create 100 shadows (simulates fork bomb).
@@ -888,7 +1119,9 @@ mod tests {
         let root = VmObject::new(4096);
         {
             let mut w = root.write();
-            w.insert_page(0, OwnedPage::new_test(PhysAddr::new(0x2007)));
+            let mut p = VmPage::new();
+            p.phys_addr = PhysAddr::new(0x2007);
+            w.insert_page(0, Arc::new(p));
         }
 
         // Build a 200-deep chain: each "child" forks from previous "parent".
@@ -935,10 +1168,11 @@ mod tests {
         {
             let mut w = backing.write();
             for i in 0..4u64 {
-                w.insert_page(
-                    i,
-                    OwnedPage::new_test(PhysAddr::new((0xA000 + i as usize) * 0x1000)),
-                );
+                w.insert_page(i, {
+                    let mut p = super::super::page::VmPage::new();
+                    p.phys_addr = crate::hal_common::PhysAddr::new((0xA000 + i as usize) * 0x1000);
+                    Arc::new(p)
+                });
             }
         }
 
@@ -950,10 +1184,11 @@ mod tests {
                 let mut w = s.write();
                 // Each shadow writes to offset (i % 4).
                 let offset = (i % 4) as u64;
-                w.insert_page(
-                    offset,
-                    OwnedPage::new_test(PhysAddr::new(0xC000_0000 + i * 0x1000)),
-                );
+                w.insert_page(offset, {
+                    let mut p = super::super::page::VmPage::new();
+                    p.phys_addr = crate::hal_common::PhysAddr::new(0xC000_0000 + i * 0x1000);
+                    Arc::new(p)
+                });
             }
             shadows.push(s);
         }

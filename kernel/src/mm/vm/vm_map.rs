@@ -7,33 +7,19 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hal_common::addr::VirtPageNum;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::hal_common::addr::VirtPageNum;
 use spin::RwLock;
 
-use hal_common::{PAGE_SIZE, VirtAddr};
+use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
 use crate::mm::vm::vm_object::VObjIndex;
 
 use super::vm_object::VmObject;
 
+use crate::fs::Vnode;
 
-#[cfg(not(test))]
-// FIXME: dependency on fs
-// use crate::fs::vnode::Vnode;
-pub trait Vnode: Send + Sync {
-    fn vnode_id(&self) -> u64;
-    fn path(&self) -> &str;
-}
-
-/// Placeholder trait for test builds where the fs module is not available.
-//TODO: adhere to Mach Vnode interface!
-#[cfg(all(test, feature = "qemu-test"))]
-pub trait Vnode: Send + Sync {
-    fn vnode_id(&self) -> u64;
-    fn path(&self) -> &str;
-}
 
 // ---------------------------------------------------------------------------
 // Monotonic VMA ID
@@ -49,17 +35,7 @@ fn next_vma_id() -> u64 {
 // MapPerm — page protection flags
 // ---------------------------------------------------------------------------
 
-bitflags::bitflags! {
-    /// Page protection / permission flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct MapPerm: u8 {
-        const R = 1 << 0;
-        const W = 1 << 1;
-        const X = 1 << 2;
-        const U = 1 << 3;
-    }
-    //TODO: add flag packs like RW, RX, UW, etc.
-}
+pub use crate::mm::vm::map::entry::MapPerm;
 
 // ---------------------------------------------------------------------------
 // EntryFlags — VmMapEntry state flags
@@ -179,7 +155,7 @@ impl VmArea {
         range: Range<VirtAddr>,
         prot: MapPerm,
         object: Arc<RwLock<VmObject>>,
-        obj_offset:VirtPageNum ,
+        obj_offset: VirtPageNum,
         vnode: Arc<dyn Vnode>,
         file_offset: usize,
         file_size: usize,
@@ -205,7 +181,7 @@ impl VmArea {
     }
 
     /// Calculate the offset into the VmObject for a given virtual address within this VMA.
-    pub fn translate_to_obj_index(&self, va: VirtAddr) ->  VObjIndex {
+    pub fn translate_to_obj_index(&self, va: VirtAddr) -> VObjIndex {
         debug_assert!(self.contains(va));
         let delta_in_pages = (va - self.range.start).div_ceil(PAGE_SIZE);
         self.obj_offset + delta_in_pages
@@ -232,7 +208,6 @@ impl VmArea {
     pub fn clear_needs_copy(&mut self) {
         self.flags.remove(EntryFlags::NEEDS_COPY);
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +384,7 @@ impl VmMap {
                 );
             let child_object = if needs_independent_copy {
                 let size = vma.object.read().size();
-                VmObject::new(size)
+                VmObject::new_anon(size)
             } else {
                 // Shared reference: read-only file-backed, device, shared-anonymous.
                 // Pages already resident in the VmObject stay visible to child.
@@ -513,7 +488,7 @@ impl VmMap {
                 let right_start = end;
 
                 // Left portion
-                let left_obj = VmObject::new(left_size);
+                let left_obj = VmObject::new_anon(left_size);
                 let left_vma = VmArea {
                     id: next_vma_id(),
                     range: vma_start..start,
@@ -524,14 +499,17 @@ impl VmMap {
                     flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size:
-                        if vma.file_size > left_size { left_size } else { vma.file_size },
+                    file_size: if vma.file_size > left_size {
+                        left_size
+                    } else {
+                        vma.file_size
+                    },
                 };
                 self.areas.insert(vma_start, left_vma);
 
                 // Right portion
                 let right_size = vma_end.as_usize() - right_start.as_usize();
-                let right_obj = VmObject::new(right_size);
+                let right_obj = VmObject::new_anon(right_size);
                 let right_offset_delta = right_start.as_usize() - vma_start.as_usize();
                 let right_vma = VmArea {
                     id: next_vma_id(),
@@ -552,7 +530,7 @@ impl VmMap {
             } else if vma_start < start {
                 // Partial overlap at end: truncate VMA to end at `start`
                 let keep_size = start.as_usize() - vma_start.as_usize();
-                let truncated_obj = VmObject::new(keep_size);
+                let truncated_obj = VmObject::new_anon(keep_size);
                 let kept = VmArea {
                     id: next_vma_id(),
                     range: vma_start..start,
@@ -563,7 +541,11 @@ impl VmMap {
                     flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset,
-                    file_size: if vma.file_size > keep_size { keep_size } else { vma.file_size },
+                    file_size: if vma.file_size > keep_size {
+                        keep_size
+                    } else {
+                        vma.file_size
+                    },
                 };
                 self.areas.insert(vma_start, kept);
                 removed.push(vma);
@@ -571,7 +553,7 @@ impl VmMap {
                 // Partial overlap at start: truncate VMA to start at `end`
                 let new_start = end;
                 let new_size = vma_end.as_usize() - new_start.as_usize();
-                let truncated_obj = VmObject::new(new_size);
+                let truncated_obj = VmObject::new_anon(new_size);
                 let offset_delta = new_start.as_usize() - vma_start.as_usize();
                 let kept = VmArea {
                     id: next_vma_id(),
@@ -625,7 +607,7 @@ impl VmMap {
                     id: next_vma_id(),
                     range: vma_start..start,
                     prot: vma.prot,
-                    object: VmObject::new(left_size),
+                    object: VmObject::new_anon(left_size),
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
                     flags: vma.flags,
@@ -641,16 +623,13 @@ impl VmMap {
                     id: next_vma_id(),
                     range: start..end,
                     prot: new_prot,
-                    object: VmObject::new(mid_size),
+                    object: VmObject::new_anon(mid_size),
                     obj_offset: vma.obj_offset + mid_offset,
                     vma_type: vma.vma_type,
                     flags: vma.flags,
                     vnode: vma.vnode.clone(),
                     file_offset: vma.file_offset + mid_offset,
-                    file_size: vma
-                        .file_size
-                        .saturating_sub(mid_offset)
-                        .min(mid_size),
+                    file_size: vma.file_size.saturating_sub(mid_offset).min(mid_size),
                 };
                 self.areas.insert(start, mid);
 
@@ -661,7 +640,7 @@ impl VmMap {
                     id: next_vma_id(),
                     range: right_start..vma_end,
                     prot: vma.prot,
-                    object: VmObject::new(right_size),
+                    object: VmObject::new_anon(right_size),
                     obj_offset: vma.obj_offset + right_offset,
                     vma_type: vma.vma_type,
                     flags: vma.flags,
@@ -677,7 +656,7 @@ impl VmMap {
                     id: next_vma_id(),
                     range: vma_start..start,
                     prot: vma.prot,
-                    object: VmObject::new(left_size),
+                    object: VmObject::new_anon(left_size),
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
                     flags: vma.flags,
@@ -693,7 +672,7 @@ impl VmMap {
                     id: next_vma_id(),
                     range: start..vma_end,
                     prot: new_prot,
-                    object: VmObject::new(right_size),
+                    object: VmObject::new_anon(right_size),
                     obj_offset: vma.obj_offset + right_offset,
                     vma_type: vma.vma_type,
                     flags: vma.flags,
@@ -709,7 +688,7 @@ impl VmMap {
                     id: next_vma_id(),
                     range: vma_start..end,
                     prot: new_prot,
-                    object: VmObject::new(left_size),
+                    object: VmObject::new_anon(left_size),
                     obj_offset: vma.obj_offset,
                     vma_type: vma.vma_type,
                     flags: vma.flags,
@@ -725,7 +704,7 @@ impl VmMap {
                     id: next_vma_id(),
                     range: end..vma_end,
                     prot: vma.prot,
-                    object: VmObject::new(right_size),
+                    object: VmObject::new_anon(right_size),
                     obj_offset: vma.obj_offset + right_offset,
                     vma_type: vma.vma_type,
                     flags: vma.flags,
@@ -839,7 +818,7 @@ mod tests {
             let mut w = obj.write();
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(0xA000)),
+                super::super::vm_object::OwnedPage::new_test(crate::hal_common::PhysAddr::new(0xA000)),
             );
         }
         let vma = VmArea::new(
@@ -891,13 +870,13 @@ mod tests {
             let mut w = obj.write();
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
+                super::super::vm_object::OwnedPage::new_test(crate::hal_common::PhysAddr::new(
                     0xDEAD_0000,
                 )),
             );
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
+                super::super::vm_object::OwnedPage::new_test(crate::hal_common::PhysAddr::new(
                     0xBEEF_0000,
                 )),
             );
@@ -919,11 +898,11 @@ mod tests {
         // Parent's pages visible through shadow chain
         assert_eq!(
             child_obj.lookup_page(VirtPageNum(0)).unwrap(),
-            hal_common::PhysAddr::new(0xDEAD_0000)
+            crate::hal_common::PhysAddr::new(0xDEAD_0000)
         );
         assert_eq!(
             child_obj.lookup_page(VirtPageNum(1)).unwrap(),
-            hal_common::PhysAddr::new(0xBEEF_0000)
+            crate::hal_common::PhysAddr::new(0xBEEF_0000)
         );
     }
 

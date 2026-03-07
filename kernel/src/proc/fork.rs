@@ -4,10 +4,8 @@
 
 use super::task::Task;
 use crate::mm::pmap;
-use crate::mm::vm::vm_map::MapPerm;
-use crate::mm::vm::vm_object::OwnedPage;
 use alloc::sync::Arc;
-use hal_common::{VirtAddr, PAGE_SIZE};
+use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
 /// Fork the parent task with deep-copy of all mapped writable pages.
 pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
@@ -21,24 +19,21 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     );
 
     // Deep-copy strategy: create independent VmObjects (not shadows)
-    {
-        let parent_vm = parent.vm_map.lock();
-        let child_vm = parent_vm.fork_deep_copy();
-        *child.vm_map.lock() = child_vm;
-    }
-
     // Deep-copy: copy all pages from parent's VmObjects into child
     deep_copy_pages(parent, &child);
 
     // Ensure child has sigcode trampoline page (not tracked in vm_map).
     // Prefer sharing parent's mapped page; fallback to creating a new one.
     {
-        let parent_pmap = parent.pmap.lock();
-        let mut child_pmap = child.pmap.lock();
-        if let Some(sigcode_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(super::signal::SIGCODE_VA))
+        let parent_vm = parent.vm_map.lock();
+        let parent_pmap = parent_vm.pmap_lock();
+        let child_vm = child.vm_map.lock();
+        let mut child_pmap = child_vm.pmap_lock();
+        if let Some(sigcode_pa) =
+            crate::mm::pmap::pmap_extract(&parent_pmap, VirtAddr::new(super::signal::SIGCODE_VA))
         {
             let prot = crate::map_perm!(R, X, U);
-            let _ = pmap::pmap_enter(
+            let _ = crate::mm::pmap::pmap_enter(
                 &mut child_pmap,
                 VirtAddr::new(super::signal::SIGCODE_VA),
                 sigcode_pa,
@@ -119,29 +114,94 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
 /// Arc::clone'd by fork_deep_copy, so demand faults will find pages there).
 fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
     let parent_vm = parent.vm_map.lock();
-    let child_vm = child.vm_map.lock();
-    let mut child_pmap = child.pmap.lock();
-    let parent_pmap = parent.pmap.lock();
+    let mut child_vm = child.vm_map.lock();
+
+    // Copy VmMapEntries
+    for vma in parent_vm.iter() {
+        let new_store = match &vma.store {
+            crate::mm::vm::map::entry::BackingStore::Object { offset, object: parent_obj } => {
+                let size = vma.end - vma.start;
+                // Create a clone of the object for the child (not a shadow)
+                let new_obj = crate::mm::vm::vm_object::VmObject::new_anon(size as usize / PAGE_SIZE);
+                // Copy pager from parent so child can demand-fault file-backed pages
+                // that the parent hasn't touched yet. Without this, unfaulted pages
+                // get zero-filled (AnonPager) instead of loaded from the ELF vnode.
+                {
+                    let parent_read = parent_obj.read();
+                    if let Some(ref pager) = parent_read.pager {
+                        if !pager.is_anon() {
+                            new_obj.write().pager = Some(Arc::clone(pager));
+                        }
+                    }
+                }
+                crate::mm::vm::map::entry::BackingStore::Object {
+                    object: new_obj,
+                    offset: *offset,
+                }
+            }
+            crate::mm::vm::map::entry::BackingStore::SubMap { .. } => {
+                panic!("SubMap not supported in fork");
+            }
+            crate::mm::vm::map::entry::BackingStore::Guard => {
+                crate::mm::vm::map::entry::BackingStore::Guard
+            }
+        };
+        let child_vma = crate::mm::vm::map::entry::VmMapEntry::new(
+            vma.start,
+            vma.end,
+            new_store,
+            vma.flags,
+            vma.protection,
+        );
+        child_vm.insert_entry(child_vma).unwrap();
+    }
+
+    let child_pmap_arc = child_vm.pmap.clone();
+    let mut child_pmap = child_pmap_arc.lock();
+    let parent_pmap_arc = parent_vm.pmap.clone();
+    let parent_pmap = parent_pmap_arc.lock();
 
     for vma in parent_vm.iter() {
-        let is_writable = vma.prot.contains(MapPerm::W);
+        let is_writable = vma
+            .protection
+            .contains(crate::mm::vm::map::entry::MapPerm::W);
 
         if is_writable {
             // Walk every page in the VMA range via parent's pmap to find
             // all mapped pages (both VmObject-backed and pmap-only).
-            let mut va = vma.range.start.as_usize();
-            while va < vma.range.end.as_usize() {
+            let mut va = vma.start as usize;
+            while va < vma.end as usize {
                 if let Some(src_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
-                    if let Some(mut new_frame) = crate::mm::allocator::alloc_anon_sync() {
+                    if let Some(new_frame) = crate::mm::allocator::alloc_anon_sync() {
                         unsafe {
-                            new_frame.as_bytes_mut().copy_from_slice(src_pa.page_align_down().as_slice());
+                            new_frame
+                                .as_bytes_mut()
+                                .copy_from_slice(src_pa.page_align_down().into_kernel_vaddr().as_page_slice());
                         }
-                        if let Some(child_vma) = child_vm.find_area(VirtAddr::new(va)) {
-                            let new_phys = new_frame.phys();
-                            let obj_idx = child_vma.pindex_for(VirtAddr::new(va));
-                            let mut child_obj = child_vma.object.write();
-                            child_obj.insert_page(obj_idx, OwnedPage::new_anonymous(new_frame));
-                            let _ = pmap::pmap_enter(&mut child_pmap, VirtAddr::new(va), new_phys, child_vma.prot, false);
+                        if let Some(child_vma) = child_vm.lookup_mut(va as u64) {
+                            if let crate::mm::vm::map::entry::BackingStore::Object {
+                                object,
+                                offset,
+                            } = &child_vma.store
+                            {
+                                let new_phys = new_frame.phys();
+                                let obj_idx =
+                                    (va as u64 - child_vma.start) / PAGE_SIZE as u64 + offset;
+                                let mut child_obj = object.write();
+                                let mut page = crate::mm::vm::page::VmPage::new();
+                                page.phys_addr = new_phys;
+                                child_obj.insert_page(
+                                    crate::hal_common::addr::VirtPageNum(obj_idx as usize),
+                                    Arc::new(page),
+                                );
+                                let _ = pmap::pmap_enter(
+                                    &mut child_pmap,
+                                    VirtAddr::new(va),
+                                    new_phys,
+                                    child_vma.protection,
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -151,10 +211,16 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
             // Read-only: share pages currently in pmap.
             // The VmObject is already Arc::clone'd by fork_deep_copy, so
             // demand faults will find pages in the shared object.
-            let mut va = vma.range.start.as_usize();
-            while va < vma.range.end.as_usize() {
+            let mut va = vma.start as usize;
+            while va < vma.end as usize {
                 if let Some(pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
-                    let _ = pmap::pmap_enter(&mut child_pmap, VirtAddr::new(va), pa, vma.prot, false);
+                    let _ = pmap::pmap_enter(
+                        &mut child_pmap,
+                        VirtAddr::new(va),
+                        pa,
+                        vma.protection,
+                        false,
+                    );
                 }
                 va += PAGE_SIZE;
             }

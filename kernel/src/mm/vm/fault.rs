@@ -13,11 +13,12 @@
 
 use alloc::sync::Arc;
 
-use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
+use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use super::super::pmap::{self, Pmap};
-use super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
-use hal_common::addr::VirtPageNum;
+use super::map::entry::{BackingStore, MapPerm, VmMapEntry};
+use super::map::map::VmMap;
+use crate::hal_common::addr::VirtPageNum;
 
 /// Result of a synchronous page fault resolution attempt.
 #[derive(Debug)]
@@ -104,59 +105,43 @@ impl core::fmt::Display for PageFaultAccessType {
 }
 
 /// Synchronous page fault handler. Runs on trap stack -- never yields.
-///
-/// Resolves:
-/// - Anonymous faults: allocate zeroed frame, insert into VmObject, map via pmap
-/// - COW faults: copy page to new frame, remap with write permission
-/// - File-backed faults: returns NeedsAsyncIO (Phase 3)
-///
-/// Uses `alloc_raw_frame_sync()` exclusively for all allocations.
-///
-/// BSD VM Fault Flow (4 stages):
-/// - Stage 1: Topology Routing (VmMap read lock, lookup VMA, check IN_TRANSITION)
-/// - Stage 2: COW Materialization (try_upgrade to write lock, shadow(), downgrade)
-/// - Stage 3: Data Extraction (grab page with exBusy, traverse backing, copy)
-/// - Stage 4: Hardware Projection (downgrade exBusy to sBusy, pmap_enter, release)
 pub fn sync_fault_handler(
-    vm_map: &VmMap,
+    vm_map: &VmMap, // Requires read-only lookup
     pmap: &mut Pmap,
     fault_va: VirtAddr,
     access_type: PageFaultAccessType,
 ) -> FaultResult {
-    // Page-align the faulting address.
-    let fault_va_aligned = fault_va.current_page_head();
+    let fault_va_aligned = VirtAddr(fault_va.0 & !(PAGE_SIZE - 1));
 
     // 1. Find the VMA containing the faulting address.
-    let vma = match vm_map.find_area(fault_va) {
+    let vma = match vm_map.lookup_readonly(fault_va.0 as u64) {
         None => {
-            klog!(vm, debug, "fault NOT_MAPPED va={:#x}", fault_va.0);
+            crate::klog!(vm, debug, "fault NOT_MAPPED va={:#x}", fault_va.0);
             return FaultResult::Error(FaultError::NotMapped);
         }
         Some(vma) => vma,
     };
 
-    klog!(
+    crate::klog!(
         vm,
         debug,
-        "fault ENTER va={:#x} aligned={:#x} type={:?} prot={:?} range=[{:#x}..{:#x})",
+        "fault ENTER va={:#x} aligned={:#x} prot={:?} range=[{:#x}..{:#x})",
         fault_va.0,
         fault_va_aligned.0,
-        vma.vma_type,
-        vma.prot,
-        vma.range.start.0,
-        vma.range.end.0
+        vma.protection,
+        vma.start,
+        vma.end
     );
 
     // 2. Check permissions.
-    if !access_type.permitted_by(vma.prot) {
-        if !(access_type.write && vma.prot.contains(MapPerm::R)) {
-            klog!(
+    if !access_type.permitted_by(vma.protection) {
+        if !(access_type.write && vma.protection.contains(MapPerm::R)) {
+            crate::klog!(
                 vm,
                 debug,
-                "fault PERM_DENIED va={:#x} type={:?} prot={:?} w={} r={} x={}",
+                "fault PERM_DENIED va={:#x} prot={:?} w={} r={} x={}",
                 fault_va.0,
-                vma.vma_type,
-                vma.prot,
+                vma.protection,
                 access_type.write,
                 access_type.read,
                 access_type.execute
@@ -166,11 +151,29 @@ pub fn sync_fault_handler(
     }
 
     // 3. Compute object offset.
-    let offset = vma.translate_to_obj_index(fault_va_aligned);
+    let (obj, obj_page_offset) = match &vma.store {
+        BackingStore::Object { object, offset } => {
+            let offset_bytes = offset + ((fault_va_aligned.0 as u64) - vma.start);
+            (
+                object.clone(),
+                VirtPageNum((offset_bytes / PAGE_SIZE as u64) as usize),
+            )
+        }
+        BackingStore::SubMap { .. } | BackingStore::Guard => {
+            return FaultResult::Error(FaultError::InvalidAccess);
+        }
+    };
 
     // 4. Classify and handle the fault.
-    let result = classify_and_handle(vma, offset, fault_va_aligned, access_type, pmap);
-    klog!(
+    let result = classify_and_handle(
+        vma,
+        obj,
+        obj_page_offset,
+        fault_va_aligned,
+        access_type,
+        pmap,
+    );
+    crate::klog!(
         vm,
         debug,
         "fault RESULT va={:#x} => {:?}",
@@ -182,39 +185,41 @@ pub fn sync_fault_handler(
 
 /// Classify the fault and handle it.
 fn classify_and_handle(
-    vma: &VmArea,
+    vma: &VmMapEntry,
+    obj: Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>>,
     obj_page_offset: VirtPageNum,
     fault_va_aligned: VirtAddr,
     access_type: PageFaultAccessType,
     pmap: &mut Pmap,
 ) -> FaultResult {
-    // Look up the page in the VmObject shadow chain FIRST — even for
-    // file-backed VMAs. After fork, the child's shadow object may already
-    // contain the page (COW from parent). Only fall through to async I/O
-    // if the page is truly absent.
-    // TODO: Traverse shadow chain via lookup_page_in_chain() instead of single-level lookup
     let existing_page = {
-        let obj = vma.object.read();
-        obj.lookup_page(obj_page_offset)
+        let obj_read = obj.read();
+        obj_read.lookup_page(obj_page_offset)
     };
 
     match existing_page {
-        None if vma.vma_type == VmAreaType::FileBacked || vma.vma_type == VmAreaType::Device => {
-            // Page not in VmObject and VMA is file-backed — need async I/O.
-            klog!(vm, debug, "fault NeedsAsyncIO va={:#x}", fault_va_aligned.0);
-            FaultResult::NeedsAsyncIO
-        }
         None => {
-            // (a) Anonymous fault: page not in any VmObject in chain.
-            handle_anonymous_fault(vma, obj_page_offset, fault_va_aligned, pmap)
+            let is_file_backed = {
+                let obj_read = obj.read();
+                // If it has a pager and it's not the anon pager, it's file backed
+                // Actually an easier way is to just return NeedsAsyncIO unless the pager is specifically AnonPager
+                // Currently, any fault without page in object can be deferred to async if we want!
+                obj_read.pager.is_some() && !obj_read.pager.as_ref().unwrap().is_anon()
+                // All object faults can be async in phase 3
+            };
+
+            if is_file_backed {
+                crate::klog!(vm, debug, "fault NeedsAsyncIO va={:#x}", fault_va_aligned.0);
+                return FaultResult::NeedsAsyncIO;
+            } else {
+                handle_anonymous_fault(vma, obj, obj_page_offset, fault_va_aligned, pmap)
+            }
         }
-        Some(_old_phys) if access_type.write && vma.prot.contains(MapPerm::W) => {
-            // (b) COW fault: write to read-only page in a writable VMA.
-            handle_cow_fault(vma, obj_page_offset, fault_va_aligned, _old_phys, pmap)
+        Some(_old_phys) if access_type.write && vma.protection.contains(MapPerm::W) => {
+            handle_cow_fault(vma, obj, obj_page_offset, fault_va_aligned, _old_phys, pmap)
         }
         Some(phys) => {
-            // Page exists in VmObject but not in pmap — re-establish mapping.
-            let _ = pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.prot, false);
+            let _ = pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.protection, false);
             FaultResult::Resolved
         }
     }
@@ -223,70 +228,71 @@ fn classify_and_handle(
 /// Handle an anonymous page fault: allocate a zeroed frame, insert into
 /// the topmost VmObject, and map it.
 fn handle_anonymous_fault(
-    vma: &VmArea,
+    vma: &VmMapEntry,
+    obj: Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>>,
     obj_page_offset: VirtPageNum,
     fault_va_aligned: VirtAddr,
     pmap: &mut Pmap,
 ) -> FaultResult {
     // Delegate allocation and insertion to the VmObject.
     let new_frame_phys = {
-        let mut obj = vma.object.write();
-        match obj.fault_allocate_anon(obj_page_offset) {
+        let mut obj_write = obj.write();
+        match obj_write.fault_allocate_anon(obj_page_offset) {
             Ok(phys) => phys,
             Err(_) => return FaultResult::Error(FaultError::OutOfMemory),
         }
     };
 
     // Map the page in the hardware page table.
-    let _ = pmap::pmap_enter(pmap, fault_va_aligned, new_frame_phys, vma.prot, false);
+    let _ = pmap::pmap_enter(
+        pmap,
+        fault_va_aligned,
+        new_frame_phys,
+        vma.protection,
+        false,
+    );
 
     FaultResult::Resolved
 }
 
 /// Handle a COW fault: copy the page to a new frame in the topmost
 /// VmObject and remap with write permission.
-///
-/// Optimization: if the backing object has shadow_count == 1, we are the
-/// sole shadow. Attempt collapse (migrate pages from backing into self),
-/// then check if the page is now local — if so, promote in-place (O(1)
-/// zero-copy) instead of copying.
 fn handle_cow_fault(
-    vma: &VmArea,
+    vma: &VmMapEntry,
+    obj: Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>>,
     obj_page_offset: VirtPageNum,
     fault_va_aligned: VirtAddr,
     old_phys: PhysAddr,
     pmap: &mut Pmap,
 ) -> FaultResult {
     // Fast path: if Arc refcount == 1, no other VMA references this object.
-    let refcount = Arc::strong_count(&vma.object);
+    let refcount = Arc::strong_count(&obj);
     if refcount == 1 {
         pmap::pmap_protect(
             pmap,
             fault_va_aligned,
             VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
-            vma.prot,
+            vma.protection,
         );
         return FaultResult::Resolved;
     }
 
     // Try collapse: if backing has shadow_count == 1, migrate pages.
     {
-        let mut obj = vma.object.write();
-        let can_collapse = obj
+        let mut obj_write = obj.write();
+        let can_collapse = obj_write
             .backing()
             .map(|b| b.read().shadow_count() == 1)
             .unwrap_or(false);
         if can_collapse {
-            obj.collapse();
-            // After collapse, check if the page is now in our top-level object.
-            if obj.has_page(obj_page_offset) {
-                // Page was renamed from backing into self — zero-copy promotion.
-                drop(obj);
+            obj_write.collapse();
+            if obj_write.has_page(obj_page_offset) {
+                drop(obj_write);
                 pmap::pmap_protect(
                     pmap,
                     fault_va_aligned,
                     VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
-                    vma.prot,
+                    vma.protection,
                 );
                 return FaultResult::Resolved;
             }
@@ -294,154 +300,21 @@ fn handle_cow_fault(
     }
 
     // Shared: need to copy the page. Delegate allocation and insertion.
-    // TODO: Acquire exBusy on new page, sBusy on old page, then copy
     let new_frame_phys = {
-        let mut obj = vma.object.write();
-        match obj.fault_cow(obj_page_offset, old_phys) {
+        let mut obj_write = obj.write();
+        match obj_write.fault_cow(obj_page_offset, old_phys) {
             Ok(phys) => phys,
             Err(_) => return FaultResult::Error(FaultError::OutOfMemory),
         }
     };
 
-    // Map the new frame with full write permission.
-    let _ = pmap::pmap_enter(pmap, fault_va_aligned, new_frame_phys, vma.prot, false);
-
-    FaultResult::Resolved
-}
-
-/// Zero a physical page via the kernel direct-map.
-///
-/// Uses the same KERNEL_ADDR_SPACE offset pattern as the pmap layer.
-#[inline]
-#[cfg(not(test))]
-fn zero_page(phys: PhysAddr) {
-    // TODO: use Constant::KERNEL_ADDR_SPACE.start for the direct-map offset
-    // once hal-common exposes it. For now, use the raw address as a pointer
-    // (valid in identity-mapped or direct-mapped kernel contexts).
-    let ptr = phys.as_usize() as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
-    }
-}
-
-/// Test stub: no-op zero_page (host cannot write to fake PhysAddr).
-#[inline]
-#[cfg(all(test, feature = "qemu-test"))]
-fn zero_page(_phys: PhysAddr) {}
-
-/// Copy PAGE_SIZE bytes from one physical page to another.
-#[inline]
-#[cfg(not(test))]
-fn copy_page(src: PhysAddr, dst: PhysAddr) {
-    unsafe {
-        dst.as_mut_slice().copy_from_slice(src.as_slice());
-    }
-}
-
-/// Test stub: no-op copy_page (host cannot write to fake PhysAddr).
-#[inline]
-#[cfg(all(test, feature = "qemu-test"))]
-fn copy_page(_src: PhysAddr, _dst: PhysAddr) {}
-
-// ---------------------------------------------------------------------------
-// Async file-backed fault handler
-// ---------------------------------------------------------------------------
-
-//TODO: file-backed faults should be handled in vmobj
-/// Async fault handler for file-backed pages.
-///
-/// Called when sync_fault_handler returns NeedsAsyncIO. Fetches the page
-/// from the page cache (which may trigger delegate I/O), handles boundary
-/// page anonymization, and inserts the page into the VmObject.
-///
-/// Boundary anonymization: when offset_in_vma + PAGE_SIZE > file_size,
-/// allocate a fresh frame, memcpy the file portion, zero the tail.
-/// Never mutate page cache frames.
-#[cfg(not(test))]
-pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
-    use crate::mm::allocator::alloc_anon_sync;
-    let fault_va_aligned = VirtAddr(fault_va.0 & !(PAGE_SIZE - 1));
-
-    let vma = match vm_map.find_area(fault_va) {
-        Some(vma) => vma,
-        None => return FaultResult::Error(FaultError::NotMapped),
-    };
-
-    let vnode = match &vma.vnode {
-        Some(v) => v,
-        None => return FaultResult::Error(FaultError::NotMapped),
-    };
-
-    // Compute offset within the VMA
-    let offset_in_vma = fault_va_aligned.0 - vma.range.start.0;
-
-    // If beyond file_size, this is a zero-fill page (BSS)
-    if offset_in_vma >= vma.file_size {
-        // Allocate a zeroed anonymous page
-        let frame = match alloc_anon_sync() {
-            Some(f) => f,
-            None => return FaultResult::Error(FaultError::OutOfMemory),
-        };
-        zero_page(frame.phys());
-
-        let obj_offset = vma.pindex_for(fault_va_aligned);
-        let mut obj = vma.object.write();
-        obj.insert_page(
-            obj_offset,
-            super::vm_object::OwnedPage::new_anonymous(frame),
-        );
-        return FaultResult::Resolved;
-    }
-
-    // File-backed page: fetch from page cache
-    let file_byte_offset = vma.file_offset + offset_in_vma;
-    let _page_offset = file_byte_offset % (PAGE_SIZE);
-    let _vnode_id = vnode.vnode_id();
-
-    // Check page cache first
-    let cached_pa = match None::<PhysAddr> {
-        Some(pa) => pa,
-        None => {
-            // FIXME: dependency on fs
-            return FaultResult::Error(FaultError::OutOfMemory);
-        }
-    };
-
-    // Check if this is a boundary page (partial file data + zero tail)
-    let bytes_from_file_in_page = if offset_in_vma + PAGE_SIZE > vma.file_size {
-        (vma.file_size - offset_in_vma) as usize
-    } else {
-        PAGE_SIZE
-    };
-
-    let obj_offset = vma.pindex_for(fault_va_aligned);
-
-    if bytes_from_file_in_page < PAGE_SIZE {
-        // Boundary page: anonymize — allocate fresh frame, copy file portion, zero tail
-        let frame = match alloc_anon_sync() {
-            Some(f) => f,
-            None => return FaultResult::Error(FaultError::OutOfMemory),
-        };
-        // Copy file portion
-        unsafe {
-            let src_slice = cached_pa.as_slice();
-            let dst_slice = frame.as_bytes_mut();
-            dst_slice[..bytes_from_file_in_page]
-                .copy_from_slice(&src_slice[..bytes_from_file_in_page]);
-            // Zero the tail
-            dst_slice[bytes_from_file_in_page..].fill(0);
-        }
-        let mut obj = vma.object.write();
-        obj.insert_page(
-            obj_offset,
-            super::vm_object::OwnedPage::new_anonymous(frame),
-        );
-    } else {
-        // Full page from cache: map read-only (COW on write fault)
-        let mut obj = vma.object.write();
-        let vm_page = crate::mm::allocator::types::get_frame_meta(cached_pa).unwrap();
-        obj.insert_page(obj_offset, super::vm_object::OwnedPage::new_cached(vm_page));
-    }
+    let _ = pmap::pmap_enter(
+        pmap,
+        fault_va_aligned,
+        new_frame_phys,
+        vma.protection,
+        false,
+    );
 
     FaultResult::Resolved
 }
@@ -450,7 +323,7 @@ pub async fn fault_in_page(vm_map: &VmMap, fault_va: VirtAddr) -> FaultResult {
 mod tests {
     use super::super::super::pmap::Pmap;
     use super::super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
-    use super::super::vm_object::{OwnedPage, VmObject};
+    use super::super::vm_object::VmObject;
     use super::*;
 
     fn make_anon_map(start: usize, end: usize, prot: MapPerm) -> VmMap {
@@ -533,7 +406,9 @@ mod tests {
         let parent_obj = VmObject::new(4096);
         {
             let mut w = parent_obj.write();
-            w.insert_page(VirtPageNum(0), OwnedPage::new_test(PhysAddr::new(0xA000)));
+            let mut p = VmPage::new();
+            p.phys_addr = PhysAddr::new(0xA000);
+            w.insert_page(VirtPageNum(0), Arc::new(p));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent_obj), 4096);
         let _sibling_ref = Arc::clone(&shadow);

@@ -3,7 +3,7 @@
 //! Tier 2.a: Offline PT walk — create/enter/extract/remove without satp switch.
 //! Tier 2.b: satp switch — identity-map kernel, map high VA, activate, read/write.
 
-use hal_common::{VirtAddr, PAGE_SIZE};
+use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
 use super::super::allocator::{alloc_raw_frame_sync, PageRole};
 use super::{pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove};
@@ -73,7 +73,7 @@ pub fn test_pmap_satp_switch() {
     .unwrap();
 
     // === BEGIN IRQ-LOCKED WINDOW ===
-    let saved = hal_common::irq_lock::arch_irq::disable_and_save();
+    let saved = crate::hal_common::irq_lock::arch_irq::disable_and_save();
 
     // 3. Activate pmap (writes satp, sfence.vma)
     pmap_activate(&mut pmap);
@@ -98,7 +98,7 @@ pub fn test_pmap_satp_switch() {
     }
 
     // === END IRQ-LOCKED WINDOW ===
-    hal_common::irq_lock::arch_irq::restore(saved);
+    crate::hal_common::irq_lock::arch_irq::restore(saved);
 
     // 7. Cleanup
     pmap_destroy(&mut pmap);

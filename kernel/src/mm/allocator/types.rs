@@ -1,6 +1,4 @@
-use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU16, Ordering};
-use hal_common::addr::{PhysAddr, PAGE_SIZE};
+use crate::hal_common::addr::{PhysAddr, PAGE_SIZE};
 
 /// Compact page role, fitting in a single u8.
 #[repr(u8)]

@@ -11,7 +11,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::task::Waker;
-use hal_common::{IrqSafeSpinLock, PhysAddr};
+use crate::hal_common::{IrqSafeSpinLock, PhysAddr};
 
 use super::vnode::VnodeId;
 

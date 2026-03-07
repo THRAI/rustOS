@@ -6,9 +6,10 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
-
+use crate::mm::vm::vm_object::VmObject;
 /// Unique vnode identifier (inode number within a filesystem).
 pub type VnodeId = u64;
+use spin::rwlock::RwLock;
 
 /// File type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub trait Vnode: Send + Sync {
     fn size(&self) -> u64;
     fn path(&self) -> &str;
     fn set_size(&self, size: u64);
+    fn grab_obj(&mut self) -> Arc<RwLock<VmObject>>;
 }
 
 /// Ext4 vnode: holds inode number, file type, cached size, and path.
@@ -49,6 +51,7 @@ pub struct Ext4Vnode {
     pub vtype: VnodeType,
     pub file_size: AtomicU64,
     pub path: String,
+    pub vm_obj: Option<Arc<RwLock<VmObject>>>,
 }
 
 impl Ext4Vnode {
@@ -58,6 +61,7 @@ impl Ext4Vnode {
             vtype,
             file_size: AtomicU64::new(size),
             path: String::new(),
+            vm_obj: None,
         })
     }
 
@@ -67,6 +71,7 @@ impl Ext4Vnode {
             vtype,
             file_size: AtomicU64::new(size),
             path,
+            vm_obj: None,
         })
     }
 }
@@ -90,5 +95,16 @@ impl Vnode for Ext4Vnode {
 
     fn set_size(&self, size: u64) {
         self.file_size.store(size, Ordering::Relaxed);
+    }
+
+    /// Get or create the unified page cache of this vnode.
+    fn grab_obj(&mut self) -> Arc<RwLock<VmObject>> {
+        if let Some(obj) = &self.vm_obj {
+            return Arc::clone(obj)
+        }
+
+        let new_obj = VmObject::new_file(self);
+        self.vm_obj = Some(Arc::clone(&new_obj));
+        new_obj
     }
 }

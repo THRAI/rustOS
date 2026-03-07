@@ -3,7 +3,7 @@
 //! Each CPU has a PerCpu holding its run queue, timer wheel, and identity.
 //! Accessed via the tp register (hot path) or global array (cross-CPU).
 
-use hal_common::{IrqSafeSpinLock, RunQueue, TimerWheel};
+use crate::hal_common::{IrqSafeSpinLock, RunQueue, TimerWheel};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 extern crate alloc;

@@ -10,7 +10,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use hal_common::{VirtAddr, PAGE_SIZE};
+use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
 use crate::hal::rv64::user_trap::trap_return;
 use crate::mm::vm::fault::PageFaultAccessType;
@@ -57,7 +57,8 @@ async fn run_tasks(task: Arc<Task>) {
         // sendsig writes the signal frame to the user stack via copy_user_chunk,
         // which requires the task's pmap to be active.
         {
-            let mut pmap = task.pmap.lock();
+            let vm_map = task.vm_map.lock();
+            let mut pmap = vm_map.pmap_lock();
             crate::mm::pmap::pmap_activate(&mut pmap);
         }
 
@@ -116,7 +117,8 @@ async fn run_tasks(task: Arc<Task>) {
 
         // Deactivate pmap (back in kernel context).
         {
-            let mut pmap = task.pmap.lock();
+            let vm_map = task.vm_map.lock();
+            let mut pmap = vm_map.pmap_lock();
             crate::mm::pmap::pmap_deactivate(&mut pmap);
         }
 
@@ -232,7 +234,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                     let pc = task.trap_frame.lock().sepc;
                     klog!(
                         trap,
-                        trace,
+                        error,
                         "fatal fault: pid={} va={:#x} pc={:#x} code={} err={:?}",
                         task.pid,
                         stval,
@@ -248,7 +250,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
         _ => {
             klog!(
                 trap,
-                trace,
+                error,
                 "unhandled exception: code={} sepc={:#x} stval={:#x}",
                 code,
                 { task.trap_frame.lock().sepc },
@@ -264,7 +266,10 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
 async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
     let (syscall_id, args) = {
         let tf = task.trap_frame.lock();
-        (tf.x[17], [tf.x[10], tf.x[11], tf.x[12], tf.x[13], tf.x[14], tf.x[15]])
+        (
+            tf.x[17],
+            [tf.x[10], tf.x[11], tf.x[12], tf.x[13], tf.x[14], tf.x[15]],
+        )
     };
 
     match crate::syscall::syscall(task, syscall_id, args).await {
@@ -310,7 +315,8 @@ impl Future for UserTaskFuture {
 
         // Activate the task's page table before running.
         {
-            let mut pmap = this.task.pmap.lock();
+            let vm_map = this.task.vm_map.lock();
+            let mut pmap = vm_map.pmap_lock();
             crate::mm::pmap::pmap_activate(&mut pmap);
         }
 
@@ -319,7 +325,8 @@ impl Future for UserTaskFuture {
 
         // Deactivate the page table after running.
         {
-            let mut pmap = this.task.pmap.lock();
+            let vm_map = this.task.vm_map.lock();
+            let mut pmap = vm_map.pmap_lock();
             crate::mm::pmap::pmap_deactivate(&mut pmap);
         }
 

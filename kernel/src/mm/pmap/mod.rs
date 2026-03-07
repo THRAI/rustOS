@@ -12,12 +12,12 @@ pub mod walk;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
+use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use self::pte::{
     encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa, PteFlags,
 };
-use super::vm::vm_map::MapPerm;
+use super::vm::map::entry::MapPerm;
 
 #[cfg(target_arch = "riscv64")]
 use crate::executor::per_cpu::MAX_CPUS;
@@ -527,7 +527,9 @@ pub fn pmap_zero_page(pa: PhysAddr) {
 /// Copy PAGE_SIZE bytes from src to dst (identity-mapped).
 pub fn pmap_copy_page(src: PhysAddr, dst: PhysAddr) {
     unsafe {
-        dst.as_mut_slice().copy_from_slice(src.as_slice());
+        let src_va = src.into_kernel_vaddr();
+        let dst_va = dst.into_kernel_vaddr();
+        core::ptr::copy_nonoverlapping(src_va.as_ptr(), dst_va.as_mut_ptr(), PAGE_SIZE);
     }
 }
 

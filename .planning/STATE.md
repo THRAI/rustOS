@@ -2,13 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-last_updated: "2026-02-26T05:40:53.053Z"
+status: Full POSIX signal delivery (sigaction/sigprocmask/kill/sendsig/sigreturn), process groups, SIGPIPE/SIGCHLD/SIGSEGV
+stopped_at: Completed 04-04-PLAN.md
+last_updated: "2026-03-07T16:58:10.205Z"
+last_activity: 2026-02-25 -- Plan 04-02 complete (~8min)
 progress:
-  total_phases: 5
-  completed_phases: 4
+  total_phases: 8
+  completed_phases: 5
   total_plans: 19
-  completed_plans: 18
+  completed_plans: 19
+  percent: 75
 ---
 
 # Project State
@@ -22,19 +25,19 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 
 ## Current Position
 
-Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — IN PROGRESS
-Plan: 3 of 4 in current phase — 04-02 complete
-Status: Full POSIX signal delivery (sigaction/sigprocmask/kill/sendsig/sigreturn), process groups, SIGPIPE/SIGCHLD/SIGSEGV
-Last activity: 2026-02-25 -- Plan 04-02 complete (~8min)
+Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — COMPLETE
+Plan: 4 of 4 in current phase — 04-04 complete
+Status: Signal-syscall integration complete: EINTR guards, SA_RESTART, SIGPIPE, SIGCHLD, SA_NOCLDWAIT
+Last activity: 2026-03-08 -- Plan 04-04 complete (~5min)
 
-Progress: [████████░░] 75% (Phase 4)
+Progress: [██████████] 100% (Phase 4)
 
 ## Performance Metrics
 
 **Velocity:**
 - Total plans completed: 19
 - Average duration: 7min
-- Total execution time: 2.07 hours
+- Total execution time: 2.15 hours
 
 **By Phase:**
 
@@ -44,13 +47,14 @@ Progress: [████████░░] 75% (Phase 4)
 | 2 | 5/5 | 24min | 5min |
 | 3 | 5/5 | 51min | 10min |
 | 3.1 | 1/1 | 6min | 6min |
-| 4 | 3/4 | 24min | 8min |
+| 4 | 4/4 | 29min | 7min |
 
 **Recent Trend:**
-- Last 5 plans: 7min, 6min, 8min, 8min, 8min
+- Last 5 plans: 6min, 8min, 8min, 8min, 5min
 - Trend: stable
 
 *Updated after each plan completion*
+| Phase 04 P04 | 5 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -136,6 +140,9 @@ Recent decisions affecting current work:
 - [04-02]: sigreturn sanitizes sstatus (SPP cleared, SPIE set), bounds-checks sepc < USER_MAX_VA
 - [Phase quick-1]: Replaced hardcoded kprintln in fault.rs with klog!(vm,...) for consistency
 - [Phase quick-2]: Display newtype pattern for klog — Signal(u8) wraps at call site, constants stay u8
+- [Phase 04]: Top-level waker registered at start of each run_tasks loop iteration for signal injection
+- [Phase 04]: SIGPIPE posted in PipeWriteFuture when EPIPE detected
+- [Phase 04]: SA_NOCLDWAIT auto-reap skips zombie state and suppresses SIGCHLD
 
 ### Pending Todos
 
@@ -155,9 +162,10 @@ None yet.
 | 4 | Fix compilation errors from VM refactoring (VirtPageNum export + interface) | 2026-03-04 | 28ca95d | Complete | [4-use-refactored-vm-interface-to-refactor-](./quick/4-use-refactored-vm-interface-to-refactor-/) |
 | 6 | Make Makefile OS-agnostic for macOS and Linux portability | 2026-03-05 | 4f20792 | Complete | [6-modify-the-makefile-so-it-s-os-agnostic-](./quick/6-modify-the-makefile-so-it-s-os-agnostic-/) |
 | 7 | Move hal-common into kernel as internal module | 2026-03-07 | 8f39ebd | Complete | [7-move-hal-common-and-kernel-mm-into-kerne](./quick/7-move-hal-common-and-kernel-mm-into-kerne/) |
+| 8 | Complete workspace consolidation by removing root hal-common and kernel-mm | 2026-03-07 | a225286 | Complete | [8-move-the-kernel-mm-and-hal-common-direct](./quick/8-move-the-kernel-mm-and-hal-common-direct/) |
 
 ## Session Continuity
 
-Last activity: 2026-03-07 - Completed quick task 7: Move hal-common into kernel
-Stopped at: Plan 04-02 complete, ready for 04-04 (integration/remaining syscalls)
+Last activity: 2026-03-07 - Completed quick task 8: Workspace consolidation
+Stopped at: Completed 04-04-PLAN.md
 Resume file: None

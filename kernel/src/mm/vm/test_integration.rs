@@ -67,7 +67,7 @@ pub fn test_cow_fault() {
     let parent_page = alloc_anon_sync().expect("OOM in COW test");
     // Zero the frame (identity-mapped in bare mode)
     unsafe {
-        let ptr = parent_page.;
+        let ptr = parent_page.phys().as_usize() as *mut u8;
         core::ptr::write_bytes(ptr, 0x42, PAGE_SIZE);
     }
 

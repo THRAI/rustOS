@@ -44,10 +44,10 @@ pub(crate) static mut FRAME_META: *mut VmPage = core::ptr::null_mut();
 pub(crate) static mut FRAME_META_LEN: usize = 0;
 
 pub fn get_frame_meta(phys: PhysAddr) -> Option<&'static mut VmPage> {
-    let pfn = phys.page_align_down();
+    let pfn = phys.page_align_down().as_usize() / PAGE_SIZE;
     unsafe {
         if pfn < FRAME_META_LEN {
-            Some(&mut *FRAME_META.add(pfn.0))
+            Some(&mut *FRAME_META.add(pfn))
         } else {
             None
         }

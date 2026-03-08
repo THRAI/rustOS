@@ -13,8 +13,7 @@ use core::task::{Poll, Waker};
 use core::future::Future;
 use crate::hal_common::IrqSafeSpinLock;
 use lwext4_rust::Ext4File;
-use crate::hal_common::{PhysAddr, IrqSafeSpinLock};
-use crate::hal_common::Errno;
+use crate::hal_common::PhysAddr;
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
 // All access is serialized in the single delegate_task — never shared across threads.
 struct SendExt4File(Ext4File);
@@ -462,7 +461,7 @@ async fn delegate_task() {
                         let _ = crate::fs::ext4::close(&mut tok, &mut file);
                         reply.complete(Ok(()));
                     }
-                    None => reply.complete(Err(-12)), //Enomem
+                    Err(_) => reply.complete(Err(-12)), //Enomem
                 }
             }
             FsRequest::WriteAt {

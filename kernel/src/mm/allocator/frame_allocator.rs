@@ -40,7 +40,7 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     // Initialize the global FRAME_META array
     // We need one VmPage per physical page in the system (up to `end` address)
     // To be safe and cover all possible PFNs up to the max address:
-    let max_pfn = end.page_align_down().0;
+    let max_pfn = end.page_align_down().0 / PAGE_SIZE;
     let meta_size_bytes = max_pfn * core::mem::size_of::<crate::mm::vm::page::VmPage>();
     let meta_pages = meta_size_bytes.div_ceil(PAGE_SIZE);
 

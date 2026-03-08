@@ -15,10 +15,10 @@ use core::marker::{Send, Sync};
 use core::sync::atomic::AtomicU32;
 use spin::RwLock;
 
+use super::page::{ExclusiveBusyGuard, SharedBusyGuard};
 use crate::fs::Vnode;
 use crate::hal_common::Errno;
 use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
-use super::page::{ExclusiveBusyGuard, SharedBusyGuard};
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
 /// Supports fetching multiple pages in a single operation for efficiency.
 pub trait Pager: core::fmt::Debug + Send + Sync {
@@ -113,13 +113,14 @@ impl Pager for VnodePager {
                 return Ok(());
             }
 
-            crate::fs::delegate::fs_read_page(&path, offset as u64, pa.as_usize())
+            crate::fs::delegate::fs_read_page(&path, offset as u64, pa)
                 .await
                 .map_err(|_| ())?;
 
             // Clamp page tail to zero when it crosses the file-backed boundary.
             if file_bytes_this_page < PAGE_SIZE {
-                let buf = unsafe { core::slice::from_raw_parts_mut(pa.as_usize() as *mut u8, PAGE_SIZE) };
+                let buf =
+                    unsafe { core::slice::from_raw_parts_mut(pa.as_usize() as *mut u8, PAGE_SIZE) };
                 buf[file_bytes_this_page..].fill(0);
             }
             Ok(())
@@ -230,6 +231,8 @@ impl VmObject {
             pager: Some(Arc::new(VnodePager {
                 vnode_id,
                 path: path.into(),
+                base_offset: 0,
+                valid_bytes: usize::MAX,
             })),
             size: size_pages,
             resident_count: 0,

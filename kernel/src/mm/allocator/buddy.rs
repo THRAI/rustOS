@@ -56,7 +56,7 @@ impl BuddyAllocator {
             "buddy init: start not page-aligned"
         );
         assert!(end.is_page_aligned(), "buddy init: end not page-aligned");
-        assert!(start < end, "buddy init: empty range");
+        assert!(start < end, "buddy init: empty range: start: {start}, end: {end}");
 
         // Pre-allocate Vec capacity to avoid realloc during the loop.
         // For 128MB, order-11 (8MB blocks) needs ~16 slots; smaller orders need fewer.
@@ -83,7 +83,7 @@ impl BuddyAllocator {
                 }
                 order -= 1;
             }
-            self.free_lists[order].push(PhysAddr::new(addr));
+            self.free_lists[order].push(addr);
             self.free_pages += 1 << order;
             addr += (1 << order) * PAGE_SIZE;
             _count += 1;

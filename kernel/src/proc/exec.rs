@@ -13,8 +13,8 @@
 //! "exec-legacy" feature flag for debugging.
 
 use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
-use alloc::string::String;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -54,28 +54,6 @@ const AT_RANDOM: usize = 25;
 // VMA insert helper
 // ---------------------------------------------------------------------------
 
-/// Insert a file-backed VMA, merging exact same-page overlaps produced by
-/// ELF PT_LOAD headers that split permissions inside one page.
-fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), VmError> {
-    if let BackingStore::Object { .. } = new_vma.store {
-        if let Some(existing) = vm.lookup_mut(new_vma.start) {
-            if existing.start == new_vma.start && existing.end == new_vma.end {
-                let same_backing = match (&existing.store, &new_vma.store) {
-                    (
-                        BackingStore::Object { offset: f1, .. },
-                        BackingStore::Object { offset: f2, .. },
-                    ) => f1 == f2,
-                    _ => false,
-                };
-                if same_backing {
-                    existing.protection |= new_vma.protection;
-                    return Ok(());
-                }
-            }
-        }
-    }
-    vm.insert_entry(new_vma)
-}
 
 fn map_insert_err(err: VmError) -> Errno {
     match err {
@@ -115,9 +93,12 @@ pub async fn do_execve(
     // 1b. Create a file-backed VmObject for the ELF vnode and fetch page 0
     //     through the pager (not the allocator directly).
     let elf_obj = VmObject::new_file(&*vnode);
-    VmObject::fetch_page_async(Arc::clone(&elf_obj), crate::hal_common::addr::VirtPageNum(0))
-        .await
-        .map_err(|_| Errno::Enoexec)?;
+    VmObject::fetch_page_async(
+        Arc::clone(&elf_obj),
+        crate::hal_common::addr::VirtPageNum(0),
+    )
+    .await
+    .map_err(|_| Errno::Enoexec)?;
 
     // 1c. Parse ELF header + program headers via goblin
     let hdr_phys = elf_obj
@@ -155,11 +136,7 @@ pub async fn do_execve(
         let file_offset_page_aligned = region.offset & !(PAGE_SIZE - 1);
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new_vnode_region(
-            vnode.vnode_id() as usize,
-            vnode.path(),
-            obj_size,
-        );
+        let obj = VmObject::new_vnode_region(vnode.vnode_id() as usize, vnode.path(), obj_size);
 
         let vma = VmMapEntry::new_file_backed(
             va_start as u64,
@@ -180,14 +157,33 @@ pub async fn do_execve(
 
     // 2c. If there is an interpreter (PT_INTERP), load it into the new VmMap
     let final_entry = if let Some(ref ipath) = exec_ctx.interp_path {
-        klog!(exec, debug, "do_execve pid={} loading interp={}", task.pid, ipath);
+        klog!(
+            exec,
+            debug,
+            "do_execve pid={} loading interp={}",
+            task.pid,
+            ipath
+        );
         match load_interp_into(&mut new_vm, ipath, DL_INTERP_OFFSET).await {
             Ok(interp_entry) => {
-                klog!(exec, debug, "do_execve pid={} interp entry={:#x}", task.pid, interp_entry);
+                klog!(
+                    exec,
+                    debug,
+                    "do_execve pid={} interp entry={:#x}",
+                    task.pid,
+                    interp_entry
+                );
                 interp_entry
             }
             Err(e) => {
-                klog!(exec, error, "do_execve pid={} failed to load interp {}: {:?}", task.pid, ipath, e);
+                klog!(
+                    exec,
+                    error,
+                    "do_execve pid={} failed to load interp {}: {:?}",
+                    task.pid,
+                    ipath,
+                    e
+                );
                 return Err(e);
             }
         }
@@ -217,9 +213,8 @@ pub async fn do_execve(
     let (sp_va, entry_for_auxv) = {
         // Eagerly allocate the top stack page through the stack VmObject
         let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-        let stack_page_idx = crate::hal_common::addr::VirtPageNum(
-            (USER_STACK_SIZE / PAGE_SIZE) - 1,
-        );
+        let stack_page_idx =
+            crate::hal_common::addr::VirtPageNum((USER_STACK_SIZE / PAGE_SIZE) - 1);
 
         // Allocate and zero the page via VmObject (not the allocator directly)
         let phys = {
@@ -241,8 +236,7 @@ pub async fn do_execve(
         }
 
         // Write stack layout into the physical frame (identity-mapped)
-        let mut cursor =
-            crate::hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
+        let mut cursor = crate::hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
         let stack_page_vbase = VirtAddr::new(stack_page_va);
 
         // Push 16 random bytes for AT_RANDOM
@@ -297,22 +291,24 @@ pub async fn do_execve(
             let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::Enomem)?;
             slice_ptr = allocated.as_mut_ptr();
         }
-        let slice =
-            unsafe { core::slice::from_raw_parts_mut(slice_ptr, slots_bytes) };
+        let slice = unsafe { core::slice::from_raw_parts_mut(slice_ptr, slots_bytes) };
 
         let mut off = 0;
         let mut write_usize = |val: usize| {
-            slice[off..off + core::mem::size_of::<usize>()]
-                .copy_from_slice(&val.to_ne_bytes());
+            slice[off..off + core::mem::size_of::<usize>()].copy_from_slice(&val.to_ne_bytes());
             off += core::mem::size_of::<usize>();
         };
 
         // argc
         write_usize(argv.len());
-        for va in &argv_vas { write_usize(*va); }
+        for va in &argv_vas {
+            write_usize(*va);
+        }
         write_usize(0); // NULL
 
-        for va in &envp_vas { write_usize(*va); }
+        for va in &envp_vas {
+            write_usize(*va);
+        }
         write_usize(0); // NULL
 
         for &(atype, aval) in &auxv {
@@ -439,11 +435,7 @@ async fn load_interp_into(
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new_vnode_region(
-            vnode.vnode_id() as usize,
-            vnode.path(),
-            obj_size,
-        );
+        let obj = VmObject::new_vnode_region(vnode.vnode_id() as usize, vnode.path(), obj_size);
         let vma = VmMapEntry::new(
             va_start as u64,
             va_end as u64,
@@ -470,321 +462,349 @@ async fn load_interp_into(
 #[cfg(feature = "exec-legacy")]
 mod legacy {
 
-use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+    use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
 
-use crate::fs::path;
-use crate::fs::vnode::VnodeType;
-use crate::mm::vm::map::entry::{BackingStore, MapPerm, VmMapEntry};
-use crate::mm::vm::map::{VmError, VmMap};
-use crate::mm::vm::vm_object::VmObject;
+    use crate::fs::path;
+    use crate::fs::vnode::VnodeType;
+    use crate::mm::vm::map::entry::{BackingStore, MapPerm, VmMapEntry};
+    use crate::mm::vm::map::{VmError, VmMap};
+    use crate::mm::vm::vm_object::VmObject;
 
-use crate::proc::task::Task;
+    use crate::proc::task::Task;
 
-use super::{
-    insert_or_merge_file_vma, map_insert_err, elf_flags_to_prot,
-    parse_elf_header, parse_phdrs, load_interp,
-    DL_INTERP_OFFSET, USER_STACK_SIZE, USER_STACK_TOP,
-    AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY, AT_RANDOM,
-    Elf64Header, PT_LOAD, PT_INTERP,
-};
+    use super::{
+        elf_flags_to_prot, insert_or_merge_file_vma, load_interp, map_insert_err, parse_elf_header,
+        parse_phdrs, Elf64Header, AT_ENTRY, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM,
+        AT_RANDOM, DL_INTERP_OFFSET, PT_INTERP, PT_LOAD, USER_STACK_SIZE, USER_STACK_TOP,
+    };
 
-/// Execute an ELF binary: resolve path, parse ELF, reset vm_map, create
-/// demand-paged VMAs, set up user stack. Returns (entry_point, stack_pointer).
-pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Errno> {
-    klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
-    let vnode = path::resolve(elf_path).await?;
-    if vnode.vtype() != VnodeType::Regular {
-        return Err(Errno::Enoexec);
-    }
+    /// Execute an ELF binary: resolve path, parse ELF, reset vm_map, create
+    /// demand-paged VMAs, set up user stack. Returns (entry_point, stack_pointer).
+    pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Errno> {
+        klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
+        let vnode = path::resolve(elf_path).await?;
+        if vnode.vtype() != VnodeType::Regular {
+            return Err(Errno::Enoexec);
+        }
 
-    let file_size = vnode.size();
-    if file_size < core::mem::size_of::<Elf64Header>() as u64 {
-        return Err(Errno::Enoexec);
-    }
+        let file_size = vnode.size();
+        if file_size < core::mem::size_of::<Elf64Header>() as u64 {
+            return Err(Errno::Enoexec);
+        }
 
-    let hdr_frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(Errno::Enomem)?;
-    let hdr_pa =
-        match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
-            Ok(()) => {
-                crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
-                hdr_frame
+        let hdr_frame =
+            crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
+                .ok_or(Errno::Enomem)?;
+        let hdr_pa =
+            match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
+                Ok(()) => {
+                    crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
+                    hdr_frame
+                }
+                Err(_) => {
+                    crate::mm::allocator::free_raw_frame(hdr_frame);
+                    return Err(Errno::Enoexec);
+                }
+            };
+
+        let hdr_buf =
+            unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
+        let elf_hdr = parse_elf_header(hdr_buf)?;
+        let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
+
+        let load_bias: usize = 0x0;
+        let entry = elf_hdr.e_entry as usize + load_bias;
+
+        let mut interp_path: Option<alloc::string::String> = None;
+        for phdr in phdrs {
+            if phdr.p_type == PT_INTERP {
+                let off = phdr.p_offset as usize;
+                let sz = phdr.p_filesz as usize;
+                if off + sz <= PAGE_SIZE {
+                    let bytes = &hdr_buf[off..off + sz];
+                    let s = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+                    if let Ok(p) = core::str::from_utf8(s) {
+                        interp_path = Some(alloc::string::String::from(p));
+                    }
+                }
+                break;
             }
-            Err(_) => {
-                crate::mm::allocator::free_raw_frame(hdr_frame);
-                return Err(Errno::Enoexec);
+        }
+
+        {
+            let mut vm = task.vm_map.lock();
+            vm.clear();
+            let mut pmap = vm.pmap_lock();
+            let mut old_pmap = core::mem::replace(&mut *pmap, crate::mm::pmap::pmap_create());
+            crate::mm::pmap::pmap_activate(&mut pmap);
+            crate::mm::pmap::pmap_destroy(&mut old_pmap);
+        }
+
+        let mut brk_end: usize = 0;
+        for phdr in phdrs {
+            if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+                continue;
             }
-        };
 
-    let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
-    let elf_hdr = parse_elf_header(hdr_buf)?;
-    let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
+            let va_start = ((phdr.p_vaddr as usize) + load_bias) & !(PAGE_SIZE - 1);
+            let va_end_raw = phdr.p_vaddr as usize + load_bias + phdr.p_memsz as usize;
+            let va_end = (va_end_raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    let load_bias: usize = 0x0;
-    let entry = elf_hdr.e_entry as usize + load_bias;
+            let prot = elf_flags_to_prot(phdr.p_flags);
+            let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
 
-    let mut interp_path: Option<alloc::string::String> = None;
-    for phdr in phdrs {
-        if phdr.p_type == PT_INTERP {
-            let off = phdr.p_offset as usize;
-            let sz = phdr.p_filesz as usize;
-            if off + sz <= PAGE_SIZE {
-                let bytes = &hdr_buf[off..off + sz];
-                let s = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
-                if let Ok(p) = core::str::from_utf8(s) {
-                    interp_path = Some(alloc::string::String::from(p));
+            let obj_size = (va_end - va_start) / PAGE_SIZE;
+            let obj = VmObject::new_anon(obj_size);
+            obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
+                vnode_id: vnode.vnode_id() as usize,
+                path: alloc::string::String::from(vnode.path()),
+            }));
+
+            let vma = VmMapEntry::new(
+                va_start as u64,
+                va_end as u64,
+                BackingStore::Object {
+                    object: obj,
+                    offset: file_offset_page_aligned as u64,
+                },
+                crate::mm::vm::map::entry::EntryFlags::empty(),
+                prot,
+            );
+
+            let mut vm = task.vm_map.lock();
+            if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
+                return Err(map_insert_err(e));
+            }
+
+            if va_end > brk_end {
+                brk_end = va_end;
+            }
+        }
+
+        task.brk
+            .store(brk_end, core::sync::atomic::Ordering::Relaxed);
+
+        let final_entry = if let Some(ref ipath) = interp_path {
+            klog!(
+                exec,
+                debug,
+                "exec pid={} loading interp={}",
+                task.pid,
+                ipath
+            );
+            match load_interp(task, ipath, DL_INTERP_OFFSET).await {
+                Ok(interp_entry) => {
+                    klog!(
+                        exec,
+                        debug,
+                        "exec pid={} interp entry={:#x}",
+                        task.pid,
+                        interp_entry
+                    );
+                    interp_entry
+                }
+                Err(e) => {
+                    klog!(
+                        exec,
+                        error,
+                        "exec pid={} failed to load interp {}: {:?}",
+                        task.pid,
+                        ipath,
+                        e
+                    );
+                    return Err(e);
                 }
             }
-            break;
-        }
-    }
+        } else {
+            entry
+        };
 
-    {
-        let mut vm = task.vm_map.lock();
-        vm.clear();
-        let mut pmap = vm.pmap_lock();
-        let mut old_pmap = core::mem::replace(&mut *pmap, crate::mm::pmap::pmap_create());
-        crate::mm::pmap::pmap_activate(&mut pmap);
-        crate::mm::pmap::pmap_destroy(&mut old_pmap);
-    }
-
-    let mut brk_end: usize = 0;
-    for phdr in phdrs {
-        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
-            continue;
-        }
-
-        let va_start = ((phdr.p_vaddr as usize) + load_bias) & !(PAGE_SIZE - 1);
-        let va_end_raw = phdr.p_vaddr as usize + load_bias + phdr.p_memsz as usize;
-        let va_end = (va_end_raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-        let prot = elf_flags_to_prot(phdr.p_flags);
-        let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
-
-        let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new_anon(obj_size);
-        obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
-            vnode_id: vnode.vnode_id() as usize,
-            path: alloc::string::String::from(vnode.path()),
-        }));
-
-        let vma = VmMapEntry::new(
-            va_start as u64,
-            va_end as u64,
+        let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+        let stack_obj = VmObject::new_anon(USER_STACK_SIZE / PAGE_SIZE);
+        let stack_vma = VmMapEntry::new(
+            stack_bottom as u64,
+            USER_STACK_TOP as u64,
             BackingStore::Object {
-                object: obj,
-                offset: file_offset_page_aligned as u64,
+                object: stack_obj,
+                offset: 0,
             },
             crate::mm::vm::map::entry::EntryFlags::empty(),
-            prot,
-        );
-
-        let mut vm = task.vm_map.lock();
-        if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
-            return Err(map_insert_err(e));
-        }
-
-        if va_end > brk_end {
-            brk_end = va_end;
-        }
-    }
-
-    task.brk
-        .store(brk_end, core::sync::atomic::Ordering::Relaxed);
-
-    let final_entry = if let Some(ref ipath) = interp_path {
-        klog!(exec, debug, "exec pid={} loading interp={}", task.pid, ipath);
-        match load_interp(task, ipath, DL_INTERP_OFFSET).await {
-            Ok(interp_entry) => {
-                klog!(exec, debug, "exec pid={} interp entry={:#x}", task.pid, interp_entry);
-                interp_entry
-            }
-            Err(e) => {
-                klog!(exec, error, "exec pid={} failed to load interp {}: {:?}", task.pid, ipath, e);
-                return Err(e);
-            }
-        }
-    } else {
-        entry
-    };
-
-    let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
-    let stack_obj = VmObject::new_anon(USER_STACK_SIZE / PAGE_SIZE);
-    let stack_vma = VmMapEntry::new(
-        stack_bottom as u64,
-        USER_STACK_TOP as u64,
-        BackingStore::Object {
-            object: stack_obj,
-            offset: 0,
-        },
-        crate::mm::vm::map::entry::EntryFlags::empty(),
-        crate::map_perm!(R, W, U),
-    );
-    {
-        let mut vm = task.vm_map.lock();
-        if vm.insert_entry(stack_vma).is_err() {
-            return Err(Errno::Enomem);
-        }
-    }
-
-    task.fd_table.lock().strip_cloexec();
-
-    {
-        let vm_map = task.vm_map.lock();
-        let mut pmap = vm_map.pmap_lock();
-        crate::proc::signal::map_sigcode_page(&mut pmap);
-    }
-
-    {
-        let mut actions = task.signals.actions.lock();
-        for act in actions.iter_mut() {
-            if act.handler != crate::proc::signal::SIG_DFL && act.handler != crate::proc::signal::SIG_IGN {
-                act.handler = crate::proc::signal::SIG_DFL;
-                act.flags = 0;
-                act.mask = 0;
-            }
-        }
-    }
-    task.signals.pending.store(
-        crate::proc::signal::SigSet(0),
-        core::sync::atomic::Ordering::Relaxed,
-    );
-    task.signals.blocked.store(
-        crate::proc::signal::SigSet(0),
-        core::sync::atomic::Ordering::Relaxed,
-    );
-
-    klog!(exec, debug, "exec pid={} entry={:#x} sp={:#x}", task.pid, final_entry, USER_STACK_TOP);
-    Ok((final_entry, USER_STACK_TOP))
-}
-
-/// Execute an ELF binary with argv/envp.
-pub async fn exec_with_args(
-    task: &Arc<Task>,
-    elf_path: &str,
-    argv: &[String],
-    envp: &[String],
-) -> Result<(usize, usize), Errno> {
-    let (entry, _) = exec(task, elf_path).await?;
-
-    let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-    let vm_page = crate::mm::allocator::alloc_anon_sync().expect("OOM when allocating user stack");
-    let phys = vm_page.phys();
-    crate::mm::pmap::pmap_zero_page(phys);
-
-    {
-        let mut vm = task.vm_map.lock();
-        if let Some(vma) = vm.lookup_mut(stack_page_va as u64) {
-            let page_idx = crate::hal_common::addr::VirtPageNum(
-                (stack_page_va - vma.start as usize) / PAGE_SIZE
-                    + match &vma.store {
-                        BackingStore::Object { offset, .. } => *offset as usize / PAGE_SIZE,
-                        _ => 0,
-                    },
-            );
-            if let BackingStore::Object { object, .. } = &vma.store {
-                let mut obj = object.write();
-                let mut page = crate::mm::vm::page::VmPage::new();
-                page.phys_addr = phys;
-                obj.insert_page(page_idx, Arc::new(page));
-            }
-        } else {
-            return Err(Errno::Enomem);
-        }
-
-        let mut pmap = vm.pmap_lock();
-        let _ = crate::mm::pmap::pmap_enter(
-            &mut pmap,
-            VirtAddr::new(stack_page_va),
-            phys,
             crate::map_perm!(R, W, U),
-            false,
         );
+        {
+            let mut vm = task.vm_map.lock();
+            if vm.insert_entry(stack_vma).is_err() {
+                return Err(Errno::Enomem);
+            }
+        }
+
+        task.fd_table.lock().strip_cloexec();
+
+        {
+            let vm_map = task.vm_map.lock();
+            let mut pmap = vm_map.pmap_lock();
+            crate::proc::signal::map_sigcode_page(&mut pmap);
+        }
+
+        {
+            let mut actions = task.signals.actions.lock();
+            for act in actions.iter_mut() {
+                if act.handler != crate::proc::signal::SIG_DFL
+                    && act.handler != crate::proc::signal::SIG_IGN
+                {
+                    act.handler = crate::proc::signal::SIG_DFL;
+                    act.flags = 0;
+                    act.mask = 0;
+                }
+            }
+        }
+        task.signals.pending.store(
+            crate::proc::signal::SigSet(0),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        task.signals.blocked.store(
+            crate::proc::signal::SigSet(0),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+
+        klog!(
+            exec,
+            debug,
+            "exec pid={} entry={:#x} sp={:#x}",
+            task.pid,
+            final_entry,
+            USER_STACK_TOP
+        );
+        Ok((final_entry, USER_STACK_TOP))
     }
 
-    let mut cursor = crate::hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
-    let stack_page_vbase = VirtAddr::new(stack_page_va);
+    /// Execute an ELF binary with argv/envp.
+    pub async fn exec_with_args(
+        task: &Arc<Task>,
+        elf_path: &str,
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<(usize, usize), Errno> {
+        let (entry, _) = exec(task, elf_path).await?;
 
-    let random_va = {
-        let slice = cursor.alloc_down_bytes(16).unwrap();
-        slice.fill(0);
-        cursor.current_va(stack_page_vbase)
-    };
+        let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
+        let vm_page =
+            crate::mm::allocator::alloc_anon_sync().expect("OOM when allocating user stack");
+        let phys = vm_page.phys();
+        crate::mm::pmap::pmap_zero_page(phys);
 
-    let mut argv_vas: Vec<usize> = Vec::with_capacity(argv.len());
-    for arg in argv {
-        let s = arg.as_bytes();
-        let len = s.len() + 1;
-        let slice = cursor.alloc_down_bytes(len).unwrap();
-        slice[..s.len()].copy_from_slice(s);
-        slice[s.len()] = 0;
-        argv_vas.push(cursor.current_va(stack_page_vbase).as_usize());
+        {
+            let mut vm = task.vm_map.lock();
+            if let Some(vma) = vm.lookup_mut(stack_page_va as u64) {
+                let page_idx = crate::hal_common::addr::VirtPageNum(
+                    (stack_page_va - vma.start as usize) / PAGE_SIZE
+                        + match &vma.store {
+                            BackingStore::Object { offset, .. } => *offset as usize / PAGE_SIZE,
+                            _ => 0,
+                        },
+                );
+                if let BackingStore::Object { object, .. } = &vma.store {
+                    let mut obj = object.write();
+                    let mut page = crate::mm::vm::page::VmPage::new();
+                    page.phys_addr = phys;
+                    obj.insert_page(page_idx, Arc::new(page));
+                }
+            } else {
+                return Err(Errno::Enomem);
+            }
+
+            let mut pmap = vm.pmap_lock();
+            let _ = crate::mm::pmap::pmap_enter(
+                &mut pmap,
+                VirtAddr::new(stack_page_va),
+                phys,
+                crate::map_perm!(R, W, U),
+                false,
+            );
+        }
+
+        let mut cursor = crate::hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
+        let stack_page_vbase = VirtAddr::new(stack_page_va);
+
+        let random_va = {
+            let slice = cursor.alloc_down_bytes(16).unwrap();
+            slice.fill(0);
+            cursor.current_va(stack_page_vbase)
+        };
+
+        let mut argv_vas: Vec<usize> = Vec::with_capacity(argv.len());
+        for arg in argv {
+            let s = arg.as_bytes();
+            let len = s.len() + 1;
+            let slice = cursor.alloc_down_bytes(len).unwrap();
+            slice[..s.len()].copy_from_slice(s);
+            slice[s.len()] = 0;
+            argv_vas.push(cursor.current_va(stack_page_vbase).as_usize());
+        }
+        let mut envp_vas: Vec<usize> = Vec::with_capacity(envp.len());
+        for env in envp {
+            let s = env.as_bytes();
+            let len = s.len() + 1;
+            let slice = cursor.alloc_down_bytes(len).unwrap();
+            slice[..s.len()].copy_from_slice(s);
+            slice[s.len()] = 0;
+            envp_vas.push(cursor.current_va(stack_page_vbase).as_usize());
+        }
+
+        let auxv: [(usize, usize); 4] = [
+            (AT_PAGESZ, PAGE_SIZE),
+            (AT_ENTRY, entry),
+            (AT_RANDOM, random_va.as_usize()),
+            (AT_NULL, 0),
+        ];
+
+        let n_slots = 1 + argv.len() + 1 + envp.len() + 1 + auxv.len() * 2;
+        let slots_bytes = n_slots * core::mem::size_of::<usize>();
+
+        cursor.align_down(16);
+
+        let prev_offset = cursor.current_offset();
+        if prev_offset < slots_bytes {
+            return Err(Errno::Enomem);
+        }
+        let new_offset = prev_offset - slots_bytes;
+        let sp_va = stack_page_vbase.as_usize() + new_offset;
+
+        let slice_ptr: *mut u8;
+        {
+            let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::Enomem)?;
+            slice_ptr = allocated.as_mut_ptr();
+        }
+        let slice = unsafe { core::slice::from_raw_parts_mut(slice_ptr, slots_bytes) };
+
+        let mut offset = 0;
+        let mut write_usize = |val: usize| {
+            slice[offset..offset + core::mem::size_of::<usize>()]
+                .copy_from_slice(&val.to_ne_bytes());
+            offset += core::mem::size_of::<usize>();
+        };
+
+        write_usize(argv.len());
+        for va in &argv_vas {
+            write_usize(*va);
+        }
+        write_usize(0);
+
+        for va in &envp_vas {
+            write_usize(*va);
+        }
+        write_usize(0);
+
+        for &(atype, aval) in &auxv {
+            write_usize(atype);
+            write_usize(aval);
+        }
+
+        Ok((entry, sp_va))
     }
-    let mut envp_vas: Vec<usize> = Vec::with_capacity(envp.len());
-    for env in envp {
-        let s = env.as_bytes();
-        let len = s.len() + 1;
-        let slice = cursor.alloc_down_bytes(len).unwrap();
-        slice[..s.len()].copy_from_slice(s);
-        slice[s.len()] = 0;
-        envp_vas.push(cursor.current_va(stack_page_vbase).as_usize());
-    }
-
-    let auxv: [(usize, usize); 4] = [
-        (AT_PAGESZ, PAGE_SIZE),
-        (AT_ENTRY, entry),
-        (AT_RANDOM, random_va.as_usize()),
-        (AT_NULL, 0),
-    ];
-
-    let n_slots = 1 + argv.len() + 1 + envp.len() + 1 + auxv.len() * 2;
-    let slots_bytes = n_slots * core::mem::size_of::<usize>();
-
-    cursor.align_down(16);
-
-    let prev_offset = cursor.current_offset();
-    if prev_offset < slots_bytes {
-        return Err(Errno::Enomem);
-    }
-    let new_offset = prev_offset - slots_bytes;
-    let sp_va = stack_page_vbase.as_usize() + new_offset;
-
-    let slice_ptr: *mut u8;
-    {
-        let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::Enomem)?;
-        slice_ptr = allocated.as_mut_ptr();
-    }
-    let slice = unsafe { core::slice::from_raw_parts_mut(slice_ptr, slots_bytes) };
-
-    let mut offset = 0;
-    let mut write_usize = |val: usize| {
-        slice[offset..offset + core::mem::size_of::<usize>()].copy_from_slice(&val.to_ne_bytes());
-        offset += core::mem::size_of::<usize>();
-    };
-
-    write_usize(argv.len());
-    for va in &argv_vas {
-        write_usize(*va);
-    }
-    write_usize(0);
-
-    for va in &envp_vas {
-        write_usize(*va);
-    }
-    write_usize(0);
-
-    for &(atype, aval) in &auxv {
-        write_usize(atype);
-        write_usize(aval);
-    }
-
-    Ok((entry, sp_va))
-}
-
 } // mod legacy
 
 // Re-export legacy functions when feature is enabled
@@ -912,13 +932,6 @@ fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), V
     vm.insert_entry(new_vma)
 }
 
-fn map_insert_err(err: VmError) -> Errno {
-    match err {
-        VmError::Overlap | VmError::InvalidRange => Errno::Enoexec,
-        VmError::NotFound => Errno::Enomem,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // exec()
 // ---------------------------------------------------------------------------
@@ -947,17 +960,16 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     let hdr_frame =
         crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
             .ok_or(Errno::Enomem)?;
-    let hdr_pa =
-        match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame).await {
-            Ok(()) => {
-                crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
-                hdr_frame
-            }
-            Err(_) => {
-                crate::mm::allocator::free_raw_frame(hdr_frame);
-                return Err(Errno::Enoexec);
-            }
-        };
+    let hdr_pa = match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame).await {
+        Ok(()) => {
+            crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
+            hdr_frame
+        }
+        Err(_) => {
+            crate::mm::allocator::free_raw_frame(hdr_frame);
+            return Err(Errno::Enoexec);
+        }
+    };
 
     // Parse from the physical page (identity-mapped in kernel)
     let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
@@ -1198,7 +1210,8 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         }
     };
 
-    let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_frame.as_usize() as *const u8, PAGE_SIZE) };
+    let hdr_buf =
+        unsafe { core::slice::from_raw_parts(hdr_frame.as_usize() as *const u8, PAGE_SIZE) };
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
     let interp_entry = elf_hdr.e_entry as usize + offset;

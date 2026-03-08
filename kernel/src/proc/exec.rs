@@ -5,6 +5,10 @@
 //!   Stage 2: Build new address space in temporary VmMap (can fail, no state change)
 //!   Stage 3: Point of no return -- atomic swap of old address space with new
 //!
+//! All page allocation goes through VmObject methods (fetch_page_async,
+//! fault_allocate_anon, new_vnode_region) — never the allocator directly.
+//! ELF file pages are fetched via VmObject's pager interface.
+//!
 //! The old exec()/exec_with_args() functions are preserved behind the
 //! "exec-legacy" feature flag for debugging.
 
@@ -107,23 +111,20 @@ pub async fn do_execve(
         return Err(Errno::Enoexec);
     }
 
-    // 1b. Allocate a temporary frame, read first page
-    let hdr_frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(Errno::Enomem)?;
-    match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
-        Ok(()) => {
-            crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
-        }
-        Err(_) => {
-            crate::mm::allocator::free_raw_frame(hdr_frame);
-            return Err(Errno::Enoexec);
-        }
-    };
+    // 1b. Create a file-backed VmObject for the ELF vnode and fetch page 0
+    //     through the pager (not the allocator directly).
+    let elf_obj = VmObject::new_file(&*vnode);
+    VmObject::fetch_page_async(Arc::clone(&elf_obj), crate::hal_common::addr::VirtPageNum(0))
+        .await
+        .map_err(|_| Errno::Enoexec)?;
 
     // 1c. Parse ELF header + program headers via goblin
+    let hdr_phys = elf_obj
+        .read()
+        .lookup_page(crate::hal_common::addr::VirtPageNum(0))
+        .ok_or(Errno::Enoexec)?;
     let hdr_buf =
-        unsafe { core::slice::from_raw_parts(hdr_frame.as_usize() as *const u8, PAGE_SIZE) };
+        unsafe { core::slice::from_raw_parts(hdr_phys.as_usize() as *const u8, PAGE_SIZE) };
 
     let (ehdr, phdrs) = match super::elf::parse_elf_first_page(hdr_buf) {
         Ok(parsed) => parsed,
@@ -153,11 +154,11 @@ pub async fn do_execve(
         let file_offset_page_aligned = region.offset & !(PAGE_SIZE - 1);
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new_anon(obj_size);
-        obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
-            vnode_id: vnode.vnode_id() as usize,
-            path: String::from(vnode.path()),
-        }));
+        let obj = VmObject::new_vnode_region(
+            vnode.vnode_id() as usize,
+            vnode.path(),
+            obj_size,
+        );
 
         let vma = VmMapEntry::new(
             va_start as u64,
@@ -196,6 +197,7 @@ pub async fn do_execve(
     // 2d. Create user stack VMA (anonymous, RW)
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
     let stack_obj = VmObject::new_anon(USER_STACK_SIZE / PAGE_SIZE);
+    let stack_obj_ref = Arc::clone(&stack_obj);
     let stack_vma = VmMapEntry::new(
         stack_bottom as u64,
         USER_STACK_TOP as u64,
@@ -212,31 +214,18 @@ pub async fn do_execve(
 
     // 2e. Set up argv/envp/auxv on top stack page
     let (sp_va, entry_for_auxv) = {
-        // Eagerly allocate and map the top stack page
+        // Eagerly allocate the top stack page through the stack VmObject
         let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-        let vm_page =
-            crate::mm::allocator::alloc_anon_sync().expect("OOM when allocating user stack");
-        let phys = vm_page.phys();
-        crate::mm::pmap::pmap_zero_page(phys);
+        let stack_page_idx = crate::hal_common::addr::VirtPageNum(
+            (USER_STACK_SIZE / PAGE_SIZE) - 1,
+        );
 
-        // Insert page into the stack VMA's VmObject
-        if let Some(vma) = new_vm.lookup_mut(stack_page_va as u64) {
-            let page_idx = crate::hal_common::addr::VirtPageNum(
-                (stack_page_va - vma.start as usize) / PAGE_SIZE
-                    + match &vma.store {
-                        BackingStore::Object { offset, .. } => *offset as usize / PAGE_SIZE,
-                        _ => 0,
-                    },
-            );
-            if let BackingStore::Object { object, .. } = &vma.store {
-                let mut obj = object.write();
-                let mut page = crate::mm::vm::page::VmPage::new();
-                page.phys_addr = phys;
-                obj.insert_page(page_idx, Arc::new(page));
-            }
-        } else {
-            return Err(Errno::Enomem);
-        }
+        // Allocate and zero the page via VmObject (not the allocator directly)
+        let phys = {
+            let mut obj = stack_obj_ref.write();
+            obj.fault_allocate_anon(stack_page_idx)
+                .map_err(|_| Errno::Enomem)?
+        };
 
         // Map in new pmap
         {
@@ -351,7 +340,7 @@ pub async fn do_execve(
     {
         let mut vm = task.vm_map.lock();
         // Replace the old VmMap; old one drops automatically
-        let mut old_vm = core::mem::replace(&mut *vm, new_vm);
+        let old_vm = core::mem::replace(&mut *vm, new_vm);
         // Destroy old pmap: switch satp first, then free old page tables
         let mut new_pmap_guard = vm.pmap_lock();
         crate::mm::pmap::pmap_activate(&mut new_pmap_guard);
@@ -408,6 +397,8 @@ pub async fn do_execve(
 
 /// Load an interpreter ELF into the given VmMap at the specified offset.
 /// Used by do_execve to load into the temporary VmMap before swap.
+///
+/// Pages are fetched through VmObject's pager interface, not the allocator.
 async fn load_interp_into(
     vm: &mut VmMap,
     interp_path: &str,
@@ -418,21 +409,21 @@ async fn load_interp_into(
         return Err(Errno::Enoexec);
     }
 
-    let hdr_frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(Errno::Enomem)?;
-    match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
-        Ok(()) => {
-            crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
-        }
-        Err(_) => {
-            crate::mm::allocator::free_raw_frame(hdr_frame);
-            return Err(Errno::Enoexec);
-        }
-    };
+    // Fetch the interpreter's first page through a VmObject
+    let interp_obj = VmObject::new_file(&*vnode);
+    VmObject::fetch_page_async(
+        Arc::clone(&interp_obj),
+        crate::hal_common::addr::VirtPageNum(0),
+    )
+    .await
+    .map_err(|_| Errno::Enoexec)?;
 
+    let hdr_phys = interp_obj
+        .read()
+        .lookup_page(crate::hal_common::addr::VirtPageNum(0))
+        .ok_or(Errno::Enoexec)?;
     let hdr_buf =
-        unsafe { core::slice::from_raw_parts(hdr_frame.as_usize() as *const u8, PAGE_SIZE) };
+        unsafe { core::slice::from_raw_parts(hdr_phys.as_usize() as *const u8, PAGE_SIZE) };
 
     // Use the hand-rolled parser for interp (same as legacy path, works fine)
     let elf_hdr = parse_elf_header(hdr_buf)?;
@@ -452,11 +443,11 @@ async fn load_interp_into(
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new_anon(obj_size);
-        obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
-            vnode_id: vnode.vnode_id() as usize,
-            path: String::from(vnode.path()),
-        }));
+        let obj = VmObject::new_vnode_region(
+            vnode.vnode_id() as usize,
+            vnode.path(),
+            obj_size,
+        );
         let vma = VmMapEntry::new(
             va_start as u64,
             va_end as u64,

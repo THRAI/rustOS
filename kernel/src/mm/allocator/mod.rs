@@ -1,4 +1,14 @@
-//! Memory allocator subsystem.
+//! Memory allocator subsystem — internal to the VM layer.
+//!
+//! **API boundary:** Process-level code (exec, fork) and filesystem code should
+//! NOT call these functions directly. Instead, use VmObject methods:
+//! - `VmObject::fetch_page_async()` — fetch a page through the pager
+//! - `VmObject::fault_allocate_anon()` — allocate a zeroed anonymous page
+//! - `VmObject::new_vnode_region()` — create a file-backed VmObject
+//! - `VmObject::new_file()` — create a VmObject for a whole vnode
+//!
+//! Direct allocator use is reserved for VM internals (fault handlers, pmap),
+//! drivers (DMA buffers), and boot-time infrastructure.
 //!
 //! - `buddy`: Buddy system frame allocator with split/coalesce
 //! - `magazine`: Per-CPU magazine cache for lock-free order-0 fast path

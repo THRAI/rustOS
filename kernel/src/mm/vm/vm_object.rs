@@ -169,7 +169,7 @@ impl VmObject {
     }
 
     /// Create a new file-backed VmObject.
-    pub fn new_file(vnode: &impl Vnode) -> Arc<RwLock<Self>> {
+    pub fn new_file(vnode: &(impl Vnode + ?Sized)) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             pages: BTreeMap::new(),
             backing: None,
@@ -179,6 +179,28 @@ impl VmObject {
                 path: vnode.path().into(),
             })),
             size: vnode.size() as usize,
+            resident_count: 0,
+            paging_in_progress: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
+            clean_generation: AtomicU32::new(0),
+        }))
+    }
+
+    /// Create a file-backed VmObject for a specific region of a vnode.
+    ///
+    /// Unlike `new_file` which uses the full file size, this creates an object
+    /// with the given size (in pages) backed by the vnode's pager.
+    /// Used by exec to create per-segment VmObjects without touching the allocator.
+    pub fn new_vnode_region(vnode_id: usize, path: &str, size_pages: usize) -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(Self {
+            pages: BTreeMap::new(),
+            backing: None,
+            shadow_count: 0,
+            pager: Some(Arc::new(VnodePager {
+                vnode_id,
+                path: path.into(),
+            })),
+            size: size_pages,
             resident_count: 0,
             paging_in_progress: AtomicU32::new(0),
             generation: AtomicU32::new(0),

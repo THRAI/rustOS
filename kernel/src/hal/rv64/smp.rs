@@ -4,13 +4,12 @@
 //! then calls secondary_rust_main which initializes PerCpu, trap vectors,
 //! timer, and enters the executor loop.
 
-use super::sbi;
 use super::fdt;
+use super::sbi;
 
 /// Boot all secondary harts. Called by hart 0 after its own init is complete.
 pub fn boot_secondary_harts(num_cpus: usize, hartids: &[usize], boot_hartid: usize) {
-    for i in 0..num_cpus {
-        let hartid = hartids[i];
+    for &hartid in hartids.iter().take(num_cpus) {
         if hartid == boot_hartid {
             continue; // skip boot hart
         }
@@ -19,11 +18,17 @@ pub fn boot_secondary_harts(num_cpus: usize, hartids: &[usize], boot_hartid: usi
 
         let ret = sbi::hart_start(
             hartid,
-            secondary_entry as usize,
+            secondary_entry as *const () as usize,
             cpu_id, // passed as a0 (opaque) to the entry point
         );
         if ret.error != 0 {
-            klog!(smp, error, "hart_start for hart {} failed: error={}", hartid, ret.error);
+            klog!(
+                smp,
+                error,
+                "hart_start for hart {} failed: error={}",
+                hartid,
+                ret.error
+            );
         }
     }
 }
@@ -81,7 +86,13 @@ extern "C" fn secondary_rust_main(cpu_id: usize) -> ! {
     // Enable global interrupts
     super::irq::enable();
 
-    klog!(smp, info, "hart {} (cpu {}) entering executor loop", hartid, cpu_id);
+    klog!(
+        smp,
+        info,
+        "hart {} (cpu {}) entering executor loop",
+        hartid,
+        cpu_id
+    );
 
     // Enter the executor loop (never returns)
     crate::executor::executor_loop()

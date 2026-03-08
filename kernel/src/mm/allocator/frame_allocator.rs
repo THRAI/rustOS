@@ -69,9 +69,9 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
         );
 
         // Initialize each VmPage correctly, particularly its physical address link
-        for pfn in 0..max_pfn {
-            meta_array[pfn] = crate::mm::vm::page::VmPage::new();
-            meta_array[pfn].phys_addr = PhysAddr::new(pfn * PAGE_SIZE);
+        for (pfn, meta) in meta_array.iter_mut().enumerate() {
+            *meta = crate::mm::vm::page::VmPage::new();
+            meta.phys_addr = PhysAddr::new(pfn * PAGE_SIZE);
         }
 
         crate::mm::allocator::types::FRAME_META = meta_array.as_mut_ptr();

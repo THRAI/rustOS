@@ -65,7 +65,7 @@ pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
                 dentry::insert(parent_id, component, Arc::clone(&child));
                 current = child;
             }
-            Err(_) => return Err(Errno::ENOENT),
+            Err(_) => return Err(Errno::Enoent),
         }
     }
 

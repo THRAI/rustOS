@@ -23,7 +23,7 @@ fn read_rdtime() -> u64 {
 pub fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(), Errno> {
     let _ = task; // used for user memory access context
     if tp == 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
 
     let ticks = read_rdtime();
@@ -36,7 +36,7 @@ pub fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(
         crate::hal::rv64::copy_user::copy_user_chunk(tp as *mut u8, ts.as_ptr() as *const u8, 16)
     };
     if rc != 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
     Ok(())
 }
@@ -47,7 +47,7 @@ pub fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(
 pub fn sys_gettimeofday(task: &Arc<Task>, tv: usize, _tz: usize) -> Result<(), Errno> {
     let _ = task;
     if tv == 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
 
     let ticks = read_rdtime();
@@ -64,7 +64,7 @@ pub fn sys_gettimeofday(task: &Arc<Task>, tv: usize, _tz: usize) -> Result<(), E
         )
     };
     if rc != 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
     Ok(())
 }
@@ -76,7 +76,7 @@ pub async fn sys_nanosleep_async(
     rem_ptr: usize,
 ) -> Result<(), Errno> {
     if req_ptr == 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
 
     // Read struct timespec from user memory
@@ -89,7 +89,7 @@ pub async fn sys_nanosleep_async(
         )
     };
     if rc != 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
     let secs = ts[0];
     let nsecs = ts[1];
@@ -121,7 +121,7 @@ pub async fn sys_nanosleep_async(
                     )
                 };
             }
-            return Err(Errno::EINTR);
+            return Err(Errno::Eintr);
         }
 
         let now = crate::hal::rv64::timer::read_time_ms();
@@ -167,14 +167,14 @@ pub async fn sys_futex_async(
             let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
             if current != val {
                 // Value changed — don't sleep
-                return Err(Errno::EAGAIN);
+                return Err(Errno::Eagain);
             }
             // Resolve physical address for futex key
             let pa = {
                 let vm_map = task.vm_map.lock();
                 let pmap = vm_map.pmap_lock();
                 crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
-                    .ok_or(Errno::EFAULT)?
+                    .ok_or(Errno::Efault)?
             };
             let pa_key = PhysAddr::new(pa.as_usize() + (uaddr & 0xFFF));
             // Park on the futex
@@ -187,12 +187,12 @@ pub async fn sys_futex_async(
                 let vm_map = task.vm_map.lock();
                 let pmap = vm_map.pmap_lock();
                 crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
-                    .ok_or(Errno::EFAULT)?
+                    .ok_or(Errno::Efault)?
             };
             let pa_key = PhysAddr::new(pa.as_usize() + (uaddr & 0xFFF));
             let woken = crate::ipc::futex::futex_wake(pa_key, val as usize);
             Ok(woken)
         }
-        _ => Err(Errno::ENOSYS),
+        _ => Err(Errno::Enosys),
     }
 }

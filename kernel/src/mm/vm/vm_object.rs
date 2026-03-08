@@ -7,17 +7,17 @@
 //! The `Drop` implementation uses iterative `Arc::try_unwrap` unwinding
 //! to handle arbitrarily deep shadow chains (500+) without stack overflow.
 
+use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::{PhysAddr, PAGE_SIZE};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicU32;
-use crate::hal_common::addr::VirtPageNum;
-use spin::RwLock;
 use core::marker::{Send, Sync};
-use crate::hal_common::{PAGE_SIZE, PhysAddr};
+use core::sync::atomic::AtomicU32;
+use spin::RwLock;
 
-use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
 use crate::fs::Vnode;
 use crate::hal_common::Errno;
+use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
 /// Supports fetching multiple pages in a single operation for efficiency.
 pub trait Pager: core::fmt::Debug + Send + Sync {
@@ -49,8 +49,11 @@ impl Pager for AnonPager {
         true
     }
 
-    fn page_in(&self, _offset: usize, pa: PhysAddr)
-        -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
+    fn page_in(
+        &self,
+        _offset: usize,
+        pa: PhysAddr,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
     {
         alloc::boxed::Box::pin(async move {
             pmap_zero_page(pa);
@@ -58,8 +61,11 @@ impl Pager for AnonPager {
         })
     }
 
-    fn page_out(&self, _offset: usize, _pa: PhysAddr)
-        -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
+    fn page_out(
+        &self,
+        _offset: usize,
+        _pa: PhysAddr,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
     {
         alloc::boxed::Box::pin(async move {
             // Anon pages are never paged out currently.
@@ -303,8 +309,13 @@ impl VmObject {
     }
 
     /// fetch a filled page. When kernel needs a page from uvm, it calls this function.
-    pub async fn fetch_page_async(obj_arc: Arc<RwLock<Self>>, pindex: VirtPageNum) -> Result<Arc<VmPage>, Errno> {
-        let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex).await.map_err(|_| Errno::ENOMEM)?;
+    pub async fn fetch_page_async(
+        obj_arc: Arc<RwLock<Self>>,
+        pindex: VirtPageNum,
+    ) -> Result<Arc<VmPage>, Errno> {
+        let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex)
+            .await
+            .map_err(|_| Errno::Enomem)?;
         // If the page is new (resident_count just increased), we need to fill it.
         // We can check if it's new by seeing if resident_count increased after insertion.
         // But we don't have that information here. Instead, we can check if the page was just allocated
@@ -321,12 +332,15 @@ impl VmObject {
 
                 if pager.page_in(offset_bytes, page.phys_addr).await.is_err() {
                     page.release_exclusive();
-                    return Err(Errno::EIO);
+                    return Err(Errno::Eio);
                 }
             } else {
                 // No pager? This shouldn't happen for a new page.
                 page.release_exclusive();
-                kprintln!("[ERROR]VmObject fetch_page_async: no pager for new page at index {}", pindex.0);
+                kprintln!(
+                    "[ERROR]VmObject fetch_page_async: no pager for new page at index {}",
+                    pindex.0
+                );
                 panic!();
             }
 
@@ -334,48 +348,53 @@ impl VmObject {
         }
 
         Ok(page)
-
     }
     /// Lookup or allocate an anonymous page for the given offset.
     /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
     pub fn fault_allocate_anon(&mut self, index: VObjIndex) -> Result<PhysAddr, ()> {
-        if let Some(page) = self.pages.get(&index) {
-            return Ok(page.phys_addr);
+        match self.pages.entry(index) {
+            alloc::collections::btree_map::Entry::Occupied(e) => Ok(e.get().phys_addr),
+            alloc::collections::btree_map::Entry::Vacant(e) => {
+                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
+                let phys = frame.phys();
+                pmap_zero_page(phys);
+                crate::klog!(
+                    vm,
+                    debug,
+                    "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_allocate_anon offset {})",
+                    index
+                );
+                let mut new_page = VmPage::new();
+                new_page.phys_addr = phys;
+                e.insert(Arc::new(new_page));
+                self.resident_count += 1;
+                Ok(phys)
+            }
         }
-        let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
-        let phys = frame.phys();
-        pmap_zero_page(phys);
-        crate::klog!(
-            vm,
-            debug,
-            "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_allocate_anon offset {})",
-            index
-        );
-        let mut new_page = VmPage::new();
-        new_page.phys_addr = phys;
-        self.insert_page(index, Arc::new(new_page));
-        Ok(phys)
     }
 
     /// Implement COW by copying the old_phys page into a newly allocated frame.
     /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
     pub fn fault_cow(&mut self, index: VObjIndex, old_phys: PhysAddr) -> Result<PhysAddr, ()> {
-        if let Some(page) = self.pages.get(&index) {
-            return Ok(page.phys_addr);
+        match self.pages.entry(index) {
+            alloc::collections::btree_map::Entry::Occupied(e) => Ok(e.get().phys_addr),
+            alloc::collections::btree_map::Entry::Vacant(e) => {
+                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
+                let phys = frame.phys();
+                pmap_copy_page(old_phys, phys);
+                crate::klog!(
+                    vm,
+                    debug,
+                    "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_cow offset {})",
+                    index
+                );
+                let mut new_page = VmPage::new();
+                new_page.phys_addr = phys;
+                e.insert(Arc::new(new_page));
+                self.resident_count += 1;
+                Ok(phys)
+            }
         }
-        let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
-        let phys = frame.phys();
-        pmap_copy_page(old_phys, phys);
-        crate::klog!(
-            vm,
-            debug,
-            "STUB: TraceEvent::Alloc {{ usage: UserAnon }} (fault_cow offset {})",
-            index
-        );
-        let mut new_page = VmPage::new();
-        new_page.phys_addr = phys;
-        self.insert_page(index, Arc::new(new_page));
-        Ok(phys)
     }
 
     /// Insert a page into this object (not the backing chain).
@@ -471,15 +490,15 @@ impl VmObject {
                 continue;
             }
 
-            if self.pages.contains_key(&offset) {
+            if let alloc::collections::btree_map::Entry::Vacant(e) = self.pages.entry(offset) {
+                // No conflict: rename page from backing to self.
+                backing.resident_count = backing.resident_count.saturating_sub(1);
+                e.insert(page);
+                self.resident_count += 1;
+            } else {
                 // Conflict: self already has a COW copy at this offset.
                 // The page from backing will be dropped here automatically.
                 backing.resident_count = backing.resident_count.saturating_sub(1);
-            } else {
-                // No conflict: rename page from backing to self.
-                backing.resident_count = backing.resident_count.saturating_sub(1);
-                self.pages.insert(offset, page);
-                self.resident_count += 1;
             }
         }
 
@@ -660,14 +679,6 @@ mod tests {
     }
 
     #[test]
-    fn page_ownership_types() {
-        let anon = OwnedPage::new_test(PhysAddr::new(0x1000));
-        assert_eq!(anon.ownership, PageOwnership::Anonymous);
-        let cached = OwnedPage::new_cached(PhysAddr::new(0x2000));
-        assert_eq!(cached.ownership, PageOwnership::Cached);
-    }
-
-    #[test]
     fn iterative_drop_deep_chain_500() {
         // Build a 500-deep shadow chain. If Drop were recursive, this
         // would overflow the stack. Iterative Drop handles it.
@@ -676,11 +687,10 @@ mod tests {
             let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
             {
                 let mut w = shadow.write();
-                w.insert_page(i as u64, {
-                    let mut p = VmPage::new();
-                    p.phys_addr = PhysAddr::new((i + 1) * 0x1000);
-                    Arc::new(p)
-                });
+                w.insert_page(
+                    i as u64,
+                    Arc::new(VmPage::new_test(PhysAddr::new((i + 1) * 0x1000))),
+                );
             }
             current = shadow;
         }

@@ -3,10 +3,10 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use crate::klog;
+// use crate::klog;
+use crate::hal_common::Errno;
 use crate::proc::signal::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
 use crate::proc::task::Task;
-use crate::hal_common::Errno;
 
 pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     klog!(signal, debug, "sigreturn pid={}", task.pid);
@@ -22,14 +22,14 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
         )
     };
     if ok != 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
     let frame = unsafe { frame.assume_init() };
 
     // Validate sepc: must be in user space (< 0x0000_0040_0000_0000)
     const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
     if frame.saved_tf.sepc >= USER_MAX_VA {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     // Restore trap frame with sanitization
@@ -62,10 +62,10 @@ pub fn sys_sigaction(
     oldact_ptr: usize,
 ) -> Result<usize, Errno> {
     if sig < 1 || sig > MAX_SIG as usize {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
     if sig == SIGKILL as usize || sig == SIGSTOP as usize {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     let idx = sig - 1;
@@ -83,7 +83,7 @@ pub fn sys_sigaction(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
     }
 
@@ -98,7 +98,7 @@ pub fn sys_sigaction(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
         actions[idx] = SigAction {
             handler: buf[0] as usize,
@@ -134,7 +134,7 @@ pub fn sys_sigprocmask(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
     }
 
@@ -148,7 +148,7 @@ pub fn sys_sigprocmask(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
 
         let unblockable = crate::proc::signal::SigSet::empty()
@@ -169,7 +169,7 @@ pub fn sys_sigprocmask(
             SIG_SETMASK => {
                 sig_state.blocked.store(set, Ordering::Release);
             }
-            _ => return Err(Errno::EINVAL),
+            _ => return Err(Errno::Einval),
         }
     }
 
@@ -186,7 +186,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         Signal::new_unchecked(sig)
     );
     if sig > MAX_SIG {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     if pid > 0 {
@@ -201,7 +201,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
                 }
                 Ok(0)
             }
-            None => Err(Errno::ESRCH),
+            None => Err(Errno::Esrch),
         }
     } else if pid == 0 {
         let pgid = sender.pgid.load(Ordering::Relaxed);

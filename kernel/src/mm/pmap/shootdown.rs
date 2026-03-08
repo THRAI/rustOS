@@ -42,6 +42,7 @@ impl ShootdownRequest {
 
 /// Global per-CPU shootdown request array.
 static SHOOTDOWN: [ShootdownRequest; MAX_CPUS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: ShootdownRequest = ShootdownRequest::new();
     [INIT; MAX_CPUS]
 };
@@ -91,15 +92,13 @@ pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: 
     adaptive_flush(va_start, va_end, asid as usize);
 
     // Send shootdown to each remote CPU that has this pmap active.
-    for cpu in 0..MAX_CPUS {
+    for (cpu, req) in SHOOTDOWN.iter().enumerate() {
         if cpu == local_cpu {
             continue;
         }
         if !active[cpu].load(Ordering::Acquire) {
             continue;
         }
-
-        let req = &SHOOTDOWN[cpu];
         // Wait for any prior shootdown to complete.
         while req.pending.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -126,12 +125,10 @@ pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: 
 pub fn ipi_broadcast_flush_all() {
     let local_cpu = crate::executor::per_cpu::current().cpu_id;
 
-    for cpu in 0..MAX_CPUS {
+    for (cpu, req) in SHOOTDOWN.iter().enumerate() {
         if cpu == local_cpu {
             continue;
         }
-
-        let req = &SHOOTDOWN[cpu];
         while req.pending.load(Ordering::Acquire) {
             core::hint::spin_loop();
         }

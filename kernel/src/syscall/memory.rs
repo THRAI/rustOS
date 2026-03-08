@@ -2,17 +2,15 @@
 //!
 //! Implements mmap, munmap, brk, mprotect and related memory operations.
 
-use alloc::sync::Arc;
 use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
+use alloc::sync::Arc;
 
 use crate::proc::task::Task;
 
 /// Free frames from removed VMAs.
 /// Pages are freed automatically via RAII (TypedFrame Drop) when the
 /// VmArea and its VmObject are dropped.
-fn free_removed_frames(
-    removed: alloc::vec::Vec<alloc::boxed::Box<crate::mm::vm::map::entry::VmMapEntry>>,
-) {
+fn free_removed_frames(removed: alloc::vec::Vec<crate::mm::vm::map::entry::VmMapEntry>) {
     drop(removed);
 }
 
@@ -31,7 +29,7 @@ pub fn sys_mmap(
 
     let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     if aligned_len == 0 {
-        return (-(Errno::EINVAL.as_i32() as isize)) as usize;
+        return (-(Errno::Einval.as_i32() as isize)) as usize;
     }
 
     let map_fixed = flags & 0x10 != 0; // MAP_FIXED
@@ -64,14 +62,14 @@ pub fn sys_mmap(
         } else {
             match vm.find_free_area_topdown(aligned_len) {
                 Some(va) => va.as_usize(),
-                None => return (-(Errno::ENOMEM.as_i32() as isize)) as usize,
+                None => return (-(Errno::Enomem.as_i32() as isize)) as usize,
             }
         }
     } else {
         // Top-down allocation
         match vm.find_free_area_topdown(aligned_len) {
             Some(va) => va.as_usize(),
-            None => return (-(Errno::ENOMEM.as_i32() as isize)) as usize,
+            None => return (-(Errno::Enomem.as_i32() as isize)) as usize,
         }
     };
 
@@ -100,7 +98,7 @@ pub fn sys_mmap(
     );
     match vm.insert_entry(vma) {
         Ok(()) => base,
-        Err(_) => (-(Errno::ENOMEM.as_i32() as isize)) as usize,
+        Err(_) => (-(Errno::Enomem.as_i32() as isize)) as usize,
     }
 }
 
@@ -109,7 +107,7 @@ pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> usize {
     let aligned_start = VirtAddr::new(addr & !0xFFF);
     let aligned_end = VirtAddr::new((addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
     if aligned_start >= aligned_end {
-        return (-(Errno::EINVAL.as_i32() as isize)) as usize;
+        return (-(Errno::Einval.as_i32() as isize)) as usize;
     }
     let mut vm = task.vm_map.lock();
     let removed = vm.remove_range(aligned_start, aligned_end);
@@ -128,7 +126,7 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
     let start = VirtAddr::new(addr & !0xFFF);
     let end = VirtAddr::new((addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
     if start >= end {
-        return (-(Errno::EINVAL.as_i32() as isize)) as usize;
+        return (-(Errno::Einval.as_i32() as isize)) as usize;
     }
 
     let mut perm = MapPerm::U;
@@ -153,9 +151,9 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
 
 /// sys_brk: change program break (heap end).
 pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
+    use crate::hal_common::addr::VirtPageNum;
     use crate::mm::vm::map::entry::{BackingStore, EntryFlags, VmMapEntry};
     use crate::mm::vm::vm_object::VmObject;
-    use crate::hal_common::addr::VirtPageNum;
 
     let current_brk = task.brk.load(core::sync::atomic::Ordering::Relaxed);
     if addr == 0 {

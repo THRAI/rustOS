@@ -4,7 +4,6 @@ use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
 use crate::executor::user_task::spawn_user_task;
-use crate::klog;
 use crate::proc::signal::Signal;
 use crate::proc::task::Task;
 use crate::proc::user_copy::{copyin_argv, copyinstr, do_exit, fault_in_user_buffer};
@@ -74,7 +73,7 @@ pub async fn sys_execve_async(
 ) -> Result<(usize, usize), Errno> {
     // Read pathname from user memory
     let raw_path = match copyinstr(task, pathname_ptr, 256).await {
-        None => return Err(Errno::EFAULT),
+        None => return Err(Errno::Efault),
         Some(s) => s,
     };
     let path = super::fs::absolutize_path(task, dirfd, &raw_path)?;
@@ -109,7 +108,7 @@ pub async fn sys_wait4_async(
     {
         let children = task.children.lock();
         if children.is_empty() {
-            return Err(Errno::ECHILD);
+            return Err(Errno::Echild);
         }
     }
 
@@ -153,7 +152,7 @@ pub async fn sys_wait4_async(
                         )
                     };
                     if rc != 0 {
-                        return Err(Errno::EFAULT);
+                        return Err(Errno::Efault);
                     }
                 }
                 return Ok(child_pid);
@@ -186,16 +185,16 @@ pub async fn sys_wait4_async(
                     )
                 };
                 if rc != 0 {
-                    return Err(Errno::EFAULT);
+                    return Err(Errno::Efault);
                 }
             }
             Ok(child_pid)
         }
         None => {
             if task.signals.has_actionable_pending() {
-                Err(Errno::EINTR)
+                Err(Errno::Eintr)
             } else {
-                Err(Errno::ECHILD)
+                Err(Errno::Echild)
             }
         }
     }
@@ -220,7 +219,7 @@ pub fn sys_setpgid(task: &Arc<Task>, pid: u32, pgid: u32) -> Result<usize, Errno
                 return Ok(0);
             }
         }
-        Err(Errno::ESRCH)
+        Err(Errno::Esrch)
     }
 }
 
@@ -230,6 +229,6 @@ pub fn sys_getpgid(task: &Arc<Task>, pid: u32) -> Result<usize, Errno> {
     } else if let Some(t) = crate::proc::signal::find_task_by_pid(pid) {
         Ok(t.pgid.load(Ordering::Relaxed) as usize)
     } else {
-        Err(Errno::ESRCH)
+        Err(Errno::Esrch)
     }
 }

@@ -28,11 +28,11 @@ impl MountTable {
 
     fn add(&mut self, entry: MountEntry) -> Result<(), Errno> {
         if self.entries.len() >= MAX_MOUNTS {
-            return Err(Errno::ENOMEM);
+            return Err(Errno::Enomem);
         }
         if self.entries.iter().any(|m| m.target == entry.target) {
             // Linux would report EBUSY; fallback to EEXIST in current errno set.
-            return Err(Errno::EEXIST);
+            return Err(Errno::Eexist);
         }
         self.entries.push(entry);
         Ok(())
@@ -44,7 +44,7 @@ impl MountTable {
             Ok(())
         } else {
             // Linux commonly reports EINVAL for non-mountpoint.
-            Err(Errno::EINVAL)
+            Err(Errno::Einval)
         }
     }
 }
@@ -53,7 +53,7 @@ static MOUNT_TABLE: SpinMutex<MountTable> = SpinMutex::new(MountTable::new());
 
 pub fn register_mount(source: &str, target: &str, fstype: &str, flags: usize) -> Result<(), Errno> {
     if source.is_empty() || target.is_empty() || fstype.is_empty() {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     let mut table = MOUNT_TABLE.lock();
@@ -67,7 +67,7 @@ pub fn register_mount(source: &str, target: &str, fstype: &str, flags: usize) ->
 
 pub fn unregister_mount(target: &str) -> Result<(), Errno> {
     if target.is_empty() {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     let mut table = MOUNT_TABLE.lock();

@@ -82,7 +82,7 @@ pub fn uiomove(
             if total_copied > 0 {
                 return Ok(UioResult { done: total_copied });
             }
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
 
         total_copied += chunk;

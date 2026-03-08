@@ -6,10 +6,10 @@
 use bitflags::bitflags;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
+use crate::hal_common::addr::PhysAddr;
 use crate::mm::allocator::types::PageRole;
 use crate::mm::vm::vm_object::VmObject;
 use crate::mm::vm::wait_queue;
-use crate::hal_common::addr::PhysAddr;
 
 bitflags! {
     /// Readers-Writer Busy Lock state.
@@ -62,6 +62,21 @@ impl VmPage {
             valid: AtomicU8::new(0),
             dirty: AtomicU8::new(0),
         }
+    }
+
+    /// Create a dummy page for tests with a specific physical address.
+    pub fn new_test(pa: PhysAddr) -> Self {
+        let mut p = Self::new();
+        p.phys_addr = pa;
+        p.valid.store(1, Ordering::Relaxed);
+        p
+    }
+
+    /// Create a dummy cached page for tests.
+    pub fn new_cached(pa: PhysAddr) -> Self {
+        let p = Self::new_test(pa);
+        p.dirty.store(0, Ordering::Relaxed);
+        p
     }
 
     // ------------------------------------------------------------------------
@@ -258,7 +273,9 @@ impl VmPage {
     /// Access the underlying page as a mutable byte slice.
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8; crate::hal_common::addr::PAGE_SIZE] {
-        unsafe { &mut *(self.phys_addr.as_usize() as *mut [u8; crate::hal_common::addr::PAGE_SIZE]) }
+        unsafe {
+            &mut *(self.phys_addr.as_usize() as *mut [u8; crate::hal_common::addr::PAGE_SIZE])
+        }
     }
 
     /// Access the underlying page as a slice of 512 u64 page table entries.
@@ -318,11 +335,9 @@ impl VmPage {
         let count = old & Self::VPRC_WIRE_MASK;
         debug_assert!(count > 0, "PTE underflow");
 
-        if count == 1 {
-            if (old & Self::VPRC_OBJREF) == 0 {
-                core::sync::atomic::fence(Ordering::Acquire);
-                self.free_to_allocator();
-            }
+        if count == 1 && (old & Self::VPRC_OBJREF) == 0 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            self.free_to_allocator();
         }
     }
 

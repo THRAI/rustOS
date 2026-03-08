@@ -4,16 +4,16 @@
 //! demand-paged VMAs with vnode + file_offset + file_size. No physical
 //! frames are allocated at exec time — the fault handler does the rest.
 
-use crate::fs::vnode::Vnode;
+// use crate::fs::vnode::Vnode;
+use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::hal_common::{Errno, PAGE_SIZE, VirtAddr, VirtPageNum};
 
 use crate::fs::path;
 use crate::fs::vnode::VnodeType;
 use crate::mm::vm::map::entry::{BackingStore, MapPerm, VmMapEntry};
-use crate::mm::vm::map::map::{VmError, VmMap};
+use crate::mm::vm::map::{VmError, VmMap};
 use crate::mm::vm::vm_object::VmObject;
 
 use super::task::Task;
@@ -81,21 +81,21 @@ struct Elf64Phdr {
 /// Parse ELF64 header from a byte buffer. Returns None if invalid.
 fn parse_elf_header(buf: &[u8]) -> Result<&Elf64Header, Errno> {
     if buf.len() < core::mem::size_of::<Elf64Header>() {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
     let hdr = unsafe { &*(buf.as_ptr() as *const Elf64Header) };
 
     // Validate magic
     if hdr.e_ident[0..4] != ELF_MAGIC {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
     // Must be 64-bit, little-endian
     if hdr.e_ident[4] != ELFCLASS64 || hdr.e_ident[5] != ELFDATA2LSB {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
     // Must be executable or shared object (PIE), RISC-V
     if (hdr.e_type != ET_EXEC && hdr.e_type != ET_DYN) || hdr.e_machine != EM_RISCV {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
     Ok(hdr)
 }
@@ -107,7 +107,7 @@ fn parse_phdrs<'a>(buf: &'a [u8], hdr: &Elf64Header) -> Result<&'a [Elf64Phdr], 
     let ent = hdr.e_phentsize as usize;
     let end = off + num * ent;
     if end > buf.len() || ent < core::mem::size_of::<Elf64Phdr>() {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
     let ptr = unsafe { buf.as_ptr().add(off) as *const Elf64Phdr };
     Ok(unsafe { core::slice::from_raw_parts(ptr, num) })
@@ -136,18 +136,14 @@ fn elf_flags_to_prot(flags: u32) -> MapPerm {
 /// match on identical file offset — sufficient because this function is
 /// only called during exec where all segments originate from the same
 /// vnode.
-fn insert_or_merge_file_vma(vm: &mut VmMap, mut new_vma: VmMapEntry) -> Result<(), VmError> {
+fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), VmError> {
     if let BackingStore::Object { .. } = new_vma.store {
         if let Some(existing) = vm.lookup_mut(new_vma.start) {
             if existing.start == new_vma.start && existing.end == new_vma.end {
                 let same_backing = match (&existing.store, &new_vma.store) {
                     (
-                        BackingStore::Object {
-                            offset: f1, ..
-                        },
-                        BackingStore::Object {
-                            offset: f2, ..
-                        },
+                        BackingStore::Object { offset: f1, .. },
+                        BackingStore::Object { offset: f2, .. },
                     ) => f1 == f2,
                     _ => false,
                 };
@@ -164,8 +160,8 @@ fn insert_or_merge_file_vma(vm: &mut VmMap, mut new_vma: VmMapEntry) -> Result<(
 
 fn map_insert_err(err: VmError) -> Errno {
     match err {
-        VmError::Overlap | VmError::InvalidRange => Errno::ENOEXEC,
-        VmError::NotFound => Errno::ENOMEM,
+        VmError::Overlap | VmError::InvalidRange => Errno::Enoexec,
+        VmError::NotFound => Errno::Enomem,
     }
 }
 
@@ -183,19 +179,20 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     // 1. Resolve path to vnode
     let vnode = path::resolve(elf_path).await?;
     if vnode.vtype() != VnodeType::Regular {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
 
     // 2. Read ELF header + program headers (first 4KB is enough)
     let file_size = vnode.size();
     if file_size < core::mem::size_of::<Elf64Header>() as u64 {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
 
     // Read first page via delegate to get headers
+    //TODO: read logic should be performed by Objects with its pager
     let hdr_frame =
         crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(Errno::ENOMEM)?;
+            .ok_or(Errno::Enomem)?;
     let hdr_pa =
         match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
             Ok(()) => {
@@ -204,7 +201,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             }
             Err(_) => {
                 crate::mm::allocator::free_raw_frame(hdr_frame);
-                return Err(Errno::ENOEXEC);
+                return Err(Errno::Enoexec);
             }
         };
 
@@ -214,7 +211,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
 
     // PIE: ET_DYN 需要一个加载基址，ET_EXEC 基址为 0
-    let load_bias: usize = if elf_hdr.e_type == ET_DYN { 0x0 } else { 0x0 };
+    let load_bias: usize = 0x0;
     let entry = elf_hdr.e_entry as usize + load_bias;
 
     // 扫描 PT_INTERP，获取动态链接器路径
@@ -286,7 +283,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         );
 
         let mut vm = task.vm_map.lock();
-        if let Err(e) = insert_or_merge_file_vma(&mut *vm, vma) {
+        if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
             return Err(map_insert_err(e));
         }
 
@@ -351,7 +348,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     {
         let mut vm = task.vm_map.lock();
         if vm.insert_entry(stack_vma).is_err() {
-            return Err(Errno::ENOMEM);
+            return Err(Errno::Enomem);
         }
     }
 
@@ -405,12 +402,12 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Result<usize, Errno> {
     let vnode = path::resolve(interp_path).await?;
     if vnode.vtype() != VnodeType::Regular {
-        return Err(Errno::ENOEXEC);
+        return Err(Errno::Enoexec);
     }
 
     let hdr_frame =
         crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(Errno::ENOMEM)?;
+            .ok_or(Errno::Enomem)?;
     let hdr_pa =
         match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
             Ok(()) => {
@@ -419,7 +416,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
             }
             Err(_) => {
                 crate::mm::allocator::free_raw_frame(hdr_frame);
-                return Err(Errno::ENOEXEC);
+                return Err(Errno::Enoexec);
             }
         };
 
@@ -458,7 +455,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         );
 
         let mut vm = task.vm_map.lock();
-        if let Err(e) = insert_or_merge_file_vma(&mut *vm, vma) {
+        if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
             return Err(map_insert_err(e));
         }
     }
@@ -532,7 +529,7 @@ pub async fn exec_with_args(
                 obj.insert_page(page_idx, Arc::new(page));
             }
         } else {
-            return Err(Errno::ENOMEM);
+            return Err(Errno::Enomem);
         }
 
         // Map in pmap
@@ -596,7 +593,7 @@ pub async fn exec_with_args(
     // First retrieve the current SP and compute the offset
     let prev_offset = cursor.current_offset();
     if prev_offset < slots_bytes {
-        return Err(Errno::ENOMEM);
+        return Err(Errno::Enomem);
     }
     let new_offset = prev_offset - slots_bytes;
     let sp_va = stack_page_vbase.as_usize() + new_offset;
@@ -604,7 +601,7 @@ pub async fn exec_with_args(
     // Now we safely do the allocation to get the mutable slice
     let slice_ptr: *mut u8;
     {
-        let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::ENOMEM)?;
+        let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::Enomem)?;
         slice_ptr = allocated.as_mut_ptr();
     }
     // Safety: we just created this slice and we know it lives inside our `frame`.
@@ -641,15 +638,15 @@ pub async fn exec_with_args(
 }
 
 /// do_exec: Merge exec and exec_with_args
+/// It reads 
 pub async fn do_execve(
     task: &Arc<Task>,
     elf_path: &str,
-    argv: &[String],
-    envp: &[String],
+    _argv: &[String],
+    _envp: &[String],
 ) -> Result<(usize, usize), Errno> {
     klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
     // 1. Resolve path to vnode
-
 
     unimplemented!()
 }

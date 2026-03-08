@@ -5,8 +5,8 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use crate::hal_common::addr::{PhysAddr, PAGE_SIZE};
+use alloc::vec::Vec;
 
 /// Maximum buddy order (2^11 = 2048 pages = 8MB).
 pub const MAX_ORDER: usize = 11;
@@ -78,7 +78,7 @@ impl BuddyAllocator {
             let mut order = MAX_ORDER;
             while order > 0 {
                 let block_pages = 1 << order;
-                if block_pages <= pages_left && (addr / PAGE_SIZE) % block_pages == 0 {
+                if block_pages <= pages_left && (addr / PAGE_SIZE).is_multiple_of(block_pages) {
                     break;
                 }
                 order -= 1;

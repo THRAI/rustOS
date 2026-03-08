@@ -10,8 +10,8 @@
 //! TrapContext sits at the top of the per-task kernel stack.
 //! sscratch points to it while in user mode.
 
-use alloc::sync::Arc;
 use crate::hal_common::TrapFrame;
+use alloc::sync::Arc;
 
 use crate::proc::task::Task;
 
@@ -22,15 +22,15 @@ use crate::proc::task::Task;
 #[repr(C)]
 pub struct TrapContext {
     /// Pointer to the task's TrapFrame.
-    pub trap_frame_ptr: usize,  // offset 0
+    pub trap_frame_ptr: usize, // offset 0
     /// Kernel sp to restore (callee-saved save area).
-    pub kernel_sp: usize,       // offset 8
+    pub kernel_sp: usize, // offset 8
     /// Kernel tp (PerCpu pointer) to restore.
-    pub kernel_tp: usize,       // offset 16
+    pub kernel_tp: usize, // offset 16
     /// Scratch slot for saving user t0 in __user_trap.
-    pub scratch0: usize,        // offset 24
+    pub scratch0: usize, // offset 24
     /// Scratch slot for saving user t1 in __user_trap.
-    pub scratch1: usize,        // offset 32
+    pub scratch1: usize, // offset 32
 }
 
 pub const TC_SIZE: usize = core::mem::size_of::<TrapContext>();
@@ -56,7 +56,9 @@ pub fn trap_return(task: &Arc<Task>) {
 
     // Kernel tp
     let kernel_tp: usize;
-    unsafe { core::arch::asm!("mv {}, tp", out(reg) kernel_tp); }
+    unsafe {
+        core::arch::asm!("mv {}, tp", out(reg) kernel_tp);
+    }
 
     // Place TrapContext at top of kernel stack.
     let kstack_top = task.kernel_sp;
@@ -68,17 +70,21 @@ pub fn trap_return(task: &Arc<Task>) {
         (*tc).kernel_tp = kernel_tp;
     }
 
-    unsafe { __trap_return(tf_ptr, tc_ptr); }
+    unsafe {
+        __trap_return(tf_ptr, tc_ptr);
+    }
 
     // Execution resumes here after __user_trap restores callee-saved regs.
     // User registers are saved in task.trap_frame by __user_trap.
 
     // Restore stvec to __kernel_trap for kernel-mode traps.
-    extern "C" { fn __kernel_trap(); }
+    extern "C" {
+        fn __kernel_trap();
+    }
     unsafe {
         core::arch::asm!(
             "csrw stvec, {}",
-            in(reg) __kernel_trap as usize,
+            in(reg) __kernel_trap as *const () as usize,
         );
     }
 }

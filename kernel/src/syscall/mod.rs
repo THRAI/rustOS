@@ -371,39 +371,39 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::WRITEV => {
             match fs::sys_writev_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
-                Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
+                Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::PPOLL => {
             match fs::sys_ppoll_async(task, a0, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
-                Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
+                Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::WRITE => {
             match fs::sys_write_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
-                Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
+                Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::READ => {
             match fs::sys_read_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
-                Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
+                Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
         SyscallId::READV => {
             match fs::sys_readv_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => SyscallAction::Return(n),
-                Err(Errno::EINTR) if should_restart_syscall(task) => SyscallAction::Continue,
+                Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
-        SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::EINVAL)),
+        SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::Einval)),
         SyscallId::OPENAT => {
             let ret = match fs::sys_openat_async(task, a0 as isize, a1, a2).await {
                 Ok(fd) => fd as usize,
@@ -453,7 +453,6 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::REBOOT => {
             crate::klog!(syscall, info, "reboot syscall: shutting down (cmd={:#x})", a2);
             crate::hal::rv64::sbi::shutdown();
-            unreachable!()
         }
         SyscallId::CLONE => SyscallAction::Return(process::sys_clone(task, a1)),
         SyscallId::EXECVE => {
@@ -482,7 +481,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         }
         SyscallId::FUTEX => {
             let ret = match sync::sys_futex_async(task, a0, a1 as u32, a2 as u32).await {
-                Ok(v) => v as usize,
+                Ok(v) => v,
                 Err(e) => errno_ret(e),
             };
             SyscallAction::Return(ret)

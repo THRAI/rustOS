@@ -11,7 +11,7 @@ use crate::hal_common::{VirtAddr, PAGE_SIZE};
 use super::super::allocator::{alloc_anon_sync, frame_free};
 use super::super::pmap;
 use super::map::entry::{BackingStore, VmMapEntry};
-use super::map::map::VmMap;
+use super::map::VmMap;
 use super::page::VmPage;
 use super::vm_object::VmObject;
 
@@ -28,7 +28,9 @@ pub fn test_anonymous_page_fault() {
         crate::mm::vm::map::entry::EntryFlags::empty(),
         crate::map_perm!(R, W),
     );
-    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(pmap::pmap_create()));
+    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(
+        pmap::pmap_create(),
+    ));
     let mut map = VmMap::new(Arc::clone(&pmap_arc));
     map.insert_entry(vma).unwrap();
 
@@ -92,7 +94,9 @@ pub fn test_cow_fault() {
         crate::mm::vm::map::entry::EntryFlags::empty(),
         crate::map_perm!(R, W),
     );
-    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(pmap::pmap_create()));
+    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(
+        pmap::pmap_create(),
+    ));
     let mut map = VmMap::new(Arc::clone(&pmap_arc));
     map.insert_entry(vma).unwrap();
 
@@ -192,7 +196,7 @@ pub fn test_fork_bomb_stress() {
         let mut w = root.write();
         let mut p = VmPage::new();
         p.phys_addr = page.phys();
-        w.insert_page(VirtPageNum(i as usize), Arc::new(p));
+        w.insert_page(VirtPageNum(i), Arc::new(p));
     }
 
     // Phase 1: Fork bomb -- create N children, each shadowing root.

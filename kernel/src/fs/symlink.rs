@@ -62,7 +62,7 @@ fn parent_dir(path: &str) -> &str {
 
 pub fn create(link_path: &str, target_path: &str) -> Result<(), Errno> {
     if link_path.is_empty() || target_path.is_empty() {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     let mut table = SYMLINK_TABLE.lock();
@@ -72,7 +72,7 @@ pub fn create(link_path: &str, target_path: &str) -> Result<(), Errno> {
     }
 
     if table.links.len() >= MAX_SYMLINKS {
-        return Err(Errno::ENOMEM);
+        return Err(Errno::Enomem);
     }
 
     table

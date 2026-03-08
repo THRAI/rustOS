@@ -153,7 +153,7 @@ impl FdTable {
         }
         let fd = self.entries.len();
         if fd >= MAX_FDS {
-            return Err(Errno::EMFILE);
+            return Err(Errno::Emfile);
         }
         self.entries.push(Some((desc, fd_flags)));
         Ok(fd as u32)
@@ -168,7 +168,7 @@ impl FdTable {
     ) -> Result<(), Errno> {
         let idx = fd as usize;
         if idx >= MAX_FDS {
-            return Err(Errno::EBADF);
+            return Err(Errno::Ebadf);
         }
         while self.entries.len() <= idx {
             self.entries.push(None);
@@ -198,17 +198,17 @@ impl FdTable {
 
     /// dup: clone Arc<FileDescription> into lowest free fd, clear CLOEXEC.
     pub fn dup(&mut self, old_fd: u32) -> Result<u32, Errno> {
-        let desc = Arc::clone(self.get(old_fd).ok_or(Errno::EBADF)?);
+        let desc = Arc::clone(self.get(old_fd).ok_or(Errno::Ebadf)?);
         self.insert(desc, FdFlags::empty())
     }
 
     /// dup2: clone into specific fd. If new_fd == old_fd, return success.
     pub fn dup2(&mut self, old_fd: u32, new_fd: u32) -> Result<u32, Errno> {
         if old_fd == new_fd {
-            let _ = self.get(old_fd).ok_or(Errno::EBADF)?;
+            let _ = self.get(old_fd).ok_or(Errno::Ebadf)?;
             return Ok(new_fd);
         }
-        let desc = Arc::clone(self.get(old_fd).ok_or(Errno::EBADF)?);
+        let desc = Arc::clone(self.get(old_fd).ok_or(Errno::Ebadf)?);
         self.insert_at(new_fd, desc, FdFlags::empty())?;
         Ok(new_fd)
     }
@@ -216,9 +216,9 @@ impl FdTable {
     /// dup3: like dup2 but old_fd != new_fd required, set CLOEXEC if requested.
     pub fn dup3(&mut self, old_fd: u32, new_fd: u32, cloexec: bool) -> Result<u32, Errno> {
         if old_fd == new_fd {
-            return Err(Errno::EINVAL);
+            return Err(Errno::Einval);
         }
-        let desc = Arc::clone(self.get(old_fd).ok_or(Errno::EBADF)?);
+        let desc = Arc::clone(self.get(old_fd).ok_or(Errno::Ebadf)?);
         let flags = if cloexec {
             FdFlags::CLOEXEC
         } else {

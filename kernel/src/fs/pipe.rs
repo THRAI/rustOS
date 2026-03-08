@@ -3,10 +3,10 @@
 //! Created by pipe2 syscall. Read/write ends share an Arc<Pipe>.
 //! Full implementation in Task 2.
 
+use crate::hal_common::{Errno, SpinMutex};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
-use crate::hal_common::{Errno, SpinMutex};
 
 /// Pipe buffer size (also PIPE_BUF for atomic write guarantee).
 const PIPE_BUF: usize = 4096;
@@ -104,12 +104,12 @@ impl Pipe {
                     klog!(pipe, debug, "read EOF");
                     return Ok(0); // EOF
                 }
-                return Err(Errno::EAGAIN);
+                return Err(Errno::Eagain);
             }
             let to_read = out.len().min(buf.available_read());
-            for i in 0..to_read {
+            for b in out.iter_mut().take(to_read) {
                 let idx = buf.head;
-                out[i] = buf.data[idx];
+                *b = buf.data[idx];
                 buf.head = (idx + 1) % PIPE_BUF;
             }
             buf.len -= to_read;
@@ -128,25 +128,25 @@ impl Pipe {
     pub fn write(&self, data: &[u8]) -> Result<usize, Errno> {
         if self.reader_closed.load(Ordering::Acquire) {
             klog!(pipe, debug, "write EPIPE (reader closed)");
-            return Err(Errno::EPIPE);
+            return Err(Errno::Epipe);
         }
         let (n, wake_reader) = {
             let mut buf = self.buf.lock();
             let avail = buf.available_write();
             if avail == 0 {
                 if self.reader_closed.load(Ordering::Acquire) {
-                    return Err(Errno::EPIPE);
+                    return Err(Errno::Epipe);
                 }
-                return Err(Errno::EAGAIN);
+                return Err(Errno::Eagain);
             }
             // PIPE_BUF atomicity: writes <= PIPE_BUF are all-or-nothing
             if data.len() <= PIPE_BUF && avail < data.len() {
-                return Err(Errno::EAGAIN);
+                return Err(Errno::Eagain);
             }
             let to_write = data.len().min(avail);
-            for i in 0..to_write {
+            for &b in data.iter().take(to_write) {
                 let idx = buf.tail;
-                buf.data[idx] = data[i];
+                buf.data[idx] = b;
                 buf.tail = (idx + 1) % PIPE_BUF;
             }
             buf.len += to_write;

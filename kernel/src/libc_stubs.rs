@@ -157,12 +157,12 @@ pub unsafe extern "C" fn strncpy(dst: *mut u8, src: *const u8, n: usize) -> *mut
 // --- printf stubs (no-ops, lwext4 uses these for debug logging) ---
 
 #[no_mangle]
-pub unsafe extern "C" fn printf(_fmt: *const u8, ...) -> i32 {
+pub unsafe extern "C" fn printf(_fmt: *const u8, _: ...) -> i32 {
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn snprintf(_buf: *mut u8, _size: usize, _fmt: *const u8, ...) -> i32 {
+pub unsafe extern "C" fn snprintf(_buf: *mut u8, _size: usize, _fmt: *const u8, _: ...) -> i32 {
     0
 }
 

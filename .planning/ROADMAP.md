@@ -182,3 +182,13 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | 5. Page Reclamation + LA64 Port | 0/8 | Not started | - |
 | 6. Network + Sockets | 0/3 | Not started | - |
 | 7. Apps + Physical Hardware + Tuning | 0/2 | Not started | - |
+
+### Phase 8: Refactor vm submodule and exec/fork logic
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 7
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 8 to break down)

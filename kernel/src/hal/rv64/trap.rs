@@ -1,7 +1,7 @@
 //! rv64 trap setup and dispatch.
 
-use core::sync::atomic::Ordering;
 use crate::hal_common::TrapFrame;
+use core::sync::atomic::Ordering;
 
 // Interrupt bit in scause (bit 63 on rv64)
 const SCAUSE_INTERRUPT: usize = 1 << 63;
@@ -40,7 +40,7 @@ pub fn set_kernel_trap_entry() {
     unsafe {
         core::arch::asm!(
             "csrw stvec, {}",
-            in(reg) __kernel_trap as usize,
+            in(reg) __kernel_trap as *const () as usize,
         );
     }
 }
@@ -50,7 +50,7 @@ pub fn set_user_trap_entry() {
     unsafe {
         core::arch::asm!(
             "csrw stvec, {}",
-            in(reg) __user_trap as usize,
+            in(reg) __user_trap as *const () as usize,
         );
     }
 }

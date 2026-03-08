@@ -2,8 +2,8 @@
 //!
 //! Implements uname and other utility syscalls.
 
-use alloc::sync::Arc;
 use crate::hal_common::Errno;
+use alloc::sync::Arc;
 
 use crate::proc::task::Task;
 
@@ -11,7 +11,7 @@ use crate::proc::task::Task;
 pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
     let _ = task;
     if buf == 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
     // struct utsname: 6 fields × 65 bytes = 390 bytes
     const FIELD_LEN: usize = 65;
@@ -24,7 +24,7 @@ pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
     }
 
     write_field(&mut utsname, 0, b"FreeBSD"); // sysname
-    write_field(&mut utsname, FIELD_LEN * 1, b"chronix"); // nodename
+    write_field(&mut utsname, FIELD_LEN, b"chronix"); // nodename
     write_field(&mut utsname, FIELD_LEN * 2, b"0.1.0"); // release
     write_field(&mut utsname, FIELD_LEN * 3, b"chronix 0.1.0"); // version
     write_field(&mut utsname, FIELD_LEN * 4, b"riscv64"); // machine
@@ -38,7 +38,7 @@ pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
         )
     };
     if rc != 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
     Ok(())
 }

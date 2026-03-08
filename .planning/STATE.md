@@ -164,6 +164,10 @@ None yet.
 | 7 | Move hal-common into kernel as internal module | 2026-03-07 | 8f39ebd | Complete | [7-move-hal-common-and-kernel-mm-into-kerne](./quick/7-move-hal-common-and-kernel-mm-into-kerne/) |
 | 8 | Complete workspace consolidation by removing root hal-common and kernel-mm | 2026-03-07 | a225286 | Complete | [8-move-the-kernel-mm-and-hal-common-direct](./quick/8-move-the-kernel-mm-and-hal-common-direct/) |
 
+### Roadmap Evolution
+
+- Phase 8 added: Refactor vm submodule and exec/fork logic
+
 ## Session Continuity
 
 Last activity: 2026-03-07 - Completed quick task 8: Workspace consolidation

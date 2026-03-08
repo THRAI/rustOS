@@ -106,7 +106,7 @@ pub async fn sys_wait4_async(
     {
         let children = task.children.lock();
         if children.is_empty() {
-            return Err(Errno::ECHILD);
+            return Err(Errno::Echild);
         }
     }
 
@@ -192,9 +192,9 @@ pub async fn sys_wait4_async(
         }
         None => {
             if task.signals.has_actionable_pending() {
-                Err(Errno::EINTR)
+                Err(Errno::Eintr)
             } else {
-                Err(Errno::ECHILD)
+                Err(Errno::Echild)
             }
         }
     }
@@ -225,7 +225,7 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     // Validate sepc: must be in user space (< 0x0000_0040_0000_0000)
     const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
     if frame.saved_tf.sepc >= USER_MAX_VA {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     // Restore trap frame with sanitization
@@ -258,10 +258,10 @@ pub fn sys_sigaction(
     oldact_ptr: usize,
 ) -> Result<usize, Errno> {
     if sig < 1 || sig > MAX_SIG as usize {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
     if sig == SIGKILL as usize || sig == SIGSTOP as usize {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     let idx = sig - 1;
@@ -365,7 +365,7 @@ pub fn sys_sigprocmask(
             SIG_SETMASK => {
                 sig_state.blocked.store(set, Ordering::Release);
             }
-            _ => return Err(Errno::EINVAL),
+            _ => return Err(Errno::Einval),
         }
     }
 
@@ -386,7 +386,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         Signal::new_unchecked(sig)
     );
     if sig > MAX_SIG {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
 
     if pid > 0 {
@@ -401,7 +401,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
                 }
                 Ok(0)
             }
-            None => Err(Errno::ESRCH),
+            None => Err(Errno::Esrch),
         }
     } else if pid == 0 {
         let pgid = sender.pgid.load(Ordering::Relaxed);
@@ -439,7 +439,7 @@ pub fn sys_setpgid(task: &Arc<Task>, pid: u32, pgid: u32) -> Result<usize, Errno
                 return Ok(0);
             }
         }
-        Err(Errno::ESRCH)
+        Err(Errno::Esrch)
     }
 }
 
@@ -450,7 +450,7 @@ pub fn sys_getpgid(task: &Arc<Task>, pid: u32) -> Result<usize, Errno> {
         if let Some(t) = crate::proc::signal::find_task_by_pid(pid) {
             Ok(t.pgid.load(Ordering::Relaxed) as usize)
         } else {
-            Err(Errno::ESRCH)
+            Err(Errno::Esrch)
         }
     }
 }

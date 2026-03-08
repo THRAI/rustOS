@@ -1,4 +1,4 @@
-use crate::mm::vm::map::map::VmMap;
+use super::VmMap;
 use crate::mm::vm::vm_object::VmObject;
 use alloc::sync::Arc;
 use bitflags::bitflags;

@@ -10,6 +10,7 @@ pub mod test_integration;
 pub mod walk;
 
 use alloc::vec::Vec;
+use core::array;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
@@ -73,7 +74,7 @@ impl Pmap {
             root: dummy_root,
             asid: 0,
             generation: 0,
-            active: [ATOMIC_FALSE; MAX_CPUS],
+            active: array::from_fn(|_| AtomicBool::new(false)),
             stats: PmapStats::default(),
         }
     }
@@ -201,20 +202,19 @@ pub fn pmap_create() -> Pmap {
 
     let (asid, generation) = asid::alloc_asid();
 
-    const ATOMIC_FALSE: AtomicBool = AtomicBool::new(false);
-
     Pmap {
         l0_tables: Vec::new(),
         l1_directories: {
-            let mut v = Vec::new();
             #[cfg(target_arch = "riscv64")]
-            v.push(l1_frame);
+            let v = Vec::from([l1_frame]);
+            #[cfg(not(target_arch = "riscv64"))]
+            let v = Vec::new();
             v
         },
         root: root_frame,
         asid,
         generation,
-        active: [ATOMIC_FALSE; MAX_CPUS],
+        active: array::from_fn(|_| AtomicBool::new(false)),
         stats: PmapStats::default(),
     }
 }

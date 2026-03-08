@@ -8,18 +8,18 @@
 //! Per-task kernel stack (8KB, 2 pages from frame allocator) is used by
 //! __user_trap / trap_return for the setjmp/longjmp trap mechanism.
 
+use crate::hal_common::SpinMutex as Mutex;
+use crate::hal_common::{PhysAddr, TrapFrame, PAGE_SIZE};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use crate::hal_common::SpinMutex as Mutex;
-use crate::hal_common::{PhysAddr, TrapFrame, PAGE_SIZE};
 
 use crate::fs::fd_table::FdTable;
 use crate::mm::allocator::{frame_alloc_contiguous, frame_free_contiguous};
 use crate::mm::pmap;
-use crate::mm::vm::map::map::VmMap;
-use crate::hal_common::IrqSafeSpinLock;
+use crate::mm::vm::map::VmMap;
+// use crate::hal_common::IrqSafeSpinLock;
 
 use super::pid::alloc_pid;
 use super::signal::SignalState;

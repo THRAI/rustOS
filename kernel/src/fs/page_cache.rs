@@ -8,10 +8,10 @@
 //! 2. If Absent: transition to Fetching, initiate I/O, wake all waiters on completion.
 //! 3. If Fetching: register waker and wait.
 
+use crate::hal_common::{IrqSafeSpinLock, PhysAddr};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::task::Waker;
-use crate::hal_common::{IrqSafeSpinLock, PhysAddr};
 
 use super::vnode::VnodeId;
 
@@ -72,11 +72,9 @@ pub fn complete(vnode_id: VnodeId, page_offset: u64, phys: PhysAddr) {
     let map = cache.as_mut().expect("page cache not initialized");
 
     let key = (vnode_id, page_offset);
-    if let Some(old) = map.insert(key, PageState::Cached(phys)) {
-        if let PageState::Fetching(waiters) = old {
-            for w in waiters {
-                w.wake();
-            }
+    if let Some(PageState::Fetching(waiters)) = map.insert(key, PageState::Cached(phys)) {
+        for w in waiters {
+            w.wake();
         }
     }
 }

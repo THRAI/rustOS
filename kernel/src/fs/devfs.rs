@@ -21,7 +21,7 @@ pub fn open_device(name: &str, flags: OpenFlags) -> Result<Arc<FileDescription>,
                 DeviceKind::ConsoleWrite
             }
         }
-        _ => return Err(Errno::ENOENT),
+        _ => return Err(Errno::Enoent),
     };
     Ok(FileDescription::new(FileObject::Device(kind), flags))
 }

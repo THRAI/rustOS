@@ -4,12 +4,12 @@
 //! ranges. Each VmArea has a monotonic `AtomicU64` ID that is unique across
 //! all VMAs, providing TOCTOU defense.
 
+use crate::hal_common::addr::VirtPageNum;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::hal_common::addr::VirtPageNum;
 use spin::RwLock;
 
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
@@ -19,7 +19,6 @@ use crate::mm::vm::vm_object::VObjIndex;
 use super::vm_object::VmObject;
 
 use crate::fs::Vnode;
-
 
 // ---------------------------------------------------------------------------
 // Monotonic VMA ID
@@ -150,7 +149,6 @@ impl VmArea {
     }
 
     /// Create a file-backed VmArea for demand-paged ELF loading.
-    //TODO: file-backed should be a vmObject concept, handled by VmObject Pager.
     pub fn new_file_backed(
         range: Range<VirtAddr>,
         prot: MapPerm,
@@ -160,7 +158,6 @@ impl VmArea {
         file_offset: usize,
         file_size: usize,
     ) -> Self {
-        kprintln!("TODO: file-backed vma concepts to VmObject layer");
         Self {
             id: next_vma_id(),
             range,
@@ -322,7 +319,7 @@ impl VmMap {
     /// VmObject (no shadow needed for file-backed, device, etc.).
     pub fn fork(&self) -> VmMap {
         let mut child = VmMap::new();
-        for (_, vma) in &self.areas {
+        for vma in self.areas.values() {
             let needs_shadow = matches!(
                 vma.vma_type,
                 VmAreaType::Anonymous
@@ -336,8 +333,7 @@ impl VmMap {
                     let obj = vma.object.read();
                     obj.size()
                 };
-                let shadow = VmObject::new_shadow(Arc::clone(&vma.object), size);
-                shadow
+                VmObject::new_shadow(Arc::clone(&vma.object), size)
             } else {
                 // Shared reference (file-backed, device, etc.)
                 Arc::clone(&vma.object)
@@ -370,7 +366,7 @@ impl VmMap {
     /// accessible to the child.
     pub fn fork_deep_copy(&self) -> VmMap {
         let mut child = VmMap::new();
-        for (_, vma) in &self.areas {
+        for vma in self.areas.values() {
             // Any writable VMA needs its own VmObject (child will get copies
             // of the parent's pages, not shared references).
             // Read-only non-private VMAs can share the parent's VmObject.
@@ -818,7 +814,9 @@ mod tests {
             let mut w = obj.write();
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(0xA000)),
+                Arc::new(crate::mm::vm::page::VmPage::new_test(
+                    crate::hal_common::PhysAddr::new(0xA000),
+                )),
             );
         }
         let vma = VmArea::new(

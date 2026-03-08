@@ -3,11 +3,11 @@
 //! Output uses a global spinlock so SMP output is not interleaved.
 //! Input is a transparent byte pipe: UART IRQ pushes bytes, ConsoleReadFuture drains them.
 
+use crate::hal::rv64::uart;
+use crate::hal_common::IrqSafeSpinLock;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
-use crate::hal::rv64::uart;
-use hal_common::IrqSafeSpinLock;
 
 /// Global print lock — ensures only one hart writes at a time.
 /// We use a raw AtomicBool instead of IrqSafeSpinLock to avoid
@@ -90,8 +90,8 @@ impl ConsoleInputBuffer {
 
     fn drain(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.len);
-        for i in 0..n {
-            buf[i] = self.data[self.head];
+        for b in buf.iter_mut().take(n) {
+            *b = self.data[self.head];
             self.head = (self.head + 1) % CONSOLE_BUF_SIZE;
         }
         self.len -= n;

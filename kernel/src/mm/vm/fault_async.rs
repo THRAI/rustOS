@@ -44,7 +44,7 @@ pub async fn resolve_user_fault(
     let sync_result = {
         let vm_map = task.vm_map.lock();
         let mut pmap = vm_map.pmap_lock();
-        sync_fault_handler(&*vm_map, &mut *pmap, fault_va, access_type)
+        sync_fault_handler(&vm_map, &mut pmap, fault_va, access_type)
     };
 
     match sync_result {
@@ -67,21 +67,25 @@ pub async fn resolve_user_fault(
             );
             let async_result = fault_in_page_async(task, fault_va).await;
             match &async_result {
-                Ok(()) => { crate::klog!(
-                    vm,
-                    trace,
-                    "resolve_user_fault: async OK pid={} va={:#x}",
-                    task.pid,
-                    fault_va.as_usize(),
-                ); },
-                Err(e) => { crate::klog!(
-                    vm,
-                    trace,
-                    "resolve_user_fault: async FAILED pid={} va={:#x} err={:?}",
-                    task.pid,
-                    fault_va.as_usize(),
-                    e
-                ); },
+                Ok(()) => {
+                    crate::klog!(
+                        vm,
+                        trace,
+                        "resolve_user_fault: async OK pid={} va={:#x}",
+                        task.pid,
+                        fault_va.as_usize(),
+                    );
+                }
+                Err(e) => {
+                    crate::klog!(
+                        vm,
+                        trace,
+                        "resolve_user_fault: async FAILED pid={} va={:#x} err={:?}",
+                        task.pid,
+                        fault_va.as_usize(),
+                        e
+                    );
+                }
             }
             async_result
         }
@@ -105,7 +109,7 @@ pub async fn resolve_user_fault(
 /// allocate a zeroed frame and map it directly.
 async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(), FaultError> {
     // 1. Look up VMA and compute object offsets
-    let (obj, obj_offset, vma_start, vma_perm) = {
+    let (obj, obj_offset, _vma_start, vma_perm) = {
         let mut map = task.vm_map.lock();
         let vma = map
             .lookup(fault_va.as_usize() as u64)
@@ -152,7 +156,11 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     let pager = { obj.read().pager.clone() };
     if let Some(pager_ref) = pager.as_ref() {
         let file_offset = obj_offset.0 as u64 * PAGE_SIZE as u64;
-        if pager_ref.page_in(file_offset as usize, frame).await.is_err() {
+        if pager_ref
+            .page_in(file_offset as usize, frame)
+            .await
+            .is_err()
+        {
             crate::mm::allocator::free_raw_frame(frame);
             return Err(FaultError::IoError);
         }

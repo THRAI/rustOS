@@ -17,7 +17,7 @@ use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use super::super::pmap::{self, Pmap};
 use super::map::entry::{BackingStore, MapPerm, VmMapEntry};
-use super::map::map::VmMap;
+use super::map::VmMap;
 use crate::hal_common::addr::VirtPageNum;
 
 /// Result of a synchronous page fault resolution attempt.
@@ -134,20 +134,20 @@ pub fn sync_fault_handler(
     );
 
     // 2. Check permissions.
-    if !access_type.permitted_by(vma.protection) {
-        if !(access_type.write && vma.protection.contains(MapPerm::R)) {
-            crate::klog!(
-                vm,
-                debug,
-                "fault PERM_DENIED va={:#x} prot={:?} w={} r={} x={}",
-                fault_va.0,
-                vma.protection,
-                access_type.write,
-                access_type.read,
-                access_type.execute
-            );
-            return FaultResult::Error(FaultError::InvalidAccess);
-        }
+    if !(access_type.permitted_by(vma.protection)
+        || (access_type.write && vma.protection.contains(MapPerm::R)))
+    {
+        crate::klog!(
+            vm,
+            debug,
+            "fault PERM_DENIED va={:#x} prot={:?} w={} r={} x={}",
+            fault_va.0,
+            vma.protection,
+            access_type.write,
+            access_type.read,
+            access_type.execute
+        );
+        return FaultResult::Error(FaultError::InvalidAccess);
     }
 
     // 3. Compute object offset.
@@ -210,7 +210,7 @@ fn classify_and_handle(
 
             if is_file_backed {
                 crate::klog!(vm, debug, "fault NeedsAsyncIO va={:#x}", fault_va_aligned.0);
-                return FaultResult::NeedsAsyncIO;
+                FaultResult::NeedsAsyncIO
             } else {
                 handle_anonymous_fault(vma, obj, obj_page_offset, fault_va_aligned, pmap)
             }

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Filesystem delegate: serializes all ext4 operations off the async executor.
 //!
 //! A single async task owns the lwext4 mount and processes requests
@@ -23,8 +24,8 @@ fn path_hash(path: &str) -> u32 {
         h
     }
 }
-use core::future::Future;
 use crate::hal_common::IrqSafeSpinLock;
+use core::future::Future;
 use lwext4_rust::Ext4File;
 
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
@@ -191,6 +192,7 @@ const REPLY_POOL_SIZE: usize = 64;
 macro_rules! define_reply_pool {
     ($name:ident, $T:ty) => {
         static $name: [ReplyInner<$T>; REPLY_POOL_SIZE] = {
+            #[allow(clippy::declare_interior_mutable_const)]
             const INIT: ReplyInner<$T> = ReplyInner {
                 done: AtomicBool::new(false),
                 waker: IrqSafeSpinLock::new(None),

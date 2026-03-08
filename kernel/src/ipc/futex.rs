@@ -23,8 +23,19 @@ static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<usize, Vec<Waker>>> =
 /// Park the current task on a futex key (physical address).
 /// Returns a future that completes when woken by futex_wake or interrupted by signal.
 pub async fn futex_wait(pa_key: PhysAddr, task: &Arc<Task>) -> Result<(), Errno> {
-    klog!(proc, debug, "futex_wait pid={} key={:#x}", task.pid, pa_key.as_usize());
-    FutexWaitFuture { pa_key: pa_key.as_usize(), registered: false, task }.await
+    klog!(
+        proc,
+        debug,
+        "futex_wait pid={} key={:#x}",
+        task.pid,
+        pa_key.as_usize()
+    );
+    FutexWaitFuture {
+        pa_key: pa_key.as_usize(),
+        registered: false,
+        task,
+    }
+    .await
 }
 
 /// Wake up to `count` waiters on the given futex key.
@@ -68,7 +79,7 @@ impl<'a> Future for FutexWaitFuture<'a> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // EINTR guard: check for pending signals before blocking
         if self.task.signals.has_actionable_pending() {
-            return Poll::Ready(Err(Errno::EINTR));
+            return Poll::Ready(Err(Errno::Eintr));
         }
         if self.registered {
             // We were woken
@@ -76,7 +87,10 @@ impl<'a> Future for FutexWaitFuture<'a> {
         } else {
             // First poll: register waker in the futex table
             let mut table = FUTEX_TABLE.lock();
-            table.entry(self.pa_key).or_insert_with(Vec::new).push(cx.waker().clone());
+            table
+                .entry(self.pa_key)
+                .or_default()
+                .push(cx.waker().clone());
             self.registered = true;
             Poll::Pending
         }

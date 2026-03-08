@@ -89,3 +89,39 @@ impl ExecContext {
         ctx
     }
 }
+
+use goblin::elf::{Header, ProgramHeader};
+use goblin::error::Error;
+
+/// 从 ELF 文件的第一页（例如 4096 字节）中安全地提取 Header 和 Program Headers
+pub fn parse_elf_first_page(page_bytes: &[u8]) -> Result<(Header, Vec<ProgramHeader>), Error> {
+    // 1. 直接解析位于文件开头的 ELF Header
+    // goblin 内部会处理 e_ident 魔数校验和平台架构识别
+    let header = Header::parse(page_bytes)?;
+
+    // 2. 提取解析 Program Headers 所需的上下文环境
+    let is_lsb = header.endianness()? == goblin::container::Endian::Little;
+    let is_64 = header.is_64;
+
+    let phoff = header.e_phoff as usize;
+    let phnum = header.e_phnum as usize;
+    let phentsize = header.e_phentsize as usize;
+    let phdrs_total_size = phnum * phentsize;
+
+    // 3. 边界防御：确保我们要读取的 Program Headers 确实包含在这第一页数据中
+    // 如果二进制文件有极为罕见的巨大 Program Headers 列表，可能会越界
+    if phoff + phdrs_total_size > page_bytes.len() {
+        panic!("Program Header larger than 1 page")
+    }
+
+    // 4. 利用独立组件直接解析 Program Headers 数组
+    let phdrs = ProgramHeader::parse(
+        page_bytes,
+        phoff,
+        phnum,
+        is_lsb,
+        is_64,
+    )?;
+
+    Ok((header, phdrs))
+}

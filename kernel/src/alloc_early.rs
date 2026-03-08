@@ -3,9 +3,9 @@
 //! Uses linked_list_allocator::Heap wrapped in our IrqSafeSpinLock.
 //! Must be initialized (init_heap) before any allocation — call right after UART.
 
+use crate::hal_common::IrqSafeSpinLock;
 use core::alloc::{GlobalAlloc, Layout};
 use linked_list_allocator::Heap;
-use hal_common::IrqSafeSpinLock;
 
 const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16MB
 static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
@@ -35,7 +35,13 @@ static ALLOCATOR: KernelAllocator = KernelAllocator;
 /// Must be called before anything that allocates (buddy init, per-CPU, etc.).
 pub fn init_heap() {
     unsafe {
-        HEAP.lock().init(HEAP_SPACE.as_mut_ptr(), HEAP_SIZE);
+        HEAP.lock()
+            .init(core::ptr::addr_of_mut!(HEAP_SPACE) as *mut u8, HEAP_SIZE);
     }
-    crate::klog!(boot, info, "heap initialized {} KB (static)", HEAP_SIZE / 1024);
+    crate::klog!(
+        boot,
+        info,
+        "heap initialized {} KB (static)",
+        HEAP_SIZE / 1024
+    );
 }

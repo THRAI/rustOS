@@ -60,8 +60,24 @@ impl VmMap {
 
     /// Clear all mappings in the address space
     pub fn clear(&mut self) {
-        // We will need a proper way to drop VmMapEntries in SplayTree.
-        // For now, we can clear the tree by assigning a new one.
+        // Unmap every existing VMA from hardware page tables first.
+        let ranges: alloc::vec::Vec<(VirtAddr, VirtAddr)> = self
+            .iter()
+            .map(|e| {
+                (
+                    VirtAddr::new(e.start as usize),
+                    VirtAddr::new(e.end as usize),
+                )
+            })
+            .collect();
+        {
+            let mut pmap = self.pmap.lock();
+            for (start, end) in ranges {
+                crate::mm::pmap::pmap_remove(&mut pmap, start, end);
+            }
+        }
+
+        // Drop all map entries.
         self.tree = SplayTree::new();
         self.size = 0;
         self.nentries = 0;
@@ -90,23 +106,94 @@ impl VmMap {
     pub fn remove_entry_containing(&mut self, va: u64) -> Option<VmMapEntry> {
         let removed = self.tree.remove(va)?;
         let entry = *removed;
+
+        // Remove hardware page table mappings for this entry's VA range
+        {
+            let mut pmap = self.pmap.lock();
+            crate::mm::pmap::pmap_remove(
+                &mut pmap,
+                VirtAddr::new(entry.start as usize),
+                VirtAddr::new(entry.end as usize),
+            );
+        }
+
         self.size = self.size.saturating_sub(entry.size());
         self.nentries = self.nentries.saturating_sub(1);
         self.timestamp.fetch_add(1, Ordering::SeqCst);
         Some(entry)
     }
 
-    pub fn remove_range(&mut self, start: VirtAddr, end: VirtAddr) -> alloc::vec::Vec<VmMapEntry> {
+    pub fn remove_range(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+    ) -> alloc::vec::Vec<VmMapEntry> {
+        if start >= end {
+            return alloc::vec::Vec::new();
+        }
+
         self.timestamp.fetch_add(1, Ordering::SeqCst);
-        let removed = alloc::vec::Vec::new();
-        // Splay tree removal over range:
-        // We iterate and slice up boxes.
-        // Since iterator is not yet fully implemented, we loop with a pointer
-        // ... Implementation to follow.
+        let start_addr = start.as_usize() as u64;
+        let end_addr = end.as_usize() as u64;
+
+        // Tear down hardware mappings first.
         {
             let mut pmap = self.pmap.lock();
             crate::mm::pmap::pmap_remove(&mut pmap, start, end);
         }
+
+        let mut removed = alloc::vec::Vec::new();
+
+        // Collect all entries that overlap [start_addr, end_addr).
+        let mut to_remove = alloc::vec::Vec::new();
+        for entry in self.iter() {
+            if entry.start < end_addr && entry.end > start_addr {
+                to_remove.push(entry.start);
+            }
+        }
+
+        // Remove/split all overlapping entries.
+        for key in to_remove {
+            let entry_box = match self.tree.remove(key) {
+                Some(e) => e,
+                None => continue,
+            };
+            let entry = *entry_box;
+            let entry_start = entry.start();
+            let entry_end = entry.end();
+
+            // Account for removing the original entry from the tree.
+            self.size = self.size.saturating_sub(entry.size());
+            self.nentries = self.nentries.saturating_sub(1);
+
+            let mut split_entries = alloc::vec::Vec::new();
+
+            // Keep left surviving piece: [entry_start, start_addr)
+            if entry_start < start_addr {
+                let mut left = entry.clone_for_split(entry_start);
+                left.set_bounds(entry_start, start_addr);
+                split_entries.push(left);
+            }
+
+            // Keep right surviving piece: [end_addr, entry_end)
+            if entry_end > end_addr {
+                let mut right = entry.clone_for_split(end_addr);
+                right.set_bounds(end_addr, entry_end);
+                split_entries.push(right);
+            }
+
+            if split_entries.is_empty() {
+                // Fully removed entry.
+                removed.push(entry);
+            } else {
+                for kept in split_entries {
+                    self.size = self.size.saturating_add(kept.size());
+                    self.nentries += 1;
+                    self.tree.insert(alloc::boxed::Box::new(kept));
+                }
+            }
+        }
+
         removed
     }
 
@@ -155,12 +242,11 @@ impl VmMap {
         None
     }
 
-    pub fn protect_range(&mut self, _start: VirtAddr, _end: VirtAddr, _perm: MapPerm) {
+    pub fn protect_range(&mut self, start: VirtAddr, end: VirtAddr, perm: MapPerm) {
         self.timestamp.fetch_add(1, Ordering::SeqCst);
         {
-            // FIXME MapPerm differs, we need to map to the legacy format or update Pmap
-            // let mut pmap = self.pmap.lock();
-            // crate::mm::pmap::pmap_protect(&mut pmap, start, end, perm);
+            let mut pmap = self.pmap.lock();
+            crate::mm::pmap::pmap_protect(&mut pmap, start, end, perm);
         }
     }
 

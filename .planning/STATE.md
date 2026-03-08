@@ -25,17 +25,17 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 
 ## Current Position
 
-Phase: 4 of 7 (Pipes + Signals + Full Syscalls) — COMPLETE
-Plan: 4 of 4 in current phase — 04-04 complete
-Status: Signal-syscall integration complete: EINTR guards, SA_RESTART, SIGPIPE, SIGCHLD, SA_NOCLDWAIT
-Last activity: 2026-03-08 -- Plan 04-04 complete (~5min)
+Phase: 8 (Refactor VM Submodule and Exec/Fork Logic) — IN PROGRESS
+Plan: 1 complete in current phase — 08-01 complete
+Status: RAII busy lock guards added (SharedBusyGuard, ExclusiveBusyGuard) with guarded VmObject access
+Last activity: 2026-03-08 -- Plan 08-01 complete (~5min)
 
-Progress: [██████████] 100% (Phase 4)
+Progress: [█---------] 10% (Phase 8)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 19
+- Total plans completed: 20
 - Average duration: 7min
 - Total execution time: 2.15 hours
 
@@ -55,6 +55,7 @@ Progress: [██████████] 100% (Phase 4)
 
 *Updated after each plan completion*
 | Phase 04 P04 | 5 | 2 tasks | 4 files |
+| Phase 08 P01 | 5 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -143,6 +144,8 @@ Recent decisions affecting current work:
 - [Phase 04]: Top-level waker registered at start of each run_tasks loop iteration for signal injection
 - [Phase 04]: SIGPIPE posted in PipeWriteFuture when EPIPE detected
 - [Phase 04]: SA_NOCLDWAIT auto-reap skips zombie state and suppresses SIGCHLD
+- [08-01]: Arc-cloning guards (not lifetime params) for VmPage RAII locks -- avoids async lifetime complexity
+- [08-01]: core::ptr::read + mem::forget for ExclusiveBusyGuard::downgrade -- safe Arc transfer without double-release
 
 ### Pending Todos
 
@@ -170,6 +173,6 @@ None yet.
 
 ## Session Continuity
 
-Last activity: 2026-03-07 - Completed quick task 8: Workspace consolidation
-Stopped at: Completed 04-04-PLAN.md
+Last activity: 2026-03-08 - Completed 08-01: RAII busy lock guards
+Stopped at: Completed 08-01-PLAN.md
 Resume file: None

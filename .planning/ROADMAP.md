@@ -185,10 +185,12 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 
 ### Phase 8: Refactor vm submodule and exec/fork logic
 
-**Goal:** [To be planned]
-**Requirements**: TBD
-**Depends on:** Phase 7
-**Plans:** 0 plans
+**Goal:** Align VM subsystem and process lifecycle with BSD architecture patterns -- RAII page cache guards, two-phase exec, and COW fork with shadow chain walk
+**Requirements**: REFACTOR-PAGE-CACHE, REFACTOR-EXEC, REFACTOR-COW-FORK
+**Depends on:** Phase 4
+**Plans:** 3 plans
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 8 to break down)
+- [x] 08-01-PLAN.md — RAII busy lock guards for VmPage + VmObject guarded access methods (wave 1)
+- [ ] 08-02-PLAN.md — Unified do_execve with two-phase commit semantics (wave 1)
+- [ ] 08-03-PLAN.md — COW fork via shadow chain + fault handler wiring (wave 2)

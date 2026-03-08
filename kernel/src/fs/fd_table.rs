@@ -6,8 +6,8 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU64;
-use crate::hal_common::Errno;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use hal_common::Errno;
 
 use super::vnode::Vnode;
 
@@ -94,15 +94,37 @@ pub struct FileDescription {
     pub object: FileObject,
     pub offset: AtomicU64,
     pub flags: OpenFlags,
+    /// fcntl(F_SETFL) managed status bits (shared by duplicated fds).
+    pub status_flags: AtomicU32,
 }
 
 impl FileDescription {
+    pub const O_APPEND: u32 = 0x0000_0400;
+    pub const O_NONBLOCK: u32 = 0x0000_0800;
+
     pub fn new(object: FileObject, flags: OpenFlags) -> Arc<Self> {
+        let mut status = 0u32;
+        if flags.append {
+            status |= Self::O_APPEND;
+        }
         Arc::new(Self {
             object,
             offset: AtomicU64::new(0),
             flags,
+            status_flags: AtomicU32::new(status),
         })
+    }
+
+    pub fn get_status_flags(&self) -> u32 {
+        self.status_flags.load(Ordering::Relaxed)
+    }
+
+    pub fn set_status_flags(&self, flags: u32) {
+        self.status_flags.store(flags, Ordering::Relaxed);
+    }
+
+    pub fn is_append(&self) -> bool {
+        (self.get_status_flags() & Self::O_APPEND) != 0
     }
 }
 
@@ -145,15 +167,35 @@ impl FdTable {
 
     /// Allocate the lowest available fd for the given file description.
     pub fn insert(&mut self, desc: Arc<FileDescription>, fd_flags: FdFlags) -> Result<u32, Errno> {
-        for (i, slot) in self.entries.iter_mut().enumerate() {
+        self.insert_from(0, desc, fd_flags)
+    }
+
+    /// Allocate the lowest available fd >= `min_fd`.
+    pub fn insert_from(
+        &mut self,
+        min_fd: u32,
+        desc: Arc<FileDescription>,
+        fd_flags: FdFlags,
+    ) -> Result<u32, Errno> {
+        let start = min_fd as usize;
+        if start >= MAX_FDS {
+            return Err(Errno::EBADF);
+        }
+        if self.entries.len() < start {
+            self.entries.resize(start, None);
+        }
+        for (i, slot) in self.entries.iter_mut().enumerate().skip(start) {
             if slot.is_none() {
                 *slot = Some((desc, fd_flags));
                 return Ok(i as u32);
             }
         }
-        let fd = self.entries.len();
+        let fd = self.entries.len().max(start);
         if fd >= MAX_FDS {
             return Err(Errno::Emfile);
+        }
+        if self.entries.len() < fd {
+            self.entries.resize(fd, None);
         }
         self.entries.push(Some((desc, fd_flags)));
         Ok(fd as u32)
@@ -188,6 +230,14 @@ impl FdTable {
     /// Get fd flags for a slot.
     pub fn get_flags(&self, fd: u32) -> Option<FdFlags> {
         self.entries.get(fd as usize)?.as_ref().map(|(_, f)| *f)
+    }
+
+    /// Update fd flags for a slot.
+    pub fn set_flags(&mut self, fd: u32, flags: FdFlags) -> Result<(), Errno> {
+        let slot = self.entries.get_mut(fd as usize).ok_or(Errno::EBADF)?;
+        let (desc, _) = slot.as_ref().ok_or(Errno::EBADF)?;
+        *slot = Some((Arc::clone(desc), flags));
+        Ok(())
     }
 
     /// Remove (close) an fd. Returns the FileDescription if it existed.

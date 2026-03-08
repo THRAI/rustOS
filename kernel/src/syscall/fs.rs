@@ -45,12 +45,22 @@ struct LinuxStat {
     __unused: [i32; 2],
 }
 
+#[inline]
+fn stat_mode_from_type(file_type: u8) -> u32 {
+    match file_type {
+        2 => 0o040755, // directory
+        7 => 0o120777, // symlink
+        _ => 0o100644, // regular
+    }
+}
+
 /// Resolve path, create `FileDescription`, and insert into fd table.
 pub async fn open(
     fd_table: &crate::hal_common::SpinMutex<FdTable>,
     path_str: &str,
     flags: OpenFlags,
     raw_flags: u32,
+    fd_flags: FdFlags,
 ) -> Result<u32, Errno> {
     #[inline]
     fn normalize_delegate_open_flags(raw_flags: u32) -> u32 {
@@ -109,7 +119,7 @@ pub async fn open(
 
     if let Some(dev_name) = path_str.strip_prefix("/dev/") {
         let desc = crate::fs::devfs::open_device(dev_name, flags)?;
-        let fd = fd_table.lock().insert(desc, FdFlags::empty())?;
+        let fd = fd_table.lock().insert(desc, fd_flags)?;
         return Ok(fd);
     }
 
@@ -154,7 +164,7 @@ pub async fn open(
     }
 
     let desc = FileDescription::new(FileObject::Vnode(vnode), flags);
-    let fd = fd_table.lock().insert(desc, FdFlags::empty())?;
+    let fd = fd_table.lock().insert(desc, fd_flags)?;
     Ok(fd)
 }
 
@@ -268,6 +278,31 @@ fn noop_waker() -> core::task::Waker {
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
 }
 
+#[inline]
+fn map_delegate_errno(code: i32) -> Errno {
+    match code.abs() {
+        1 => Errno::EPERM,
+        2 => Errno::ENOENT,
+        5 => Errno::EIO,
+        9 => Errno::EBADF,
+        12 => Errno::ENOMEM,
+        13 => Errno::EPERM,
+        17 => Errno::EEXIST,
+        19 => Errno::ENODEV,
+        20 => Errno::ENOTDIR,
+        21 => Errno::EISDIR,
+        22 => Errno::EINVAL,
+        24 => Errno::EMFILE,
+        25 => Errno::ENOTTY,
+        29 => Errno::ESPIPE,
+        32 => Errno::EPIPE,
+        34 => Errno::ERANGE,
+        38 => Errno::ENOSYS,
+        39 => Errno::ENOTEMPTY,
+        _ => Errno::EIO,
+    }
+}
+
 /// sys_lseek: reposition file offset.
 pub fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<u64, Errno> {
     use crate::fs::fd_table::FileObject;
@@ -348,12 +383,12 @@ pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno>
             let num_blocks = size.div_ceil(512) as i64;
             st.st_blocks = num_blocks;
             st.st_ino = v.vnode_id();
-            // S_IFREG=0o100000 or S_IFDIR=0o040000
             use crate::fs::vnode::VnodeType;
-            st.st_mode = match v.vtype() {
-                VnodeType::Regular => 0o100644,
-                VnodeType::Directory => 0o040755,
+            let ftype = match v.vtype() {
+                VnodeType::Regular => 1u8,
+                VnodeType::Directory => 2u8,
             };
+            st.st_mode = stat_mode_from_type(ftype);
         }
         FileObject::PipeRead(_) | FileObject::PipeWrite(_) => {
             st.st_mode = 0o010600; // S_IFIFO | rw
@@ -389,18 +424,41 @@ pub async fn sys_fstatat_async(
     dirfd: isize,
     pathname_ptr: usize,
     statbuf: usize,
+    flags: usize,
 ) -> Result<(), Errno> {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+
     if statbuf == 0 {
         return Err(Errno::Efault);
     }
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT)) != 0 {
+        return Err(Errno::EINVAL);
+    }
 
-    let raw_path = copyinstr(task, pathname_ptr, 256)
-        .await
-        .ok_or(Errno::Efault)?;
+    // AT_EMPTY_PATH: stat by fd when pathname is NULL/empty.
+    if pathname_ptr == 0 && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return Err(Errno::EBADF);
+        }
+        return sys_fstat(task, dirfd as u32, statbuf);
+    }
+    if pathname_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return Err(Errno::EBADF);
+        }
+        return sys_fstat(task, dirfd as u32, statbuf);
+    }
+    if raw_path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
-
-    // Resolve the path to a vnode
-    let vnode = crate::fs::path::resolve(&path_str).await?;
+    let (ino, ftype, size) = delegate::fs_lookup(0, &path_str).await.map_err(map_delegate_errno)?;
 
     let mut st = LinuxStat {
         st_dev: 0,
@@ -424,15 +482,10 @@ pub async fn sys_fstatat_async(
         __unused: [0; 2],
     };
 
-    st.st_ino = vnode.vnode_id();
-    st.st_size = vnode.size() as i64;
-    let num_blocks = vnode.size().div_ceil(512) as i64;
-    st.st_blocks = num_blocks;
-    use crate::fs::vnode::VnodeType;
-    st.st_mode = match vnode.vtype() {
-        VnodeType::Regular => 0o100755, // executable
-        VnodeType::Directory => 0o040755,
-    };
+    st.st_ino = ino as u64;
+    st.st_size = size as i64;
+    st.st_blocks = ((size + 511) / 512) as i64;
+    st.st_mode = stat_mode_from_type(ftype);
 
     fault_in_user_buffer(
         task,
@@ -513,13 +566,15 @@ pub async fn sys_utimensat_async(
 }
 
 /// sys_fcntl: file control operations.
-pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, _arg: usize) -> Result<usize, Errno> {
+pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usize, Errno> {
     const F_DUPFD: u32 = 0;
     const F_GETFD: u32 = 1;
     const F_SETFD: u32 = 2;
     const F_GETFL: u32 = 3;
     const F_SETFL: u32 = 4;
     const F_DUPFD_CLOEXEC: u32 = 1030;
+    const O_APPEND: usize = 0x0000_0400;
+    const O_NONBLOCK: usize = 0x0000_0800;
 
     use crate::fs::fd_table::FdFlags;
 
@@ -533,7 +588,7 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, _arg: usize) -> Result<usi
                 FdFlags::empty()
             };
             // Find lowest fd >= arg
-            let new_fd = tab.insert(desc, flags)?;
+            let new_fd = tab.insert_from(arg as u32, desc, flags)?;
             Ok(new_fd as usize)
         }
         F_GETFD => {
@@ -546,10 +601,14 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, _arg: usize) -> Result<usi
             })
         }
         F_SETFD => {
-            // We only support CLOEXEC (bit 0)
-            // For now, accept silently — FdTable doesn't have set_flags, so stub it
-            let tab = task.fd_table.lock();
-            let _ = tab.get(fd).ok_or(Errno::Ebadf)?;
+            let mut tab = task.fd_table.lock();
+            let _ = tab.get(fd).ok_or(Errno::EBADF)?;
+            let new_flags = if (arg & 1) != 0 {
+                FdFlags::CLOEXEC
+            } else {
+                FdFlags::empty()
+            };
+            tab.set_flags(fd, new_flags)?;
             Ok(0)
         }
         F_GETFL => {
@@ -562,12 +621,17 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, _arg: usize) -> Result<usi
                 fl = 1; // O_WRONLY
             }
             // O_RDONLY = 0
+            let status = desc.get_status_flags() as usize;
+            fl |= status & (O_APPEND | O_NONBLOCK);
             Ok(fl)
         }
         F_SETFL => {
-            // Accept silently — we don't support O_NONBLOCK/O_APPEND yet
             let tab = task.fd_table.lock();
-            let _ = tab.get(fd).ok_or(Errno::Ebadf)?;
+            let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+            let settable_mask = (O_APPEND | O_NONBLOCK) as u32;
+            let cur = desc.get_status_flags();
+            let next = (cur & !settable_mask) | ((arg as u32) & settable_mask);
+            desc.set_status_flags(next);
             Ok(0)
         }
         _ => Err(Errno::Einval),
@@ -641,6 +705,10 @@ pub async fn sys_mount_async(
     }
 
     let target = absolutize_path(task, AT_FDCWD, &raw_target)?;
+    let target_vnode = crate::fs::path::resolve(&target).await.map_err(|_| Errno::ENOENT)?;
+    if target_vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
     crate::fs::mount::register_mount(&source, &target, &fstype, flags)
 }
 
@@ -671,7 +739,183 @@ pub async fn sys_umount2_async(
         .await
         .ok_or(Errno::Efault)?;
     let target = absolutize_path(task, AT_FDCWD, &raw_target)?;
+    if target == "/" {
+        return Err(Errno::EINVAL);
+    }
     crate::fs::mount::unregister_mount(&target)
+}
+
+/// sys_linkat: create hard link.
+pub async fn sys_linkat_async(
+    task: &Arc<Task>,
+    olddirfd: isize,
+    oldpath_ptr: usize,
+    newdirfd: isize,
+    newpath_ptr: usize,
+    flags: i32,
+) -> Result<(), Errno> {
+    const AT_SYMLINK_FOLLOW: i32 = 0x400;
+    if (flags & !AT_SYMLINK_FOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let old_raw = copyinstr(task, oldpath_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let new_raw = copyinstr(task, newpath_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let old_path = absolutize_path(task, olddirfd, &old_raw)?;
+    let new_path = absolutize_path(task, newdirfd, &new_raw)?;
+    // Minimal cross-mount guard. Linux reports EXDEV; use EINVAL until EXDEV exists.
+    if !crate::fs::mount::same_mount_domain(&old_path, &new_path) {
+        return Err(Errno::EINVAL);
+    }
+    delegate::fs_link(&old_path, &new_path)
+        .await
+        .map_err(map_delegate_errno)?;
+    Ok(())
+}
+
+/// sys_renameat2: rename/move path.
+pub async fn sys_renameat2_async(
+    task: &Arc<Task>,
+    olddirfd: isize,
+    oldpath_ptr: usize,
+    newdirfd: isize,
+    newpath_ptr: usize,
+    flags: usize,
+) -> Result<(), Errno> {
+    // Minimal implementation: only support Linux default behavior.
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let old_raw = copyinstr(task, oldpath_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let new_raw = copyinstr(task, newpath_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let old_path = absolutize_path(task, olddirfd, &old_raw)?;
+    let new_path = absolutize_path(task, newdirfd, &new_raw)?;
+    // Minimal cross-mount guard. Linux reports EXDEV; use EINVAL until EXDEV exists.
+    if !crate::fs::mount::same_mount_domain(&old_path, &new_path) {
+        return Err(Errno::EINVAL);
+    }
+    delegate::fs_rename(&old_path, &new_path)
+        .await
+        .map_err(map_delegate_errno)?;
+    Ok(())
+}
+
+/// sys_readlinkat: read symbolic link target.
+pub async fn sys_readlinkat_async(
+    task: &Arc<Task>,
+    dirfd: isize,
+    pathname_ptr: usize,
+    buf_ptr: usize,
+    bufsiz: usize,
+) -> Result<usize, Errno> {
+    if bufsiz == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    let path = absolutize_path(task, dirfd, &raw_path)?;
+    let (mut n, data) = delegate::fs_readlink(&path)
+        .await
+        .map_err(map_delegate_errno)?;
+    if n > 0 && data[n - 1] == 0 {
+        n -= 1;
+    }
+    let copy_len = core::cmp::min(n, bufsiz);
+    fault_in_user_buffer(task, buf_ptr, copy_len, PageFaultAccessType::WRITE).await;
+    let rc = unsafe {
+        crate::hal::rv64::copy_user::copy_user_chunk(buf_ptr as *mut u8, data.as_ptr(), copy_len)
+    };
+    if rc != 0 {
+        return Err(Errno::EFAULT);
+    }
+    Ok(copy_len)
+}
+
+/// sys_faccessat: access check (minimal).
+pub async fn sys_faccessat_async(
+    task: &Arc<Task>,
+    dirfd: isize,
+    pathname_ptr: usize,
+    mode: i32,
+    flags: i32,
+) -> Result<(), Errno> {
+    const R_OK: i32 = 4;
+    const W_OK: i32 = 2;
+    const X_OK: i32 = 1;
+    const F_OK: i32 = 0;
+    const AT_EACCESS: i32 = 0x200;
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+    if mode != F_OK && (mode & !(R_OK | W_OK | X_OK)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    if pathname_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::EFAULT)?;
+    if raw_path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    let path = absolutize_path(task, dirfd, &raw_path)?;
+    let _ = delegate::fs_lookup(0, &path)
+        .await
+        .map_err(map_delegate_errno)?;
+    Ok(())
+}
+
+/// sys_ftruncate: truncate regular file by fd.
+pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<(), Errno> {
+    use crate::fs::fd_table::FileObject;
+    let desc = {
+        let tab = task.fd_table.lock();
+        Arc::clone(tab.get(fd).ok_or(Errno::EBADF)?)
+    };
+    let (path, vnode_id) = match &desc.object {
+        FileObject::Vnode(v) => (String::from(v.path()), v.vnode_id()),
+        _ => return Err(Errno::EINVAL),
+    };
+    delegate::fs_truncate(&path, len)
+        .await
+        .map_err(map_delegate_errno)?;
+    if let FileObject::Vnode(v) = &desc.object {
+        v.set_size(len);
+    }
+    let cur = desc.offset.load(Ordering::Relaxed);
+    if cur > len {
+        desc.offset.store(len, Ordering::Relaxed);
+    }
+    page_cache::invalidate_all(vnode_id);
+    Ok(())
+}
+
+/// sys_fsync: flush data and metadata.
+pub async fn sys_fsync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
+    use crate::fs::fd_table::FileObject;
+    let path = {
+        let tab = task.fd_table.lock();
+        let desc = tab.get(fd).ok_or(Errno::EBADF)?;
+        match &desc.object {
+            FileObject::Vnode(v) => String::from(v.path()),
+            _ => return Ok(()),
+        }
+    };
+    delegate::fs_cache_flush(&path)
+        .await
+        .map_err(map_delegate_errno)
+}
+
+/// sys_fdatasync: flush data (same as fsync for now).
+pub async fn sys_fdatasync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
+    sys_fsync_async(task, fd).await
+}
+
+/// sys_sync: flush all filesystem cache.
+pub async fn sys_sync_async() -> Result<(), Errno> {
+    delegate::fs_cache_flush("/")
+        .await
+        .map_err(map_delegate_errno)
 }
 
 /// sys_pipe2: create a pipe with optional flags.
@@ -733,11 +977,9 @@ pub async fn sys_openat_async(
     const O_RDONLY: usize = 0;
     const O_WRONLY: usize = 1;
     const O_RDWR: usize = 2;
-    const O_CREAT: usize = 0x40;
-    const O_EXCL: usize = 0x80;
     const O_TRUNC: usize = 0x200;
     const O_APPEND: usize = 0x400;
-    const O_DIRECTORY: usize = 0x10000;
+    const O_CLOEXEC: usize = 0x80000;
 
     // Read pathname from user memory using fault-safe copyinstr.
     let raw_path = copyinstr(task, pathname_ptr, 256)
@@ -747,16 +989,27 @@ pub async fn sys_openat_async(
 
     // Parse access mode
     let access_mode = flags & 0x3;
+    if access_mode > O_RDWR {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & O_TRUNC) != 0 && access_mode == O_RDONLY {
+        return Err(Errno::EINVAL);
+    }
     let open_flags = OpenFlags {
         read: access_mode == O_RDONLY || access_mode == O_RDWR,
         write: access_mode == O_WRONLY || access_mode == O_RDWR,
         append: (flags & O_APPEND) != 0,
     };
+    let fd_flags = if (flags & O_CLOEXEC) != 0 {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
 
     // Pass full flags to delegate for O_CREAT/O_TRUNC handling
     let delegate_flags = flags as u32;
 
-    open(&task.fd_table, &path_str, open_flags, delegate_flags).await
+    open(&task.fd_table, &path_str, open_flags, delegate_flags, fd_flags).await
 }
 
 /// sys_close: close a file descriptor.
@@ -1040,7 +1293,7 @@ pub async fn sys_write_async(
             FileObject::Vnode(v) => WriteTarget::Vnode {
                 path: String::from(v.path()),
                 offset: d.offset.load(core::sync::atomic::Ordering::Relaxed),
-                append: d.flags.append,
+                append: d.is_append(),
             },
         };
         (tgt, Arc::clone(d))
@@ -1061,9 +1314,8 @@ pub async fn sys_write_async(
             if rc != 0 {
                 return Err(Errno::Efault);
             }
-            for &b in &kbuf {
-                crate::console::putchar(b);
-            }
+            // Use atomic batch write to prevent output interleaving
+            crate::console::putchars(&kbuf);
             Ok(len)
         }
         WriteTarget::PipeWrite(pipe) => {
@@ -1672,12 +1924,6 @@ pub async fn sys_unlinkat_async(
     }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
 
-    // In-memory symlink compatibility path.
-    if (flags & AT_REMOVEDIR) == 0 && crate::fs::symlink::remove(&path_str) {
-        crate::klog!(syscall, debug, "unlinkat: removed symlink {}", path_str);
-        return Ok(());
-    }
-
     // Check existence and type
     let (_, ftype, _) = delegate::fs_lookup(0, &path_str)
         .await
@@ -1713,7 +1959,7 @@ pub async fn sys_unlinkat_async(
     Ok(())
 }
 
-/// sys_symlinkat: create a symbolic link (compatibility in-memory mapping).
+/// sys_symlinkat: create a symbolic link on ext4.
 pub async fn sys_symlinkat_async(
     task: &Arc<Task>,
     target_ptr: usize,
@@ -1752,7 +1998,7 @@ pub async fn sys_symlinkat_async(
         return Err(Errno::Enotdir);
     }
 
-    let target_norm = if raw_target.starts_with('/') {
+    let target_abs = if raw_target.starts_with('/') {
         normalize_absolute_path(&raw_target)
     } else {
         let mut joined = String::from(parent);
@@ -1763,8 +2009,21 @@ pub async fn sys_symlinkat_async(
         normalize_absolute_path(&joined)
     };
 
+<<<<<<< HEAD
     crate::fs::symlink::create(&link_abs, &target_norm)?;
     crate::klog!(syscall, debug, "symlinkat: {} -> {}", link_abs, target_norm);
+=======
+    delegate::fs_symlink(&target_abs, &link_abs)
+        .await
+        .map_err(map_delegate_errno)?;
+    crate::klog!(
+        syscall,
+        debug,
+        "symlinkat: {} -> {}",
+        link_abs,
+        target_abs
+    );
+>>>>>>> fd3c3caa93fdd405db675e185e793d097bed831a
     Ok(())
 }
 

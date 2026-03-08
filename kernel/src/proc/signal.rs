@@ -588,7 +588,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
     };
     klog!(
         signal,
-        error,
+        debug,
         "check_pending pid={} sig={}",
         task.pid,
         Signal(sig)
@@ -598,7 +598,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
     if sig == SIGKILL {
         klog!(
             signal,
-            error,
+            debug,
             "check_pending pid={} SIGKILL -> fatal",
             task.pid
         );
@@ -621,7 +621,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
                 SigDefault::Terminate => {
                     klog!(
                         signal,
-                        error,
+                        debug,
                         "check_pending pid={} sig={} SIG_DFL -> Terminate",
                         task.pid,
                         Signal(sig)
@@ -637,7 +637,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
         _handler => {
             klog!(
                 signal,
-                error,
+                debug,
                 "check_pending pid={} sig={} -> user handler {:#x}",
                 task.pid,
                 Signal(sig),
@@ -649,7 +649,7 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
                 Err(()) => {
                     klog!(
                         signal,
-                        error,
+                        debug,
                         "check_pending pid={} sendsig FAILED -> SIGILL",
                         task.pid
                     );

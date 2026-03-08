@@ -115,11 +115,11 @@ pub fn close(_tok: &mut DelegateToken, file: &mut Ext4File) -> Result<(), i32> {
 
 // ── Native stat via ext4_raw_inode_fill (Phase 1) ───────────────────
 
-/// Stat a path: returns `(file_size, file_type_u8)`.
-/// file_type: 1=regular, 2=directory.
+/// Stat a path: returns `(inode, file_size, file_type_u8)`.
+/// file_type: 1=regular, 2=directory, 7=symlink.
 ///
 /// Uses the native `ext4_raw_inode_fill` C API — no file_open needed.
-pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u64, u8), i32> {
+pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u32, u64, u8), i32> {
     let cpath = path_to_cstr(path);
     let mut ino: u32 = 0;
     let mut inode: ext4_inode = unsafe { core::mem::zeroed() };
@@ -137,9 +137,13 @@ pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u64, u8), i32> {
     }
 
     let mode = inode.mode;
-    let ftype = if (mode & 0xF000) == 0x4000 { 2u8 } else { 1u8 };
+    let ftype = match mode & 0xF000 {
+        0x4000 => 2u8, // S_IFDIR
+        0xA000 => 7u8, // S_IFLNK
+        _ => 1u8,      // S_IFREG and fallback
+    };
     let size = (inode.size_hi as u64) << 32 | (inode.size_lo as u64);
-    Ok((size, ftype))
+    Ok((ino, size, ftype))
 }
 
 /// Check if an inode exists at the given path.
@@ -202,5 +206,42 @@ pub fn mkdir(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
 pub fn unlink(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
     let mut file = Ext4File::new(path, InodeTypes::EXT4_DE_REG_FILE);
     file.file_remove(path)?;
+    Ok(())
+}
+
+/// Create a hard link: `new_path` links to `old_path`.
+pub fn link(_tok: &mut DelegateToken, old_path: &str, new_path: &str) -> Result<(), i32> {
+    let file = Ext4File::new(old_path, InodeTypes::EXT4_DE_REG_FILE);
+    let _ = file.link_create(new_path)?;
+    Ok(())
+}
+
+/// Rename/move a file or directory.
+pub fn rename(_tok: &mut DelegateToken, old_path: &str, new_path: &str) -> Result<(), i32> {
+    let mut file = Ext4File::new(old_path, InodeTypes::EXT4_DE_REG_FILE);
+    let _ = file.file_rename(old_path, new_path)?;
+    Ok(())
+}
+
+/// Create a symbolic link: `path` points to `target`.
+pub fn symlink(_tok: &mut DelegateToken, target: &str, path: &str) -> Result<(), i32> {
+    let file = Ext4File::new(path, InodeTypes::EXT4_DE_SYMLINK);
+    let _ = file.symlink_create(target, path)?;
+    Ok(())
+}
+
+/// Read symbolic link content into `buf`. Returns bytes written.
+pub fn readlink(_tok: &mut DelegateToken, path: &str, buf: &mut [u8]) -> Result<usize, i32> {
+    let file = Ext4File::new(path, InodeTypes::EXT4_DE_SYMLINK);
+    file.symlink_read(buf)
+}
+
+/// Flush filesystem cache for the mount point that contains `path`.
+pub fn cache_flush(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
+    let cpath = path_to_cstr(path);
+    let rc = unsafe { bindings::ext4_cache_flush(cpath.as_ptr() as *const core::ffi::c_char) };
+    if rc != EOK as i32 {
+        return Err(-(rc.abs()));
+    }
     Ok(())
 }

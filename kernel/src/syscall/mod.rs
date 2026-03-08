@@ -37,7 +37,11 @@ impl SyscallId {
     pub const DUP: Self = Self(23);
     pub const DUP3: Self = Self(24);
     pub const IOCTL: Self = Self(29);
+    pub const LINKAT: Self = Self(37);
+    pub const RENAMEAT: Self = Self(38);
     pub const CHDIR: Self = Self(49);
+    pub const FTRUNCATE: Self = Self(46);
+    pub const FACCESSAT: Self = Self(48);
     pub const OPENAT: Self = Self(56);
     pub const CLOSE: Self = Self(57);
     pub const GETDENTS64: Self = Self(61);
@@ -47,7 +51,11 @@ impl SyscallId {
     pub const READV: Self = Self(65);
     pub const WRITEV: Self = Self(66);
     pub const SENDFILE: Self = Self(71);
+    pub const READLINKAT: Self = Self(78);
     pub const FSTATAT: Self = Self(79);
+    pub const SYNC: Self = Self(81);
+    pub const FSYNC: Self = Self(82);
+    pub const FDATASYNC: Self = Self(83);
     pub const FSTAT: Self = Self(80);
     pub const UTIMENSAT: Self = Self(88);
     pub const EXIT: Self = Self(93);
@@ -81,6 +89,7 @@ impl SyscallId {
     pub const MMAP: Self = Self(222);
     pub const MPROTECT: Self = Self(226);
     pub const WAIT4: Self = Self(260);
+    pub const RENAMEAT2: Self = Self(276);
     pub const MKDIRAT: Self = Self(34);
     pub const UNLINKAT: Self = Self(35);
     pub const SYMLINKAT: Self = Self(36);
@@ -100,7 +109,11 @@ impl core::fmt::Display for SyscallId {
             Self::DUP => "dup",
             Self::DUP3 => "dup3",
             Self::IOCTL => "ioctl",
+            Self::LINKAT => "linkat",
+            Self::RENAMEAT => "renameat",
             Self::CHDIR => "chdir",
+            Self::FTRUNCATE => "ftruncate",
+            Self::FACCESSAT => "faccessat",
             Self::OPENAT => "openat",
             Self::CLOSE => "close",
             Self::GETDENTS64 => "getdents64",
@@ -110,7 +123,11 @@ impl core::fmt::Display for SyscallId {
             Self::WRITE => "write",
             Self::WRITEV => "writev",
             Self::SENDFILE => "sendfile",
+            Self::READLINKAT => "readlinkat",
             Self::FSTATAT => "fstatat",
+            Self::SYNC => "sync",
+            Self::FSYNC => "fsync",
+            Self::FDATASYNC => "fdatasync",
             Self::FSTAT => "fstat",
             Self::UTIMENSAT => "utimensat",
             Self::EXIT => "exit",
@@ -144,6 +161,7 @@ impl core::fmt::Display for SyscallId {
             Self::MMAP => "mmap",
             Self::MPROTECT => "mprotect",
             Self::WAIT4 => "wait4",
+            Self::RENAMEAT2 => "renameat2",
             Self::MKDIRAT => "mkdirat",
             Self::UNLINKAT => "unlinkat",
             Self::SYMLINKAT => "symlinkat",
@@ -354,9 +372,37 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             };
             SyscallAction::Return(ret)
         }
+        SyscallId::LINKAT => {
+            let ret = match fs::sys_linkat_async(task, a0 as isize, a1, a2 as isize, a3, a4 as i32).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::RENAMEAT => {
+            let ret = match fs::sys_renameat2_async(task, a0 as isize, a1, a2 as isize, a3, 0).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
         SyscallId::GETCWD => {
             let ret = match fs::sys_getcwd(task, a0, a1) {
                 Ok(v) => v,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::FTRUNCATE => {
+            let ret = match fs::sys_ftruncate_async(task, a0 as u32, a1 as u64).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::FACCESSAT => {
+            let ret = match fs::sys_faccessat_async(task, a0 as isize, a1, a2 as i32, a3 as i32).await {
+                Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };
             SyscallAction::Return(ret)
@@ -403,7 +449,35 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
-        SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::Einval)),
+        SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::EINVAL)),
+        SyscallId::READLINKAT => {
+            let ret = match fs::sys_readlinkat_async(task, a0 as isize, a1, a2, a3).await {
+                Ok(n) => n,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::SYNC => {
+            let ret = match fs::sys_sync_async().await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::FSYNC => {
+            let ret = match fs::sys_fsync_async(task, a0 as u32).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
+        SyscallId::FDATASYNC => {
+            let ret = match fs::sys_fdatasync_async(task, a0 as u32).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
         SyscallId::OPENAT => {
             let ret = match fs::sys_openat_async(task, a0 as isize, a1, a2).await {
                 Ok(fd) => fd as usize,
@@ -528,12 +602,19 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             };
             SyscallAction::Return(ret)
         }
+        SyscallId::RENAMEAT2 => {
+            let ret = match fs::sys_renameat2_async(task, a0 as isize, a1, a2 as isize, a3, a4).await {
+                Ok(()) => 0,
+                Err(e) => errno_ret(e),
+            };
+            SyscallAction::Return(ret)
+        }
         SyscallId::UMASK => {
             // Stub: return previous umask (0o022), accept silently
             SyscallAction::Return(0o022)
         }
         SyscallId::FSTATAT => {
-            let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2).await {
+            let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(()) => 0,
                 Err(e) => errno_ret(e),
             };

@@ -49,9 +49,50 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
-/// Write a single byte to the UART (no locking, for syscall write path).
+/// Write a single byte to the UART (with locking for atomic output).
 pub fn putchar(c: u8) {
+    // Disable IRQs on this hart
+    let saved: usize;
+    unsafe {
+        core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
+    }
+    // Acquire cross-hart spinlock
+    while PRINT_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
     uart::putchar(c);
+    // Release
+    PRINT_LOCK.store(false, Ordering::Release);
+    // Restore IRQs
+    if saved & 0x2 != 0 {
+        unsafe {
+            core::arch::asm!("csrsi sstatus, 0x2");
+        }
+    }
+}
+
+/// Write multiple bytes to the UART atomically (with locking).
+pub fn putchars(bytes: &[u8]) {
+    // Disable IRQs on this hart
+    let saved: usize;
+    unsafe {
+        core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
+    }
+    // Acquire cross-hart spinlock
+    while PRINT_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    for &b in bytes {
+        uart::putchar(b);
+    }
+    // Release
+    PRINT_LOCK.store(false, Ordering::Release);
+    // Restore IRQs
+    if saved & 0x2 != 0 {
+        unsafe {
+            core::arch::asm!("csrsi sstatus, 0x2");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

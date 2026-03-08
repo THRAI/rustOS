@@ -24,3 +24,5 @@ scripts/sdcard-la.img
 *.expect
 *.img
 kernel-rv
+# allow testcase text fixtures
+!testcase/**/*.txt

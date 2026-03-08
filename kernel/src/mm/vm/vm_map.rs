@@ -158,6 +158,7 @@ impl VmArea {
         file_offset: usize,
         file_size: usize,
     ) -> Self {
+        //kprintln!("TODO: file-backed vma concepts to VmObject layer");
         Self {
             id: next_vma_id(),
             range,

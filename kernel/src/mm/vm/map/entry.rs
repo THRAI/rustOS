@@ -13,6 +13,8 @@ bitflags! {
         const GROWS_DOWN     = 1 << 2;
         const IN_TRANSITION  = 1 << 3;
         const NEEDS_WAKEUP   = 1 << 4;
+        /// User heap area managed by brk(2).
+        const HEAP           = 1 << 5;
     }
 }
 

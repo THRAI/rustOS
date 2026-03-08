@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use hal_common::Errno;
+use crate::hal_common::Errno;
 
 use super::vnode::Vnode;
 
@@ -179,7 +179,7 @@ impl FdTable {
     ) -> Result<u32, Errno> {
         let start = min_fd as usize;
         if start >= MAX_FDS {
-            return Err(Errno::EBADF);
+            return Err(Errno::Ebadf);
         }
         if self.entries.len() < start {
             self.entries.resize(start, None);
@@ -234,8 +234,8 @@ impl FdTable {
 
     /// Update fd flags for a slot.
     pub fn set_flags(&mut self, fd: u32, flags: FdFlags) -> Result<(), Errno> {
-        let slot = self.entries.get_mut(fd as usize).ok_or(Errno::EBADF)?;
-        let (desc, _) = slot.as_ref().ok_or(Errno::EBADF)?;
+        let slot = self.entries.get_mut(fd as usize).ok_or(Errno::Ebadf)?;
+        let (desc, _) = slot.as_ref().ok_or(Errno::Ebadf)?;
         *slot = Some((Arc::clone(desc), flags));
         Ok(())
     }

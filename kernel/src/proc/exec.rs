@@ -7,6 +7,7 @@
 // use crate::fs::vnode::Vnode;
 use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
 use alloc::string::String;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -247,6 +248,24 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         crate::mm::pmap::pmap_destroy(&mut old_pmap);
     }
 
+    // Some ELF binaries split one page across multiple PT_LOAD segments
+    // (e.g. text + rodata). Keep the maximum file-backed coverage per merged page.
+    let mut merged_file_bytes: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for phdr in phdrs.iter() {
+        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+            continue;
+        }
+        let va_start = ((phdr.p_vaddr as usize) + load_bias) & !(PAGE_SIZE - 1);
+        let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
+        let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
+        let key = (va_start, file_offset_page_aligned);
+        let cur = merged_file_bytes.get(&key).copied().unwrap_or(0);
+        if file_backed_bytes > cur {
+            merged_file_bytes.insert(key, file_backed_bytes);
+        }
+    }
+
     // 4. Create demand-paged VMAs for each PT_LOAD segment
     let mut brk_end: usize = 0;
     for phdr in phdrs {
@@ -265,10 +284,18 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         // Adjustment for non-page-aligned p_vaddr
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
+        let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
+        let merged_backed_bytes = merged_file_bytes
+            .get(&(va_start, file_offset_page_aligned))
+            .copied()
+            .unwrap_or(file_backed_bytes);
         let obj = VmObject::new_anon(obj_size);
         obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
             vnode_id: vnode.vnode_id() as usize,
             path: alloc::string::String::from(vnode.path()),
+            base_offset: file_offset_page_aligned,
+            valid_bytes: merged_backed_bytes,
         }));
 
         let vma = VmMapEntry::new(
@@ -425,6 +452,22 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
     let interp_entry = elf_hdr.e_entry as usize + offset;
 
+    let mut merged_file_bytes: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for phdr in phdrs.iter() {
+        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+            continue;
+        }
+        let va_start = ((phdr.p_vaddr as usize) + offset) & !(PAGE_SIZE - 1);
+        let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
+        let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
+        let key = (va_start, file_offset_page_aligned);
+        let cur = merged_file_bytes.get(&key).copied().unwrap_or(0);
+        if file_backed_bytes > cur {
+            merged_file_bytes.insert(key, file_backed_bytes);
+        }
+    }
+
     for phdr in phdrs {
         if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
             continue;
@@ -438,10 +481,18 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
+        let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
+        let merged_backed_bytes = merged_file_bytes
+            .get(&(va_start, file_offset_page_aligned))
+            .copied()
+            .unwrap_or(file_backed_bytes);
         let obj = VmObject::new_anon(obj_size);
         obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
             vnode_id: vnode.vnode_id() as usize,
             path: alloc::string::String::from(vnode.path()),
+            base_offset: file_offset_page_aligned,
+            valid_bytes: merged_backed_bytes,
         }));
         let vma = VmMapEntry::new(
             va_start as u64,

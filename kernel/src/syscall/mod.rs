@@ -449,7 +449,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                 Err(e) => SyscallAction::Return(errno_ret(e)),
             }
         }
-        SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::EINVAL)),
+        SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::Einval)),
         SyscallId::READLINKAT => {
             let ret = match fs::sys_readlinkat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(n) => n,

@@ -11,6 +11,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use core::future::Future;
+use crate::hal_common::IrqSafeSpinLock;
 use lwext4_rust::Ext4File;
 
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
@@ -460,25 +461,15 @@ async fn delegate_task() {
             } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                match crate::mm::allocator::alloc_raw_frame_sync(
-                    crate::mm::allocator::PageRole::FileCache,
-                ) {
-                    Some(frame) => {
-                        //TODO: extract this as fill_with_zero for pages.
-                        let pa = frame.as_usize();
-                        let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
-                        buf.fill(0);
-                        match crate::fs::ext4::open(&mut tok, &backend_path, 0) {
-                            Ok(mut file) => {
-                                let _ = file.file_seek(offset as i64, 0); // SEEK_SET
-                                let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
-                                let _ = crate::fs::ext4::close(&mut tok, &mut file);
-                                reply.complete(Ok(pa));
-                            }
-                            Err(e) => {
-                                reply.complete(Err(e));
-                            }
-                        }
+                // Fill the caller-provided page with file contents.
+                let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
+                buf.fill(0);
+                match crate::fs::ext4::open(&mut tok, &backend_path, 0) {
+                    Ok(mut file) => {
+                        let _ = file.file_seek(offset as i64, 0); // SEEK_SET
+                        let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
+                        let _ = crate::fs::ext4::close(&mut tok, &mut file);
+                        reply.complete(Ok(()));
                     }
                     Err(e) => reply.complete(Err(e)),
                 }

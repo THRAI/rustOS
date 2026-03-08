@@ -89,7 +89,7 @@ fn parse_source_root(source: &str) -> Result<String, Errno> {
         source
     };
     if !source_path.starts_with('/') {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
     Ok(normalize_absolute_path(source_path))
 }
@@ -146,7 +146,7 @@ pub fn register_mount(source: &str, target: &str, fstype: &str, flags: usize) ->
         return Err(Errno::Einval);
     }
     if !target.starts_with('/') {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
     let source_path = parse_source_root(source)?;
     let target_path = normalize_absolute_path(target);
@@ -166,7 +166,7 @@ pub fn unregister_mount(target: &str) -> Result<(), Errno> {
         return Err(Errno::Einval);
     }
     if !target.starts_with('/') {
-        return Err(Errno::EINVAL);
+        return Err(Errno::Einval);
     }
     let target = normalize_absolute_path(target);
 

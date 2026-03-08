@@ -72,7 +72,7 @@ pub async fn sys_execve_async(
 ) -> Result<(usize, usize), Errno> {
     // Read pathname from user memory
     let path = match copyinstr(task, pathname_ptr, 256).await {
-        None => return Err(Errno::EFAULT),
+        None => return Err(Errno::Efault),
         Some(s) => s,
     };
     // Read argv array from user memory (before exec destroys address space)
@@ -152,7 +152,7 @@ pub async fn sys_wait4_async(
                         )
                     };
                     if rc != 0 {
-                        return Err(Errno::EFAULT);
+                        return Err(Errno::Efault);
                     }
                 }
                 return Ok(child_pid);
@@ -185,7 +185,7 @@ pub async fn sys_wait4_async(
                     )
                 };
                 if rc != 0 {
-                    return Err(Errno::EFAULT);
+                    return Err(Errno::Efault);
                 }
             }
             Ok(child_pid)
@@ -218,7 +218,7 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
         )
     };
     if ok != 0 {
-        return Err(Errno::EFAULT);
+        return Err(Errno::Efault);
     }
     let frame = unsafe { frame.assume_init() };
 
@@ -279,7 +279,7 @@ pub fn sys_sigaction(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
     }
 
@@ -294,7 +294,7 @@ pub fn sys_sigaction(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
         actions[idx] = SigAction {
             handler: buf[0] as usize,
@@ -330,7 +330,7 @@ pub fn sys_sigprocmask(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
     }
 
@@ -344,7 +344,7 @@ pub fn sys_sigprocmask(
             )
         };
         if rc != 0 {
-            return Err(Errno::EFAULT);
+            return Err(Errno::Efault);
         }
 
         let unblockable = crate::proc::signal::SigSet::empty()

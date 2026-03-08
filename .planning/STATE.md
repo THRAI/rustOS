@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Completed 04-04-PLAN.md
-last_updated: "2026-03-07T17:03:37.531Z"
-last_activity: 2026-03-08 -- Plan 04-04 complete (~5min)
+status: Unified do_execve with two-phase commit semantics
+stopped_at: Completed 08-02-PLAN.md
+last_updated: "2026-03-08T11:01:53.223Z"
+last_activity: 2026-03-08 -- Plan 08-02 complete (~5min)
 progress:
-  total_phases: 8
+  total_phases: 9
   completed_phases: 5
-  total_plans: 19
-  completed_plans: 19
-  percent: 100
+  total_plans: 30
+  completed_plans: 21
+  percent: 70
 ---
 
 # Project State
@@ -26,16 +26,16 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 8 (Refactor VM Submodule and Exec/Fork Logic) — IN PROGRESS
-Plan: 1 complete in current phase — 08-01 complete
-Status: RAII busy lock guards added (SharedBusyGuard, ExclusiveBusyGuard) with guarded VmObject access
-Last activity: 2026-03-08 -- Plan 08-01 complete (~5min)
+Plan: 2 complete in current phase — 08-02 complete
+Status: Unified do_execve with two-phase commit semantics
+Last activity: 2026-03-08 -- Plan 08-02 complete (~5min)
 
-Progress: [█---------] 10% (Phase 8)
+Progress: [███████░░░] 70%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 20
+- Total plans completed: 22
 - Average duration: 7min
 - Total execution time: 2.15 hours
 
@@ -56,6 +56,7 @@ Progress: [█---------] 10% (Phase 8)
 *Updated after each plan completion*
 | Phase 04 P04 | 5 | 2 tasks | 4 files |
 | Phase 08 P01 | 5 | 2 tasks | 2 files |
+| Phase 08 P02 | 5 | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -146,6 +147,9 @@ Recent decisions affecting current work:
 - [Phase 04]: SA_NOCLDWAIT auto-reap skips zombie state and suppresses SIGCHLD
 - [08-01]: Arc-cloning guards (not lifetime params) for VmPage RAII locks -- avoids async lifetime complexity
 - [08-01]: core::ptr::read + mem::forget for ExclusiveBusyGuard::downgrade -- safe Arc transfer without double-release
+- [Phase 08-02]: Two-phase commit exec: parse ELF and build new VmMap in temp before atomic swap via core::mem::replace
+- [Phase 08-02]: ExecContext::build as pure function using goblin -- no VmMap ops, no I/O
+- [Phase 08-02]: Legacy exec gated behind cfg(feature = exec-legacy) for debugging
 
 ### Pending Todos
 
@@ -174,5 +178,5 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-08 - Completed 08-01: RAII busy lock guards
-Stopped at: Completed 08-01-PLAN.md
+Stopped at: Completed 08-02-PLAN.md
 Resume file: None

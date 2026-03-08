@@ -37,6 +37,7 @@ macro_rules! implement_affine_space {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PhysAddr(pub usize);
 
+
 /// Virtual address newtype
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VirtAddr(pub usize);
@@ -82,10 +83,10 @@ impl PhysAddr {
     pub const fn new(addr: usize) -> Self {
         Self(addr)
     }
+
     pub const fn as_usize(self) -> usize {
         self.0
     }
-
     pub fn floor_page(&self) -> PhysPageNum {
         PhysPageNum(self.0 / PAGE_SIZE)
     }
@@ -114,6 +115,22 @@ impl PhysAddr {
     pub fn into_kernel_vaddr(self) -> VirtAddr {
         // Identity-mapped in kernel
         VirtAddr(self.0)
+    }
+
+    pub fn as_slice<'a>(self) -> &'a [u8] {
+        self.into_kernel_vaddr().as_page_slice()
+    }
+}
+
+impl From<PhysAddr> for usize {
+    fn from(value: PhysAddr) -> Self {
+        value.0
+    }
+}
+
+impl core::fmt::LowerHex for PhysAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "PA 0x{:x}", self.0)
     }
 }
 
@@ -208,7 +225,7 @@ impl PageCursor {
         }
         self.offset -= size;
         unsafe {
-            let ptr = (self.base.as_usize() + self.offset) as *mut u8;
+            let ptr = (self.base.0 + self.offset) as *mut u8;
             Some(core::slice::from_raw_parts_mut(ptr, size))
         }
     }

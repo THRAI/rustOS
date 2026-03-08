@@ -108,6 +108,24 @@ impl VmMapEntry {
         }
     }
 
+    //va_start as u64,
+    //va_end as u64,
+    //BackingStore::Object {
+    //    object: obj,
+    //    offset: file_offset_page_aligned as u64,
+    //},
+    //crate::mm::vm::map::entry::EntryFlags::empty(),
+    //region.prot,
+    pub fn new_file_backed(start: u64, end: u64, store: BackingStore, flags: EntryFlags, protection: MapPerm) -> Self {
+        Self::new(
+            start,
+            end,
+            store,
+            flags,
+            protection,
+        )
+    }
+
     pub fn start(&self) -> u64 {
         self.start
     }

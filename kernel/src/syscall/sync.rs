@@ -3,7 +3,7 @@
 //! Implements futex, nanosleep, clock_gettime and related operations.
 
 use alloc::sync::Arc;
-use crate::hal_common::{Errno, PhysAddr, VirtAddr};
+use crate::hal_common::{Errno, VirtAddr};
 
 use crate::proc::task::Task;
 
@@ -176,7 +176,7 @@ pub async fn sys_futex_async(
                 crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
                     .ok_or(Errno::Efault)?
             };
-            let pa_key = PhysAddr::new(pa.as_usize() + (uaddr & 0xFFF));
+            let pa_key = pa + (uaddr & 0xFFF);
             // Park on the futex
             crate::ipc::futex::futex_wait(pa_key, task).await?;
             Ok(0)
@@ -189,7 +189,7 @@ pub async fn sys_futex_async(
                 crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
                     .ok_or(Errno::Efault)?
             };
-            let pa_key = PhysAddr::new(pa.as_usize() + (uaddr & 0xFFF));
+            let pa_key = pa + (uaddr & 0xFFF);
             let woken = crate::ipc::futex::futex_wake(pa_key, val as usize);
             Ok(woken)
         }

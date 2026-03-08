@@ -75,7 +75,7 @@ impl VmPage {
     }
 
     /// Create a dummy cached page for tests.
-    pub fn new_cached(pa: PhysAddr) -> Self {
+    pub fn new_cached_test(pa: PhysAddr) -> Self {
         let p = Self::new_test(pa);
         p.dirty.store(0, Ordering::Relaxed);
         p
@@ -257,7 +257,7 @@ impl VmPage {
 
     /// Access physical address as a mutable pointer for I/O / bzero.
     pub unsafe fn phys_addr_as_mut_ptr(&self) -> *mut u8 {
-        self.phys_addr.as_usize() as *mut u8
+        self.phys_addr.into_kernel_vaddr().as_mut_ptr()
     }
 
     /// Get the raw physical address.
@@ -268,28 +268,28 @@ impl VmPage {
 
     /// Access the underlying page as a byte slice.
     #[inline]
-    pub fn as_bytes(&self) -> &[u8; crate::hal_common::addr::PAGE_SIZE] {
-        unsafe { &*(self.phys_addr.as_usize() as *const [u8; crate::hal_common::addr::PAGE_SIZE]) }
+    pub fn as_page_slice(&self) -> &[u8; crate::hal_common::addr::PAGE_SIZE] {
+        unsafe { &*(self.phys_addr.into_kernel_vaddr().as_ptr() as *const [u8; crate::hal_common::addr::PAGE_SIZE]) }
     }
 
     /// Access the underlying page as a mutable byte slice.
     #[inline]
-    pub fn as_bytes_mut(&mut self) -> &mut [u8; crate::hal_common::addr::PAGE_SIZE] {
+    pub fn as_page_slice_mut(&mut self) -> &mut [u8; crate::hal_common::addr::PAGE_SIZE] {
         unsafe {
-            &mut *(self.phys_addr.as_usize() as *mut [u8; crate::hal_common::addr::PAGE_SIZE])
+            &mut *(self.phys_addr.into_kernel_vaddr().as_mut_ptr() as *mut [u8; crate::hal_common::addr::PAGE_SIZE])
         }
     }
 
     /// Access the underlying page as a slice of 512 u64 page table entries.
     #[inline]
     pub fn as_ptes(&self) -> &[u64; 512] {
-        unsafe { &*(self.phys_addr.as_usize() as *const [u64; 512]) }
+        unsafe { &*(self.phys_addr.into_kernel_vaddr().as_ptr() as *const [u64; 512]) }
     }
 
     /// Access the underlying page as a mutable slice of 512 u64 page table entries.
     #[inline]
     pub fn as_ptes_mut(&mut self) -> &mut [u64; 512] {
-        unsafe { &mut *(self.phys_addr.as_usize() as *mut [u64; 512]) }
+        unsafe { &mut *(self.phys_addr.into_kernel_vaddr().as_mut_ptr() as *mut [u64; 512]) }
     }
 
     // ------------------------------------------------------------------------

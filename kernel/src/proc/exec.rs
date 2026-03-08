@@ -123,8 +123,8 @@ pub async fn do_execve(
         .read()
         .lookup_page(crate::hal_common::addr::VirtPageNum(0))
         .ok_or(Errno::Enoexec)?;
-    let hdr_buf =
-        unsafe { core::slice::from_raw_parts(hdr_phys.as_usize() as *const u8, PAGE_SIZE) };
+
+    let hdr_buf = hdr_phys.as_slice();
 
     let (ehdr, phdrs) = match super::elf::parse_elf_first_page(hdr_buf) {
         Ok(parsed) => parsed,
@@ -160,7 +160,7 @@ pub async fn do_execve(
             obj_size,
         );
 
-        let vma = VmMapEntry::new(
+        let vma = VmMapEntry::new_file_backed(
             va_start as u64,
             va_end as u64,
             BackingStore::Object {
@@ -308,14 +308,10 @@ pub async fn do_execve(
 
         // argc
         write_usize(argv.len());
-        for va in &argv_vas {
-            write_usize(*va);
-        }
+        for va in &argv_vas { write_usize(*va); }
         write_usize(0); // NULL
 
-        for va in &envp_vas {
-            write_usize(*va);
-        }
+        for va in &envp_vas { write_usize(*va); }
         write_usize(0); // NULL
 
         for &(atype, aval) in &auxv {
@@ -422,8 +418,7 @@ async fn load_interp_into(
         .read()
         .lookup_page(crate::hal_common::addr::VirtPageNum(0))
         .ok_or(Errno::Enoexec)?;
-    let hdr_buf =
-        unsafe { core::slice::from_raw_parts(hdr_phys.as_usize() as *const u8, PAGE_SIZE) };
+    let hdr_buf = hdr_phys.as_slice();
 
     // Use the hand-rolled parser for interp (same as legacy path, works fine)
     let elf_hdr = parse_elf_header(hdr_buf)?;

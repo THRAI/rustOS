@@ -26,3 +26,6 @@ scripts/sdcard-la.img
 kernel-rv
 # allow testcase text fixtures
 !testcase/**/*.txt
+*/__pycache__/
+ai/
+runtest.sh

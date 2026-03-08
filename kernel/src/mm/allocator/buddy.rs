@@ -56,7 +56,7 @@ impl BuddyAllocator {
             "buddy init: start not page-aligned"
         );
         assert!(end.is_page_aligned(), "buddy init: end not page-aligned");
-        assert!(start.as_usize() < end.as_usize(), "buddy init: empty range");
+        assert!(start < end, "buddy init: empty range");
 
         // Pre-allocate Vec capacity to avoid realloc during the loop.
         // For 128MB, order-11 (8MB blocks) needs ~16 slots; smaller orders need fewer.
@@ -67,8 +67,8 @@ impl BuddyAllocator {
         }
         crate::klog!(boot, info, "buddy vecs pre-allocated");
 
-        let mut addr = start.as_usize();
-        let end_addr = end.as_usize();
+        let mut addr = start;
+        let end_addr = end;
         let total = (end_addr - addr) / PAGE_SIZE;
         self.total_pages += total;
 
@@ -78,7 +78,7 @@ impl BuddyAllocator {
             let mut order = MAX_ORDER;
             while order > 0 {
                 let block_pages = 1 << order;
-                if block_pages <= pages_left && (addr / PAGE_SIZE).is_multiple_of(block_pages) {
+                if block_pages <= pages_left && (addr.page_align_down().0).is_multiple_of(block_pages) {
                     break;
                 }
                 order -= 1;
@@ -101,7 +101,7 @@ impl BuddyAllocator {
             if let Some(block) = self.free_lists[current_order].pop() {
                 // Split down to the requested order.
                 let mut split_order = current_order;
-                let addr = block.as_usize();
+                let addr = block.0;
                 while split_order > order {
                     split_order -= 1;
                     // The upper half becomes a free buddy at split_order.
@@ -121,7 +121,7 @@ impl BuddyAllocator {
         assert!(order <= MAX_ORDER, "buddy free: order too large");
         assert!(addr.is_page_aligned(), "buddy free: addr not page-aligned");
 
-        let mut current_addr = addr.as_usize();
+        let mut current_addr = addr.0;
         let mut current_order = order;
 
         // Try to coalesce with buddy at each level.

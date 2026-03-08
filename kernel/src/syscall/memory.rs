@@ -148,12 +148,12 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
     }
     0
 }
-
 /// sys_brk: change program break (heap end).
 pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
+    use crate::mm::vm::vm_map::VmAreaType;
     use crate::hal_common::addr::VirtPageNum;
-    use crate::mm::vm::map::entry::{BackingStore, EntryFlags, VmMapEntry};
     use crate::mm::vm::vm_object::VmObject;
+    use crate::mm::vm::vm_map::VmArea;
 
     let current_brk = task.brk.load(core::sync::atomic::Ordering::Relaxed);
     if addr == 0 {

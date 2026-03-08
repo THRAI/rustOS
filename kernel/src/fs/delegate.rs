@@ -12,7 +12,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use core::future::Future;
 use lwext4_rust::Ext4File;
-
+use crate::hal_common::{PhysAddr, IrqSafeSpinLock};
+use crate::hal_common::Errno;
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
 // All access is serialized in the single delegate_task — never shared across threads.
 struct SendExt4File(Ext4File);
@@ -278,33 +279,23 @@ macro_rules! define_alloc_reply {
     };
 }
 
-define_alloc_reply!(alloc_open_reply, OPEN_REPLIES, OPEN_REPLY_IDX, Result<FsFileHandle, i32>);
-define_alloc_reply!(alloc_read_reply, READ_REPLIES, READ_REPLY_IDX, Result<usize, i32>);
-define_alloc_reply!(alloc_write_reply, WRITE_REPLIES, WRITE_REPLY_IDX, Result<usize, i32>);
-define_alloc_reply!(alloc_close_reply, CLOSE_REPLIES, CLOSE_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_lookup_reply, LOOKUP_REPLIES, LOOKUP_REPLY_IDX, Result<(u32, u8, u64), i32>);
-define_alloc_reply!(alloc_stat_reply, STAT_REPLIES, STAT_REPLY_IDX, Result<(u64, u8), i32>);
-define_alloc_reply!(alloc_readpage_reply, READPAGE_REPLIES, READPAGE_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_writeat_reply, WRITEAT_REPLIES, WRITEAT_REPLY_IDX, Result<usize, i32>);
-define_alloc_reply!(alloc_truncate_reply, TRUNCATE_REPLIES, TRUNCATE_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_mkdir_reply, MKDIR_REPLIES, MKDIR_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_unlink_reply, UNLINK_REPLIES, UNLINK_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_link_reply, LINK_REPLIES, LINK_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_rename_reply, RENAME_REPLIES, RENAME_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_symlink_reply, SYMLINK_REPLIES, SYMLINK_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(
-    alloc_readlink_reply,
-    READLINK_REPLIES,
-    READLINK_REPLY_IDX,
-    Result<(usize, [u8; 256]), i32>
-);
-define_alloc_reply!(
-    alloc_cacheflush_reply,
-    CACHEFLUSH_REPLIES,
-    CACHEFLUSH_REPLY_IDX,
-    Result<(), i32>
-);
-define_alloc_reply!(alloc_readdir_reply, READDIR_REPLIES, READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
+define_alloc_reply!(alloc_open_reply,       OPEN_REPLIES,       OPEN_REPLY_IDX,   Result<FsFileHandle, i32>);
+define_alloc_reply!(alloc_read_reply,       READ_REPLIES,       READ_REPLY_IDX,   Result<usize, i32>);
+define_alloc_reply!(alloc_write_reply,      WRITE_REPLIES,      WRITE_REPLY_IDX,  Result<usize, i32>);
+define_alloc_reply!(alloc_close_reply,      CLOSE_REPLIES,      CLOSE_REPLY_IDX,  Result<(), i32>);
+define_alloc_reply!(alloc_lookup_reply,     LOOKUP_REPLIES,     LOOKUP_REPLY_IDX, Result<(u32, u8, u64), i32>);
+define_alloc_reply!(alloc_stat_reply,       STAT_REPLIES,       STAT_REPLY_IDX,   Result<(u64, u8), i32>);
+define_alloc_reply!(alloc_readpage_reply,   READPAGE_REPLIES,   READPAGE_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_writeat_reply,    WRITEAT_REPLIES,    WRITEAT_REPLY_IDX, Result<usize, i32>);
+define_alloc_reply!(alloc_truncate_reply,   TRUNCATE_REPLIES,   TRUNCATE_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_mkdir_reply,      MKDIR_REPLIES,      MKDIR_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_unlink_reply,     UNLINK_REPLIES,     UNLINK_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_link_reply,       LINK_REPLIES,       LINK_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_rename_reply,     RENAME_REPLIES,     RENAME_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!(alloc_symlink_reply,    SYMLINK_REPLIES,    SYMLINK_REPLY_IDX, Result<(), i32>);
+define_alloc_reply!( alloc_readlink_reply,  READLINK_REPLIES,   READLINK_REPLY_IDX, Result<(usize, [u8; 256]), i32> );
+define_alloc_reply!( alloc_cacheflush_reply, CACHEFLUSH_REPLIES, CACHEFLUSH_REPLY_IDX, Result<(), i32> );
+define_alloc_reply!(alloc_readdir_reply,    READDIR_REPLIES,    READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
 
 /// Bounded request channel.
 static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>> = IrqSafeSpinLock::new(VecDeque::new());
@@ -465,7 +456,7 @@ async fn delegate_task() {
                 ) {
                     Some(frame) => {
                         //TODO: extract this as fill_with_zero for pages.
-                        let pa = frame.as_usize();
+                        let pa = frame.0;
                         let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
                         buf.fill(0);
                         match crate::fs::ext4::open(&mut tok, &backend_path, 0) {
@@ -473,14 +464,14 @@ async fn delegate_task() {
                                 let _ = file.file_seek(offset as i64, 0); // SEEK_SET
                                 let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
                                 let _ = crate::fs::ext4::close(&mut tok, &mut file);
-                                reply.complete(Ok(pa));
+                                reply.complete(Ok(()));
                             }
                             Err(e) => {
                                 reply.complete(Err(e));
                             }
                         }
                     }
-                    Err(e) => reply.complete(Err(e)),
+                    None => reply.complete(Err(-12)), //Enomem
                 }
             }
             FsRequest::WriteAt {
@@ -783,14 +774,14 @@ pub async fn fs_stat(ino: u32) -> Result<(u64, u8), i32> {
 }
 
 /// Read one page of file data into the given pa physical address, at the given byte offset.
-pub async fn fs_read_page(path: &str, offset: u64, pa: usize) -> Result<(), i32> {
+pub async fn fs_read_page(path: &str, offset: u64, pa: PhysAddr) -> Result<(), i32> {
     crate::klog!(
         fs,
         debug,
         "fs_read_page: path={}, offset={}, pa={:#x}",
         path,
         offset,
-        pa
+        pa.0
     );
     let reply_inner = alloc_readpage_reply();
     let mut path_buf = [0u8; 256];
@@ -801,7 +792,7 @@ pub async fn fs_read_page(path: &str, offset: u64, pa: usize) -> Result<(), i32>
         path: path_buf,
         path_len: len,
         offset,
-        pa,
+        pa: pa.0,
         reply: ReplySlot::new(reply_inner),
     });
 

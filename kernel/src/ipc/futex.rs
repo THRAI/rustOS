@@ -17,7 +17,7 @@ use crate::hal_common::IrqSafeSpinLock;
 use crate::proc::task::Task;
 
 /// Global futex wait table: maps physical address to list of waiting wakers.
-static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<usize, Vec<Waker>>> =
+static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<Waker>>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Park the current task on a futex key (physical address).
@@ -28,10 +28,10 @@ pub async fn futex_wait(pa_key: PhysAddr, task: &Arc<Task>) -> Result<(), Errno>
         debug,
         "futex_wait pid={} key={:#x}",
         task.pid,
-        pa_key.as_usize()
+        pa_key
     );
     FutexWaitFuture {
-        pa_key: pa_key.as_usize(),
+        pa_key,
         registered: false,
         task,
     }
@@ -41,7 +41,7 @@ pub async fn futex_wait(pa_key: PhysAddr, task: &Arc<Task>) -> Result<(), Errno>
 /// Wake up to `count` waiters on the given futex key.
 /// Returns the number of waiters actually woken.
 pub fn futex_wake(pa_key: PhysAddr, count: usize) -> usize {
-    let key = pa_key.as_usize();
+    let key = pa_key;
     let mut table = FUTEX_TABLE.lock();
     let waiters = match table.get_mut(&key) {
         Some(v) => v,
@@ -68,7 +68,7 @@ pub fn futex_wake(pa_key: PhysAddr, count: usize) -> usize {
 
 /// Future that parks on a futex key until woken.
 struct FutexWaitFuture<'a> {
-    pa_key: usize,
+    pa_key: PhysAddr,
     registered: bool,
     task: &'a Arc<Task>,
 }

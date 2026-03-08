@@ -40,14 +40,14 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     // Initialize the global FRAME_META array
     // We need one VmPage per physical page in the system (up to `end` address)
     // To be safe and cover all possible PFNs up to the max address:
-    let max_pfn = end.as_usize() / PAGE_SIZE;
+    let max_pfn = end.page_align_down().0;
     let meta_size_bytes = max_pfn * core::mem::size_of::<crate::mm::vm::page::VmPage>();
     let meta_pages = meta_size_bytes.div_ceil(PAGE_SIZE);
 
     // Steal memory for metadata array before giving the rest to the buddy allocator
     let meta_ptr = start;
-    let next_start_addr = start.as_usize() + meta_pages * PAGE_SIZE;
-    let buddy_start = PhysAddr::new(next_start_addr);
+    let next_start_addr = start + meta_pages * PAGE_SIZE;
+    let buddy_start = next_start_addr;
 
     crate::klog!(boot, info, "frame: Box::new(BuddyAllocator::new())...");
     let mut buddy = alloc::boxed::Box::new(BuddyAllocator::new());
@@ -313,7 +313,7 @@ pub fn frame_alloc_contiguous(order: usize) -> Option<PhysAddr> {
     if let Some(addr) = result {
         // Check poison on each page in the block.
         for i in 0..(1usize << order) {
-            check_poison(PhysAddr::new(addr.as_usize() + i * PAGE_SIZE));
+            check_poison(PhysAddr::new(addr.0 + i * PAGE_SIZE));
         }
     }
     result
@@ -324,7 +324,7 @@ pub fn frame_free_contiguous(addr: PhysAddr, order: usize) {
     assert!(addr.is_page_aligned(), "frame_free_contiguous: not aligned");
     #[cfg(debug_assertions)]
     for i in 0..(1usize << order) {
-        poison_frame(PhysAddr::new(addr.as_usize() + i * PAGE_SIZE));
+        poison_frame(PhysAddr::new(addr.0 + i * PAGE_SIZE));
     }
     let mut buddy = GLOBAL_BUDDY.lock();
     buddy.free(addr, order);
@@ -350,7 +350,7 @@ pub fn available_pages() -> usize {
 /// Fill a page frame with the poison pattern on free.
 #[cfg(debug_assertions)]
 fn poison_frame(addr: PhysAddr) {
-    let ptr = addr.as_usize() as *mut u64;
+    let ptr = addr.0 as *mut u64;
     let count = PAGE_SIZE / core::mem::size_of::<u64>();
     for i in 0..count {
         unsafe { ptr.add(i).write_volatile(POISON_PATTERN) };
@@ -361,7 +361,7 @@ fn poison_frame(addr: PhysAddr) {
 /// Panics if corruption is detected (use-after-free).
 #[cfg(debug_assertions)]
 fn check_poison(addr: PhysAddr) {
-    let ptr = addr.as_usize() as *const u64;
+    let ptr = addr.0 as *const u64;
     let count = PAGE_SIZE / core::mem::size_of::<u64>();
     for i in 0..count {
         let val = unsafe { ptr.add(i).read_volatile() };

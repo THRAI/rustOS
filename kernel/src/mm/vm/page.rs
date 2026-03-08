@@ -3,7 +3,9 @@
 //! Handles cross-thread sync (`exBusy`/`sBusy`), object linkage, and hardware
 //! referencing. Aligned to FreeBSD's definition.
 
+use alloc::sync::Arc;
 use bitflags::bitflags;
+use core::ops::Deref;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 use crate::hal_common::addr::PhysAddr;
@@ -343,5 +345,107 @@ impl VmPage {
 
     fn free_to_allocator(&self) {
         crate::mm::allocator::free_raw_frame(self.phys_addr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAII Busy Lock Guards
+// ---------------------------------------------------------------------------
+
+/// RAII guard for a shared busy lock (sBusy) on a `VmPage`.
+///
+/// Automatically calls `release_steady_state()` on drop, preventing
+/// forgotten lock releases that would deadlock future page faults.
+pub struct SharedBusyGuard {
+    page: Arc<VmPage>,
+}
+
+impl SharedBusyGuard {
+    /// Try to acquire the shared busy lock on the given page.
+    /// Returns `None` if the page is exclusively busied.
+    pub fn try_new(page: &Arc<VmPage>) -> Option<Self> {
+        if page.try_acquire_steady_state() {
+            Some(Self {
+                page: Arc::clone(page),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Get a reference to the underlying `Arc<VmPage>`.
+    pub fn arc(&self) -> &Arc<VmPage> {
+        &self.page
+    }
+}
+
+impl Deref for SharedBusyGuard {
+    type Target = VmPage;
+
+    fn deref(&self) -> &VmPage {
+        &self.page
+    }
+}
+
+impl Drop for SharedBusyGuard {
+    fn drop(&mut self) {
+        self.page.release_steady_state();
+    }
+}
+
+/// RAII guard for an exclusive busy lock (exBusy) on a `VmPage`.
+///
+/// Automatically calls `release_exclusive()` on drop, preventing
+/// forgotten lock releases that would deadlock future page faults.
+pub struct ExclusiveBusyGuard {
+    page: Arc<VmPage>,
+}
+
+impl ExclusiveBusyGuard {
+    /// Try to acquire the exclusive busy lock on the given page.
+    /// Returns `None` if the page has any active busy lock (shared or exclusive).
+    pub fn try_new(page: &Arc<VmPage>) -> Option<Self> {
+        if page.try_acquire_exclusive() {
+            Some(Self {
+                page: Arc::clone(page),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Downgrade this exclusive lock to a shared lock.
+    ///
+    /// Consumes `self` (the exclusive guard) and returns a `SharedBusyGuard`.
+    /// Uses `core::ptr::read` + `core::mem::forget` to prevent the `Drop` impl
+    /// from releasing the exclusive lock before the atomic downgrade occurs.
+    pub fn downgrade(self) -> SharedBusyGuard {
+        // Atomically downgrade exBusy -> sBusy on the page.
+        self.page.downgrade_exclusive_to_shared();
+        let page = unsafe {
+            // Read the Arc out without running Drop (which would release_exclusive).
+            core::ptr::read(&self.page)
+        };
+        core::mem::forget(self);
+        SharedBusyGuard { page }
+    }
+
+    /// Get a reference to the underlying `Arc<VmPage>`.
+    pub fn arc(&self) -> &Arc<VmPage> {
+        &self.page
+    }
+}
+
+impl Deref for ExclusiveBusyGuard {
+    type Target = VmPage;
+
+    fn deref(&self) -> &VmPage {
+        &self.page
+    }
+}
+
+impl Drop for ExclusiveBusyGuard {
+    fn drop(&mut self) {
+        self.page.release_exclusive();
     }
 }

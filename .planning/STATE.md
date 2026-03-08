@@ -10,8 +10,8 @@ progress:
   total_phases: 9
   completed_phases: 5
   total_plans: 30
-  completed_plans: 21
-  percent: 70
+  completed_plans: 22
+  percent: 73
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 8 (Refactor VM Submodule and Exec/Fork Logic) — IN PROGRESS
-Plan: 2 complete in current phase — 08-02 complete
-Status: Unified do_execve with two-phase commit semantics
-Last activity: 2026-03-08 -- Plan 08-02 complete (~5min)
+Plan: 3 complete in current phase — 08-03 complete
+Status: COW fork via shadow chain creation with fault handler wiring
+Last activity: 2026-03-08 -- Plan 08-03 complete (~5min)
 
-Progress: [███████░░░] 70%
+Progress: [███████░░░] 73%
 
 ## Performance Metrics
 
@@ -57,6 +57,7 @@ Progress: [███████░░░] 70%
 | Phase 04 P04 | 5 | 2 tasks | 4 files |
 | Phase 08 P01 | 5 | 2 tasks | 2 files |
 | Phase 08 P02 | 5 | 2 tasks | 7 files |
+| Phase 08 P03 | 5 | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -150,6 +151,9 @@ Recent decisions affecting current work:
 - [Phase 08-02]: Two-phase commit exec: parse ELF and build new VmMap in temp before atomic swap via core::mem::replace
 - [Phase 08-02]: ExecContext::build as pure function using goblin -- no VmMap ops, no I/O
 - [Phase 08-02]: Legacy exec gated behind cfg(feature = exec-legacy) for debugging
+- [Phase 08-03]: COW fork downgrades parent PTEs to read-only via pmap_protect (forces fault on both sides)
+- [Phase 08-03]: Read-only VMAs share same VmObject via Arc::clone (no shadow needed)
+- [Phase 08-03]: handle_cow_fault fast path guarded by has_page check to prevent shadow chain page promotion
 
 ### Pending Todos
 
@@ -177,6 +181,6 @@ None yet.
 
 ## Session Continuity
 
-Last activity: 2026-03-08 - Completed 08-01: RAII busy lock guards
-Stopped at: Completed 08-02-PLAN.md
+Last activity: 2026-03-08 - Completed 08-03: COW fork with shadow chains
+Stopped at: Completed 08-03-PLAN.md
 Resume file: None

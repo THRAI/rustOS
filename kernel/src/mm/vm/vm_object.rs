@@ -18,6 +18,7 @@ use spin::RwLock;
 use crate::fs::Vnode;
 use crate::hal_common::Errno;
 use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
+use super::page::{ExclusiveBusyGuard, SharedBusyGuard};
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
 /// Supports fetching multiple pages in a single operation for efficiency.
 pub trait Pager: core::fmt::Debug + Send + Sync {
@@ -404,9 +405,36 @@ impl VmObject {
         }
     }
 
-    // Remove a page from this object only (does not touch backing).
-    // Pages should be managed automatically via RAII.
-    // pub fn remove_page(&mut self, index: VObjIndex) -> NOT IMPLEMENTED ON PURPOSE
+    /// Remove a page from this object only (does not touch backing).
+    /// Returns the `Arc<VmPage>` for the caller to handle teardown.
+    /// Decrements `resident_count` if the page was present.
+    pub fn remove_page(&mut self, index: VObjIndex) -> Option<Arc<VmPage>> {
+        let removed = self.pages.remove(&index);
+        if removed.is_some() {
+            self.resident_count = self.resident_count.saturating_sub(1);
+        }
+        removed
+    }
+
+    /// Look up a page in this object (not the backing chain) and acquire a
+    /// shared busy lock (sBusy) via RAII guard.
+    ///
+    /// Returns `None` if the page is not found or the busy lock is contended.
+    /// Does NOT walk the shadow chain -- the caller handles chain traversal
+    /// for COW scenarios.
+    pub fn lookup_page_guarded(&self, index: VObjIndex) -> Option<SharedBusyGuard> {
+        let page = self.pages.get(&index)?;
+        SharedBusyGuard::try_new(page)
+    }
+
+    /// Look up a page in this object (not the backing chain) and acquire an
+    /// exclusive busy lock (exBusy) via RAII guard.
+    ///
+    /// Returns `None` if the page is not found or the busy lock is contended.
+    pub fn grab_page_guarded(&self, index: VObjIndex) -> Option<ExclusiveBusyGuard> {
+        let page = self.pages.get(&index)?;
+        ExclusiveBusyGuard::try_new(page)
+    }
 
     /// Count the shadow chain depth (for debug/testing).
     #[allow(unused)]

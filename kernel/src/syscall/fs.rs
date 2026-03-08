@@ -2009,21 +2009,8 @@ pub async fn sys_symlinkat_async(
         normalize_absolute_path(&joined)
     };
 
-<<<<<<< HEAD
-    crate::fs::symlink::create(&link_abs, &target_norm)?;
-    crate::klog!(syscall, debug, "symlinkat: {} -> {}", link_abs, target_norm);
-=======
-    delegate::fs_symlink(&target_abs, &link_abs)
-        .await
-        .map_err(map_delegate_errno)?;
-    crate::klog!(
-        syscall,
-        debug,
-        "symlinkat: {} -> {}",
-        link_abs,
-        target_abs
-    );
->>>>>>> fd3c3caa93fdd405db675e185e793d097bed831a
+    crate::fs::symlink::create(&link_abs, &target_abs)?;
+    crate::klog!(syscall, debug, "symlinkat: {} -> {}", link_abs, target_abs);
     Ok(())
 }
 

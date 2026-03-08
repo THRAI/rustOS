@@ -265,9 +265,13 @@ fn handle_cow_fault(
     old_phys: PhysAddr,
     pmap: &mut Pmap,
 ) -> FaultResult {
-    // Fast path: if Arc refcount == 1, no other VMA references this object.
-    let refcount = Arc::strong_count(&obj);
-    if refcount == 1 {
+    // Fast path: page is in THIS object (not a backing ancestor) AND we are
+    // the sole reference. Safe to just flip the PTE to writable.
+    // Without the has_page check, a page found via shadow chain walk (in a
+    // parent object) would be incorrectly promoted to writable, corrupting
+    // the parent's view.
+    let is_local_page = obj.read().has_page(obj_page_offset);
+    if is_local_page && Arc::strong_count(&obj) == 1 {
         pmap::pmap_protect(
             pmap,
             fault_va_aligned,

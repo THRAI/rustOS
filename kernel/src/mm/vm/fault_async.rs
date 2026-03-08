@@ -48,7 +48,18 @@ pub async fn resolve_user_fault(
     };
 
     match sync_result {
-        FaultResult::Resolved => Ok(()),
+        FaultResult::Resolved => {
+            if access_type.write {
+                crate::klog!(
+                    vm,
+                    trace,
+                    "resolve_user_fault: COW resolved pid={} va={:#x}",
+                    task.pid,
+                    fault_va.as_usize()
+                );
+            }
+            Ok(())
+        }
         FaultResult::NeedsAsyncIO => {
             crate::klog!(
                 vm,

@@ -1,14 +1,15 @@
-//! fork(): create a child process with deep-copy of writable pages.
+//! fork(): create a child process.
 //!
-//! Phase 4 strategy: deep copy for correctness. COW optimization deferred.
+//! Default path uses COW shadow chains (O(VMAs) instead of O(pages)).
+//! Legacy deep-copy path available behind `#[cfg(feature = "fork-hardcopy")]`.
 
 use super::task::Task;
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 use crate::mm::pmap;
+use crate::mm::vm::map::entry::{BackingStore, MapPerm};
 use alloc::sync::Arc;
 
-/// Fork the parent task with deep-copy of all mapped writable pages.
-//TODO: use COW for deep copies
+/// Fork the parent task, creating a child with COW (or deep-copy) VM.
 pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     let child = Task::new(Arc::downgrade(parent));
     klog!(
@@ -19,8 +20,10 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
         child.pid
     );
 
-    // Deep-copy strategy: create independent VmObjects (not shadows)
-    // Deep-copy: copy all pages from parent's VmObjects into child
+    // VM copy strategy: COW shadow chains (default) or deep copy (feature flag).
+    #[cfg(not(feature = "fork-hardcopy"))]
+    cow_fork_vm(parent, &child);
+    #[cfg(feature = "fork-hardcopy")]
     deep_copy_pages(parent, &child);
 
     // Ensure child has sigcode trampoline page (not tracked in vm_map).
@@ -98,6 +101,124 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     child
 }
 
+// ---------------------------------------------------------------------------
+// COW fork (default)
+// ---------------------------------------------------------------------------
+
+/// COW fork: create shadow chains for writable VMAs, share read-only VMAs.
+///
+/// For each writable VMA, creates a shadow VmObject backed by the parent's
+/// object. Both parent and child PTEs are downgraded to read-only so that
+/// the first write triggers a COW fault.
+#[cfg(not(feature = "fork-hardcopy"))]
+fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
+    let parent_vm = parent.vm_map.lock();
+    let mut child_vm = child.vm_map.lock();
+
+    // Phase 1: create VmMapEntries in child's vm_map
+    for vma in parent_vm.iter() {
+        let is_writable = vma.protection.contains(MapPerm::W);
+
+        let new_store = match &vma.store {
+            BackingStore::Object {
+                offset,
+                object: parent_obj,
+            } => {
+                if is_writable {
+                    // Create a shadow object for COW
+                    let size = (vma.end - vma.start) as usize / PAGE_SIZE;
+                    let child_obj =
+                        crate::mm::vm::vm_object::VmObject::new_shadow(Arc::clone(parent_obj), size);
+                    // Copy pager so child can demand-fault file-backed pages
+                    {
+                        let parent_read = parent_obj.read();
+                        if let Some(ref pager) = parent_read.pager {
+                            if !pager.is_anon() {
+                                child_obj.write().pager = Some(Arc::clone(pager));
+                            }
+                        }
+                    }
+                    BackingStore::Object {
+                        object: child_obj,
+                        offset: *offset,
+                    }
+                } else {
+                    // Read-only: share the same VmObject (no shadow needed)
+                    BackingStore::Object {
+                        object: Arc::clone(parent_obj),
+                        offset: *offset,
+                    }
+                }
+            }
+            BackingStore::SubMap(_) => {
+                panic!("SubMap not supported in fork");
+            }
+            BackingStore::Guard => BackingStore::Guard,
+        };
+
+        let child_vma = crate::mm::vm::map::entry::VmMapEntry::new(
+            vma.start,
+            vma.end,
+            new_store,
+            vma.flags,
+            vma.protection,
+        );
+        child_vm.insert_entry(child_vma).unwrap();
+    }
+
+    // Phase 2: set up pmap mappings
+    let child_pmap_arc = child_vm.pmap.clone();
+    let mut child_pmap = child_pmap_arc.lock();
+    let parent_pmap_arc = parent_vm.pmap.clone();
+    let mut parent_pmap = parent_pmap_arc.lock();
+
+    for vma in parent_vm.iter() {
+        let is_writable = vma.protection.contains(MapPerm::W);
+
+        if matches!(vma.store, BackingStore::Guard) {
+            continue;
+        }
+
+        let mut va = vma.start as usize;
+        while va < vma.end as usize {
+            if let Some(pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
+                if is_writable {
+                    // Strip W from parent PTE to force COW fault on parent writes too
+                    let ro_prot = vma.protection & !MapPerm::W;
+                    pmap::pmap_protect(
+                        &mut parent_pmap,
+                        VirtAddr::new(va),
+                        VirtAddr(va + PAGE_SIZE),
+                        ro_prot,
+                    );
+                    // Map same physical page read-only in child
+                    let _ = pmap::pmap_enter(
+                        &mut child_pmap,
+                        VirtAddr::new(va),
+                        pa,
+                        ro_prot,
+                        false,
+                    );
+                } else {
+                    // Read-only: share with same permissions
+                    let _ = pmap::pmap_enter(
+                        &mut child_pmap,
+                        VirtAddr::new(va),
+                        pa,
+                        vma.protection,
+                        false,
+                    );
+                }
+            }
+            va += PAGE_SIZE;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deep-copy fork (legacy, feature-gated)
+// ---------------------------------------------------------------------------
+
 /// Deep-copy all pages from parent into child.
 ///
 /// For writable VMAs: walk the parent's **pmap** (not VmObject) to find every
@@ -110,6 +231,7 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
 /// For read-only VMAs: share physical pages via pmap (VmObject already
 /// Arc::clone'd by fork_deep_copy, so demand faults will find pages there).
 /// Should be used as a fallback when COW errors.
+#[cfg(feature = "fork-hardcopy")]
 fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
     let parent_vm = parent.vm_map.lock();
     let mut child_vm = child.vm_map.lock();
@@ -141,7 +263,7 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                     offset: *offset,
                 }
             }
-            crate::mm::vm::map::entry::BackingStore::SubMap { .. } => {
+            crate::mm::vm::map::entry::BackingStore::SubMap(_) => {
                 panic!("SubMap not supported in fork");
             }
             crate::mm::vm::map::entry::BackingStore::Guard => {

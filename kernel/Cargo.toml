@@ -31,6 +31,7 @@ log-level-debug = ["log-level-info"]
 log-level-trace = ["log-level-debug"]
 log-level-all   = ["log-level-trace"]
 exec-legacy = []
+fork-hardcopy = []
 [dependencies]
 async-task = { version = "4.7", default-features = false }
 bitflags = { workspace = true }

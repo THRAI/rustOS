@@ -373,7 +373,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
                     let mut launched = false;
                     for (exec_path, argv) in launch_attempts {
-                        match proc::exec::exec_with_args(&init_task2, exec_path, &argv, &envp).await
+                        match proc::exec::do_execve(&init_task2, exec_path, &argv, &envp).await
                         {
                             Ok((entry, sp)) => {
                                 {

@@ -131,11 +131,13 @@ pub struct VmObject {
     /// Uses BTreeMap instead of SkipMap: crossbeam-skiplist requires std (not no_std compatible).
     /// BTreeMap provides O(log n) lookup, sufficient for current workloads.
     pages: BTreeMap<VObjIndex, Arc<VmPage>>,
+    pub pager: Option<Arc<dyn Pager>>,
+
     /// Parent in the shadow chain (for COW).
     backing: Option<Arc<RwLock<VmObject>>>,
     /// How many shadow objects use this as their backing.
     shadow_count: usize,
-    pub pager: Option<Arc<dyn Pager>>,
+
     /// Object size in bytes.
     size: usize,
     /// Number of pages resident in *this* object (not backing).

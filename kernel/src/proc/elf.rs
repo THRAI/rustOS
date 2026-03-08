@@ -161,10 +161,8 @@ use goblin::error::Error;
 /// and all program headers.  Panics if program headers extend beyond the
 /// provided buffer.
 pub fn parse_elf_first_page(page_bytes: &[u8]) -> Result<(Header, Vec<ProgramHeader>), Error> {
-    let header = Header::parse(page_bytes)?;
-
-    let is_lsb = header.endianness()? == goblin::container::Endian::Little;
-    let is_64 = header.is_64;
+    // Parse unified Header via Elf::parse_header (uses scroll::Pread internally)
+    let header = goblin::elf::Elf::parse_header(page_bytes)?;
 
     let phoff = header.e_phoff as usize;
     let phnum = header.e_phnum as usize;
@@ -175,12 +173,16 @@ pub fn parse_elf_first_page(page_bytes: &[u8]) -> Result<(Header, Vec<ProgramHea
         panic!("Program Header larger than 1 page")
     }
 
+    // Build Ctx from header for ProgramHeader::parse
+    let container = header.container()?;
+    let endianness = header.endianness()?;
+    let ctx = goblin::container::Ctx::new(container, endianness);
+
     let phdrs = ProgramHeader::parse(
         page_bytes,
         phoff,
         phnum,
-        is_lsb,
-        is_64,
+        ctx,
     )?;
 
     Ok((header, phdrs))

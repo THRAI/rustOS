@@ -82,7 +82,7 @@ pub async fn sys_execve_async(
     // Read envp array
     let envp = copyin_argv(task, envp_ptr, 64, 4096).await;
 
-    crate::proc::exec::exec_with_args(task, &path, &argv, &envp).await
+    crate::proc::exec::do_execve(task, &path, &argv, &envp).await
 }
 
 pub async fn sys_wait4_async(

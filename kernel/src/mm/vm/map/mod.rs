@@ -86,6 +86,16 @@ impl VmMap {
         Ok(())
     }
 
+    /// Remove the entry containing `va`.
+    pub fn remove_entry_containing(&mut self, va: u64) -> Option<VmMapEntry> {
+        let removed = self.tree.remove(va)?;
+        let entry = *removed;
+        self.size = self.size.saturating_sub(entry.size());
+        self.nentries = self.nentries.saturating_sub(1);
+        self.timestamp.fetch_add(1, Ordering::SeqCst);
+        Some(entry)
+    }
+
     pub fn remove_range(&mut self, start: VirtAddr, end: VirtAddr) -> alloc::vec::Vec<VmMapEntry> {
         self.timestamp.fetch_add(1, Ordering::SeqCst);
         let removed = alloc::vec::Vec::new();

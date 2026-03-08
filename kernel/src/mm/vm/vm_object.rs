@@ -80,6 +80,11 @@ impl Pager for AnonPager {
 pub struct VnodePager {
     pub vnode_id: usize,
     pub path: alloc::string::String,
+    /// File offset that corresponds to object offset 0.
+    pub base_offset: usize,
+    /// Number of valid file-backed bytes from `base_offset`.
+    /// Bytes beyond this range are treated as zero-fill (ELF BSS tail).
+    pub valid_bytes: usize,
 }
 
 impl Pager for VnodePager {
@@ -90,10 +95,34 @@ impl Pager for VnodePager {
     ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
     {
         let path = self.path.clone();
+        let base_offset = self.base_offset;
+        let valid_bytes = self.valid_bytes;
         alloc::boxed::Box::pin(async move {
+            let rel = offset.saturating_sub(base_offset);
+            let file_bytes_this_page = if valid_bytes == usize::MAX {
+                PAGE_SIZE
+            } else if rel >= valid_bytes {
+                0
+            } else {
+                core::cmp::min(PAGE_SIZE, valid_bytes - rel)
+            };
+
+            // Pure zero-fill page (beyond p_filesz or zero-file segment).
+            if file_bytes_this_page == 0 {
+                crate::mm::pmap::pmap_zero_page(pa);
+                return Ok(());
+            }
+
             crate::fs::delegate::fs_read_page(&path, offset as u64, pa.as_usize())
                 .await
-                .map_err(|_| ())
+                .map_err(|_| ())?;
+
+            // Clamp page tail to zero when it crosses the file-backed boundary.
+            if file_bytes_this_page < PAGE_SIZE {
+                let buf = unsafe { core::slice::from_raw_parts_mut(pa.as_usize() as *mut u8, PAGE_SIZE) };
+                buf[file_bytes_this_page..].fill(0);
+            }
+            Ok(())
         })
     }
 
@@ -177,6 +206,8 @@ impl VmObject {
             pager: Some(Arc::new(VnodePager {
                 vnode_id: vnode.vnode_id() as usize,
                 path: vnode.path().into(),
+                base_offset: 0,
+                valid_bytes: vnode.size() as usize,
             })),
             size: vnode.size() as usize,
             resident_count: 0,

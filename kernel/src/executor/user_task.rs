@@ -102,7 +102,6 @@ async fn run_tasks(task: Arc<Task>) {
             task.trap_frame.lock().sp(),
             task.trap_frame.lock().ra()
         );
-
         // Return to userspace. Blocks until user traps back.
         trap_return(&task);
 
@@ -112,7 +111,6 @@ async fn run_tasks(task: Arc<Task>) {
             "run_tasks: returned from trap_return pid={}",
             task.pid
         );
-
         // Dispatch based on scause in the trap frame.
         // Keep user pmap active — syscall handlers need it for copy_user / fault resolution.
         let result = user_trap_handler(&task).await;

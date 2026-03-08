@@ -107,18 +107,22 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                 }
                 // No fixup — real fault, panic
                 panic!(
-                    "[trap] page fault: cause={}, stval={:#x}, sepc={:#x}",
+                    "[trap] page fault: cause={}, stval={:#x}, sepc={:#x}, ra={:#x}, sp={:#x}",
                     code,
                     frame.stval(),
-                    frame.pc()
+                    frame.pc(),
+                    frame.ra(),
+                    frame.sp(),
                 );
             }
             _ => {
                 panic!(
-                    "[trap] unhandled exception: cause={}, stval={:#x}, sepc={:#x}",
+                    "[trap] unhandled exception: cause={}, stval={:#x}, sepc={:#x}, ra={:#x}, sp={:#x}",
                     code,
                     frame.stval(),
-                    frame.pc()
+                    frame.pc(),
+                    frame.ra(),
+                    frame.sp(),
                 );
             }
         }

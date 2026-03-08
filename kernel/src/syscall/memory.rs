@@ -152,84 +152,109 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
 pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
     use crate::mm::vm::vm_map::VmAreaType;
     use crate::hal_common::addr::VirtPageNum;
+    use crate::mm::vm::map::entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
     use crate::mm::vm::vm_object::VmObject;
-    use crate::mm::vm::vm_map::VmArea;
+    use core::sync::atomic::Ordering;
 
-    let current_brk = task.brk.load(core::sync::atomic::Ordering::Relaxed);
+    let current_brk = task.brk.load(Ordering::Relaxed);
     if addr == 0 {
-        // Query current brk
         return current_brk;
     }
 
-    // Save user's requested address (byte-level precision)
     let requested_brk = addr;
-    // Use page-aligned addresses for internal memory management
     let new_brk_aligned = (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let old_brk_aligned = (current_brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
+    if new_brk_aligned == old_brk_aligned {
+        task.brk.store(requested_brk, Ordering::Relaxed);
+        return requested_brk;
+    }
+
+    let mut vm = task.vm_map.lock();
+
     if new_brk_aligned > old_brk_aligned {
-        // --- Expand ---
-        let mut vm = task.vm_map.lock();
-        if let Some(heap_vma) =
-            vm.find_area_ending_at_mut(VirtAddr::new(old_brk_aligned), VmAreaType::Heap)
-        {
-            // In-place extension: slide end, grow VmObject
-            heap_vma.range.end = VirtAddr::new(new_brk_aligned);
-            let mut obj = heap_vma.object.write();
-            obj.set_size(new_brk_aligned - heap_vma.range.start.as_usize());
-        } else {
-            // First brk or no adjacent heap VMA — create new
-            let size = new_brk_aligned - old_brk_aligned;
-            let obj = VmObject::new(size);
-            let vma = VmArea::new(
-                VirtAddr::new(old_brk_aligned)..VirtAddr::new(new_brk_aligned),
-                crate::map_perm!(R, W, U),
+        // Prefer in-place extension of the existing heap VMA.
+        let mut extended = false;
+        if old_brk_aligned > 0 {
+            if let Some(vma) = vm.lookup_mut((old_brk_aligned - 1) as u64) {
+                if vma.end() == old_brk_aligned as u64 && vma.flags.contains(EntryFlags::HEAP) {
+                    let heap_start = vma.start();
+                    vma.set_bounds(heap_start, new_brk_aligned as u64);
+                    if let BackingStore::Object { object, .. } = &vma.store {
+                        let mut obj = object.write();
+                        obj.set_size((new_brk_aligned - heap_start as usize) / PAGE_SIZE);
+                    }
+                    extended = true;
+                }
+            }
+        }
+
+        // First brk growth creates a dedicated heap VMA.
+        if !extended {
+            if !vm.is_range_free(old_brk_aligned as u64, new_brk_aligned as u64) {
+                return current_brk;
+            }
+            let grow_len = new_brk_aligned - old_brk_aligned;
+            let obj = VmObject::new_anon(grow_len / PAGE_SIZE);
+            let vma = VmMapEntry::new(
+                old_brk_aligned as u64,
+                new_brk_aligned as u64,
+                BackingStore::Object {
+                    object: obj,
+                    offset: 0,
+                },
+                EntryFlags::HEAP,
+                MapPerm::R | MapPerm::W | MapPerm::U,
             );
             if vm.insert_entry(vma).is_err() {
                 return current_brk;
             }
         }
     } else if new_brk_aligned < old_brk_aligned {
-        // --- Shrink ---
-        // 1. Tear down hardware PTEs + TLB shootdown
-        let mut vm = task.vm_map.lock();
-        {
-            let mut pmap = task.pmap.lock();
-            crate::mm::pmap::pmap_remove(
-                &mut pmap,
-                VirtAddr::new(new_brk_aligned),
-                VirtAddr::new(old_brk_aligned),
-            );
-        }
-        // 2. Truncate VmObject pages and free anonymous frames
-        let mut vm = task.vm_map.lock();
-        // Find the heap VMA that contains old_brk_aligned - 1
-        if let Some(heap_vma) = vm.find_area_mut(VirtAddr::new(old_brk_aligned - 1)) {
-            if heap_vma.vma_type == VmAreaType::Heap {
-                let vma_start = heap_vma.range.start.as_usize();
-                let from_page = VirtPageNum((new_brk_aligned - vma_start) / PAGE_SIZE);
-                // Truncate pages from VmObject (top-level only — COW safe).
-                // Pages are freed automatically via RAII (TypedFrame Drop).
-                {
-                    let mut obj = heap_vma.object.write();
-                    let _freed = obj.truncate_pages(from_page);
-                    obj.set_size(new_brk_aligned.saturating_sub(vma_start));
-                    // _freed drops here, freeing frames via TypedFrame RAII
-                }
-                // Slide VMA end down (or remove if fully shrunk)
-                if new_brk_aligned <= vma_start {
-                    vm.remove(VirtAddr::new(vma_start));
-                } else {
-                    // Re-lookup since we dropped the borrow for frame_free
-                    if let Some(vma) = vm.find_area_mut(VirtAddr::new(vma_start)) {
-                        vma.range.end = VirtAddr::new(new_brk_aligned);
+        // Shrink only the heap VMA; do not tear down unrelated VMAs.
+        let mut unmap_start: Option<usize> = None;
+        let mut remove_heap_va: Option<u64> = None;
+
+        if old_brk_aligned > 0 {
+            if let Some(vma) = vm.lookup_mut((old_brk_aligned - 1) as u64) {
+                if vma.end() == old_brk_aligned as u64 && vma.flags.contains(EntryFlags::HEAP) {
+                    let heap_start = vma.start() as usize;
+                    let new_heap_end = core::cmp::max(new_brk_aligned, heap_start);
+                    unmap_start = Some(new_heap_end);
+
+                    if new_heap_end <= heap_start {
+                        remove_heap_va = Some((old_brk_aligned - 1) as u64);
+                    } else {
+                        vma.set_bounds(heap_start as u64, new_heap_end as u64);
+                        if let BackingStore::Object { object, .. } = &vma.store {
+                            let new_pages = (new_heap_end - heap_start) / PAGE_SIZE;
+                            let mut obj = object.write();
+                            obj.set_size(new_pages);
+                            let dropped = obj.truncate_pages(VirtPageNum(new_pages));
+                            drop(dropped);
+                        }
                     }
                 }
             }
         }
+
+        if let Some(start) = unmap_start {
+            if start < old_brk_aligned {
+                let mut pmap = vm.pmap_lock();
+                crate::mm::pmap::pmap_remove(
+                    &mut pmap,
+                    VirtAddr::new(start),
+                    VirtAddr::new(old_brk_aligned),
+                );
+            }
+        }
+        if let Some(va) = remove_heap_va {
+            if let Some(removed) = vm.remove_entry_containing(va) {
+                free_removed_frames(alloc::vec![removed]);
+            }
+        }
     }
 
-    // Store and return the user's requested address (byte-level precision)
-    task.brk.store(requested_brk, core::sync::atomic::Ordering::Relaxed);
+    task.brk.store(requested_brk, Ordering::Relaxed);
     requested_brk
 }

@@ -6,6 +6,7 @@
 use super::task::Task;
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 use crate::mm::pmap;
+#[cfg(not(feature = "fork-hardcopy"))]
 use crate::mm::vm::map::entry::{BackingStore, MapPerm};
 use alloc::sync::Arc;
 

@@ -11,6 +11,16 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 
+fn is_page_aligned(addr: usize) -> bool {
+    addr & (PAGE_SIZE - 1) == 0
+}
+
+fn align_up_to_page(value: usize) -> Option<usize> {
+    value
+        .checked_add(PAGE_SIZE - 1)
+        .map(|aligned| aligned & !(PAGE_SIZE - 1))
+}
+
 fn prot_bits_to_perm(prot_bits: usize) -> crate::mm::vm::map::entry::MapPerm {
     use crate::mm::vm::map::entry::MapPerm;
 
@@ -124,8 +134,20 @@ pub fn sys_mmap(
 
 /// sys_munmap: tear down PTEs + TLB + remove/split VMAs.
 pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> usize {
-    let aligned_start = VirtAddr::new(addr & !0xFFF);
-    let aligned_end = VirtAddr::new((addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+    if len == 0 || !is_page_aligned(addr) {
+        return (-(Errno::Einval.as_i32() as isize)) as usize;
+    }
+
+    let end = match addr.checked_add(len) {
+        Some(end) => end,
+        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+    };
+
+    let aligned_end = match align_up_to_page(end) {
+        Some(end) => VirtAddr::new(end),
+        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+    };
+    let aligned_start = VirtAddr::new(addr);
     if aligned_start >= aligned_end {
         return (-(Errno::Einval.as_i32() as isize)) as usize;
     }

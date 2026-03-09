@@ -55,12 +55,13 @@ pub fn sys_mmap(
     offset: u64,
 ) -> usize {
     use crate::mm::vm::map::entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
+    use crate::mm::vm::map::VmError;
     use crate::mm::vm::vm_object::VmObject;
 
-    let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    if aligned_len == 0 {
-        return (-(Errno::Einval.as_i32() as isize)) as usize;
-    }
+    let aligned_len = match align_up_to_page(len) {
+        Some(aligned_len) if aligned_len != 0 => aligned_len,
+        _ => return (-(Errno::Einval.as_i32() as isize)) as usize,
+    };
 
     let map_fixed = flags & MAP_FIXED != 0;
     let map_anon = flags & MAP_ANONYMOUS != 0;
@@ -80,11 +81,19 @@ pub fn sys_mmap(
     }
     let _ = fd;
 
+    if map_fixed && !is_page_aligned(addr) {
+        return (-(Errno::Einval.as_i32() as isize)) as usize;
+    }
+
     let mut vm = task.vm_map.lock();
 
     let base = if map_fixed {
-        let start = VirtAddr::new(addr & !0xFFF);
-        let end = VirtAddr::new(start.as_usize() + aligned_len);
+        let end = match addr.checked_add(aligned_len) {
+            Some(end) => end,
+            None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+        };
+        let start = VirtAddr::new(addr);
+        let end = VirtAddr::new(end);
         // MAP_FIXED: delete existing mappings in range first
         let removed = vm.remove_range(start, end);
         // Free anonymous frames from removed VMAs
@@ -93,7 +102,10 @@ pub fn sys_mmap(
     } else if addr != 0 {
         // Hint address: try it, fall back to top-down
         let hint = VirtAddr::new(addr & !0xFFF);
-        let hint_end = VirtAddr::new(hint.as_usize() + aligned_len);
+        let hint_end = match hint.as_usize().checked_add(aligned_len) {
+            Some(end) => VirtAddr::new(end),
+            None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+        };
         // Check if hint range is free
         let hint_ok = vm.is_range_free(hint.as_usize() as u64, hint_end.as_usize() as u64);
         if hint_ok {
@@ -128,7 +140,9 @@ pub fn sys_mmap(
     );
     match vm.insert_entry(vma) {
         Ok(()) => base,
-        Err(_) => (-(Errno::Enomem.as_i32() as isize)) as usize,
+        Err(VmError::Overlap) => (-(Errno::Einval.as_i32() as isize)) as usize,
+        Err(VmError::InvalidRange) => (-(Errno::Einval.as_i32() as isize)) as usize,
+        Err(VmError::NotFound) => (-(Errno::Enomem.as_i32() as isize)) as usize,
     }
 }
 
@@ -159,8 +173,22 @@ pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> usize {
 
 /// sys_mprotect: change VMA permissions + update PTEs.
 pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize) -> usize {
-    let start = VirtAddr::new(addr & !0xFFF);
-    let end = VirtAddr::new((addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+    use crate::mm::vm::map::VmError;
+
+    if len == 0 || !is_page_aligned(addr) {
+        return (-(Errno::Einval.as_i32() as isize)) as usize;
+    }
+
+    let end = match addr.checked_add(len) {
+        Some(end) => end,
+        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+    };
+
+    let end = match align_up_to_page(end) {
+        Some(end) => VirtAddr::new(end),
+        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+    };
+    let start = VirtAddr::new(addr);
     if start >= end {
         return (-(Errno::Einval.as_i32() as isize)) as usize;
     }
@@ -170,7 +198,10 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
     let mut vm = task.vm_map.lock();
     match vm.protect_range(start, end, perm) {
         Ok(()) => 0,
-        Err(_) => (-(Errno::Einval.as_i32() as isize)) as usize,
+        Err(VmError::NotFound) => (-(Errno::Enomem.as_i32() as isize)) as usize,
+        Err(VmError::Overlap) | Err(VmError::InvalidRange) => {
+            (-(Errno::Einval.as_i32() as isize)) as usize
+        }
     }
 }
 /// sys_brk: change program break (heap end).

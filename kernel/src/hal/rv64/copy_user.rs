@@ -13,6 +13,8 @@ const OFFSET_ONFAULT: usize = core::mem::offset_of!(PerCpu, pcb_onfault);
 
 /// SUM bit in sstatus (bit 18) — permits S-mode access to U-mode pages.
 const SSTATUS_SUM: usize = 1 << 18;
+/// Upper bound (exclusive) of user virtual address space.
+const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
 
 // Emit the copy_user_chunk assembly with compile-time constants.
 global_asm!(
@@ -23,6 +25,15 @@ global_asm!(
     // a0 = dst, a1 = src, a2 = len
     // Returns 0 on success, 14 (EFAULT) on fault.
     "copy_user_chunk:",
+    // Safety gate: one side must be a user pointer. If both pointers are
+    // in kernel address space, reject to avoid accidental kernel-to-kernel
+    // writes via user-controlled syscall arguments.
+    "    li      t0, {user_max}",
+    "    bltu    a0, t0, .Lcopy_user_ok",
+    "    bltu    a1, t0, .Lcopy_user_ok",
+    "    li      a0, 14",
+    "    ret",
+    ".Lcopy_user_ok:",
     // Prologue: set pcb_onfault to landing pad address
     "    la      t0, .Lcopy_fault",
     "    sd      t0, {onfault}(tp)",
@@ -54,6 +65,7 @@ global_asm!(
     "    ret",
     onfault = const OFFSET_ONFAULT,
     sum = const SSTATUS_SUM,
+    user_max = const USER_MAX_VA,
 );
 
 extern "C" {

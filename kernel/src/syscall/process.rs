@@ -45,14 +45,36 @@ pub fn sys_gettid(task: &Arc<Task>) -> usize {
 // Process Lifecycle: clone, execve, exit, wait4
 // ---------------------------------------------------------------------------
 
-// TODO: handle flags
-pub fn sys_clone(task: &Arc<Task>, child_stack: usize) -> usize {
+pub fn sys_clone(
+    task: &Arc<Task>,
+    flags: usize,
+    child_stack: usize,
+    _parent_tid: usize,
+    tls: usize,
+    _child_tid: usize,
+) -> usize {
+    // Minimal clone support:
+    // - process-style clone/fork is supported
+    // - thread-group clone is not supported yet
+    const CLONE_THREAD: usize = 0x0001_0000;
+    const CLONE_SETTLS: usize = 0x0008_0000;
+
+    if flags & CLONE_THREAD != 0 {
+        return (-(Errno::Enosys.as_i32() as isize)) as usize;
+    }
+
     let child = crate::proc::fork::fork(task);
+
     // If caller supplied a child stack, override sp in the child's trap frame.
     // musl __clone stores fn/arg on this stack before ecall; child reads them via sp.
     if child_stack != 0 {
         child.trap_frame.lock().x[2] = child_stack;
     }
+    // For clone with CLONE_SETTLS, initialize user tp (x4) for the child.
+    if (flags & CLONE_SETTLS) != 0 && tls != 0 {
+        child.trap_frame.lock().x[4] = tls;
+    }
+
     let child_pid = child.pid;
     let cpu = crate::executor::per_cpu::current().cpu_id;
     spawn_user_task(child, cpu);
@@ -70,7 +92,7 @@ pub async fn sys_execve_async(
     pathname_ptr: usize,
     argv_ptr: usize,
     envp_ptr: usize,
-) -> Result<(usize, usize), Errno> {
+) -> Result<(usize, usize, usize, usize), Errno> {
     // Read pathname from user memory
     let raw_path = match copyinstr(task, pathname_ptr, 256).await {
         None => return Err(Errno::Efault),
@@ -82,7 +104,8 @@ pub async fn sys_execve_async(
     // Read envp array
     let envp = copyin_argv(task, envp_ptr, 64, 4096).await;
 
-    crate::proc::exec::do_execve(task, &path, &argv, &envp).await
+    let (entry, sp) = crate::proc::exec::do_execve(task, &path, &argv, &envp).await?;
+    Ok((entry, sp, argv.len(), envp.len()))
 }
 
 pub async fn sys_wait4_async(

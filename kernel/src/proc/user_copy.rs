@@ -139,6 +139,7 @@ pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
     task.exit_status
         .store(wstatus.0, core::sync::atomic::Ordering::Release);
     task.set_zombie();
+    task.release_zombie_resources();
 
     // Unregister from global task registry
     crate::proc::signal::unregister_task(task.pid);

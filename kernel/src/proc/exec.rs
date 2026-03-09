@@ -127,6 +127,25 @@ pub async fn do_execve(
     let new_pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(new_pmap));
     let mut new_vm = VmMap::new(Arc::clone(&new_pmap_arc));
 
+    // Some ELF binaries split one page across multiple PT_LOAD segments.
+    // Keep the maximum file-backed coverage per merged page to preserve
+    // correct zero-fill semantics for BSS tails.
+    let mut merged_file_bytes: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for region in &exec_ctx.mapped_regions {
+        if region.memsz == 0 {
+            continue;
+        }
+        let va_start = region.vaddr & !(PAGE_SIZE - 1);
+        let file_offset_page_aligned = region.offset & !(PAGE_SIZE - 1);
+        let file_prefix = region.offset.saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + region.filesz;
+        let key = (va_start, file_offset_page_aligned);
+        let cur = merged_file_bytes.get(&key).copied().unwrap_or(0);
+        if file_backed_bytes > cur {
+            merged_file_bytes.insert(key, file_backed_bytes);
+        }
+    }
+
     // 2b. Create VMAs for each PT_LOAD region from ExecContext
     for region in &exec_ctx.mapped_regions {
         let va_start = region.vaddr & !(PAGE_SIZE - 1);
@@ -134,9 +153,21 @@ pub async fn do_execve(
         let va_end = (va_end_raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         let file_offset_page_aligned = region.offset & !(PAGE_SIZE - 1);
+        let file_prefix = region.offset.saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + region.filesz;
+        let merged_backed_bytes = merged_file_bytes
+            .get(&(va_start, file_offset_page_aligned))
+            .copied()
+            .unwrap_or(file_backed_bytes);
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new_vnode_region(vnode.vnode_id() as usize, vnode.path(), obj_size);
+        let obj = VmObject::new_vnode_region(
+            vnode.vnode_id() as usize,
+            vnode.path(),
+            obj_size,
+            file_offset_page_aligned,
+            merged_backed_bytes,
+        );
 
         let vma = VmMapEntry::new_file_backed(
             va_start as u64,
@@ -422,6 +453,22 @@ async fn load_interp_into(
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
     let interp_entry = elf_hdr.e_entry as usize + offset;
 
+    let mut merged_file_bytes: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for phdr in phdrs.iter() {
+        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+            continue;
+        }
+        let va_start = ((phdr.p_vaddr as usize) + offset) & !(PAGE_SIZE - 1);
+        let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
+        let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
+        let key = (va_start, file_offset_page_aligned);
+        let cur = merged_file_bytes.get(&key).copied().unwrap_or(0);
+        if file_backed_bytes > cur {
+            merged_file_bytes.insert(key, file_backed_bytes);
+        }
+    }
+
     for phdr in phdrs {
         if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
             continue;
@@ -433,9 +480,21 @@ async fn load_interp_into(
 
         let prot = elf_flags_to_prot(phdr.p_flags);
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
+        let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
+        let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
+        let merged_backed_bytes = merged_file_bytes
+            .get(&(va_start, file_offset_page_aligned))
+            .copied()
+            .unwrap_or(file_backed_bytes);
 
         let obj_size = (va_end - va_start) / PAGE_SIZE;
-        let obj = VmObject::new_vnode_region(vnode.vnode_id() as usize, vnode.path(), obj_size);
+        let obj = VmObject::new_vnode_region(
+            vnode.vnode_id() as usize,
+            vnode.path(),
+            obj_size,
+            file_offset_page_aligned,
+            merged_backed_bytes,
+        );
         let vma = VmMapEntry::new(
             va_start as u64,
             va_end as u64,

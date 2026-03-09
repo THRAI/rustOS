@@ -108,6 +108,12 @@ impl Task {
             .upgrade()
             .map_or(pid, |p| p.pgid.load(Ordering::Relaxed));
         let pmap = Arc::new(Mutex::new(pmap::pmap_create()));
+        crate::kprintln!(
+            "[task] new pid={} kstack_base={:#x} kernel_sp={:#x}",
+            pid,
+            kstack_base.as_usize(),
+            kernel_sp
+        );
         Arc::new(Self {
             pid,
             parent,
@@ -133,6 +139,12 @@ impl Task {
         let (kstack_base, kernel_sp) = alloc_kstack();
         let pid = alloc_pid();
         let pmap = Arc::new(Mutex::new(pmap::pmap_create()));
+        crate::kprintln!(
+            "[task] new_init pid={} kstack_base={:#x} kernel_sp={:#x}",
+            pid,
+            kstack_base.as_usize(),
+            kernel_sp
+        );
         Arc::new(Self {
             pid,
             parent: Weak::new(),
@@ -169,6 +181,15 @@ impl Task {
             Some(p) => p.pid,
             None => 0,
         }
+    }
+
+    /// Release heavyweight per-process resources once the task has exited.
+    ///
+    /// This keeps zombie tasks lightweight so parent-side `wait4()` reaping
+    /// does not end up dropping a full address space on the current kernel stack.
+    pub fn release_zombie_resources(&self) {
+        self.vm_map.lock().clear();
+        *self.fd_table.lock() = FdTable::new();
     }
 }
 

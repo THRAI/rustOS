@@ -137,6 +137,11 @@ __trap_return:
     # a0 = TrapFrame pointer
     # a1 = TrapContext pointer (top of kstack - TC_SIZE)
 
+    # Critical section: from here until sret, we must not take S-mode IRQs.
+    # Otherwise an interrupt could observe partially switched trap state
+    # (e.g. stvec already points to __user_trap) and corrupt return context.
+    csrci   sstatus, 0x2
+
     # Save callee-saved registers below TrapContext on kstack.
     # Save area: 15 slots * 8 bytes = 120 bytes below tc_ptr.
     # Slot 14 holds the caller's sp so __user_trap can restore it.

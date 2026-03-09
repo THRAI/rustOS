@@ -18,6 +18,7 @@ use spin::RwLock;
 use super::page::{ExclusiveBusyGuard, SharedBusyGuard};
 use crate::fs::Vnode;
 use crate::hal_common::Errno;
+use crate::mm::allocator::types::{get_frame_meta, PageRole};
 use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
 /// Supports fetching multiple pages in a single operation for efficiency.
@@ -183,6 +184,23 @@ pub struct VmObject {
 pub type VObjIndex = VirtPageNum;
 
 impl VmObject {
+    fn release_unmapped_page(page: Arc<VmPage>) {
+        let phys = page.phys_addr;
+        drop(page);
+
+        if let Some(meta) = get_frame_meta(phys) {
+            let old_ref = meta.dec_ref();
+            debug_assert!(
+                old_ref > 0,
+                "collapse released a page whose frame refcount was already 0"
+            );
+            if old_ref == 1 {
+                meta.set_role(PageRole::Free);
+                crate::mm::allocator::free_raw_frame(phys);
+            }
+        }
+    }
+
     /// Create a new anonymous VmObject (no backing).
     pub fn new_anon(size: usize) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
@@ -220,10 +238,16 @@ impl VmObject {
 
     /// Create a file-backed VmObject for a specific region of a vnode.
     ///
-    /// Unlike `new_file` which uses the full file size, this creates an object
-    /// with the given size (in pages) backed by the vnode's pager.
-    /// Used by exec to create per-segment VmObjects without touching the allocator.
-    pub fn new_vnode_region(vnode_id: usize, path: &str, size_pages: usize) -> Arc<RwLock<Self>> {
+    /// `base_offset` is the file offset corresponding to object page 0.
+    /// `valid_bytes` controls how many bytes from `base_offset` are file-backed;
+    /// bytes beyond that range are zero-filled (ELF BSS tail semantics).
+    pub fn new_vnode_region(
+        vnode_id: usize,
+        path: &str,
+        size_pages: usize,
+        base_offset: usize,
+        valid_bytes: usize,
+    ) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             pages: BTreeMap::new(),
             backing: None,
@@ -231,10 +255,10 @@ impl VmObject {
             pager: Some(Arc::new(VnodePager {
                 vnode_id,
                 path: path.into(),
-                base_offset: 0,
-                valid_bytes: usize::MAX,
+                base_offset,
+                valid_bytes,
             })),
-            size: size_pages,
+            size: size_pages * PAGE_SIZE,
             resident_count: 0,
             paging_in_progress: AtomicU32::new(0),
             generation: AtomicU32::new(0),
@@ -583,8 +607,10 @@ impl VmObject {
                 self.resident_count += 1;
             } else {
                 // Conflict: self already has a COW copy at this offset.
-                // The page from backing will be dropped here automatically.
+                // This backing page has become a phantom: no shadow chain can
+                // reach it anymore once collapse succeeds, so release its frame.
                 backing.resident_count = backing.resident_count.saturating_sub(1);
+                Self::release_unmapped_page(page);
             }
         }
 

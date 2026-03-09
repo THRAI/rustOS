@@ -12,6 +12,7 @@ const IRQ_S_TIMER: usize = 5;
 const IRQ_S_EXTERNAL: usize = 9;
 
 // Exception cause codes
+const EXC_ILLEGAL_INST: usize = 2;
 const EXC_LOAD_ACCESS_FAULT: usize = 5;
 const EXC_STORE_ACCESS_FAULT: usize = 7;
 const EXC_ECALL_U: usize = 8;
@@ -88,6 +89,15 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                     "[trap] unexpected U-ecall in __kernel_trap: sepc={:#x}, a7={}",
                     frame.pc(),
                     frame.arg(7)
+                );
+            }
+            EXC_ILLEGAL_INST => {
+                panic!(
+                    "[trap] illegal instruction: stval={:#x}, sepc={:#x}, ra={:#x}, sp={:#x}",
+                    frame.stval(),
+                    frame.pc(),
+                    frame.ra(),
+                    frame.sp(),
                 );
             }
             EXC_LOAD_ACCESS_FAULT

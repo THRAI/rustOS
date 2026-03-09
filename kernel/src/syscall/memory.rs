@@ -2,14 +2,26 @@
 //!
 //! Implements mmap, munmap, brk, mprotect and related memory operations.
 
+use crate::fs::fd_table::FileObject;
 use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
 use alloc::sync::Arc;
 
 use crate::proc::task::Task;
 
+const PROT_READ: usize = 0x1;
+const PROT_WRITE: usize = 0x2;
+const PROT_EXEC: usize = 0x4;
+
+const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
+const MAP_TYPE_MASK: usize = 0x0f;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
+const SUPPORTED_MMAP_FLAGS: usize = MAP_TYPE_MASK | MAP_FIXED | MAP_ANONYMOUS;
+
+fn errno_ret(errno: Errno) -> usize {
+    (-(errno.as_i32() as isize)) as usize
+}
 
 fn is_page_aligned(addr: usize) -> bool {
     addr & (PAGE_SIZE - 1) == 0
@@ -21,30 +33,82 @@ fn align_up_to_page(value: usize) -> Option<usize> {
         .map(|aligned| aligned & !(PAGE_SIZE - 1))
 }
 
-fn prot_bits_to_perm(prot_bits: usize) -> crate::mm::vm::map::entry::MapPerm {
+fn prot_bits_to_perm(prot_bits: usize) -> Result<crate::mm::vm::map::entry::MapPerm, Errno> {
     use crate::mm::vm::map::entry::MapPerm;
 
+    if prot_bits & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return Err(Errno::Einval);
+    }
+
     let mut perm = MapPerm::U;
-    if prot_bits & 0x1 != 0 {
+    if prot_bits & PROT_READ != 0 {
         perm |= MapPerm::R;
     }
-    if prot_bits & 0x2 != 0 {
+    if prot_bits & PROT_WRITE != 0 {
         perm |= MapPerm::W;
     }
-    if prot_bits & 0x4 != 0 {
+    if prot_bits & PROT_EXEC != 0 {
         perm |= MapPerm::X;
     }
-    perm
+    Ok(perm)
 }
 
-/// Free frames from removed VMAs.
-/// Pages are freed automatically via RAII (TypedFrame Drop) when the
-/// VmArea and its VmObject are dropped.
 fn free_removed_frames(removed: alloc::vec::Vec<crate::mm::vm::map::entry::VmMapEntry>) {
     drop(removed);
 }
 
-/// sys_mmap: real mmap with top-down allocation and MAP_FIXED.
+fn resolve_mmap_base(
+    vm: &mut crate::mm::vm::map::VmMap,
+    addr: usize,
+    aligned_len: usize,
+    map_fixed: bool,
+) -> Result<usize, Errno> {
+    if map_fixed {
+        if !is_page_aligned(addr) {
+            return Err(Errno::Einval);
+        }
+        let end = addr.checked_add(aligned_len).ok_or(Errno::Einval)?;
+        let removed = vm.remove_range(VirtAddr::new(addr), VirtAddr::new(end));
+        free_removed_frames(removed);
+        return Ok(addr);
+    }
+
+    if addr != 0 {
+        let hint = addr & !(PAGE_SIZE - 1);
+        let hint_end = hint.checked_add(aligned_len).ok_or(Errno::Einval)?;
+        if vm.is_range_free(hint as u64, hint_end as u64) {
+            return Ok(hint);
+        }
+    }
+
+    vm.find_free_area_topdown(aligned_len)
+        .map(|va| va.as_usize())
+        .ok_or(Errno::Enomem)
+}
+
+fn build_file_backed_object(
+    vnode: &Arc<dyn crate::fs::Vnode>,
+    map_private: bool,
+) -> Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>> {
+    let base_obj = crate::fs::vnode::shared_vm_object(vnode);
+
+    if !map_private {
+        return base_obj;
+    }
+
+    let shadow = crate::mm::vm::vm_object::VmObject::new_shadow(
+        Arc::clone(&base_obj),
+        base_obj.read().size(),
+    );
+    if let Some(ref pager) = base_obj.read().pager {
+        if !pager.is_anon() {
+            shadow.write().pager = Some(Arc::clone(pager));
+        }
+    }
+    shadow
+}
+
+/// sys_mmap: build a VMA over the current VmMap/Object model.
 pub fn sys_mmap(
     task: &Arc<Task>,
     addr: usize,
@@ -54,116 +118,114 @@ pub fn sys_mmap(
     fd: u32,
     offset: u64,
 ) -> usize {
+    use crate::fs::vnode::VnodeType;
     use crate::mm::vm::map::entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
     use crate::mm::vm::map::VmError;
     use crate::mm::vm::vm_object::VmObject;
 
     let aligned_len = match align_up_to_page(len) {
         Some(aligned_len) if aligned_len != 0 => aligned_len,
-        _ => return (-(Errno::Einval.as_i32() as isize)) as usize,
+        _ => return errno_ret(Errno::Einval),
     };
+
+    if flags & !SUPPORTED_MMAP_FLAGS != 0 {
+        return errno_ret(Errno::Einval);
+    }
+
+    let map_type = flags & MAP_TYPE_MASK;
+    let map_shared = map_type == MAP_SHARED;
+    let map_private = map_type == MAP_PRIVATE;
+    if !map_shared && !map_private {
+        return errno_ret(Errno::Einval);
+    }
 
     let map_fixed = flags & MAP_FIXED != 0;
     let map_anon = flags & MAP_ANONYMOUS != 0;
-    let map_private = flags & MAP_PRIVATE != 0;
 
-    // Current VM syscall layer only supports anonymous private mappings.
-    // File-backed mmap should be wired through vnode-backed VmObject + pager,
-    // not silently downgraded to anonymous memory.
-    if !map_anon || !map_private {
-        return (-(Errno::Enosys.as_i32() as isize)) as usize;
-    }
-
-    // Linux ignores fd for MAP_ANONYMOUS, but offset must still be page-aligned.
-    // Keep the interface strict here to match the current implementation.
-    if offset != 0 {
-        return (-(Errno::Einval.as_i32() as isize)) as usize;
-    }
-    let _ = fd;
-
-    if map_fixed && !is_page_aligned(addr) {
-        return (-(Errno::Einval.as_i32() as isize)) as usize;
-    }
-
-    let mut vm = task.vm_map.lock();
-
-    let base = if map_fixed {
-        let end = match addr.checked_add(aligned_len) {
-            Some(end) => end,
-            None => return (-(Errno::Einval.as_i32() as isize)) as usize,
-        };
-        let start = VirtAddr::new(addr);
-        let end = VirtAddr::new(end);
-        // MAP_FIXED: delete existing mappings in range first
-        let removed = vm.remove_range(start, end);
-        // Free anonymous frames from removed VMAs
-        free_removed_frames(removed);
-        start.as_usize()
-    } else if addr != 0 {
-        // Hint address: try it, fall back to top-down
-        let hint = VirtAddr::new(addr & !0xFFF);
-        let hint_end = match hint.as_usize().checked_add(aligned_len) {
-            Some(end) => VirtAddr::new(end),
-            None => return (-(Errno::Einval.as_i32() as isize)) as usize,
-        };
-        // Check if hint range is free
-        let hint_ok = vm.is_range_free(hint.as_usize() as u64, hint_end.as_usize() as u64);
-        if hint_ok {
-            hint.as_usize()
-        } else {
-            match vm.find_free_area_topdown(aligned_len) {
-                Some(va) => va.as_usize(),
-                None => return (-(Errno::Enomem.as_i32() as isize)) as usize,
-            }
-        }
-    } else {
-        // Top-down allocation
-        match vm.find_free_area_topdown(aligned_len) {
-            Some(va) => va.as_usize(),
-            None => return (-(Errno::Enomem.as_i32() as isize)) as usize,
-        }
+    let perm: MapPerm = match prot_bits_to_perm(prot_bits) {
+        Ok(perm) => perm,
+        Err(errno) => return errno_ret(errno),
     };
 
-    // Build VMA
-    let perm: MapPerm = prot_bits_to_perm(prot_bits);
+    if offset % PAGE_SIZE as u64 != 0 {
+        return errno_ret(Errno::Einval);
+    }
 
-    let obj = VmObject::new_anon(aligned_len);
+    let object = if map_anon {
+        if !map_private {
+            return errno_ret(Errno::Enosys);
+        }
+        VmObject::new_anon(aligned_len)
+    } else {
+        let fd_table = task.fd_table.lock();
+        let desc = match fd_table.get(fd) {
+            Some(desc) => Arc::clone(desc),
+            None => return errno_ret(Errno::Ebadf),
+        };
+        drop(fd_table);
+
+        let vnode = match &desc.object {
+            FileObject::Vnode(vnode) => Arc::clone(vnode),
+            _ => return errno_ret(Errno::Enodev),
+        };
+
+        if vnode.vtype() != VnodeType::Regular {
+            return errno_ret(Errno::Enodev);
+        }
+        if perm.contains(MapPerm::R) && !desc.flags.read {
+            return errno_ret(Errno::Ebadf);
+        }
+        if perm.contains(MapPerm::W) && !desc.flags.write {
+            return errno_ret(Errno::Ebadf);
+        }
+
+        let _ = aligned_len;
+        let _ = offset;
+        build_file_backed_object(&vnode, map_private)
+    };
+
+    let mut vm = task.vm_map.lock();
+    let base = match resolve_mmap_base(&mut vm, addr, aligned_len, map_fixed) {
+        Ok(base) => base,
+        Err(errno) => return errno_ret(errno),
+    };
+
     let vma = VmMapEntry::new(
         base as u64,
         (base + aligned_len) as u64,
         BackingStore::Object {
-            object: obj,
-            offset: 0,
+            object,
+            offset,
         },
         EntryFlags::empty(),
         perm,
     );
+
     match vm.insert_entry(vma) {
         Ok(()) => base,
-        Err(VmError::Overlap) => (-(Errno::Einval.as_i32() as isize)) as usize,
-        Err(VmError::InvalidRange) => (-(Errno::Einval.as_i32() as isize)) as usize,
-        Err(VmError::NotFound) => (-(Errno::Enomem.as_i32() as isize)) as usize,
+        Err(VmError::Overlap) | Err(VmError::InvalidRange) => errno_ret(Errno::Einval),
+        Err(VmError::NotFound) => errno_ret(Errno::Enomem),
     }
 }
 
 /// sys_munmap: tear down PTEs + TLB + remove/split VMAs.
 pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> usize {
     if len == 0 || !is_page_aligned(addr) {
-        return (-(Errno::Einval.as_i32() as isize)) as usize;
+        return errno_ret(Errno::Einval);
     }
 
     let end = match addr.checked_add(len) {
         Some(end) => end,
-        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+        None => return errno_ret(Errno::Einval),
     };
 
     let aligned_end = match align_up_to_page(end) {
         Some(end) => VirtAddr::new(end),
-        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+        None => return errno_ret(Errno::Einval),
     };
     let aligned_start = VirtAddr::new(addr);
     if aligned_start >= aligned_end {
-        return (-(Errno::Einval.as_i32() as isize)) as usize;
+        return errno_ret(Errno::Einval);
     }
     let mut vm = task.vm_map.lock();
     let removed = vm.remove_range(aligned_start, aligned_end);
@@ -176,34 +238,36 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
     use crate::mm::vm::map::VmError;
 
     if len == 0 || !is_page_aligned(addr) {
-        return (-(Errno::Einval.as_i32() as isize)) as usize;
+        return errno_ret(Errno::Einval);
     }
 
     let end = match addr.checked_add(len) {
         Some(end) => end,
-        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+        None => return errno_ret(Errno::Einval),
     };
 
     let end = match align_up_to_page(end) {
         Some(end) => VirtAddr::new(end),
-        None => return (-(Errno::Einval.as_i32() as isize)) as usize,
+        None => return errno_ret(Errno::Einval),
     };
     let start = VirtAddr::new(addr);
     if start >= end {
-        return (-(Errno::Einval.as_i32() as isize)) as usize;
+        return errno_ret(Errno::Einval);
     }
 
-    let perm = prot_bits_to_perm(prot_bits);
+    let perm = match prot_bits_to_perm(prot_bits) {
+        Ok(perm) => perm,
+        Err(errno) => return errno_ret(errno),
+    };
 
     let mut vm = task.vm_map.lock();
     match vm.protect_range(start, end, perm) {
         Ok(()) => 0,
-        Err(VmError::NotFound) => (-(Errno::Enomem.as_i32() as isize)) as usize,
-        Err(VmError::Overlap) | Err(VmError::InvalidRange) => {
-            (-(Errno::Einval.as_i32() as isize)) as usize
-        }
+        Err(VmError::NotFound) => errno_ret(Errno::Enomem),
+        Err(VmError::Overlap) | Err(VmError::InvalidRange) => errno_ret(Errno::Einval),
     }
 }
+
 /// sys_brk: change program break (heap end).
 pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
     use core::sync::atomic::Ordering;

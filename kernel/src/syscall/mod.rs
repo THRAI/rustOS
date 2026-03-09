@@ -528,10 +528,14 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             crate::klog!(syscall, info, "reboot syscall: shutting down (cmd={:#x})", a2);
             crate::hal::rv64::sbi::shutdown();
         }
-        SyscallId::CLONE => SyscallAction::Return(process::sys_clone(task, a1)),
+        SyscallId::CLONE => SyscallAction::Return(process::sys_clone(task, a0, a1, a2, a3, a4)),
         SyscallId::EXECVE => {
             match process::sys_execve_async(task, AT_FDCWD, a0, a1, a2).await {
-                Ok((entry, sp)) => {
+                Ok((entry, sp, argc, envc)) => {
+                    let ptr_sz = core::mem::size_of::<usize>();
+                    let argv_ptr = sp + ptr_sz;
+                    let envp_ptr = argv_ptr + (argc + 1) * ptr_sz;
+                    let _ = envc;
                     let mut tf = task.trap_frame.lock();
                     tf.sepc = entry;
                     tf.x[2] = sp;
@@ -540,6 +544,11 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                             tf.x[i] = 0;
                         }
                     }
+                    // Linux rv64 process entry ABI:
+                    // a0=argc, a1=argv, a2=envp.
+                    tf.x[10] = argc;
+                    tf.x[11] = argv_ptr;
+                    tf.x[12] = envp_ptr;
                     tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                     SyscallAction::Continue
                 }

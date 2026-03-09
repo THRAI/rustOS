@@ -14,6 +14,7 @@ use core::array;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
+use crate::mm::allocator::types::{get_frame_meta, PageRole};
 
 use self::pte::{
     encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa, PteFlags,
@@ -248,7 +249,15 @@ impl Drop for Pmap {
         // However, dummy objects might cause issues here if they were Box::leaked!
         // We should skip dummy objects if they have PA == 0.
         if self.root.phys_addr.as_usize() != 0 {
-            crate::mm::allocator::free_raw_frame(self.root.phys_addr);
+            let phys = self.root.phys_addr;
+            if let Some(meta) = get_frame_meta(phys) {
+                let old_ref = meta.dec_ref();
+                debug_assert!(old_ref > 0, "pmap root frame refcount underflow");
+                if old_ref == 1 {
+                    meta.set_role(PageRole::Free);
+                    crate::mm::allocator::free_raw_frame(phys);
+                }
+            }
         }
     }
 }
@@ -289,16 +298,15 @@ pub fn pmap_enter(
             va.0
         );
 
-        if was_valid {
-            // Mapping changed: shootdown old TLB entry.
-            #[cfg(target_arch = "riscv64")]
-            shootdown::pmap_shootdown(
-                &pmap.active,
-                va.as_usize(),
-                va.as_usize() + PAGE_SIZE,
-                pmap.asid,
-            );
-        }
+        // Always flush this VA: RISC-V may cache invalid translations, so
+        // invalid->valid installs must also execute sfence.vma.
+        #[cfg(target_arch = "riscv64")]
+        shootdown::pmap_shootdown(
+            &pmap.active,
+            va.as_usize(),
+            va.as_usize() + PAGE_SIZE,
+            pmap.asid,
+        );
 
         if !was_valid {
             pmap.stats.resident_count += 1;

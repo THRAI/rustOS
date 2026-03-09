@@ -134,9 +134,7 @@ pub fn sync_fault_handler(
     );
 
     // 2. Check permissions.
-    if !(access_type.permitted_by(vma.protection)
-        || (access_type.write && vma.protection.contains(MapPerm::R)))
-    {
+    if !access_type.permitted_by(vma.protection) {
         crate::klog!(
             vm,
             debug,
@@ -219,7 +217,26 @@ fn classify_and_handle(
             handle_cow_fault(vma, obj, obj_page_offset, fault_va_aligned, _old_phys, pmap)
         }
         Some(phys) => {
-            let _ = pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.protection, false);
+            if pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.protection, false).is_err() {
+                crate::klog!(
+                    vm,
+                    error,
+                    "fault map FAILED va={:#x} pa={:#x} perm={:?}",
+                    fault_va_aligned.0,
+                    phys.as_usize(),
+                    vma.protection
+                );
+                return FaultResult::Error(FaultError::OutOfMemory);
+            }
+            if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
+                crate::klog!(
+                    vm,
+                    error,
+                    "fault map VERIFY_FAILED va={:#x} (pte missing right after enter)",
+                    fault_va_aligned.0
+                );
+                return FaultResult::Error(FaultError::NotMapped);
+            }
             FaultResult::Resolved
         }
     }
@@ -244,13 +261,33 @@ fn handle_anonymous_fault(
     };
 
     // Map the page in the hardware page table.
-    let _ = pmap::pmap_enter(
+    if pmap::pmap_enter(
         pmap,
         fault_va_aligned,
         new_frame_phys,
         vma.protection,
         false,
-    );
+    )
+    .is_err()
+    {
+        crate::klog!(
+            vm,
+            error,
+            "anon fault map FAILED va={:#x} pa={:#x}",
+            fault_va_aligned.0,
+            new_frame_phys.as_usize()
+        );
+        return FaultResult::Error(FaultError::OutOfMemory);
+    }
+    if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
+        crate::klog!(
+            vm,
+            error,
+            "anon fault VERIFY_FAILED va={:#x}",
+            fault_va_aligned.0
+        );
+        return FaultResult::Error(FaultError::NotMapped);
+    }
 
     FaultResult::Resolved
 }
@@ -281,24 +318,24 @@ fn handle_cow_fault(
         return FaultResult::Resolved;
     }
 
-    // Try collapse: if backing has shadow_count == 1, migrate pages.
+    // Optimization: if our backing object is no longer shared by any sibling
+    // shadow, collapse the chain and retry. This preserves COW semantics while
+    // shortening future lookups.
     {
         let mut obj_write = obj.write();
-        let can_collapse = obj_write
-            .backing()
-            .map(|b| b.read().shadow_count() == 1)
-            .unwrap_or(false);
-        if can_collapse {
-            obj_write.collapse();
-            if obj_write.has_page(obj_page_offset) {
-                drop(obj_write);
-                pmap::pmap_protect(
-                    pmap,
-                    fault_va_aligned,
-                    VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
-                    vma.protection,
-                );
-                return FaultResult::Resolved;
+        if let Some(backing) = obj_write.backing_object() {
+            if backing.read().shadow_count() == 1 {
+                obj_write.collapse();
+                if obj_write.has_page(obj_page_offset) {
+                    drop(obj_write);
+                    pmap::pmap_protect(
+                        pmap,
+                        fault_va_aligned,
+                        VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
+                        vma.protection,
+                    );
+                    return FaultResult::Resolved;
+                }
             }
         }
     }
@@ -312,13 +349,33 @@ fn handle_cow_fault(
         }
     };
 
-    let _ = pmap::pmap_enter(
+    if pmap::pmap_enter(
         pmap,
         fault_va_aligned,
         new_frame_phys,
         vma.protection,
         false,
-    );
+    )
+    .is_err()
+    {
+        crate::klog!(
+            vm,
+            error,
+            "cow fault map FAILED va={:#x} pa={:#x}",
+            fault_va_aligned.0,
+            new_frame_phys.as_usize()
+        );
+        return FaultResult::Error(FaultError::OutOfMemory);
+    }
+    if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
+        crate::klog!(
+            vm,
+            error,
+            "cow fault VERIFY_FAILED va={:#x}",
+            fault_va_aligned.0
+        );
+        return FaultResult::Error(FaultError::NotMapped);
+    }
 
     FaultResult::Resolved
 }

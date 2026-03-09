@@ -37,6 +37,16 @@ pub async fn resolve_user_fault(
             if ok {
                 return Ok(());
             }
+            crate::klog!(
+                vm,
+                trace,
+                "resolve_user_fault fastpath miss: pid={} va={:#x} flags={:?} access(w={},x={})",
+                task.pid,
+                fault_va_aligned.as_usize(),
+                flags,
+                access_type.write,
+                access_type.execute
+            );
         }
     }
 
@@ -144,13 +154,11 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let mut pmap = map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
         if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-            let _ = crate::mm::pmap::pmap_enter(
-                &mut pmap,
-                fault_va_aligned,
-                existing_pa,
-                vma_perm,
-                false,
-            );
+            if crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false)
+                .is_err()
+            {
+                return Err(FaultError::OutOfMemory);
+            }
         }
         return Ok(());
     }
@@ -191,13 +199,17 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         if let Some(existing_pa) = obj_write.lookup_page(obj_offset) {
             crate::mm::allocator::free_raw_frame(frame);
             if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-                let _ = crate::mm::pmap::pmap_enter(
+                if crate::mm::pmap::pmap_enter(
                     &mut pmap,
                     fault_va_aligned,
                     existing_pa,
                     vma_perm,
                     false,
-                );
+                )
+                .is_err()
+                {
+                    return Err(FaultError::OutOfMemory);
+                }
             }
             return Ok(());
         }
@@ -210,8 +222,11 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         });
 
         if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-            let _ =
-                crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, frame, vma_perm, false);
+            if crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, frame, vma_perm, false)
+                .is_err()
+            {
+                return Err(FaultError::OutOfMemory);
+            }
         }
     }
 

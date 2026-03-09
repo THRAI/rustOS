@@ -3,13 +3,18 @@
 //! The Vnode trait is the core filesystem abstraction. Ext4Vnode implements
 //! it by sending operations to the delegate task via the bounded channel.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::mm::vm::vm_object::VmObject;
 /// Unique vnode identifier (inode number within a filesystem).
 pub type VnodeId = u64;
 use spin::rwlock::RwLock;
+use crate::hal_common::IrqSafeSpinLock;
+
+static SHARED_VM_OBJECTS: IrqSafeSpinLock<Option<BTreeMap<VnodeId, Weak<RwLock<VmObject>>>>> =
+    IrqSafeSpinLock::new(None);
 
 /// File type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +48,20 @@ pub trait Vnode: Send + Sync {
     fn path(&self) -> &str;
     fn set_size(&self, size: u64);
     fn grab_obj(&mut self) -> Arc<RwLock<VmObject>>;
+}
+
+/// Get or create the shared vnode-backed VmObject for mmap(MAP_SHARED).
+pub fn shared_vm_object(vnode: &Arc<dyn Vnode>) -> Arc<RwLock<VmObject>> {
+    let mut cache = SHARED_VM_OBJECTS.lock();
+    let map = cache.get_or_insert_with(BTreeMap::new);
+
+    if let Some(existing) = map.get(&vnode.vnode_id()).and_then(Weak::upgrade) {
+        return existing;
+    }
+
+    let obj = VmObject::new_file(&**vnode);
+    map.insert(vnode.vnode_id(), Arc::downgrade(&obj));
+    obj
 }
 
 /// Ext4 vnode: holds inode number, file type, cached size, and path.

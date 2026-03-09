@@ -1,4 +1,4 @@
-use crate::hal_common::VirtAddr;
+use crate::hal_common::{VirtAddr, PAGE_SIZE};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7,7 +7,7 @@ pub mod splay;
 
 use crate::hal_common::spin_mutex::SpinMutex;
 use crate::mm::pmap::Pmap;
-use crate::mm::vm::map::entry::{MapPerm, VmMapEntry};
+use crate::mm::vm::map::entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
 use crate::mm::vm::map::splay::{SplayTree, SplayTreeIter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +94,21 @@ impl VmMap {
     }
 
     pub fn insert_entry(&mut self, entry: VmMapEntry) -> Result<(), VmError> {
+        if entry.start() >= entry.end() {
+            return Err(VmError::InvalidRange);
+        }
+
+        let page_size = PAGE_SIZE as u64;
+        if entry.start() % page_size != 0 || entry.end() % page_size != 0 {
+            return Err(VmError::InvalidRange);
+        }
+
+        for existing in self.iter() {
+            if existing.start < entry.end() && existing.end > entry.start() {
+                return Err(VmError::Overlap);
+            }
+        }
+
         let entry_size = entry.size();
         self.tree.insert(alloc::boxed::Box::new(entry));
         self.size += entry_size;
@@ -242,12 +257,218 @@ impl VmMap {
         None
     }
 
-    pub fn protect_range(&mut self, start: VirtAddr, end: VirtAddr, perm: MapPerm) {
+    pub fn protect_range(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        perm: MapPerm,
+    ) -> Result<(), VmError> {
+        if start >= end {
+            return Err(VmError::InvalidRange);
+        }
+
+        let start_addr = start.as_usize() as u64;
+        let end_addr = end.as_usize() as u64;
+
+        let mut overlapping = alloc::vec::Vec::new();
+        for entry in self.iter() {
+            if entry.start < end_addr && entry.end > start_addr {
+                overlapping.push((entry.start, entry.end, entry.max_protection));
+            }
+        }
+
+        if overlapping.is_empty() {
+            return Err(VmError::NotFound);
+        }
+
+        overlapping.sort_unstable_by_key(|&(entry_start, _, _)| entry_start);
+
+        let mut covered_until = start_addr;
+        for &(entry_start, entry_end, max_protection) in &overlapping {
+            if entry_start > covered_until {
+                return Err(VmError::NotFound);
+            }
+            if !max_protection.contains(perm) {
+                return Err(VmError::InvalidRange);
+            }
+            if entry_end > covered_until {
+                covered_until = entry_end;
+            }
+            if covered_until >= end_addr {
+                break;
+            }
+        }
+
+        if covered_until < end_addr {
+            return Err(VmError::NotFound);
+        }
+
+        let keys: alloc::vec::Vec<u64> = overlapping
+            .into_iter()
+            .map(|(entry_start, _, _)| entry_start)
+            .collect();
+
+        for key in keys {
+            let entry_box = match self.tree.remove(key) {
+                Some(entry) => entry,
+                None => continue,
+            };
+            let entry = *entry_box;
+
+            self.size = self.size.saturating_sub(entry.size());
+            self.nentries = self.nentries.saturating_sub(1);
+
+            let entry_start = entry.start();
+            let entry_end = entry.end();
+
+            if entry_start < start_addr {
+                let mut left = entry.clone_for_split(entry_start);
+                left.set_bounds(entry_start, start_addr);
+                self.size = self.size.saturating_add(left.size());
+                self.nentries += 1;
+                self.tree.insert(alloc::boxed::Box::new(left));
+            }
+
+            let protected_start = core::cmp::max(entry_start, start_addr);
+            let protected_end = core::cmp::min(entry_end, end_addr);
+            if protected_start < protected_end {
+                let mut middle = entry.clone_for_split(protected_start);
+                middle.set_bounds(protected_start, protected_end);
+                middle.protection = perm;
+                self.size = self.size.saturating_add(middle.size());
+                self.nentries += 1;
+                self.tree.insert(alloc::boxed::Box::new(middle));
+            }
+
+            if entry_end > end_addr {
+                let mut right = entry.clone_for_split(end_addr);
+                right.set_bounds(end_addr, entry_end);
+                self.size = self.size.saturating_add(right.size());
+                self.nentries += 1;
+                self.tree.insert(alloc::boxed::Box::new(right));
+            }
+        }
+
         self.timestamp.fetch_add(1, Ordering::SeqCst);
         {
             let mut pmap = self.pmap.lock();
             crate::mm::pmap::pmap_protect(&mut pmap, start, end, perm);
         }
+        Ok(())
+    }
+
+    pub fn grow_heap(&mut self, old_brk_aligned: usize, new_brk_aligned: usize) -> Result<(), VmError> {
+        if new_brk_aligned <= old_brk_aligned {
+            return Err(VmError::InvalidRange);
+        }
+
+        if old_brk_aligned > 0 {
+            let mut heap_start = 0usize;
+            let mut extended = false;
+            {
+                if let Some(vma) = self.lookup_mut((old_brk_aligned - 1) as u64) {
+                    if vma.end() == old_brk_aligned as u64 && vma.flags.contains(EntryFlags::HEAP) {
+                        heap_start = vma.start() as usize;
+                        vma.set_bounds(heap_start as u64, new_brk_aligned as u64);
+                        if let BackingStore::Object { object, .. } = &vma.store {
+                            object.write().set_size(new_brk_aligned - heap_start);
+                        }
+                        extended = true;
+                    }
+                }
+            }
+
+            if extended {
+                self.size = self
+                    .size
+                    .saturating_add((new_brk_aligned - old_brk_aligned) as u64);
+                self.timestamp.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+
+        if !self.is_range_free(old_brk_aligned as u64, new_brk_aligned as u64) {
+            return Err(VmError::Overlap);
+        }
+
+        let grow_len = new_brk_aligned - old_brk_aligned;
+        let obj = crate::mm::vm::vm_object::VmObject::new_anon(grow_len);
+        let vma = VmMapEntry::new(
+            old_brk_aligned as u64,
+            new_brk_aligned as u64,
+            BackingStore::Object {
+                object: obj,
+                offset: 0,
+            },
+            EntryFlags::HEAP,
+            MapPerm::R | MapPerm::W | MapPerm::U,
+        );
+        self.insert_entry(vma)
+    }
+
+    pub fn shrink_heap(
+        &mut self,
+        old_brk_aligned: usize,
+        new_brk_aligned: usize,
+    ) -> Result<alloc::vec::Vec<VmMapEntry>, VmError> {
+        if new_brk_aligned >= old_brk_aligned {
+            return Err(VmError::InvalidRange);
+        }
+
+        if old_brk_aligned == 0 {
+            return Ok(alloc::vec::Vec::new());
+        }
+
+        let mut unmap_range = None;
+        let mut remove_heap_va = None;
+
+        {
+            if let Some(vma) = self.lookup_mut((old_brk_aligned - 1) as u64) {
+                if vma.end() == old_brk_aligned as u64 && vma.flags.contains(EntryFlags::HEAP) {
+                    let heap_start = vma.start() as usize;
+                    let new_heap_end = core::cmp::max(new_brk_aligned, heap_start);
+
+                    if new_heap_end <= heap_start {
+                        remove_heap_va = Some((old_brk_aligned - 1) as u64);
+                    } else {
+                        vma.set_bounds(heap_start as u64, new_heap_end as u64);
+                        if let BackingStore::Object { object, .. } = &vma.store {
+                            let new_pages = (new_heap_end - heap_start) / crate::hal_common::PAGE_SIZE;
+                            let mut obj = object.write();
+                            obj.set_size(new_heap_end - heap_start);
+                            let dropped = obj.truncate_pages(crate::hal_common::addr::VirtPageNum(new_pages));
+                            drop(dropped);
+                        }
+                        unmap_range = Some((new_heap_end, old_brk_aligned));
+                    }
+                }
+            }
+        }
+
+        if let Some(va) = remove_heap_va {
+            let mut removed_entries = alloc::vec::Vec::new();
+            if let Some(removed) = self.remove_entry_containing(va) {
+                removed_entries.push(removed);
+            }
+            return Ok(removed_entries);
+        }
+
+        if let Some((new_heap_end, old_heap_end)) = unmap_range {
+            if new_heap_end < old_heap_end {
+                let mut pmap = self.pmap.lock();
+                crate::mm::pmap::pmap_remove(
+                    &mut pmap,
+                    VirtAddr::new(new_heap_end),
+                    VirtAddr::new(old_heap_end),
+                );
+                self.size = self
+                    .size
+                    .saturating_sub((old_heap_end - new_heap_end) as u64);
+                self.timestamp.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        Ok(alloc::vec::Vec::new())
     }
 
     pub fn iter(&self) -> SplayTreeIter<'_> {

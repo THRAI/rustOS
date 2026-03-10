@@ -2,9 +2,10 @@
 
 use crate::fs::delegate;
 use crate::fs::fd_table::{FdFlags, FdTable, FileDescription, FileObject, OpenFlags};
-use crate::fs::page_cache;
-use crate::fs::vnode::VnodeType;
-use crate::hal_common::{Errno, PhysAddr, VirtAddr};
+use crate::fs::vnode::{VnodeType, vnode_object, vnode_object_if_exists, vnode_destroy_object};
+use crate::mm::vm::vm_object::VmObject;
+use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::{Errno, VirtAddr};
 use crate::mm::uio::{uiomove, UioDir};
 use crate::mm::vm::fault::PageFaultAccessType;
 use crate::mm::vm::fault_async::resolve_user_fault;
@@ -159,7 +160,7 @@ pub async fn open(
         delegate::fs_truncate(path_str, 0)
             .await
             .map_err(|_| Errno::Eio)?;
-        page_cache::invalidate_all(vnode.vnode_id());
+        vnode_destroy_object(vnode.vnode_id());
         vnode.set_size(0);
     }
 
@@ -200,13 +201,12 @@ pub async fn read(
     fd: u32,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
-    let (id, path, size, offset, desc) = {
+    let (vnode, size, offset, desc): (Arc<dyn crate::fs::Vnode>, u64, u64, Arc<FileDescription>) = {
         let tab = fd_table.lock();
         let d = tab.get(fd).ok_or(Errno::Ebadf)?;
         match &d.object {
             FileObject::Vnode(v) => (
-                v.vnode_id(),
-                alloc::string::String::from(v.path()),
+                Arc::clone(v),
                 v.size(),
                 d.offset.load(Ordering::Relaxed),
                 Arc::clone(d),
@@ -220,62 +220,26 @@ pub async fn read(
     }
     let to_read = core::cmp::min(buf.len(), (size - offset) as usize);
     let mut total = 0usize;
+    let obj = vnode_object(&*vnode);
 
     while total < to_read {
-        let page_off = (offset + total as u64) / PAGE_SIZE as u64;
-        let in_page = ((offset + total as u64) % PAGE_SIZE as u64) as usize;
+        let byte_off = offset + total as u64;
+        let page_idx = VirtPageNum(byte_off as usize / PAGE_SIZE);
+        let in_page = (byte_off % PAGE_SIZE as u64) as usize;
         let chunk = core::cmp::min(PAGE_SIZE - in_page, to_read - total);
 
-        let pa = page_cache_fetch(id, &path, page_off * PAGE_SIZE as u64).await?;
-        let src_slice = pa.into_kernel_vaddr().as_page_slice();
+        let page = VmObject::fetch_page_async(Arc::clone(&obj), page_idx)
+            .await
+            .map_err(|_| Errno::Eio)?;
+        let src_slice = unsafe {
+            core::slice::from_raw_parts(page.phys_addr.as_usize() as *const u8, PAGE_SIZE)
+        };
         buf[total..total + chunk].copy_from_slice(&src_slice[in_page..in_page + chunk]);
         total += chunk;
     }
 
     desc.offset.store(offset + total as u64, Ordering::Relaxed);
     Ok(total)
-}
-
-/// Fetch a page from the page cache (kernel-side helper for `read`).
-async fn page_cache_fetch(vnode_id: u64, path: &str, file_offset: u64) -> Result<PhysAddr, Errno> {
-    use crate::fs::page_cache::LookupResult;
-
-    let page_offset = file_offset / PAGE_SIZE as u64;
-    loop {
-        let noop = noop_waker();
-        match page_cache::lookup(vnode_id, page_offset, &noop) {
-            LookupResult::Hit(pa) => return Ok(pa),
-            LookupResult::InitiateFetch => {
-                let frame = crate::mm::allocator::alloc_raw_frame_sync(
-                    crate::mm::allocator::PageRole::FileCache,
-                )
-                .ok_or(Errno::Enomem)?;
-                match crate::fs::delegate::fs_read_page(path, file_offset, frame).await {
-                    Ok(()) => {
-                        crate::fs::page_cache::complete(vnode_id, page_offset, frame);
-                        return Ok(frame);
-                    }
-                    Err(_) => {
-                        crate::mm::allocator::free_raw_frame(frame);
-                        return Err(Errno::Eio);
-                    }
-                }
-            }
-            LookupResult::WaitingOnFetch => {
-                crate::executor::schedule::yield_now().await;
-            }
-        }
-    }
-}
-
-fn noop_waker() -> core::task::Waker {
-    use core::task::{RawWaker, RawWakerVTable, Waker};
-    fn noop(_: *const ()) {}
-    fn clone_fn(p: *const ()) -> RawWaker {
-        RawWaker::new(p, &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, noop, noop, noop);
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
 }
 
 #[inline]
@@ -872,8 +836,8 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
         let tab = task.fd_table.lock();
         Arc::clone(tab.get(fd).ok_or(Errno::Ebadf)?)
     };
-    let (path, vnode_id) = match &desc.object {
-        FileObject::Vnode(v) => (String::from(v.path()), v.vnode_id()),
+    let path = match &desc.object {
+        FileObject::Vnode(v) => String::from(v.path()),
         _ => return Err(Errno::Einval),
     };
     delegate::fs_truncate(&path, len)
@@ -886,7 +850,6 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
     if cur > len {
         desc.offset.store(len, Ordering::Relaxed);
     }
-    page_cache::invalidate_all(vnode_id);
     Ok(())
 }
 
@@ -1114,8 +1077,7 @@ pub async fn sys_read_async(
 
     enum ReadSource {
         Vnode {
-            id: u64,
-            path: String,
+            vnode: Arc<dyn crate::fs::Vnode>,
             size: u64,
             offset: u64,
         },
@@ -1133,8 +1095,7 @@ pub async fn sys_read_async(
         }
         let src = match &d.object {
             FileObject::Vnode(v) => ReadSource::Vnode {
-                id: v.vnode_id(),
-                path: String::from(v.path()),
+                vnode: Arc::clone(v),
                 size: v.size(),
                 offset: d.offset.load(core::sync::atomic::Ordering::Relaxed),
             },
@@ -1184,8 +1145,7 @@ pub async fn sys_read_async(
             .await
         }
         ReadSource::Vnode {
-            id,
-            path,
+            vnode,
             size,
             mut offset,
         } => {
@@ -1194,17 +1154,18 @@ pub async fn sys_read_async(
             }
             let to_read = core::cmp::min(len, (size - offset) as usize);
             let mut total = 0usize;
+            let obj = vnode_object(&*vnode);
 
             while total < to_read {
-                let page_offset = offset / PAGE_SIZE as u64;
+                let page_idx = VirtPageNum(offset as usize / PAGE_SIZE);
                 let offset_in_page = (offset % PAGE_SIZE as u64) as usize;
                 let chunk = core::cmp::min(PAGE_SIZE - offset_in_page, to_read - total);
 
-                let pa = page_cache_fetch_by_id(id, &path, page_offset * PAGE_SIZE as u64)
+                let page = VmObject::fetch_page_async(Arc::clone(&obj), page_idx)
                     .await
                     .map_err(|_| Errno::Eio)?;
 
-                let kern = (pa.as_usize() + offset_in_page) as *mut u8;
+                let kern = (page.phys_addr.as_usize() + offset_in_page) as *mut u8;
                 let user = (user_buf + total) as *mut u8;
 
                 match uiomove(kern, user, chunk, UioDir::CopyOut) {
@@ -1229,24 +1190,6 @@ pub async fn sys_read_async(
             desc.offset
                 .store(offset, core::sync::atomic::Ordering::Relaxed);
             Ok(total)
-        }
-    }
-}
-
-async fn page_cache_fetch_by_id(
-    _vnode_id: u64,
-    path: &str,
-    page_offset_bytes: u64,
-) -> Result<PhysAddr, ()> {
-    let frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(())?;
-    let pa = frame;
-    match crate::fs::delegate::fs_read_page(path, page_offset_bytes, pa).await {
-        Ok(_) => Ok(pa),
-        Err(_) => {
-            crate::mm::allocator::free_raw_frame(pa);
-            Err(())
         }
     }
 }
@@ -1374,7 +1317,34 @@ pub async fn sys_write_async(
                     desc.offset
                         .store(offset + n as u64, core::sync::atomic::Ordering::Relaxed);
                     if let FileObject::Vnode(v) = &desc.object {
-                        page_cache::invalidate_range(v.vnode_id(), offset, n);
+                        if let Some(obj) = vnode_object_if_exists(v.vnode_id()) {
+                            let obj_r = obj.read();
+                            let start_page = offset as usize / PAGE_SIZE;
+                            let end_page = (offset as usize + n - 1) / PAGE_SIZE;
+                            for pi in start_page..=end_page {
+                                if let Some(page) = obj_r.get_page(VirtPageNum(pi)) {
+                                    let page_base = pi * PAGE_SIZE;
+                                    let copy_start = if offset as usize > page_base {
+                                        offset as usize - page_base
+                                    } else {
+                                        0
+                                    };
+                                    let copy_end = core::cmp::min(
+                                        PAGE_SIZE,
+                                        offset as usize + n - page_base,
+                                    );
+                                    let src_off = page_base + copy_start - offset as usize;
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            kbuf[src_off..].as_ptr(),
+                                            (page.phys_addr.as_usize() + copy_start) as *mut u8,
+                                            copy_end - copy_start,
+                                        );
+                                    }
+                                    page.set_dirty();
+                                }
+                            }
+                        }
                         let old_size = v.size();
                         let new_size = core::cmp::max(old_size, offset + n as u64);
                         v.set_size(new_size);
@@ -1923,7 +1893,7 @@ pub async fn sys_unlinkat_async(
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
 
     // Check existence and type
-    let (_, ftype, _) = delegate::fs_lookup(0, &path_str)
+    let (child_ino, ftype, _) = delegate::fs_lookup(0, &path_str)
         .await
         .map_err(|_| Errno::Enoent)?;
     let is_dir = ftype == 2;
@@ -1951,6 +1921,9 @@ pub async fn sys_unlinkat_async(
         if let Ok(vnode) = crate::fs::path::resolve(parent_path).await {
             crate::fs::dentry::invalidate(vnode.vnode_id(), child_name);
         }
+    }
+    if !is_dir {
+        vnode_destroy_object(child_ino as u64);
     }
 
     crate::klog!(syscall, debug, "unlinkat: removed {}", path_str);

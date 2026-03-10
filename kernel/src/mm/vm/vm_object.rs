@@ -226,7 +226,7 @@ impl VmObject {
                 vnode_id: vnode.vnode_id() as usize,
                 path: vnode.path().into(),
                 base_offset: 0,
-                valid_bytes: vnode.size() as usize,
+                valid_bytes: usize::MAX,
             })),
             size: vnode.size() as usize,
             resident_count: 0,
@@ -481,6 +481,10 @@ impl VmObject {
     }
 
     /// Insert a page into this object (not the backing chain).
+    pub fn get_page(&self, index: VObjIndex) -> Option<&Arc<VmPage>> {
+        self.pages.get(&index)
+    }
+
     pub fn insert_page(&mut self, index: VObjIndex, page: Arc<VmPage>) {
         if self.pages.insert(index, page).is_none() {
             self.resident_count += 1;

@@ -554,23 +554,13 @@ mod legacy {
             return Err(Errno::Enoexec);
         }
 
-        let hdr_frame =
-            crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-                .ok_or(Errno::Enomem)?;
-        let hdr_pa =
-            match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame.as_usize()).await {
-                Ok(()) => {
-                    crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
-                    hdr_frame
-                }
-                Err(_) => {
-                    crate::mm::allocator::free_raw_frame(hdr_frame);
-                    return Err(Errno::Enoexec);
-                }
-            };
+        let obj = crate::fs::vnode::vnode_object(&*vnode);
+        let page0 = crate::mm::vm::vm_object::VmObject::fetch_page_async(
+            obj, crate::hal_common::addr::VirtPageNum(0),
+        ).await.map_err(|_| Errno::Enoexec)?;
 
         let hdr_buf =
-            unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
+            unsafe { core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE) };
         let elf_hdr = parse_elf_header(hdr_buf)?;
         let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
 
@@ -1014,24 +1004,12 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         return Err(Errno::Enoexec);
     }
 
-    // Read first page via delegate to get headers
-    //TODO: read logic should be performed by Objects with its pager
-    let hdr_frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(Errno::Enomem)?;
-    let hdr_pa = match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame).await {
-        Ok(()) => {
-            crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
-            hdr_frame
-        }
-        Err(_) => {
-            crate::mm::allocator::free_raw_frame(hdr_frame);
-            return Err(Errno::Enoexec);
-        }
-    };
+    let obj = crate::fs::vnode::vnode_object(&*vnode);
+    let page0 = crate::mm::vm::vm_object::VmObject::fetch_page_async(
+        obj, crate::hal_common::addr::VirtPageNum(0),
+    ).await.map_err(|_| Errno::Enoexec)?;
 
-    // Parse from the physical page (identity-mapped in kernel)
-    let hdr_buf = unsafe { core::slice::from_raw_parts(hdr_pa.as_usize() as *const u8, PAGE_SIZE) };
+    let hdr_buf = unsafe { core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE) };
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
 
@@ -1256,21 +1234,13 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         return Err(Errno::Enoexec);
     }
 
-    let hdr_frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::FileCache)
-            .ok_or(Errno::Enomem)?;
-    match crate::fs::delegate::fs_read_page(vnode.path(), 0, hdr_frame).await {
-        Ok(()) => {
-            crate::fs::page_cache::complete(vnode.vnode_id(), 0, hdr_frame);
-        }
-        Err(_) => {
-            crate::mm::allocator::free_raw_frame(hdr_frame);
-            return Err(Errno::Enoexec);
-        }
-    };
+    let obj = crate::fs::vnode::vnode_object(&*vnode);
+    let page0 = crate::mm::vm::vm_object::VmObject::fetch_page_async(
+        obj, crate::hal_common::addr::VirtPageNum(0),
+    ).await.map_err(|_| Errno::Enoexec)?;
 
     let hdr_buf =
-        unsafe { core::slice::from_raw_parts(hdr_frame.as_usize() as *const u8, PAGE_SIZE) };
+        unsafe { core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE) };
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
     let interp_entry = elf_hdr.e_entry as usize + offset;

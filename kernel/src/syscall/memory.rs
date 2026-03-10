@@ -90,7 +90,7 @@ fn build_file_backed_object(
     vnode: &Arc<dyn crate::fs::Vnode>,
     map_private: bool,
 ) -> Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>> {
-    let base_obj = crate::fs::vnode::shared_vm_object(vnode);
+    let base_obj = crate::fs::vnode::vnode_object(&**vnode);
 
     if !map_private {
         return base_obj;

@@ -5,16 +5,119 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
+use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::mm::vm::vm_object::VmObject;
+use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::PAGE_SIZE;
 /// Unique vnode identifier (inode number within a filesystem).
 pub type VnodeId = u64;
 use spin::rwlock::RwLock;
 use crate::hal_common::IrqSafeSpinLock;
 
-static SHARED_VM_OBJECTS: IrqSafeSpinLock<Option<BTreeMap<VnodeId, Weak<RwLock<VmObject>>>>> =
+static VNODE_OBJECTS: IrqSafeSpinLock<Option<BTreeMap<VnodeId, Arc<RwLock<VmObject>>>>> =
     IrqSafeSpinLock::new(None);
+
+const MAX_CACHED_VNODES: usize = 64;
+
+struct VnodeLru {
+    entries: VecDeque<VnodeId>,
+}
+
+static VNODE_LRU: IrqSafeSpinLock<Option<VnodeLru>> = IrqSafeSpinLock::new(None);
+
+pub fn init_vnode_cache() {
+    *VNODE_OBJECTS.lock() = Some(BTreeMap::new());
+    *VNODE_LRU.lock() = Some(VnodeLru {
+        entries: VecDeque::new(),
+    });
+}
+
+pub fn vnode_object(vnode: &dyn Vnode) -> Arc<RwLock<VmObject>> {
+    let id = vnode.vnode_id();
+    {
+        let cache = VNODE_OBJECTS.lock();
+        let map = cache.as_ref().expect("vnode cache not initialized");
+        if let Some(existing) = map.get(&id) {
+            let obj = Arc::clone(existing);
+            drop(cache);
+            // Promote in LRU
+            if let Some(lru) = VNODE_LRU.lock().as_mut() {
+                lru.entries.retain(|e| *e != id);
+                lru.entries.push_back(id);
+            }
+            return obj;
+        }
+    }
+
+    let obj = VmObject::new_file(vnode);
+    {
+        let mut cache = VNODE_OBJECTS.lock();
+        let map = cache.as_mut().expect("vnode cache not initialized");
+        // Double-check after re-acquiring lock
+        if let Some(existing) = map.get(&id) {
+            return Arc::clone(existing);
+        }
+        map.insert(id, Arc::clone(&obj));
+    }
+    if let Some(lru) = VNODE_LRU.lock().as_mut() {
+        lru.entries.push_back(id);
+    }
+    evict_idle_vnodes();
+    obj
+}
+
+pub fn vnode_object_if_exists(vnode_id: VnodeId) -> Option<Arc<RwLock<VmObject>>> {
+    let cache = VNODE_OBJECTS.lock();
+    let map = cache.as_ref()?;
+    map.get(&vnode_id).cloned()
+}
+
+pub fn vnode_destroy_object(vnode_id: VnodeId) {
+    {
+        let mut cache = VNODE_OBJECTS.lock();
+        if let Some(map) = cache.as_mut() {
+            map.remove(&vnode_id);
+        }
+    }
+    if let Some(lru) = VNODE_LRU.lock().as_mut() {
+        lru.entries.retain(|e| *e != vnode_id);
+    }
+}
+
+fn evict_idle_vnodes() {
+    let mut cache = VNODE_OBJECTS.lock();
+    let map = match cache.as_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    if map.len() <= MAX_CACHED_VNODES {
+        return;
+    }
+
+    let mut lru = VNODE_LRU.lock();
+    let lru = match lru.as_mut() {
+        Some(l) => l,
+        None => return,
+    };
+
+    let mut to_remove = alloc::vec::Vec::new();
+    for id in lru.entries.iter() {
+        if map.len() - to_remove.len() <= MAX_CACHED_VNODES {
+            break;
+        }
+        if let Some(arc) = map.get(id) {
+            if Arc::strong_count(arc) == 1 {
+                to_remove.push(*id);
+            }
+        }
+    }
+    for id in &to_remove {
+        map.remove(id);
+        lru.entries.retain(|e| e != id);
+    }
+}
 
 /// File type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,21 +150,6 @@ pub trait Vnode: Send + Sync {
     fn size(&self) -> u64;
     fn path(&self) -> &str;
     fn set_size(&self, size: u64);
-    fn grab_obj(&mut self) -> Arc<RwLock<VmObject>>;
-}
-
-/// Get or create the shared vnode-backed VmObject for mmap(MAP_SHARED).
-pub fn shared_vm_object(vnode: &Arc<dyn Vnode>) -> Arc<RwLock<VmObject>> {
-    let mut cache = SHARED_VM_OBJECTS.lock();
-    let map = cache.get_or_insert_with(BTreeMap::new);
-
-    if let Some(existing) = map.get(&vnode.vnode_id()).and_then(Weak::upgrade) {
-        return existing;
-    }
-
-    let obj = VmObject::new_file(&**vnode);
-    map.insert(vnode.vnode_id(), Arc::downgrade(&obj));
-    obj
 }
 
 /// Ext4 vnode: holds inode number, file type, cached size, and path.
@@ -70,7 +158,6 @@ pub struct Ext4Vnode {
     pub vtype: VnodeType,
     pub file_size: AtomicU64,
     pub path: String,
-    pub vm_obj: Option<Arc<RwLock<VmObject>>>,
 }
 
 impl Ext4Vnode {
@@ -80,7 +167,6 @@ impl Ext4Vnode {
             vtype,
             file_size: AtomicU64::new(size),
             path: String::new(),
-            vm_obj: None,
         })
     }
 
@@ -90,7 +176,6 @@ impl Ext4Vnode {
             vtype,
             file_size: AtomicU64::new(size),
             path,
-            vm_obj: None,
         })
     }
 }
@@ -113,17 +198,15 @@ impl Vnode for Ext4Vnode {
     }
 
     fn set_size(&self, size: u64) {
-        self.file_size.store(size, Ordering::Relaxed);
-    }
-
-    /// Get or create the unified page cache of this vnode.
-    fn grab_obj(&mut self) -> Arc<RwLock<VmObject>> {
-        if let Some(obj) = &self.vm_obj {
-            return Arc::clone(obj)
+        let old_size = self.file_size.swap(size, Ordering::Relaxed);
+        if let Some(obj) = vnode_object_if_exists(self.ino as VnodeId) {
+            let mut w = obj.write();
+            if size < old_size {
+                let new_pages = (size as usize + PAGE_SIZE - 1) / PAGE_SIZE;
+                w.truncate_pages(VirtPageNum(new_pages));
+            }
+            w.set_size(size as usize);
         }
-
-        let new_obj = VmObject::new_file(self);
-        self.vm_obj = Some(Arc::clone(&new_obj));
-        new_obj
     }
+
 }

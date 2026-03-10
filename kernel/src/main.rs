@@ -113,8 +113,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Initialize VFS caches
         klog!(boot, info, "dentry::init...");
         fs::dentry::init();
-        klog!(boot, info, "page_cache::init...");
-        fs::page_cache::init();
+        klog!(boot, info, "vnode_cache::init...");
+        fs::vnode::init_vnode_cache();
 
         klog!(boot, info, "delegate::init...");
         // Initialize filesystem delegate (mounts ext4, spawns delegate task)

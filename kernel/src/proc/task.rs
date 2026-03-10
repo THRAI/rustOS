@@ -108,12 +108,12 @@ impl Task {
             .upgrade()
             .map_or(pid, |p| p.pgid.load(Ordering::Relaxed));
         let pmap = Arc::new(Mutex::new(pmap::pmap_create()));
-        crate::kprintln!(
-            "[task] new pid={} kstack_base={:#x} kernel_sp={:#x}",
-            pid,
-            kstack_base.as_usize(),
-            kernel_sp
-        );
+        // crate::kprintln!(
+        //     "[task] new pid={} kstack_base={:#x} kernel_sp={:#x}",
+        //     pid,
+        //     kstack_base.as_usize(),
+        //     kernel_sp
+        // );
         Arc::new(Self {
             pid,
             parent,

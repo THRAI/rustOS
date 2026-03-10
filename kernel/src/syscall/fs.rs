@@ -242,31 +242,6 @@ pub async fn read(
     Ok(total)
 }
 
-#[inline]
-fn map_delegate_errno(code: i32) -> Errno {
-    match code.abs() {
-        1 => Errno::Eperm,
-        2 => Errno::Enoent,
-        5 => Errno::Eio,
-        9 => Errno::Ebadf,
-        12 => Errno::Enomem,
-        13 => Errno::Eperm,
-        17 => Errno::Eexist,
-        19 => Errno::Enodev,
-        20 => Errno::Enotdir,
-        21 => Errno::Eisdir,
-        22 => Errno::Einval,
-        24 => Errno::Emfile,
-        25 => Errno::Enotty,
-        29 => Errno::Espipe,
-        32 => Errno::Epipe,
-        34 => Errno::Erange,
-        38 => Errno::Enosys,
-        39 => Errno::Enotempty,
-        _ => Errno::Eio,
-    }
-}
-
 /// sys_lseek: reposition file offset.
 pub fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<u64, Errno> {
     use crate::fs::fd_table::FileObject;
@@ -422,7 +397,7 @@ pub async fn sys_fstatat_async(
         return Err(Errno::Enoent);
     }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
-    let (ino, ftype, size) = delegate::fs_lookup(0, &path_str).await.map_err(map_delegate_errno)?;
+    let (ino, ftype, size) = delegate::fs_lookup(0, &path_str).await?;;
 
     let mut st = LinuxStat {
         st_dev: 0,
@@ -731,8 +706,7 @@ pub async fn sys_linkat_async(
         return Err(Errno::Einval);
     }
     delegate::fs_link(&old_path, &new_path)
-        .await
-        .map_err(map_delegate_errno)?;
+        .await?;
     Ok(())
 }
 
@@ -758,8 +732,7 @@ pub async fn sys_renameat2_async(
         return Err(Errno::Einval);
     }
     delegate::fs_rename(&old_path, &new_path)
-        .await
-        .map_err(map_delegate_errno)?;
+        .await?;
     Ok(())
 }
 
@@ -777,8 +750,7 @@ pub async fn sys_readlinkat_async(
     let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::Efault)?;
     let path = absolutize_path(task, dirfd, &raw_path)?;
     let (mut n, data) = delegate::fs_readlink(&path)
-        .await
-        .map_err(map_delegate_errno)?;
+        .await?;;
     if n > 0 && data[n - 1] == 0 {
         n -= 1;
     }
@@ -824,8 +796,7 @@ pub async fn sys_faccessat_async(
     }
     let path = absolutize_path(task, dirfd, &raw_path)?;
     let _ = delegate::fs_lookup(0, &path)
-        .await
-        .map_err(map_delegate_errno)?;
+        .await?;
     Ok(())
 }
 
@@ -841,8 +812,7 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
         _ => return Err(Errno::Einval),
     };
     delegate::fs_truncate(&path, len)
-        .await
-        .map_err(map_delegate_errno)?;
+        .await?;;
     if let FileObject::Vnode(v) = &desc.object {
         v.set_size(len);
     }
@@ -866,7 +836,6 @@ pub async fn sys_fsync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
     };
     delegate::fs_cache_flush(&path)
         .await
-        .map_err(map_delegate_errno)
 }
 
 /// sys_fdatasync: flush data (same as fsync for now).
@@ -878,7 +847,6 @@ pub async fn sys_fdatasync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno>
 pub async fn sys_sync_async() -> Result<(), Errno> {
     delegate::fs_cache_flush("/")
         .await
-        .map_err(map_delegate_errno)
 }
 
 /// sys_pipe2: create a pipe with optional flags.
@@ -1981,8 +1949,7 @@ pub async fn sys_symlinkat_async(
     };
 
     delegate::fs_symlink(&target_abs, &link_abs)
-        .await
-        .map_err(map_delegate_errno)?;
+        .await?;;
     crate::klog!(
         syscall,
         debug,

@@ -22,9 +22,6 @@ pub struct UioResult {
     pub done: usize,
 }
 
-/// EFAULT error code matching the assembly landing pad return value.
-const EFAULT_RAW: usize = 14;
-
 /// Compute the chunk size that won't cross a page boundary.
 #[inline]
 pub fn chunk_size(addr: usize, remaining: usize) -> usize {
@@ -78,7 +75,7 @@ pub fn uiomove(
             },
         };
 
-        if ret == EFAULT_RAW {
+        if ret == Errno::Efault.as_i32() as usize {
             if total_copied > 0 {
                 return Ok(UioResult { done: total_copied });
             }

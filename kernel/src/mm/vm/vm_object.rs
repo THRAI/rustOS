@@ -319,7 +319,7 @@ impl VmObject {
     pub async fn grab_for_fault(
         top_object: Arc<RwLock<Self>>,
         pindex: VirtPageNum,
-    ) -> Result<Arc<VmPage>, ()> {
+    ) -> Result<Arc<VmPage>, Errno> {
         loop {
             // Quick pass: look for page in the shadow chain.
             let mut found_page: Option<Arc<VmPage>> = None;
@@ -360,7 +360,7 @@ impl VmObject {
                 }
 
                 // Allocate born locked.
-                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
+                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(Errno::Enomem)?;
 
                 let mut new_page = VmPage::new();
                 new_page.phys_addr = frame.phys();
@@ -397,8 +397,7 @@ impl VmObject {
         pindex: VirtPageNum,
     ) -> Result<Arc<VmPage>, Errno> {
         let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex)
-            .await
-            .map_err(|_| Errno::Enomem)?;
+            .await?;
         // If the page is new (resident_count just increased), we need to fill it.
         // We can check if it's new by seeing if resident_count increased after insertion.
         // But we don't have that information here. Instead, we can check if the page was just allocated
@@ -434,11 +433,11 @@ impl VmObject {
     }
     /// Lookup or allocate an anonymous page for the given offset.
     /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
-    pub fn fault_allocate_anon(&mut self, index: VObjIndex) -> Result<PhysAddr, ()> {
+    pub fn fault_allocate_anon(&mut self, index: VObjIndex) -> Result<PhysAddr, Errno> {
         match self.pages.entry(index) {
             alloc::collections::btree_map::Entry::Occupied(e) => Ok(e.get().phys_addr),
             alloc::collections::btree_map::Entry::Vacant(e) => {
-                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
+                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(Errno::Enomem)?;
                 let phys = frame.phys();
                 pmap_zero_page(phys);
                 crate::klog!(
@@ -458,11 +457,11 @@ impl VmObject {
 
     /// Implement COW by copying the old_phys page into a newly allocated frame.
     /// Emits `TraceEvent::Alloc { usage: UserAnon }` upon allocation.
-    pub fn fault_cow(&mut self, index: VObjIndex, old_phys: PhysAddr) -> Result<PhysAddr, ()> {
+    pub fn fault_cow(&mut self, index: VObjIndex, old_phys: PhysAddr) -> Result<PhysAddr, Errno> {
         match self.pages.entry(index) {
             alloc::collections::btree_map::Entry::Occupied(e) => Ok(e.get().phys_addr),
             alloc::collections::btree_map::Entry::Vacant(e) => {
-                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(())?;
+                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(Errno::Enomem)?;
                 let phys = frame.phys();
                 pmap_copy_page(old_phys, phys);
                 crate::klog!(

@@ -93,6 +93,17 @@ pub enum VmError {
     InvalidRange,
 }
 
+impl From<VmError> for crate::hal_common::Errno {
+    fn from(e: VmError) -> crate::hal_common::Errno {
+        use crate::hal_common::Errno;
+        match e {
+            VmError::Overlap      => Errno::Einval,
+            VmError::NotFound     => Errno::Einval,
+            VmError::InvalidRange => Errno::Einval,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VmArea
 // ---------------------------------------------------------------------------

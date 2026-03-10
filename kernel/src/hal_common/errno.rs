@@ -58,3 +58,6 @@ impl Errno {
         }
     }
 }
+
+/// Kernel-wide result type: error is always an errno code.
+pub type KernelResult<T> = core::result::Result<T, Errno>;

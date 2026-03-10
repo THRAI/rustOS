@@ -8,7 +8,7 @@ pub mod timer_wheel;
 pub mod trap_frame;
 
 pub use addr::{PhysAddr, VirtAddr, PAGE_SIZE};
-pub use errno::Errno;
+pub use errno::{Errno, KernelResult};
 pub use irq_lock::IrqSafeSpinLock;
 pub use once::Once;
 pub use run_queue::RunQueue;

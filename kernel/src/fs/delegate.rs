@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use core::future::Future;
 use crate::hal_common::IrqSafeSpinLock;
+use crate::hal_common::Errno;
 use lwext4_rust::Ext4File;
 use crate::hal_common::PhysAddr;
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
@@ -49,23 +50,23 @@ pub enum FsRequest {
         path: [u8; 256],
         path_len: usize,
         flags: u32,
-        reply: ReplySlot<Result<FsFileHandle, i32>>,
+        reply: ReplySlot<Result<FsFileHandle, Errno>>,
     },
     Read {
         handle: FsFileHandle,
         buf_ptr: usize,
         len: usize,
-        reply: ReplySlot<Result<usize, i32>>,
+        reply: ReplySlot<Result<usize, Errno>>,
     },
     Write {
         handle: FsFileHandle,
         buf_ptr: usize,
         len: usize,
-        reply: ReplySlot<Result<usize, i32>>,
+        reply: ReplySlot<Result<usize, Errno>>,
     },
     Close {
         handle: FsFileHandle,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Look up a child entry in a directory by parent path + name.
     /// Returns (child_ino, file_type, file_size).
@@ -73,12 +74,12 @@ pub enum FsRequest {
         parent_ino: u32,
         name: [u8; 256],
         name_len: usize,
-        reply: ReplySlot<Result<(u32, u8, u64), i32>>,
+        reply: ReplySlot<Result<(u32, u8, u64), Errno>>,
     },
     /// Stat an inode: returns (size, file_type_u8).
     Stat {
         ino: u32,
-        reply: ReplySlot<Result<(u64, u8), i32>>,
+        reply: ReplySlot<Result<(u64, u8), Errno>>,
     },
     /// Read one page of file data into the given pa physical address, at the given byte offset.
     ReadPage {
@@ -86,7 +87,7 @@ pub enum FsRequest {
         path_len: usize,
         offset: u64,
         pa: usize,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Write data to a file at the given byte offset.
     /// Opens file, seeks, writes, closes. Returns bytes written.
@@ -96,20 +97,20 @@ pub enum FsRequest {
         offset: u64,
         data_ptr: usize,
         data_len: usize,
-        reply: ReplySlot<Result<usize, i32>>,
+        reply: ReplySlot<Result<usize, Errno>>,
     },
     /// Truncate file at path to the given size.
     Truncate {
         path: [u8; 256],
         path_len: usize,
         size: u64,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Create a directory at the given path.
     Mkdir {
         path: [u8; 256],
         path_len: usize,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Remove a file or directory at the given path.
     /// `is_dir`: true for rmdir, false for unlink.
@@ -117,7 +118,7 @@ pub enum FsRequest {
         path: [u8; 256],
         path_len: usize,
         is_dir: bool,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Create hard link: `new_path` links to `old_path`.
     Link {
@@ -125,7 +126,7 @@ pub enum FsRequest {
         old_len: usize,
         new_path: [u8; 256],
         new_len: usize,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Rename/move path.
     Rename {
@@ -133,7 +134,7 @@ pub enum FsRequest {
         old_len: usize,
         new_path: [u8; 256],
         new_len: usize,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Create symlink: `path` -> `target`.
     Symlink {
@@ -141,19 +142,19 @@ pub enum FsRequest {
         target_len: usize,
         path: [u8; 256],
         path_len: usize,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Read symlink target by path.
     ReadLink {
         path: [u8; 256],
         path_len: usize,
-        reply: ReplySlot<Result<(usize, [u8; 256]), i32>>,
+        reply: ReplySlot<Result<(usize, [u8; 256]), Errno>>,
     },
     /// Flush cache by path (mount point dispatch is done in lwext4).
     CacheFlush {
         path: [u8; 256],
         path_len: usize,
-        reply: ReplySlot<Result<(), i32>>,
+        reply: ReplySlot<Result<(), Errno>>,
     },
     /// Read all directory entries from a directory path.
     /// Returns (entries, count) starting from `start_idx`.
@@ -161,7 +162,7 @@ pub enum FsRequest {
         path: [u8; 256],
         path_len: usize,
         start_idx: usize,
-        reply: ReplySlot<Result<([DirEntryRaw; READDIR_BATCH], usize), i32>>,
+        reply: ReplySlot<Result<([DirEntryRaw; READDIR_BATCH], usize), Errno>>,
     },
 }
 
@@ -230,23 +231,23 @@ macro_rules! define_reply_pool {
     };
 }
 
-define_reply_pool!(OPEN_REPLIES, Result<FsFileHandle, i32>);
-define_reply_pool!(READ_REPLIES, Result<usize, i32>);
-define_reply_pool!(WRITE_REPLIES, Result<usize, i32>);
-define_reply_pool!(CLOSE_REPLIES, Result<(), i32>);
-define_reply_pool!(LOOKUP_REPLIES, Result<(u32, u8, u64), i32>);
-define_reply_pool!(STAT_REPLIES, Result<(u64, u8), i32>);
-define_reply_pool!(READPAGE_REPLIES, Result<(), i32>);
-define_reply_pool!(WRITEAT_REPLIES, Result<usize, i32>);
-define_reply_pool!(TRUNCATE_REPLIES, Result<(), i32>);
-define_reply_pool!(MKDIR_REPLIES, Result<(), i32>);
-define_reply_pool!(UNLINK_REPLIES, Result<(), i32>);
-define_reply_pool!(LINK_REPLIES, Result<(), i32>);
-define_reply_pool!(RENAME_REPLIES, Result<(), i32>);
-define_reply_pool!(SYMLINK_REPLIES, Result<(), i32>);
-define_reply_pool!(READLINK_REPLIES, Result<(usize, [u8; 256]), i32>);
-define_reply_pool!(CACHEFLUSH_REPLIES, Result<(), i32>);
-define_reply_pool!(READDIR_REPLIES, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
+define_reply_pool!(OPEN_REPLIES, Result<FsFileHandle, Errno>);
+define_reply_pool!(READ_REPLIES, Result<usize, Errno>);
+define_reply_pool!(WRITE_REPLIES, Result<usize, Errno>);
+define_reply_pool!(CLOSE_REPLIES, Result<(), Errno>);
+define_reply_pool!(LOOKUP_REPLIES, Result<(u32, u8, u64), Errno>);
+define_reply_pool!(STAT_REPLIES, Result<(u64, u8), Errno>);
+define_reply_pool!(READPAGE_REPLIES, Result<(), Errno>);
+define_reply_pool!(WRITEAT_REPLIES, Result<usize, Errno>);
+define_reply_pool!(TRUNCATE_REPLIES, Result<(), Errno>);
+define_reply_pool!(MKDIR_REPLIES, Result<(), Errno>);
+define_reply_pool!(UNLINK_REPLIES, Result<(), Errno>);
+define_reply_pool!(LINK_REPLIES, Result<(), Errno>);
+define_reply_pool!(RENAME_REPLIES, Result<(), Errno>);
+define_reply_pool!(SYMLINK_REPLIES, Result<(), Errno>);
+define_reply_pool!(READLINK_REPLIES, Result<(usize, [u8; 256]), Errno>);
+define_reply_pool!(CACHEFLUSH_REPLIES, Result<(), Errno>);
+define_reply_pool!(READDIR_REPLIES, Result<([DirEntryRaw; READDIR_BATCH], usize), Errno>);
 
 static OPEN_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 static READ_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
@@ -279,23 +280,23 @@ macro_rules! define_alloc_reply {
     };
 }
 
-define_alloc_reply!(alloc_open_reply,       OPEN_REPLIES,       OPEN_REPLY_IDX,   Result<FsFileHandle, i32>);
-define_alloc_reply!(alloc_read_reply,       READ_REPLIES,       READ_REPLY_IDX,   Result<usize, i32>);
-define_alloc_reply!(alloc_write_reply,      WRITE_REPLIES,      WRITE_REPLY_IDX,  Result<usize, i32>);
-define_alloc_reply!(alloc_close_reply,      CLOSE_REPLIES,      CLOSE_REPLY_IDX,  Result<(), i32>);
-define_alloc_reply!(alloc_lookup_reply,     LOOKUP_REPLIES,     LOOKUP_REPLY_IDX, Result<(u32, u8, u64), i32>);
-define_alloc_reply!(alloc_stat_reply,       STAT_REPLIES,       STAT_REPLY_IDX,   Result<(u64, u8), i32>);
-define_alloc_reply!(alloc_readpage_reply,   READPAGE_REPLIES,   READPAGE_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_writeat_reply,    WRITEAT_REPLIES,    WRITEAT_REPLY_IDX, Result<usize, i32>);
-define_alloc_reply!(alloc_truncate_reply,   TRUNCATE_REPLIES,   TRUNCATE_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_mkdir_reply,      MKDIR_REPLIES,      MKDIR_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_unlink_reply,     UNLINK_REPLIES,     UNLINK_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_link_reply,       LINK_REPLIES,       LINK_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_rename_reply,     RENAME_REPLIES,     RENAME_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!(alloc_symlink_reply,    SYMLINK_REPLIES,    SYMLINK_REPLY_IDX, Result<(), i32>);
-define_alloc_reply!( alloc_readlink_reply,  READLINK_REPLIES,   READLINK_REPLY_IDX, Result<(usize, [u8; 256]), i32> );
-define_alloc_reply!( alloc_cacheflush_reply, CACHEFLUSH_REPLIES, CACHEFLUSH_REPLY_IDX, Result<(), i32> );
-define_alloc_reply!(alloc_readdir_reply,    READDIR_REPLIES,    READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), i32>);
+define_alloc_reply!(alloc_open_reply,       OPEN_REPLIES,       OPEN_REPLY_IDX,   Result<FsFileHandle, Errno>);
+define_alloc_reply!(alloc_read_reply,       READ_REPLIES,       READ_REPLY_IDX,   Result<usize, Errno>);
+define_alloc_reply!(alloc_write_reply,      WRITE_REPLIES,      WRITE_REPLY_IDX,  Result<usize, Errno>);
+define_alloc_reply!(alloc_close_reply,      CLOSE_REPLIES,      CLOSE_REPLY_IDX,  Result<(), Errno>);
+define_alloc_reply!(alloc_lookup_reply,     LOOKUP_REPLIES,     LOOKUP_REPLY_IDX, Result<(u32, u8, u64), Errno>);
+define_alloc_reply!(alloc_stat_reply,       STAT_REPLIES,       STAT_REPLY_IDX,   Result<(u64, u8), Errno>);
+define_alloc_reply!(alloc_readpage_reply,   READPAGE_REPLIES,   READPAGE_REPLY_IDX, Result<(), Errno>);
+define_alloc_reply!(alloc_writeat_reply,    WRITEAT_REPLIES,    WRITEAT_REPLY_IDX, Result<usize, Errno>);
+define_alloc_reply!(alloc_truncate_reply,   TRUNCATE_REPLIES,   TRUNCATE_REPLY_IDX, Result<(), Errno>);
+define_alloc_reply!(alloc_mkdir_reply,      MKDIR_REPLIES,      MKDIR_REPLY_IDX, Result<(), Errno>);
+define_alloc_reply!(alloc_unlink_reply,     UNLINK_REPLIES,     UNLINK_REPLY_IDX, Result<(), Errno>);
+define_alloc_reply!(alloc_link_reply,       LINK_REPLIES,       LINK_REPLY_IDX, Result<(), Errno>);
+define_alloc_reply!(alloc_rename_reply,     RENAME_REPLIES,     RENAME_REPLY_IDX, Result<(), Errno>);
+define_alloc_reply!(alloc_symlink_reply,    SYMLINK_REPLIES,    SYMLINK_REPLY_IDX, Result<(), Errno>);
+define_alloc_reply!( alloc_readlink_reply,  READLINK_REPLIES,   READLINK_REPLY_IDX, Result<(usize, [u8; 256]), Errno> );
+define_alloc_reply!( alloc_cacheflush_reply, CACHEFLUSH_REPLIES, CACHEFLUSH_REPLY_IDX, Result<(), Errno> );
+define_alloc_reply!(alloc_readdir_reply,    READDIR_REPLIES,    READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), Errno>);
 
 /// Bounded request channel.
 static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>> = IrqSafeSpinLock::new(VecDeque::new());
@@ -321,7 +322,7 @@ const MAX_OPEN_FILES: usize = 64;
 async fn delegate_task() {
     // Mount the ext4 filesystem via lwext4
     if let Err(e) = crate::fs::ext4::mount() {
-        klog!(fs, error, "ext4 mount failed: {}", e);
+        klog!(fs, error, "ext4 mount failed: {:?}", e);
         return;
     }
     klog!(fs, info, "ext4 mounted, delegate running");
@@ -366,7 +367,7 @@ async fn delegate_task() {
                                 open_files[i] = Some(SendExt4File(file));
                                 reply.complete(Ok(FsFileHandle(i as u16)));
                             }
-                            None => reply.complete(Err(-24)), // EMFILE
+                            None => reply.complete(Err(Errno::Emfile)), // EMFILE
                         }
                     }
                     Err(e) => reply.complete(Err(e)),
@@ -380,7 +381,7 @@ async fn delegate_task() {
             } => {
                 let idx = handle.0 as usize;
                 if idx >= MAX_OPEN_FILES || open_files[idx].is_none() {
-                    reply.complete(Err(-9)); // EBADF
+                    reply.complete(Err(Errno::Ebadf)); // EBADF
                     crate::executor::yield_now().await;
                     continue;
                 }
@@ -399,7 +400,7 @@ async fn delegate_task() {
             } => {
                 let idx = handle.0 as usize;
                 if idx >= MAX_OPEN_FILES || open_files[idx].is_none() {
-                    reply.complete(Err(-9)); // EBADF
+                    reply.complete(Err(Errno::Ebadf)); // EBADF
                     crate::executor::yield_now().await;
                     continue;
                 }
@@ -434,13 +435,13 @@ async fn delegate_task() {
                     Ok((ino, size, ftype)) => {
                         reply.complete(Ok((ino, ftype, size)));
                     }
-                    Err(_) => reply.complete(Err(-2)), // ENOENT
+                    Err(_) => reply.complete(Err(Errno::Enoent)), // ENOENT
                 }
             }
             FsRequest::Stat { ino: _, reply } => {
                 // Stat not directly usable without a path in lwext4.
                 // Callers should use Lookup which returns size+type.
-                reply.complete(Err(-38)); // ENOSYS
+                reply.complete(Err(Errno::Enosys)); // ENOSYS
             }
             FsRequest::ReadPage {
                 path,
@@ -461,7 +462,7 @@ async fn delegate_task() {
                         let _ = crate::fs::ext4::close(&mut tok, &mut file);
                         reply.complete(Ok(()));
                     }
-                    Err(_) => reply.complete(Err(-12)), //Enomem
+                    Err(_) => reply.complete(Err(Errno::Enomem)), //Enomem
                 }
             }
             FsRequest::WriteAt {
@@ -510,7 +511,7 @@ async fn delegate_task() {
             } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                reply.complete(crate::fs::ext4::mkdir(&mut tok, &backend_path).map_err(|e| -(e.abs())));
+                reply.complete(crate::fs::ext4::mkdir(&mut tok, &backend_path));
             }
             FsRequest::Unlink {
                 path,
@@ -526,7 +527,7 @@ async fn delegate_task() {
                 } else {
                     crate::fs::ext4::unlink(&mut tok, &backend_path)
                 };
-                reply.complete(result.map_err(|e| -(e.abs())));
+                reply.complete(result);
             }
             FsRequest::Link {
                 old_path,
@@ -540,8 +541,7 @@ async fn delegate_task() {
                 let old_backend = map_backend_path(old_path_str);
                 let new_backend = map_backend_path(new_path_str);
                 reply.complete(
-                    crate::fs::ext4::link(&mut tok, &old_backend, &new_backend)
-                        .map_err(|e| -(e.abs())),
+                    crate::fs::ext4::link(&mut tok, &old_backend, &new_backend),
                 );
             }
             FsRequest::Rename {
@@ -556,8 +556,7 @@ async fn delegate_task() {
                 let old_backend = map_backend_path(old_path_str);
                 let new_backend = map_backend_path(new_path_str);
                 reply.complete(
-                    crate::fs::ext4::rename(&mut tok, &old_backend, &new_backend)
-                        .map_err(|e| -(e.abs())),
+                    crate::fs::ext4::rename(&mut tok, &old_backend, &new_backend),
                 );
             }
             FsRequest::Symlink {
@@ -571,8 +570,7 @@ async fn delegate_task() {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
                 reply.complete(
-                    crate::fs::ext4::symlink(&mut tok, target_str, &backend_path)
-                        .map_err(|e| -(e.abs())),
+                    crate::fs::ext4::symlink(&mut tok, target_str, &backend_path),
                 );
             }
             FsRequest::ReadLink {
@@ -585,7 +583,7 @@ async fn delegate_task() {
                 let mut out = [0u8; 256];
                 match crate::fs::ext4::readlink(&mut tok, &backend_path, &mut out) {
                     Ok(n) => reply.complete(Ok((n, out))),
-                    Err(e) => reply.complete(Err(-(e.abs()))),
+                    Err(e) => reply.complete(Err(e)),
                 }
             }
             FsRequest::CacheFlush {
@@ -595,7 +593,7 @@ async fn delegate_task() {
             } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                reply.complete(crate::fs::ext4::cache_flush(&mut tok, &backend_path).map_err(|e| -(e.abs())));
+                reply.complete(crate::fs::ext4::cache_flush(&mut tok, &backend_path));
             }
             FsRequest::ReadDir { path, path_len, start_idx, reply } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
@@ -633,7 +631,7 @@ async fn delegate_task() {
                         let _ = crate::fs::ext4::dir_close(&mut tok, &mut dir);
                         reply.complete(Ok((entries, count)));
                     }
-                    Err(e) => reply.complete(Err(-(e.abs()))),
+                    Err(e) => reply.complete(Err(e)),
                 }
             }
         }
@@ -673,12 +671,12 @@ impl Future for DelegateRecvFuture {
 // --- Public async API ---
 
 /// Open a file by path. Returns a file handle.
-pub async fn fs_open(path: &str) -> Result<FsFileHandle, i32> {
+pub async fn fs_open(path: &str) -> Result<FsFileHandle, Errno> {
     fs_open_flags(path, 0).await
 }
 
 /// Open a file by path with flags. Returns a file handle.
-pub async fn fs_open_flags(path: &str, flags: u32) -> Result<FsFileHandle, i32> {
+pub async fn fs_open_flags(path: &str, flags: u32) -> Result<FsFileHandle, Errno> {
     let reply_inner = alloc_open_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);
@@ -695,7 +693,7 @@ pub async fn fs_open_flags(path: &str, flags: u32) -> Result<FsFileHandle, i32> 
 }
 
 /// Read from an open file into buf. Returns bytes read.
-pub async fn fs_read(handle: FsFileHandle, buf: &mut [u8]) -> Result<usize, i32> {
+pub async fn fs_read(handle: FsFileHandle, buf: &mut [u8]) -> Result<usize, Errno> {
     let reply_inner = alloc_read_reply();
 
     send_request(FsRequest::Read {
@@ -709,7 +707,7 @@ pub async fn fs_read(handle: FsFileHandle, buf: &mut [u8]) -> Result<usize, i32>
 }
 
 /// Write to an open file from buf. Returns bytes written.
-pub async fn fs_write(handle: FsFileHandle, buf: &[u8]) -> Result<usize, i32> {
+pub async fn fs_write(handle: FsFileHandle, buf: &[u8]) -> Result<usize, Errno> {
     let reply_inner = alloc_write_reply();
 
     send_request(FsRequest::Write {
@@ -723,7 +721,7 @@ pub async fn fs_write(handle: FsFileHandle, buf: &[u8]) -> Result<usize, i32> {
 }
 
 /// Close an open file handle.
-pub async fn fs_close(handle: FsFileHandle) -> Result<(), i32> {
+pub async fn fs_close(handle: FsFileHandle) -> Result<(), Errno> {
     let reply_inner = alloc_close_reply();
 
     send_request(FsRequest::Close {
@@ -735,7 +733,7 @@ pub async fn fs_close(handle: FsFileHandle) -> Result<(), i32> {
 }
 
 /// Look up a child entry in a directory. Returns (child_ino, file_type, file_size).
-pub async fn fs_lookup(parent_ino: u32, name: &str) -> Result<(u32, u8, u64), i32> {
+pub async fn fs_lookup(parent_ino: u32, name: &str) -> Result<(u32, u8, u64), Errno> {
     let reply_inner = alloc_lookup_reply();
     let mut name_buf = [0u8; 256];
     let len = name.len().min(256);
@@ -752,7 +750,7 @@ pub async fn fs_lookup(parent_ino: u32, name: &str) -> Result<(u32, u8, u64), i3
 }
 
 /// Stat an inode. Returns (size, file_type_u8).
-pub async fn fs_stat(ino: u32) -> Result<(u64, u8), i32> {
+pub async fn fs_stat(ino: u32) -> Result<(u64, u8), Errno> {
     let reply_inner = alloc_stat_reply();
 
     send_request(FsRequest::Stat {
@@ -764,7 +762,7 @@ pub async fn fs_stat(ino: u32) -> Result<(u64, u8), i32> {
 }
 
 /// Read one page of file data into the given pa physical address, at the given byte offset.
-pub async fn fs_read_page(path: &str, offset: u64, pa: PhysAddr) -> Result<(), i32> {
+pub async fn fs_read_page(path: &str, offset: u64, pa: PhysAddr) -> Result<(), Errno> {
     crate::klog!(
         fs,
         debug,
@@ -791,7 +789,7 @@ pub async fn fs_read_page(path: &str, offset: u64, pa: PhysAddr) -> Result<(), i
 
 /// Write data to a file at the given byte offset.
 /// Opens file, seeks, writes, closes. Returns bytes written.
-pub async fn fs_write_at(path: &str, offset: u64, data: &[u8]) -> Result<usize, i32> {
+pub async fn fs_write_at(path: &str, offset: u64, data: &[u8]) -> Result<usize, Errno> {
     let reply_inner = alloc_writeat_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);
@@ -810,7 +808,7 @@ pub async fn fs_write_at(path: &str, offset: u64, data: &[u8]) -> Result<usize, 
 }
 
 /// Truncate file at path to `size`.
-pub async fn fs_truncate(path: &str, size: u64) -> Result<(), i32> {
+pub async fn fs_truncate(path: &str, size: u64) -> Result<(), Errno> {
     let reply_inner = alloc_truncate_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);
@@ -827,7 +825,7 @@ pub async fn fs_truncate(path: &str, size: u64) -> Result<(), i32> {
 }
 
 /// Create a directory at the given path.
-pub async fn fs_mkdir(path: &str) -> Result<(), i32> {
+pub async fn fs_mkdir(path: &str) -> Result<(), Errno> {
     let reply_inner = alloc_mkdir_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);
@@ -843,7 +841,7 @@ pub async fn fs_mkdir(path: &str) -> Result<(), i32> {
 }
 
 /// Remove a file or directory at the given path.
-pub async fn fs_unlink(path: &str, is_dir: bool) -> Result<(), i32> {
+pub async fn fs_unlink(path: &str, is_dir: bool) -> Result<(), Errno> {
     let reply_inner = alloc_unlink_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);
@@ -860,7 +858,7 @@ pub async fn fs_unlink(path: &str, is_dir: bool) -> Result<(), i32> {
 }
 
 /// Create hard link `new_path` -> `old_path`.
-pub async fn fs_link(old_path: &str, new_path: &str) -> Result<(), i32> {
+pub async fn fs_link(old_path: &str, new_path: &str) -> Result<(), Errno> {
     let reply_inner = alloc_link_reply();
     let mut old_buf = [0u8; 256];
     let mut new_buf = [0u8; 256];
@@ -879,7 +877,7 @@ pub async fn fs_link(old_path: &str, new_path: &str) -> Result<(), i32> {
 }
 
 /// Rename/move path.
-pub async fn fs_rename(old_path: &str, new_path: &str) -> Result<(), i32> {
+pub async fn fs_rename(old_path: &str, new_path: &str) -> Result<(), Errno> {
     let reply_inner = alloc_rename_reply();
     let mut old_buf = [0u8; 256];
     let mut new_buf = [0u8; 256];
@@ -898,7 +896,7 @@ pub async fn fs_rename(old_path: &str, new_path: &str) -> Result<(), i32> {
 }
 
 /// Create symbolic link `path` -> `target`.
-pub async fn fs_symlink(target: &str, path: &str) -> Result<(), i32> {
+pub async fn fs_symlink(target: &str, path: &str) -> Result<(), Errno> {
     let reply_inner = alloc_symlink_reply();
     let mut target_buf = [0u8; 256];
     let mut path_buf = [0u8; 256];
@@ -917,7 +915,7 @@ pub async fn fs_symlink(target: &str, path: &str) -> Result<(), i32> {
 }
 
 /// Read symbolic link content.
-pub async fn fs_readlink(path: &str) -> Result<(usize, [u8; 256]), i32> {
+pub async fn fs_readlink(path: &str) -> Result<(usize, [u8; 256]), Errno> {
     let reply_inner = alloc_readlink_reply();
     let mut path_buf = [0u8; 256];
     let path_len = path.len().min(256);
@@ -931,7 +929,7 @@ pub async fn fs_readlink(path: &str) -> Result<(usize, [u8; 256]), i32> {
 }
 
 /// Flush cache for the filesystem containing `path`.
-pub async fn fs_cache_flush(path: &str) -> Result<(), i32> {
+pub async fn fs_cache_flush(path: &str) -> Result<(), Errno> {
     let reply_inner = alloc_cacheflush_reply();
     let mut path_buf = [0u8; 256];
     let path_len = path.len().min(256);
@@ -949,7 +947,7 @@ pub async fn fs_cache_flush(path: &str) -> Result<(), i32> {
 pub async fn fs_readdir(
     path: &str,
     start_idx: usize,
-) -> Result<([DirEntryRaw; READDIR_BATCH], usize), i32> {
+) -> Result<([DirEntryRaw; READDIR_BATCH], usize), Errno> {
     let reply_inner = alloc_readdir_reply();
     let mut path_buf = [0u8; 256];
     let len = path.len().min(256);

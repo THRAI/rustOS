@@ -1,4 +1,5 @@
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
+use crate::hal_common::Errno;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -15,6 +16,16 @@ pub enum VmError {
     Overlap,
     NotFound,
     InvalidRange,
+}
+
+impl From<VmError> for Errno {
+    fn from(e: VmError) -> Errno {
+        match e {
+            VmError::Overlap      => Errno::Einval,
+            VmError::NotFound     => Errno::Einval,
+            VmError::InvalidRange => Errno::Einval,
+        }
+    }
 }
 
 pub struct VmMap {

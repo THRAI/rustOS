@@ -6,8 +6,29 @@
 //! (`ext4_raw_inode_fill`, `ext4_inode_exist`) instead of file-open hacks.
 
 use super::lwext4_disk::Disk;
+use crate::hal_common::Errno;
 use lwext4_rust::bindings::{self, ext4_dir, ext4_direntry, ext4_inode, EOK};
 use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
+
+/// Map a raw lwext4 C error code (positive integer) to an `Errno`.
+fn lwext4_err(rc: i32) -> Errno {
+    match rc.unsigned_abs() {
+        1 => Errno::Eperm,
+        2 => Errno::Enoent,
+        5 => Errno::Eio,
+        9 => Errno::Ebadf,
+        12 => Errno::Enomem,
+        17 => Errno::Eexist,
+        19 => Errno::Enodev,
+        20 => Errno::Enotdir,
+        21 => Errno::Eisdir,
+        22 => Errno::Einval,
+        24 => Errno::Emfile,
+        34 => Errno::Erange,
+        39 => Errno::Enotempty,
+        _ => Errno::Eio,
+    }
+}
 
 // SAFETY: All lwext4 access is serialized through the delegate task.
 unsafe impl Send for Disk {}
@@ -63,12 +84,12 @@ pub mod flags {
 // ── Mount ───────────────────────────────────────────────────────────
 
 /// Mount the ext4 filesystem from VirtIO-blk.
-pub fn mount() -> Result<(), i32> {
+pub fn mount() -> Result<(), Errno> {
     let disk = Disk::new();
     let bw = Ext4BlockWrapper::<Disk>::new(disk, "/", "ext4_fs").map_err(|e| {
         klog!(fs, error, "ext4 mount failed: {}", e);
-        -5
-    })?;
+        Errno::Eio
+    })?;;
     EXT4_BW.call_once(|| crate::hal_common::SpinMutex::new(SendSyncBW(bw)));
     crate::kprintln!("lwext4 mounted at /");
     Ok(())
@@ -77,39 +98,39 @@ pub fn mount() -> Result<(), i32> {
 // ── File I/O (require DelegateToken) ────────────────────────────────
 
 /// Open a file. Returns an Ext4File handle.
-pub fn open(_tok: &mut DelegateToken, path: &str, open_flags: u32) -> Result<Ext4File, i32> {
+pub fn open(_tok: &mut DelegateToken, path: &str, open_flags: u32) -> Result<Ext4File, Errno> {
     let ftype = if open_flags & flags::O_DIRECTORY != 0 {
         InodeTypes::EXT4_DE_DIR
     } else {
         InodeTypes::EXT4_DE_REG_FILE
     };
     let mut file = Ext4File::new(path, ftype);
-    file.file_open(path, open_flags)?;
+    file.file_open(path, open_flags).map_err(lwext4_err)?;
     Ok(file)
 }
 
 /// Read from an open file into buf. Returns bytes read.
-pub fn read(_tok: &mut DelegateToken, file: &mut Ext4File, buf: &mut [u8]) -> Result<usize, i32> {
-    file.file_read(buf)
+pub fn read(_tok: &mut DelegateToken, file: &mut Ext4File, buf: &mut [u8]) -> Result<usize, Errno> {
+    file.file_read(buf).map_err(lwext4_err)
 }
 
 /// Write to an open file. Returns bytes written.
-pub fn write(_tok: &mut DelegateToken, file: &mut Ext4File, buf: &[u8]) -> Result<usize, i32> {
-    file.file_write(buf)
+pub fn write(_tok: &mut DelegateToken, file: &mut Ext4File, buf: &[u8]) -> Result<usize, Errno> {
+    file.file_write(buf).map_err(lwext4_err)
 }
 
 /// Truncate a file to `size` bytes.
-pub fn truncate(_tok: &mut DelegateToken, path: &str, size: u64) -> Result<(), i32> {
+pub fn truncate(_tok: &mut DelegateToken, path: &str, size: u64) -> Result<(), Errno> {
     let mut file = Ext4File::new(path, InodeTypes::EXT4_DE_REG_FILE);
-    file.file_open(path, flags::O_RDWR)?;
-    file.file_truncate(size)?;
-    file.file_close()?;
+    file.file_open(path, flags::O_RDWR).map_err(lwext4_err)?;
+    file.file_truncate(size).map_err(lwext4_err)?;
+    file.file_close().map_err(lwext4_err)?;
     Ok(())
 }
 
 /// Close an open file.
-pub fn close(_tok: &mut DelegateToken, file: &mut Ext4File) -> Result<(), i32> {
-    file.file_close()?;
+pub fn close(_tok: &mut DelegateToken, file: &mut Ext4File) -> Result<(), Errno> {
+    file.file_close().map_err(lwext4_err)?;
     Ok(())
 }
 
@@ -119,7 +140,7 @@ pub fn close(_tok: &mut DelegateToken, file: &mut Ext4File) -> Result<(), i32> {
 /// file_type: 1=regular, 2=directory, 7=symlink.
 ///
 /// Uses the native `ext4_raw_inode_fill` C API — no file_open needed.
-pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u32, u64, u8), i32> {
+pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u32, u64, u8), Errno> {
     let cpath = path_to_cstr(path);
     let mut ino: u32 = 0;
     let mut inode: ext4_inode = unsafe { core::mem::zeroed() };
@@ -133,7 +154,7 @@ pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u32, u64, u8), i32>
     };
 
     if rc != EOK as i32 {
-        return Err(-(rc.abs()));
+        return Err(lwext4_err(rc));
     }
 
     let mode = inode.mode;
@@ -161,13 +182,13 @@ pub fn exists(_tok: &mut DelegateToken, path: &str) -> bool {
 // ── Directory iteration (native C API) ──────────────────────────────
 
 /// Open a directory for iteration. Returns an opaque `ext4_dir` handle.
-pub fn dir_open(_tok: &mut DelegateToken, path: &str) -> Result<ext4_dir, i32> {
+pub fn dir_open(_tok: &mut DelegateToken, path: &str) -> Result<ext4_dir, Errno> {
     let cpath = path_to_cstr(path);
     let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
     let rc =
         unsafe { bindings::ext4_dir_open(&mut dir, cpath.as_ptr() as *const core::ffi::c_char) };
     if rc != EOK as i32 {
-        return Err(-(rc.abs()));
+        return Err(lwext4_err(rc));
     }
     Ok(dir)
 }
@@ -187,61 +208,61 @@ pub fn dir_next(_tok: &mut DelegateToken, dir: &mut ext4_dir) -> Option<([u8; 25
 }
 
 /// Close a directory handle.
-pub fn dir_close(_tok: &mut DelegateToken, dir: &mut ext4_dir) -> Result<(), i32> {
+pub fn dir_close(_tok: &mut DelegateToken, dir: &mut ext4_dir) -> Result<(), Errno> {
     let rc = unsafe { bindings::ext4_dir_close(dir) };
     if rc != EOK as i32 {
-        return Err(-(rc.abs()));
+        return Err(lwext4_err(rc));
     }
     Ok(())
 }
 
 /// Create a directory.
-pub fn mkdir(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
+pub fn mkdir(_tok: &mut DelegateToken, path: &str) -> Result<(), Errno> {
     let mut file = Ext4File::new(path, InodeTypes::EXT4_DE_DIR);
-    file.dir_mk(path)?;
+    file.dir_mk(path).map_err(lwext4_err)?;
     Ok(())
 }
 
 /// Remove a file.
-pub fn unlink(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
+pub fn unlink(_tok: &mut DelegateToken, path: &str) -> Result<(), Errno> {
     let mut file = Ext4File::new(path, InodeTypes::EXT4_DE_REG_FILE);
-    file.file_remove(path)?;
+    file.file_remove(path).map_err(lwext4_err)?;
     Ok(())
 }
 
 /// Create a hard link: `new_path` links to `old_path`.
-pub fn link(_tok: &mut DelegateToken, old_path: &str, new_path: &str) -> Result<(), i32> {
+pub fn link(_tok: &mut DelegateToken, old_path: &str, new_path: &str) -> Result<(), Errno> {
     let file = Ext4File::new(old_path, InodeTypes::EXT4_DE_REG_FILE);
-    let _ = file.link_create(new_path)?;
+    let _ = file.link_create(new_path).map_err(lwext4_err)?;
     Ok(())
 }
 
 /// Rename/move a file or directory.
-pub fn rename(_tok: &mut DelegateToken, old_path: &str, new_path: &str) -> Result<(), i32> {
+pub fn rename(_tok: &mut DelegateToken, old_path: &str, new_path: &str) -> Result<(), Errno> {
     let mut file = Ext4File::new(old_path, InodeTypes::EXT4_DE_REG_FILE);
-    let _ = file.file_rename(old_path, new_path)?;
+    let _ = file.file_rename(old_path, new_path).map_err(lwext4_err)?;
     Ok(())
 }
 
 /// Create a symbolic link: `path` points to `target`.
-pub fn symlink(_tok: &mut DelegateToken, target: &str, path: &str) -> Result<(), i32> {
+pub fn symlink(_tok: &mut DelegateToken, target: &str, path: &str) -> Result<(), Errno> {
     let file = Ext4File::new(path, InodeTypes::EXT4_DE_SYMLINK);
-    let _ = file.symlink_create(target, path)?;
+    let _ = file.symlink_create(target, path).map_err(lwext4_err)?;
     Ok(())
 }
 
 /// Read symbolic link content into `buf`. Returns bytes written.
-pub fn readlink(_tok: &mut DelegateToken, path: &str, buf: &mut [u8]) -> Result<usize, i32> {
+pub fn readlink(_tok: &mut DelegateToken, path: &str, buf: &mut [u8]) -> Result<usize, Errno> {
     let file = Ext4File::new(path, InodeTypes::EXT4_DE_SYMLINK);
-    file.symlink_read(buf)
+    file.symlink_read(buf).map_err(lwext4_err)
 }
 
 /// Flush filesystem cache for the mount point that contains `path`.
-pub fn cache_flush(_tok: &mut DelegateToken, path: &str) -> Result<(), i32> {
+pub fn cache_flush(_tok: &mut DelegateToken, path: &str) -> Result<(), Errno> {
     let cpath = path_to_cstr(path);
     let rc = unsafe { bindings::ext4_cache_flush(cpath.as_ptr() as *const core::ffi::c_char) };
     if rc != EOK as i32 {
-        return Err(-(rc.abs()));
+        return Err(lwext4_err(rc));
     }
     Ok(())
 }

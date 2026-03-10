@@ -5,8 +5,8 @@
 //! Metadata queries (`stat`, `exists`) use the native C APIs
 //! (`ext4_raw_inode_fill`, `ext4_inode_exist`) instead of file-open hacks.
 
-use crate::hal_common::Errno;
 use crate::fs::Disk;
+use crate::hal_common::Errno;
 use lwext4_rust::bindings::{self, ext4_dir, ext4_direntry, ext4_inode, EOK};
 use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
 
@@ -90,7 +90,7 @@ pub fn mount() -> Result<(), Errno> {
     let bw = Ext4BlockWrapper::<Disk>::new(disk, "/", "ext4_fs").map_err(|e| {
         klog!(fs, error, "ext4 mount failed: {}", e);
         Errno::Eio
-    })?;;
+    })?;
     EXT4_BW.call_once(|| crate::hal_common::SpinMutex::new(SendSyncBW(bw)));
     crate::kprintln!("lwext4 mounted at /");
     Ok(())

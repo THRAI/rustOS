@@ -395,8 +395,7 @@ impl VmObject {
         obj_arc: Arc<RwLock<Self>>,
         pindex: VirtPageNum,
     ) -> Result<Arc<VmPage>, Errno> {
-        let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex)
-            .await?;
+        let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex).await?;
         // If the page is new (resident_count just increased), we need to fill it.
         // We can check if it's new by seeing if resident_count increased after insertion.
         // But we don't have that information here. Instead, we can check if the page was just allocated

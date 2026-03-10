@@ -845,8 +845,7 @@ pub async fn sys_fsync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
             _ => return Ok(()),
         }
     };
-    crate::fs::fs_cache_flush(&path)
-        .await
+    crate::fs::fs_cache_flush(&path).await
 }
 
 /// sys_fdatasync: flush data (same as fsync for now).
@@ -856,8 +855,7 @@ pub async fn sys_fdatasync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno>
 
 /// sys_sync: flush all filesystem cache.
 pub async fn sys_sync_async() -> Result<(), Errno> {
-    crate::fs::fs_cache_flush("/")
-        .await
+    crate::fs::fs_cache_flush("/").await
 }
 
 /// sys_pipe2: create a pipe with optional flags.

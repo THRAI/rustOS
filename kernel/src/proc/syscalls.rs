@@ -5,16 +5,15 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use crate::executor::per_cpu;
-use crate::executor::user_task::{
-    copyin_argv, copyinstr, do_exit, fault_in_user_buffer, spawn_user_task,
-};
+use crate::executor::{current, spawn_user_task};
 use crate::klog;
-use crate::proc::exit_wait::WaitStatus;
-use crate::proc::fork::fork;
-use crate::proc::signal::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
-use crate::proc::task::Task;
 use crate::hal_common::Errno;
+use crate::mm::PageFaultAccessType;
+use crate::proc::{
+    copyin_argv, copyinstr, do_exit, fault_in_user_buffer, fork, SigAction, SigFrame, SigSet,
+    Signal, Task, TaskState, WaitChildFuture, WaitStatus, MAX_SIG, SIGCHLD, SIGFRAME_SIZE,
+    SIGKILL, SIGSTOP,
+};
 
 // ---------------------------------------------------------------------------
 // Basic Info Syscalls
@@ -54,7 +53,7 @@ pub fn sys_clone(task: &Arc<Task>) -> usize {
     let child = fork(task);
     let child_pid = child.pid;
     // Spawn child on same CPU
-    let cpu = per_cpu::current().cpu_id;
+    let cpu = current().cpu_id;
     spawn_user_task(child, cpu);
     child_pid as usize
 }
@@ -80,7 +79,7 @@ pub async fn sys_execve_async(
     // Read envp array
     let envp = copyin_argv(task, envp_ptr, 64, 4096).await;
 
-    crate::proc::exec::exec_with_args(task, &path, &argv, &envp).await
+    crate::proc::exec_with_args(task, &path, &argv, &envp).await
 }
 
 pub async fn sys_wait4_async(
@@ -97,7 +96,7 @@ pub async fn sys_wait4_async(
             task,
             wstatus_ptr,
             4,
-            crate::mm::vm::fault::PageFaultAccessType::WRITE,
+            PageFaultAccessType::WRITE,
         )
         .await;
     }
@@ -114,7 +113,7 @@ pub async fn sys_wait4_async(
         // Non-blocking: scan for a zombie child, return immediately
         let children = task.children.lock();
         for child in children.iter() {
-            if child.state() == crate::proc::task::TaskState::Zombie {
+            if child.state() == TaskState::Zombie {
                 if pid > 0 && child.pid != pid as u32 {
                     continue;
                 }
@@ -129,8 +128,8 @@ pub async fn sys_wait4_async(
                 task.children.lock().retain(|c| c.pid != child_pid);
 
                 // Consume pending SIGCHLD
-                let mut sig_chld = crate::proc::signal::SigSet::empty();
-                sig_chld.add(Signal::new_unchecked(crate::proc::signal::SIGCHLD));
+                let mut sig_chld = SigSet::empty();
+                sig_chld.add(Signal::new_unchecked(SIGCHLD));
                 task.signals
                     .pending
                     .fetch_difference(sig_chld, core::sync::atomic::Ordering::Release);
@@ -145,7 +144,7 @@ pub async fn sys_wait4_async(
                         status
                     );
                     let rc = unsafe {
-                        crate::hal::rv64::copy_user::copy_user_chunk(
+                        crate::hal::copy_user_chunk(
                             wstatus_ptr as *mut u8,
                             &status as *const i32 as *const u8,
                             4,
@@ -164,21 +163,20 @@ pub async fn sys_wait4_async(
     }
 
     // Blocking path
-    use crate::proc::exit_wait::WaitChildFuture;
     let result = WaitChildFuture::new(Arc::clone(task), pid).await;
 
     match result {
         Some((child_pid, status)) => {
             // Consume pending SIGCHLD
-            let mut sig_chld = crate::proc::signal::SigSet::empty();
-            sig_chld.add(Signal::new_unchecked(crate::proc::signal::SIGCHLD));
+            let mut sig_chld = SigSet::empty();
+            sig_chld.add(Signal::new_unchecked(SIGCHLD));
             task.signals
                 .pending
                 .fetch_difference(sig_chld, core::sync::atomic::Ordering::Release);
             // Write status to user memory if pointer is non-null
             if wstatus_ptr != 0 {
                 let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
+                    crate::hal::copy_user_chunk(
                         wstatus_ptr as *mut u8,
                         &status as *const i32 as *const u8,
                         4,
@@ -211,7 +209,7 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     // Copyin the sigframe from user memory
     let mut frame = core::mem::MaybeUninit::<SigFrame>::uninit();
     let ok = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
+        crate::hal::copy_user_chunk(
             frame.as_mut_ptr() as *mut u8,
             sp as *const u8,
             SIGFRAME_SIZE,
@@ -242,7 +240,7 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
 
     // Restore signal mask
     task.signals.blocked.store(
-        crate::proc::signal::SigSet::from_u64(frame.saved_mask),
+        crate::proc::SigSet::from_u64(frame.saved_mask),
         Ordering::Release,
     );
 
@@ -272,7 +270,7 @@ pub fn sys_sigaction(
         let old = actions[idx];
         let buf: [u64; 4] = [old.handler as u64, old.flags, old.restorer as u64, old.mask];
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 oldact_ptr as *mut u8,
                 buf.as_ptr() as *const u8,
                 SIGACTION_USER_SIZE,
@@ -287,7 +285,7 @@ pub fn sys_sigaction(
     if act_ptr != 0 {
         let mut buf = [0u64; 4];
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 buf.as_mut_ptr() as *mut u8,
                 act_ptr as *const u8,
                 SIGACTION_USER_SIZE,
@@ -323,7 +321,7 @@ pub fn sys_sigprocmask(
         let old = sig_state.blocked.load(Ordering::Relaxed);
         let old_u64 = old.as_u64();
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 oldset_ptr as *mut u8,
                 &old_u64 as *const u64 as *const u8,
                 8,
@@ -337,7 +335,7 @@ pub fn sys_sigprocmask(
     if set_ptr != 0 {
         let mut new_set: u64 = 0;
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 &mut new_set as *mut u64 as *mut u8,
                 set_ptr as *const u8,
                 8,
@@ -347,13 +345,13 @@ pub fn sys_sigprocmask(
             return Err(Errno::Efault);
         }
 
-        let unblockable = crate::proc::signal::SigSet::empty()
+        let unblockable = crate::proc::SigSet::empty()
             .add(Signal::new_unchecked(SIGKILL))
             .add(Signal::new_unchecked(SIGSTOP))
             .as_u64();
 
         new_set &= !unblockable;
-        let set = crate::proc::signal::SigSet::from_u64(new_set);
+        let set = crate::proc::SigSet::from_u64(new_set);
 
         match how {
             SIG_BLOCK => {
@@ -390,7 +388,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
     }
 
     if pid > 0 {
-        let target = crate::proc::signal::find_task_by_pid(pid as u32);
+        let target = crate::proc::find_task_by_pid(pid as u32);
         match target {
             Some(t) => {
                 if sig > 0 {
@@ -405,10 +403,10 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         }
     } else if pid == 0 {
         let pgid = sender.pgid.load(Ordering::Relaxed);
-        crate::proc::signal::kill_pgrp(pgid, sig);
+        crate::proc::kill_pgrp(pgid, sig);
         Ok(0)
     } else if pid == -1 {
-        crate::proc::signal::for_each_task(|t| {
+        crate::proc::for_each_task(|t| {
             if t.pid != 1 && sig > 0 {
                 t.signals.post_signal(sig);
                 if let Some(w) = t.top_level_waker.lock().take() {
@@ -419,7 +417,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         Ok(0)
     } else {
         let pgid = (-pid) as u32;
-        crate::proc::signal::kill_pgrp(pgid, sig);
+        crate::proc::kill_pgrp(pgid, sig);
         Ok(0)
     }
 }
@@ -447,7 +445,7 @@ pub fn sys_getpgid(task: &Arc<Task>, pid: u32) -> Result<usize, Errno> {
     if pid == 0 {
         Ok(task.pgid.load(Ordering::Relaxed) as usize)
     } else {
-        if let Some(t) = crate::proc::signal::find_task_by_pid(pid) {
+        if let Some(t) = crate::proc::find_task_by_pid(pid) {
             Ok(t.pgid.load(Ordering::Relaxed) as usize)
         } else {
             Err(Errno::Esrch)

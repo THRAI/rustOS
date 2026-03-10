@@ -15,14 +15,13 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
-use crate::fs::fd_table::FdTable;
+use crate::fs::FdTable;
 use crate::mm::allocator::{frame_alloc_contiguous, frame_free_contiguous};
 use crate::mm::pmap;
-use crate::mm::vm::map::VmMap;
+use crate::mm::vm::VmMap;
 // use crate::hal_common::IrqSafeSpinLock;
 
-use super::pid::alloc_pid;
-use super::signal::SignalState;
+use crate::proc::{alloc_pid, SignalState};
 
 /// Kernel stack size: 4 pages (16KB).
 const KSTACK_ORDER: usize = 2; // 2^2 = 4 pages

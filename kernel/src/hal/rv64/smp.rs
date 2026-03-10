@@ -67,7 +67,7 @@ extern "C" fn secondary_rust_main(cpu_id: usize) -> ! {
 
     // Initialize PerCpu for this CPU
     crate::executor::init_per_cpu(cpu_id, hartid);
-    unsafe { crate::executor::per_cpu::set_tp(cpu_id) };
+    unsafe { crate::executor::set_tp(cpu_id) };
 
     // Set up trap vectors
     super::trap::init();

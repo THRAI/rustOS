@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::hal_common::SpinMutex as Mutex;
 use crate::hal_common::{TrapFrame, VirtAddr, PAGE_SIZE};
 
-use super::task::Task;
+use crate::proc::Task;
 
 // ---------------------------------------------------------------------------
 // Signal numbers (1-indexed, matching Linux)
@@ -500,9 +500,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     let siginfo_va = if action.flags & SA_SIGINFO != 0 {
         sp = (sp - SIGINFO_SIZE) & !0xF;
         let si = build_siginfo(sig);
-        let ok = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(sp as *mut u8, si.as_ptr(), SIGINFO_SIZE)
-        };
+        let ok = unsafe { crate::hal::copy_user_chunk(sp as *mut u8, si.as_ptr(), SIGINFO_SIZE) };
         if ok != 0 {
             return Err(());
         }
@@ -530,7 +528,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     sig_state.blocked.store(new_blocked, Ordering::Relaxed);
     // Copyout to user stack using pcb_onfault guard
     let ok = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
+        crate::hal::copy_user_chunk(
             sp as *mut u8,
             &frame as *const SigFrame as *const u8,
             SIGFRAME_SIZE,
@@ -713,8 +711,8 @@ pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
 
 /// Map the sigcode trampoline page into the given pmap.
 /// Called during exec (and for init).
-pub fn map_sigcode_page(pmap: &mut crate::mm::pmap::Pmap) {
-    use crate::mm::pmap::pmap_enter;
+pub fn map_sigcode_page(pmap: &mut crate::mm::Pmap) {
+    use crate::mm::pmap_enter;
 
     let frame =
         crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::SigTrampoline)

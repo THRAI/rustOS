@@ -3,13 +3,13 @@
 //! Provides safe wrappers for copying data between kernel and user space,
 //! with automatic page fault handling.
 
+use crate::hal_common::{VirtAddr, PAGE_SIZE};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::hal_common::{PAGE_SIZE, VirtAddr};
 
-use crate::mm::vm::fault::PageFaultAccessType;
-use crate::proc::task::Task;
+use crate::mm::PageFaultAccessType;
+use crate::proc::Task;
 
 /// Pre-fault all user pages covering [user_ptr, user_ptr+len).
 ///
@@ -28,7 +28,7 @@ pub async fn fault_in_user_buffer(
     let end = (user_ptr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let mut va = start;
     while va < end {
-        let _ = crate::mm::vm::fault_async::resolve_user_fault(task, VirtAddr::new(va), access).await;
+        let _ = crate::mm::resolve_user_fault(task, VirtAddr::new(va), access).await;
         va += PAGE_SIZE;
     }
 }
@@ -54,13 +54,7 @@ pub async fn copyinstr(task: &Arc<Task>, user_ptr: usize, max_len: usize) -> Opt
         }
 
         let mut ch = 0u8;
-        let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                &mut ch as *mut u8,
-                src as *const u8,
-                1,
-            )
-        };
+        let rc = unsafe { crate::hal::copy_user_chunk(&mut ch as *mut u8, src as *const u8, 1) };
         if rc != 0 {
             return None;
         }
@@ -101,7 +95,7 @@ pub async fn copyin_argv(
         .await;
         let mut str_ptr: usize = 0;
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 &mut str_ptr as *mut usize as *mut u8,
                 ptr_addr as *const u8,
                 core::mem::size_of::<usize>(),
@@ -128,7 +122,7 @@ pub async fn copyin_argv(
 /// `wstatus` must be pre-encoded in Linux format:
 ///   normal exit:  (code << 8) & 0x7f00   (low 7 bits = 0)
 ///   signal kill:  signo & 0x7f           (low 7 bits = signal)
-pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
+pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::WaitStatus) {
     crate::klog!(
         proc,
         trace,
@@ -142,18 +136,18 @@ pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
     task.release_zombie_resources();
 
     // Unregister from global task registry
-    crate::proc::signal::unregister_task(task.pid);
+    crate::proc::unregister_task(task.pid);
 
     // Post SIGCHLD to parent
     if let Some(parent) = task.parent.upgrade() {
-        parent.signals.post_signal(crate::proc::signal::SIGCHLD);
+        parent.signals.post_signal(crate::proc::SIGCHLD);
 
         // SA_NOCLDWAIT: auto-reap child (remove from parent's children list)
         let sigchld_action = {
             let actions = parent.signals.actions.lock();
-            actions[(crate::proc::signal::SIGCHLD - 1) as usize]
+            actions[(crate::proc::SIGCHLD - 1) as usize]
         };
-        if sigchld_action.flags & crate::proc::signal::SA_NOCLDWAIT != 0 {
+        if sigchld_action.flags & crate::proc::SA_NOCLDWAIT != 0 {
             parent.children.lock().retain(|c| c.pid != task.pid);
         }
 
@@ -172,7 +166,7 @@ pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::exit_wait::WaitStatus) {
     if task.pid == 1 {
         #[cfg(feature = "autotest")]
         {
-            crate::hal::rv64::sbi::shutdown();
+            crate::hal::shutdown();
         }
     }
 }

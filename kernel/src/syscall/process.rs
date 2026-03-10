@@ -3,11 +3,13 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use crate::executor::user_task::spawn_user_task;
-use crate::proc::signal::Signal;
-use crate::proc::task::Task;
-use crate::proc::user_copy::{copyin_argv, copyinstr, do_exit, fault_in_user_buffer};
+use crate::executor::{current, spawn_user_task};
 use crate::hal_common::Errno;
+use crate::mm::PageFaultAccessType;
+use crate::proc::{
+    copyin_argv, copyinstr, do_execve, do_exit, fault_in_user_buffer, find_task_by_pid, fork,
+    SigSet, Signal, Task, TaskState, WaitChildFuture, WaitStatus, SIGCHLD,
+};
 
 // ---------------------------------------------------------------------------
 // Basic Info Syscalls
@@ -63,7 +65,7 @@ pub fn sys_clone(
         return (-(Errno::Enosys.as_i32() as isize)) as usize;
     }
 
-    let child = crate::proc::fork::fork(task);
+    let child = fork(task);
 
     // If caller supplied a child stack, override sp in the child's trap frame.
     // musl __clone stores fn/arg on this stack before ecall; child reads them via sp.
@@ -76,13 +78,13 @@ pub fn sys_clone(
     }
 
     let child_pid = child.pid;
-    let cpu = crate::executor::per_cpu::current().cpu_id;
+    let cpu = current().cpu_id;
     spawn_user_task(child, cpu);
     child_pid as usize
 }
 
 pub fn sys_exit(task: &Arc<Task>, status: i32) {
-    let wstatus = crate::proc::exit_wait::WaitStatus::exited(status);
+    let wstatus = WaitStatus::exited(status);
     do_exit(task, wstatus);
 }
 
@@ -104,7 +106,7 @@ pub async fn sys_execve_async(
     // Read envp array
     let envp = copyin_argv(task, envp_ptr, 64, 4096).await;
 
-    let (entry, sp) = crate::proc::exec::do_execve(task, &path, &argv, &envp).await?;
+    let (entry, sp) = do_execve(task, &path, &argv, &envp).await?;
     Ok((entry, sp, argv.len(), envp.len()))
 }
 
@@ -118,13 +120,7 @@ pub async fn sys_wait4_async(
 
     // Pre-fault wstatus page so copy_user_chunk won't EFAULT on demand-paged stack
     if wstatus_ptr != 0 {
-        fault_in_user_buffer(
-            task,
-            wstatus_ptr,
-            4,
-            crate::mm::vm::fault::PageFaultAccessType::WRITE,
-        )
-        .await;
+        fault_in_user_buffer(task, wstatus_ptr, 4, PageFaultAccessType::WRITE).await;
     }
 
     // Check if there are any children at all
@@ -139,21 +135,23 @@ pub async fn sys_wait4_async(
         // Non-blocking: scan for a zombie child, return immediately
         let children = task.children.lock();
         for child in children.iter() {
-            if child.state() == crate::proc::task::TaskState::Zombie {
+            if child.state() == TaskState::Zombie {
                 if pid > 0 && child.pid != pid as u32 {
                     continue;
                 }
 
                 let child_pid = child.pid;
-                let status = child.exit_status.load(core::sync::atomic::Ordering::Acquire);
+                let status = child
+                    .exit_status
+                    .load(core::sync::atomic::Ordering::Acquire);
                 drop(children);
 
                 // Remove the zombie child from parent's children list
                 task.children.lock().retain(|c| c.pid != child_pid);
 
                 // Consume pending SIGCHLD
-                let mut sig_chld = crate::proc::signal::SigSet::empty();
-                sig_chld.add(Signal::new_unchecked(crate::proc::signal::SIGCHLD));
+                let mut sig_chld = SigSet::empty();
+                sig_chld.add(Signal::new_unchecked(SIGCHLD));
                 task.signals
                     .pending
                     .fetch_difference(sig_chld, core::sync::atomic::Ordering::Release);
@@ -168,7 +166,7 @@ pub async fn sys_wait4_async(
                         status
                     );
                     let rc = unsafe {
-                        crate::hal::rv64::copy_user::copy_user_chunk(
+                        crate::hal::copy_user_chunk(
                             wstatus_ptr as *mut u8,
                             &status as *const i32 as *const u8,
                             4,
@@ -187,21 +185,20 @@ pub async fn sys_wait4_async(
     }
 
     // Blocking path
-    use crate::proc::exit_wait::WaitChildFuture;
     let result = WaitChildFuture::new(Arc::clone(task), pid).await;
 
     match result {
         Some((child_pid, status)) => {
             // Consume pending SIGCHLD
-            let mut sig_chld = crate::proc::signal::SigSet::empty();
-            sig_chld.add(Signal::new_unchecked(crate::proc::signal::SIGCHLD));
+            let mut sig_chld = SigSet::empty();
+            sig_chld.add(Signal::new_unchecked(SIGCHLD));
             task.signals
                 .pending
                 .fetch_difference(sig_chld, core::sync::atomic::Ordering::Release);
             // Write status to user memory if pointer is non-null
             if wstatus_ptr != 0 {
                 let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
+                    crate::hal::copy_user_chunk(
                         wstatus_ptr as *mut u8,
                         &status as *const i32 as *const u8,
                         4,
@@ -249,7 +246,7 @@ pub fn sys_setpgid(task: &Arc<Task>, pid: u32, pgid: u32) -> Result<usize, Errno
 pub fn sys_getpgid(task: &Arc<Task>, pid: u32) -> Result<usize, Errno> {
     if pid == 0 {
         Ok(task.pgid.load(Ordering::Relaxed) as usize)
-    } else if let Some(t) = crate::proc::signal::find_task_by_pid(pid) {
+    } else if let Some(t) = find_task_by_pid(pid) {
         Ok(t.pgid.load(Ordering::Relaxed) as usize)
     } else {
         Err(Errno::Esrch)

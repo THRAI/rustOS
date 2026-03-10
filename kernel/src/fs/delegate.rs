@@ -5,8 +5,16 @@
 //! from a bounded channel. Callers use async functions (fs_open, fs_read, etc.)
 //! that send requests and await replies via oneshot channels.
 
+use crate::fs::{
+    ext4_cache_flush, ext4_close, ext4_dir_close, ext4_dir_next, ext4_dir_open, ext4_link,
+    ext4_mkdir, ext4_mount, ext4_open, ext4_read, ext4_readlink, ext4_rename, ext4_stat,
+    ext4_symlink, ext4_truncate, ext4_unlink, ext4_write, DelegateToken,
+};
+use crate::hal_common::IrqSafeSpinLock;
+use crate::hal_common::PhysAddr;
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
@@ -14,7 +22,6 @@ use core::future::Future;
 use crate::hal_common::IrqSafeSpinLock;
 use crate::hal_common::Errno;
 use lwext4_rust::Ext4File;
-use crate::hal_common::PhysAddr;
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
 // All access is serialized in the single delegate_task — never shared across threads.
 struct SendExt4File(Ext4File);
@@ -22,7 +29,7 @@ unsafe impl Send for SendExt4File {}
 
 #[inline]
 fn map_backend_path(path: &str) -> String {
-    crate::fs::mount::resolve_to_source(path)
+    crate::fs::resolve_to_source(path)
 }
 
 /// Maximum pending requests in the channel.
@@ -328,7 +335,7 @@ async fn delegate_task() {
     klog!(fs, info, "ext4 mounted, delegate running");
 
     // SAFETY: We are the single delegate task — the only holder of this token.
-    let mut tok = unsafe { crate::fs::ext4::DelegateToken::new() };
+    let mut tok = unsafe { DelegateToken::new() };
 
     // Open file table: each slot holds an Option<SendExt4File>
     let mut open_files: [Option<SendExt4File>; MAX_OPEN_FILES] = [const { None }; MAX_OPEN_FILES];
@@ -353,7 +360,7 @@ async fn delegate_task() {
             } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                match crate::fs::ext4::open(&mut tok, &backend_path, flags) {
+                match ext4_open(&mut tok, &backend_path, flags) {
                     Ok(file) => {
                         let mut slot = None;
                         for (i, f) in open_files.iter().enumerate() {
@@ -387,7 +394,7 @@ async fn delegate_task() {
                 }
                 let file = &mut open_files[idx].as_mut().unwrap().0;
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
-                match crate::fs::ext4::read(&mut tok, file, buf) {
+                match ext4_read(&mut tok, file, buf) {
                     Ok(n) => reply.complete(Ok(n)),
                     Err(e) => reply.complete(Err(e)),
                 }
@@ -406,7 +413,7 @@ async fn delegate_task() {
                 }
                 let file = &mut open_files[idx].as_mut().unwrap().0;
                 let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
-                match crate::fs::ext4::write(&mut tok, file, buf) {
+                match ext4_write(&mut tok, file, buf) {
                     Ok(n) => reply.complete(Ok(n)),
                     Err(e) => reply.complete(Err(e)),
                 }
@@ -415,7 +422,7 @@ async fn delegate_task() {
                 let idx = handle.0 as usize;
                 if idx < MAX_OPEN_FILES {
                     if let Some(ref mut wrapper) = open_files[idx] {
-                        let _ = crate::fs::ext4::close(&mut tok, &mut wrapper.0);
+                        let _ = ext4_close(&mut tok, &mut wrapper.0);
                     }
                     open_files[idx] = None;
                 }
@@ -431,7 +438,7 @@ async fn delegate_task() {
                 let full_path = core::str::from_utf8(&name[..name_len]).unwrap_or("");
                 let backend_path = map_backend_path(full_path);
                 klog!(fs, debug, "lookup: {:?} -> {:?}", full_path, backend_path);
-                match crate::fs::ext4::stat(&mut tok, &backend_path) {
+                match ext4_stat(&mut tok, &backend_path) {
                     Ok((ino, size, ftype)) => {
                         reply.complete(Ok((ino, ftype, size)));
                     }
@@ -455,11 +462,11 @@ async fn delegate_task() {
                 // Fill the caller-provided page with file contents.
                 let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
                 buf.fill(0);
-                match crate::fs::ext4::open(&mut tok, &backend_path, 0) {
+                match ext4_open(&mut tok, &backend_path, 0) {
                     Ok(mut file) => {
                         let _ = file.file_seek(offset as i64, 0); // SEEK_SET
-                        let _ = crate::fs::ext4::read(&mut tok, &mut file, buf);
-                        let _ = crate::fs::ext4::close(&mut tok, &mut file);
+                        let _ = ext4_read(&mut tok, &mut file, buf);
+                        let _ = ext4_close(&mut tok, &mut file);
                         reply.complete(Ok(()));
                     }
                     Err(_) => reply.complete(Err(Errno::Enomem)), //Enomem
@@ -477,16 +484,16 @@ async fn delegate_task() {
                 let backend_path = map_backend_path(path_str);
                 let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_len) };
                 // Open with write flags, seek, write, close
-                match crate::fs::ext4::open(&mut tok, &backend_path, 0x0002) {
+                match ext4_open(&mut tok, &backend_path, 0x0002) {
                     Ok(mut file) => {
                         let _ = file.file_seek(offset as i64, 0); // SEEK_SET
-                        match crate::fs::ext4::write(&mut tok, &mut file, data) {
+                        match ext4_write(&mut tok, &mut file, data) {
                             Ok(n) => {
-                                let _ = crate::fs::ext4::close(&mut tok, &mut file);
+                                let _ = ext4_close(&mut tok, &mut file);
                                 reply.complete(Ok(n));
                             }
                             Err(e) => {
-                                let _ = crate::fs::ext4::close(&mut tok, &mut file);
+                                let _ = ext4_close(&mut tok, &mut file);
                                 reply.complete(Err(e));
                             }
                         }
@@ -502,7 +509,7 @@ async fn delegate_task() {
             } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                reply.complete(crate::fs::ext4::truncate(&mut tok, &backend_path, size));
+                reply.complete(ext4_truncate(&mut tok, &backend_path, size));
             }
             FsRequest::Mkdir {
                 path,
@@ -523,9 +530,9 @@ async fn delegate_task() {
                 let backend_path = map_backend_path(path_str);
                 let result = if is_dir {
                     // lwext4 dir_rm: use file_remove which handles dirs too
-                    crate::fs::ext4::unlink(&mut tok, &backend_path)
+                    ext4_unlink(&mut tok, &backend_path)
                 } else {
-                    crate::fs::ext4::unlink(&mut tok, &backend_path)
+                    ext4_unlink(&mut tok, &backend_path)
                 };
                 reply.complete(result);
             }
@@ -581,7 +588,7 @@ async fn delegate_task() {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
                 let mut out = [0u8; 256];
-                match crate::fs::ext4::readlink(&mut tok, &backend_path, &mut out) {
+                match ext4_readlink(&mut tok, &backend_path, &mut out) {
                     Ok(n) => reply.complete(Ok((n, out))),
                     Err(e) => reply.complete(Err(e)),
                 }
@@ -595,14 +602,19 @@ async fn delegate_task() {
                 let backend_path = map_backend_path(path_str);
                 reply.complete(crate::fs::ext4::cache_flush(&mut tok, &backend_path));
             }
-            FsRequest::ReadDir { path, path_len, start_idx, reply } => {
+            FsRequest::ReadDir {
+                path,
+                path_len,
+                start_idx,
+                reply,
+            } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                match crate::fs::ext4::dir_open(&mut tok, &backend_path) {
+                match ext4_dir_open(&mut tok, &backend_path) {
                     Ok(mut dir) => {
                         let mut skipped = 0usize;
                         while skipped < start_idx {
-                            if crate::fs::ext4::dir_next(&mut tok, &mut dir).is_none() {
+                            if ext4_dir_next(&mut tok, &mut dir).is_none() {
                                 break;
                             }
                             skipped += 1;
@@ -615,7 +627,7 @@ async fn delegate_task() {
                         }; READDIR_BATCH];
                         let mut count = 0usize;
                         while count < READDIR_BATCH {
-                            match crate::fs::ext4::dir_next(&mut tok, &mut dir) {
+                            match ext4_dir_next(&mut tok, &mut dir) {
                                 Some((name, name_len, itype, ino)) => {
                                     entries[count] = DirEntryRaw {
                                         name,
@@ -628,7 +640,7 @@ async fn delegate_task() {
                                 None => break,
                             }
                         }
-                        let _ = crate::fs::ext4::dir_close(&mut tok, &mut dir);
+                        let _ = ext4_dir_close(&mut tok, &mut dir);
                         reply.complete(Ok((entries, count)));
                     }
                     Err(e) => reply.complete(Err(e)),
@@ -965,6 +977,6 @@ pub async fn fs_readdir(
 
 /// Initialize the delegate: mount ext4 and spawn the delegate task.
 pub fn init() {
-    let cpu = crate::executor::per_cpu::current().cpu_id;
+    let cpu = crate::executor::current().cpu_id;
     crate::executor::spawn_kernel_task(delegate_task(), cpu).detach();
 }

@@ -3,13 +3,11 @@
 //! Splits path on '/', calls delegate lookup for each component,
 //! caches results in the dentry cache.
 
+use crate::hal_common::Errno;
 use alloc::string::String;
 use alloc::sync::Arc;
-use crate::hal_common::Errno;
 
-use super::dentry;
-use super::delegate;
-use super::vnode::{Ext4Vnode, Vnode, VnodeType};
+use crate::fs::{fs_lookup, insert_dentry, lookup_dentry, Ext4Vnode, Vnode, VnodeType};
 
 /// Root inode number for ext4.
 const EXT4_ROOT_INO: u32 = 2;
@@ -44,14 +42,14 @@ pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
         built_path.push_str(component);
 
         // Check dentry cache first
-        if let Some(cached) = dentry::lookup(parent_id, component) {
+        if let Some(cached) = lookup_dentry(parent_id, component) {
             current = cached;
             continue;
         }
 
         // Not cached — ask delegate to look up this component
         let parent_ino = parent_id as u32;
-        let result = delegate::fs_lookup(parent_ino, &built_path).await;
+        let result = fs_lookup(parent_ino, &built_path).await;
 
         match result {
             Ok((child_ino, child_type, child_size)) => {
@@ -60,8 +58,9 @@ pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
                 } else {
                     VnodeType::Regular
                 };
-                let child: Arc<dyn Vnode> = Ext4Vnode::new_with_path(child_ino, vtype, child_size, built_path.clone());
-                dentry::insert(parent_id, component, Arc::clone(&child));
+                let child: Arc<dyn Vnode> =
+                    Ext4Vnode::new_with_path(child_ino, vtype, child_size, built_path.clone());
+                insert_dentry(parent_id, component, Arc::clone(&child));
                 current = child;
             }
             Err(_) => return Err(Errno::Enoent),

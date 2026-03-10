@@ -19,7 +19,7 @@ impl Disk {
     }
 
     fn size(&self) -> u64 {
-        let blk = crate::drivers::virtio_blk::get();
+        let blk = crate::drivers::virtio_blk_get();
         blk.lock().capacity() * BLOCK_SIZE as u64
     }
 
@@ -33,17 +33,18 @@ impl Disk {
     }
 
     fn read_one(&mut self, buf: &mut [u8]) -> Result<usize, i32> {
-        let blk = crate::drivers::virtio_blk::get();
+        let blk = crate::drivers::virtio_blk_get();
         let read_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
-            let sector_buf: &mut [u8; 512] =
-                (&mut buf[..BLOCK_SIZE]).try_into().unwrap();
-            blk.lock().read_sector(self.block_id as u64, sector_buf)
+            let sector_buf: &mut [u8; 512] = (&mut buf[..BLOCK_SIZE]).try_into().unwrap();
+            blk.lock()
+                .read_sector(self.block_id as u64, sector_buf)
                 .map_err(|_| -5)?;
             self.block_id += 1;
             BLOCK_SIZE
         } else {
             let mut data = [0u8; BLOCK_SIZE];
-            blk.lock().read_sector(self.block_id as u64, &mut data)
+            blk.lock()
+                .read_sector(self.block_id as u64, &mut data)
                 .map_err(|_| -5)?;
             let start = self.offset;
             let count = buf.len().min(BLOCK_SIZE - self.offset);
@@ -59,22 +60,24 @@ impl Disk {
     }
 
     fn write_one(&mut self, buf: &[u8]) -> Result<usize, i32> {
-        let blk = crate::drivers::virtio_blk::get();
+        let blk = crate::drivers::virtio_blk_get();
         let write_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
-            let sector_buf: &[u8; 512] =
-                (&buf[..BLOCK_SIZE]).try_into().unwrap();
-            blk.lock().write_sector(self.block_id as u64, sector_buf)
+            let sector_buf: &[u8; 512] = (&buf[..BLOCK_SIZE]).try_into().unwrap();
+            blk.lock()
+                .write_sector(self.block_id as u64, sector_buf)
                 .map_err(|_| -5)?;
             self.block_id += 1;
             BLOCK_SIZE
         } else {
             let mut data = [0u8; BLOCK_SIZE];
-            blk.lock().read_sector(self.block_id as u64, &mut data)
+            blk.lock()
+                .read_sector(self.block_id as u64, &mut data)
                 .map_err(|_| -5)?;
             let start = self.offset;
             let count = buf.len().min(BLOCK_SIZE - self.offset);
             data[start..start + count].copy_from_slice(&buf[..count]);
-            blk.lock().write_sector(self.block_id as u64, &data)
+            blk.lock()
+                .write_sector(self.block_id as u64, &data)
                 .map_err(|_| -5)?;
             self.offset += count;
             if self.offset >= BLOCK_SIZE {
@@ -132,9 +135,7 @@ impl KernelDevOp for Disk {
             lwext4_rust::bindings::SEEK_CUR => {
                 dev.position().checked_add_signed(off).map(|v| v as i64)
             }
-            lwext4_rust::bindings::SEEK_END => {
-                size.checked_add_signed(off).map(|v| v as i64)
-            }
+            lwext4_rust::bindings::SEEK_END => size.checked_add_signed(off).map(|v| v as i64),
             _ => Some(off),
         }
         .ok_or(-1)?;

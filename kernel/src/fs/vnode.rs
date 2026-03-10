@@ -3,18 +3,18 @@
 //! The Vnode trait is the core filesystem abstraction. Ext4Vnode implements
 //! it by sending operations to the delegate task via the bounded channel.
 
+use crate::hal_common::VirtPageNum;
+use crate::hal_common::PAGE_SIZE;
+use crate::mm::vm::VmObject;
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::mm::vm::vm_object::VmObject;
-use crate::hal_common::addr::VirtPageNum;
-use crate::hal_common::PAGE_SIZE;
 /// Unique vnode identifier (inode number within a filesystem).
 pub type VnodeId = u64;
-use spin::rwlock::RwLock;
 use crate::hal_common::IrqSafeSpinLock;
+use spin::rwlock::RwLock;
 
 static VNODE_OBJECTS: IrqSafeSpinLock<Option<BTreeMap<VnodeId, Arc<RwLock<VmObject>>>>> =
     IrqSafeSpinLock::new(None);
@@ -208,5 +208,4 @@ impl Vnode for Ext4Vnode {
             w.set_size(size as usize);
         }
     }
-
 }

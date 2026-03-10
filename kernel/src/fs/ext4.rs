@@ -5,8 +5,8 @@
 //! Metadata queries (`stat`, `exists`) use the native C APIs
 //! (`ext4_raw_inode_fill`, `ext4_inode_exist`) instead of file-open hacks.
 
-use super::lwext4_disk::Disk;
 use crate::hal_common::Errno;
+use crate::fs::Disk;
 use lwext4_rust::bindings::{self, ext4_dir, ext4_direntry, ext4_inode, EOK};
 use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
 
@@ -38,7 +38,8 @@ struct SendSyncBW(Ext4BlockWrapper<Disk>);
 unsafe impl Send for SendSyncBW {}
 unsafe impl Sync for SendSyncBW {}
 
-static EXT4_BW: crate::hal_common::Once<crate::hal_common::SpinMutex<SendSyncBW>> = crate::hal_common::Once::new();
+static EXT4_BW: crate::hal_common::Once<crate::hal_common::SpinMutex<SendSyncBW>> =
+    crate::hal_common::Once::new();
 
 // ── DelegateToken (Phase 2) ─────────────────────────────────────────
 

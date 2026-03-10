@@ -2,10 +2,12 @@
 //!
 //! Implements futex, nanosleep, clock_gettime and related operations.
 
-use alloc::sync::Arc;
 use crate::hal_common::{Errno, VirtAddr};
+use alloc::sync::Arc;
 
-use crate::proc::task::Task;
+use crate::ipc::{futex_wait, futex_wake};
+use crate::mm::pmap_extract;
+use crate::proc::Task;
 
 /// Timer frequency: QEMU virt = 10 MHz.
 const TIMER_FREQ: u64 = 10_000_000;
@@ -32,9 +34,7 @@ pub fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(
 
     // struct timespec { time_t tv_sec; long tv_nsec; } — 16 bytes on rv64
     let ts: [u64; 2] = [secs, nsecs];
-    let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(tp as *mut u8, ts.as_ptr() as *const u8, 16)
-    };
+    let rc = unsafe { crate::hal::copy_user_chunk(tp as *mut u8, ts.as_ptr() as *const u8, 16) };
     if rc != 0 {
         return Err(Errno::Efault);
     }
@@ -56,13 +56,8 @@ pub fn sys_gettimeofday(task: &Arc<Task>, tv: usize, _tz: usize) -> Result<(), E
 
     // struct timeval { long tv_sec; long tv_usec; } on rv64 => 16 bytes
     let tv_out: [u64; 2] = [secs, usecs];
-    let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            tv as *mut u8,
-            tv_out.as_ptr() as *const u8,
-            16,
-        )
-    };
+    let rc =
+        unsafe { crate::hal::copy_user_chunk(tv as *mut u8, tv_out.as_ptr() as *const u8, 16) };
     if rc != 0 {
         return Err(Errno::Efault);
     }
@@ -82,11 +77,7 @@ pub async fn sys_nanosleep_async(
     // Read struct timespec from user memory
     let mut ts = [0u64; 2];
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            ts.as_mut_ptr() as *mut u8,
-            req_ptr as *const u8,
-            16,
-        )
+        crate::hal::copy_user_chunk(ts.as_mut_ptr() as *mut u8, req_ptr as *const u8, 16)
     };
     if rc != 0 {
         return Err(Errno::Efault);
@@ -101,20 +92,20 @@ pub async fn sys_nanosleep_async(
     }
 
     // Interruptible sleep: poll in 10ms increments to check signals
-    let start = crate::hal::rv64::timer::read_time_ms();
+    let start = crate::hal::read_time_ms();
     let deadline = start + total_ms;
 
     loop {
         if task.signals.has_actionable_pending() {
             // Write remaining time to rem pointer
             if rem_ptr != 0 {
-                let now = crate::hal::rv64::timer::read_time_ms();
+                let now = crate::hal::read_time_ms();
                 let remaining_ms = deadline.saturating_sub(now);
                 let rem_secs = remaining_ms / 1000;
                 let rem_nsecs = (remaining_ms % 1000) * 1_000_000;
                 let rem_ts = [rem_secs, rem_nsecs];
                 let _ = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
+                    crate::hal::copy_user_chunk(
                         rem_ptr as *mut u8,
                         rem_ts.as_ptr() as *const u8,
                         16,
@@ -124,7 +115,7 @@ pub async fn sys_nanosleep_async(
             return Err(Errno::Eintr);
         }
 
-        let now = crate::hal::rv64::timer::read_time_ms();
+        let now = crate::hal::read_time_ms();
         if now >= deadline {
             break;
         }
@@ -139,11 +130,7 @@ pub async fn sys_nanosleep_async(
     if rem_ptr != 0 {
         let zero_ts = [0u64; 2];
         let _ = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                rem_ptr as *mut u8,
-                zero_ts.as_ptr() as *const u8,
-                16,
-            )
+            crate::hal::copy_user_chunk(rem_ptr as *mut u8, zero_ts.as_ptr() as *const u8, 16)
         };
     }
     Ok(())
@@ -173,12 +160,11 @@ pub async fn sys_futex_async(
             let pa = {
                 let vm_map = task.vm_map.lock();
                 let pmap = vm_map.pmap_lock();
-                crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
-                    .ok_or(Errno::Efault)?
+                pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF)).ok_or(Errno::Efault)?
             };
             let pa_key = pa + (uaddr & 0xFFF);
             // Park on the futex
-            crate::ipc::futex::futex_wait(pa_key, task).await?;
+            futex_wait(pa_key, task).await?;
             Ok(0)
         }
         FUTEX_WAKE => {
@@ -186,11 +172,10 @@ pub async fn sys_futex_async(
             let pa = {
                 let vm_map = task.vm_map.lock();
                 let pmap = vm_map.pmap_lock();
-                crate::mm::pmap::pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF))
-                    .ok_or(Errno::Efault)?
+                pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF)).ok_or(Errno::Efault)?
             };
             let pa_key = pa + (uaddr & 0xFFF);
-            let woken = crate::ipc::futex::futex_wake(pa_key, val as usize);
+            let woken = futex_wake(pa_key, val as usize);
             Ok(woken)
         }
         _ => Err(Errno::Enosys),

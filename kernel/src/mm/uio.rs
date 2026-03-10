@@ -37,13 +37,8 @@ pub fn chunk_size(addr: usize, remaining: usize) -> usize {
 ///
 /// POSIX short-read semantics: if some chunks succeed before a fault,
 /// returns `Ok` with `done < len`.
-pub fn uiomove(
-    kern: *mut u8,
-    user: *mut u8,
-    len: usize,
-    dir: UioDir,
-) -> Result<UioResult, Errno> {
-    use crate::hal::rv64::copy_user::copy_user_chunk;
+pub fn uiomove(kern: *mut u8, user: *mut u8, len: usize, dir: UioDir) -> Result<UioResult, Errno> {
+    use crate::hal::copy_user_chunk;
 
     if len == 0 {
         return Ok(UioResult { done: 0 });
@@ -60,18 +55,10 @@ pub fn uiomove(
 
         let ret = match dir {
             UioDir::CopyIn => unsafe {
-                copy_user_chunk(
-                    kern.add(kern_off),
-                    (user as *const u8).add(user_off),
-                    chunk,
-                )
+                copy_user_chunk(kern.add(kern_off), (user as *const u8).add(user_off), chunk)
             },
             UioDir::CopyOut => unsafe {
-                copy_user_chunk(
-                    user.add(user_off),
-                    (kern as *const u8).add(kern_off),
-                    chunk,
-                )
+                copy_user_chunk(user.add(user_off), (kern as *const u8).add(kern_off), chunk)
             },
         };
 

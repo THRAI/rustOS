@@ -1,5 +1,5 @@
 use super::VmMap;
-use crate::mm::vm::vm_object::VmObject;
+use crate::mm::vm::VmObject;
 use alloc::sync::Arc;
 use bitflags::bitflags;
 use core::ptr::NonNull;
@@ -116,16 +116,16 @@ impl VmMapEntry {
     //    object: obj,
     //    offset: file_offset_page_aligned as u64,
     //},
-    //crate::mm::vm::map::entry::EntryFlags::empty(),
+    //crate::mm::vm::EntryFlags::empty(),
     //region.prot,
-    pub fn new_file_backed(start: u64, end: u64, store: BackingStore, flags: EntryFlags, protection: MapPerm) -> Self {
-        Self::new(
-            start,
-            end,
-            store,
-            flags,
-            protection,
-        )
+    pub fn new_file_backed(
+        start: u64,
+        end: u64,
+        store: BackingStore,
+        flags: EntryFlags,
+        protection: MapPerm,
+    ) -> Self {
+        Self::new(start, end, store, flags, protection)
     }
 
     pub fn start(&self) -> u64 {

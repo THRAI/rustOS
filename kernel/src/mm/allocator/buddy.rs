@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use crate::hal_common::addr::{PhysAddr, PAGE_SIZE};
+use crate::hal_common::{PhysAddr, PAGE_SIZE};
 use alloc::vec::Vec;
 
 /// Maximum buddy order (2^11 = 2048 pages = 8MB).
@@ -56,7 +56,10 @@ impl BuddyAllocator {
             "buddy init: start not page-aligned"
         );
         assert!(end.is_page_aligned(), "buddy init: end not page-aligned");
-        assert!(start < end, "buddy init: empty range: start: {start}, end: {end}");
+        assert!(
+            start < end,
+            "buddy init: empty range: start: {start}, end: {end}"
+        );
 
         // Pre-allocate Vec capacity to avoid realloc during the loop.
         // For 128MB, order-11 (8MB blocks) needs ~16 slots; smaller orders need fewer.
@@ -78,7 +81,9 @@ impl BuddyAllocator {
             let mut order = MAX_ORDER;
             while order > 0 {
                 let block_pages = 1 << order;
-                if block_pages <= pages_left && (addr.page_align_down().0).is_multiple_of(block_pages) {
+                if block_pages <= pages_left
+                    && (addr.page_align_down().0).is_multiple_of(block_pages)
+                {
                     break;
                 }
                 order -= 1;

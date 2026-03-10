@@ -7,7 +7,7 @@
 //! The `Drop` implementation uses iterative `Arc::try_unwrap` unwinding
 //! to handle arbitrarily deep shadow chains (500+) without stack overflow.
 
-use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::VirtPageNum;
 use crate::hal_common::{PhysAddr, PAGE_SIZE};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -15,11 +15,12 @@ use core::marker::{Send, Sync};
 use core::sync::atomic::AtomicU32;
 use spin::RwLock;
 
-use super::page::{ExclusiveBusyGuard, SharedBusyGuard};
 use crate::fs::Vnode;
 use crate::hal_common::Errno;
-use crate::mm::allocator::types::{get_frame_meta, PageRole};
-use crate::mm::pmap::{pmap_copy_page, pmap_zero_page};
+use crate::mm::allocator::{get_frame_meta, PageRole};
+use crate::mm::vm::{ExclusiveBusyGuard, SharedBusyGuard};
+use crate::mm::VmPage;
+use crate::mm::{pmap_copy_page, pmap_zero_page};
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
 /// Supports fetching multiple pages in a single operation for efficiency.
 pub trait Pager: core::fmt::Debug + Send + Sync {
@@ -110,11 +111,11 @@ impl Pager for VnodePager {
 
             // Pure zero-fill page (beyond p_filesz or zero-file segment).
             if file_bytes_this_page == 0 {
-                crate::mm::pmap::pmap_zero_page(pa);
+                pmap_zero_page(pa);
                 return Ok(());
             }
 
-            crate::fs::delegate::fs_read_page(&path, offset as u64, pa)
+            crate::fs::fs_read_page(&path, offset as u64, pa)
                 .await
                 .map_err(|_| ())?;
 
@@ -137,15 +138,13 @@ impl Pager for VnodePager {
         let path = self.path.clone();
         alloc::boxed::Box::pin(async move {
             let data = unsafe { core::slice::from_raw_parts(pa.as_usize() as *const u8, 4096) };
-            crate::fs::delegate::fs_write_at(&path, offset as u64, data)
+            crate::fs::fs_write_at(&path, offset as u64, data)
                 .await
                 .map(|_| ())
                 .map_err(|_| ())
         })
     }
 }
-
-use crate::mm::vm::page::VmPage;
 
 // ---------------------------------------------------------------------------
 // VmObject
@@ -340,7 +339,7 @@ impl VmObject {
                 }
                 // Page is exclusively busied. Wait for it to become available.
                 // Note: we've dropped the object lock, so it's safe to await.
-                crate::executor::schedule::yield_now().await;
+                crate::executor::yield_now().await;
                 page.wait_for_exclusive_unlock().await;
                 // Loop again because the page might have been removed while we slept.
             } else {
@@ -354,7 +353,7 @@ impl VmObject {
                     }
                     let page_clone = Arc::clone(page);
                     drop(root);
-                    crate::executor::schedule::yield_now().await;
+                    crate::executor::yield_now().await;
                     page_clone.wait_for_exclusive_unlock().await;
                     continue;
                 }
@@ -1294,7 +1293,7 @@ mod tests {
             let mut w = backing.write();
             for i in 0..4u64 {
                 w.insert_page(i, {
-                    let mut p = super::super::page::VmPage::new();
+                    let mut p = crate::mm::VmPage::new();
                     p.phys_addr = hal_common::PhysAddr::new((0xA000 + i as usize) * 0x1000);
                     Arc::new(p)
                 });
@@ -1310,7 +1309,7 @@ mod tests {
                 // Each shadow writes to offset (i % 4).
                 let offset = (i % 4) as u64;
                 w.insert_page(offset, {
-                    let mut p = super::super::page::VmPage::new();
+                    let mut p = crate::mm::VmPage::new();
                     p.phys_addr = hal_common::PhysAddr::new(0xC000_0000 + i * 0x1000);
                     Arc::new(p)
                 });

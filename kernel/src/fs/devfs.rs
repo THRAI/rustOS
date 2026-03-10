@@ -1,9 +1,9 @@
 //! Static device node lookup for /dev/null, /dev/zero, /dev/console.
 
-use alloc::sync::Arc;
 use crate::hal_common::Errno;
+use alloc::sync::Arc;
 
-use super::fd_table::{DeviceKind, FileDescription, FileObject, OpenFlags};
+use crate::fs::{DeviceKind, FileDescription, FileObject, OpenFlags};
 
 /// Look up a device by path under /dev/.
 /// Returns a FileDescription for the device, or ENOENT.

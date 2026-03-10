@@ -5,10 +5,11 @@
 //! - `free_raw_frame()`: returns frame via per-CPU magazine, drains to buddy when full
 //! - `frame_alloc_contiguous()`: multi-page allocation directly from buddy
 
-use super::buddy::BuddyAllocator;
-use super::magazine::Magazine;
-use crate::hal_common::addr::{PhysAddr, PAGE_SIZE};
 use crate::hal_common::IrqSafeSpinLock;
+use crate::hal_common::{PhysAddr, PAGE_SIZE};
+use crate::mm::allocator::{get_frame_meta, PageRole, FRAME_META, FRAME_META_LEN};
+use crate::mm::allocator::{BuddyAllocator, Magazine};
+use crate::mm::VmPage;
 
 /// Debug-build poison pattern: written to every u64 in a freed frame.
 #[cfg(debug_assertions)]
@@ -41,7 +42,7 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     // We need one VmPage per physical page in the system (up to `end` address)
     // To be safe and cover all possible PFNs up to the max address:
     let max_pfn = end.page_align_down().0 / PAGE_SIZE;
-    let meta_size_bytes = max_pfn * core::mem::size_of::<crate::mm::vm::page::VmPage>();
+    let meta_size_bytes = max_pfn * core::mem::size_of::<VmPage>();
     let meta_pages = meta_size_bytes.div_ceil(PAGE_SIZE);
 
     // Steal memory for metadata array before giving the rest to the buddy allocator
@@ -63,19 +64,17 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
 
     // Zero out the allocated metadata memory
     unsafe {
-        let meta_array = core::slice::from_raw_parts_mut(
-            meta_ptr.as_usize() as *mut crate::mm::vm::page::VmPage,
-            max_pfn,
-        );
+        let meta_array =
+            core::slice::from_raw_parts_mut(meta_ptr.as_usize() as *mut VmPage, max_pfn);
 
         // Initialize each VmPage correctly, particularly its physical address link
         for (pfn, meta) in meta_array.iter_mut().enumerate() {
-            *meta = crate::mm::vm::page::VmPage::new();
+            *meta = VmPage::new();
             meta.phys_addr = PhysAddr::new(pfn * PAGE_SIZE);
         }
 
-        crate::mm::allocator::types::FRAME_META = meta_array.as_mut_ptr();
-        crate::mm::allocator::types::FRAME_META_LEN = max_pfn;
+        FRAME_META = meta_array.as_mut_ptr();
+        FRAME_META_LEN = max_pfn;
     }
 
     crate::klog!(
@@ -114,11 +113,11 @@ fn current_cpu_id() -> usize {
 }
 
 /// Helper to initialize metadata for a newly allocated frame.
-fn finalize_alloc(addr: PhysAddr, role: crate::mm::allocator::types::PageRole) -> PhysAddr {
+fn finalize_alloc(addr: PhysAddr, role: PageRole) -> PhysAddr {
     #[cfg(debug_assertions)]
     check_poison(addr);
 
-    if let Some(meta) = crate::mm::allocator::types::get_frame_meta(addr) {
+    if let Some(meta) = get_frame_meta(addr) {
         meta.set_role(role);
         // Note: new allocations start with refcount 0 by default, so we bump to 1.
         // Wait, atomic inc_ref returns the *new* value, well in `types::VmPage` it returns *old* fetch_add value
@@ -132,7 +131,7 @@ fn finalize_alloc(addr: PhysAddr, role: crate::mm::allocator::types::PageRole) -
 /// Safe for trap context (sync_fault_handler).
 ///
 /// Fallback chain: magazine -> buddy -> emergency_reclaim -> None
-pub fn alloc_raw_frame_sync(role: crate::mm::allocator::types::PageRole) -> Option<PhysAddr> {
+pub fn alloc_raw_frame_sync(role: PageRole) -> Option<PhysAddr> {
     let cpu_id = current_cpu_id();
 
     // 1. Try per-CPU magazine (fast path, minimal contention).
@@ -165,13 +164,13 @@ pub fn alloc_raw_frame_sync(role: crate::mm::allocator::types::PageRole) -> Opti
 ///
 /// Equivalent to `alloc_raw_frame_sync(PageRole::UserAnon)`.
 pub fn frame_alloc_sync() -> Option<PhysAddr> {
-    alloc_raw_frame_sync(crate::mm::allocator::types::PageRole::UserAnon)
+    alloc_raw_frame_sync(PageRole::UserAnon)
 }
 
 /// Async frame allocation. Can yield to cooperate with page daemon.
 ///
 /// Fallback chain: magazine -> buddy -> (wake page daemon + yield) -> emergency_reclaim -> None
-pub async fn alloc_raw_frame(role: crate::mm::allocator::types::PageRole) -> Option<PhysAddr> {
+pub async fn alloc_raw_frame(role: PageRole) -> Option<PhysAddr> {
     let cpu_id = current_cpu_id();
 
     // 1. Try per-CPU magazine.
@@ -216,19 +215,16 @@ pub async fn alloc_raw_frame(role: crate::mm::allocator::types::PageRole) -> Opt
 // Strongly Typed Allocator Wrappers
 // ---------------------------------------------------------------------------
 
-use crate::mm::allocator::types::PageRole;
-
 macro_rules! define_alloc_wrapper {
     ($name:ident, $name_sync:ident, $role_variant:ident) => {
-        pub async fn $name() -> Option<&'static mut crate::mm::vm::page::VmPage> {
+        pub async fn $name() -> Option<&'static mut VmPage> {
             alloc_raw_frame(PageRole::$role_variant)
                 .await
-                .map(|phys| crate::mm::allocator::types::get_frame_meta(phys).unwrap())
+                .map(|phys| get_frame_meta(phys).unwrap())
         }
 
-        pub fn $name_sync() -> Option<&'static mut crate::mm::vm::page::VmPage> {
-            alloc_raw_frame_sync(PageRole::$role_variant)
-                .map(|phys| crate::mm::allocator::types::get_frame_meta(phys).unwrap())
+        pub fn $name_sync() -> Option<&'static mut VmPage> {
+            alloc_raw_frame_sync(PageRole::$role_variant).map(|phys| get_frame_meta(phys).unwrap())
         }
     };
 }
@@ -251,11 +247,11 @@ define_alloc_wrapper!(
 /// Free a VmPage usage reference previously returned by an allocator wrapper.
 ///
 /// Refcount is decremented. If it hits 0, the frame is returned to the pool.
-pub fn frame_free(frame: &'static mut crate::mm::vm::page::VmPage) {
+pub fn frame_free(frame: &'static mut VmPage) {
     let addr = frame.phys_addr;
 
     // Check and decrement refcount
-    if let Some(meta) = crate::mm::allocator::types::get_frame_meta(addr) {
+    if let Some(meta) = get_frame_meta(addr) {
         let old_ref = meta.dec_ref();
         debug_assert!(
             old_ref > 0,
@@ -275,7 +271,7 @@ pub fn frame_free(frame: &'static mut crate::mm::vm::page::VmPage) {
 }
 
 /// Alias for `frame_free` to represent dropping a usage reference.
-pub fn frame_free_usage(frame: &'static mut crate::mm::vm::page::VmPage) {
+pub fn frame_free_usage(frame: &'static mut VmPage) {
     frame_free(frame);
 }
 

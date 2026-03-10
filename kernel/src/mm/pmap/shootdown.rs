@@ -8,7 +8,7 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "riscv64")]
-use crate::executor::per_cpu::MAX_CPUS;
+use crate::executor::MAX_CPUS;
 #[cfg(not(target_arch = "riscv64"))]
 const MAX_CPUS: usize = 8;
 
@@ -66,7 +66,7 @@ pub fn handle_shootdown_ipi(cpu_id: usize) {
     #[cfg(target_arch = "riscv64")]
     {
         if req.flush_all.load(Ordering::Relaxed) {
-            crate::hal::rv64::tlb::flush_all();
+            crate::hal::flush_all();
         } else {
             let va_start = req.va_start.load(Ordering::Relaxed);
             let va_end = req.va_end.load(Ordering::Relaxed);
@@ -86,7 +86,7 @@ pub fn handle_shootdown_ipi(cpu_id: usize) {
 /// remote CPUs via IPI.
 #[cfg(target_arch = "riscv64")]
 pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: usize, asid: u16) {
-    let local_cpu = crate::executor::per_cpu::current().cpu_id;
+    let local_cpu = crate::executor::current().cpu_id;
 
     // Flush local TLB first.
     adaptive_flush(va_start, va_end, asid as usize);
@@ -111,7 +111,7 @@ pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: 
         req.ack.store(false, Ordering::Release);
         req.pending.store(true, Ordering::Release);
 
-        crate::hal::rv64::ipi::send_ipi(cpu);
+        crate::hal::send_ipi(cpu);
 
         // Spin until acknowledged.
         while !req.ack.load(Ordering::Acquire) {
@@ -123,7 +123,7 @@ pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: 
 /// Broadcast full TLB flush to all CPUs (for ASID generation rollover).
 #[cfg(target_arch = "riscv64")]
 pub fn ipi_broadcast_flush_all() {
-    let local_cpu = crate::executor::per_cpu::current().cpu_id;
+    let local_cpu = crate::executor::current().cpu_id;
 
     for (cpu, req) in SHOOTDOWN.iter().enumerate() {
         if cpu == local_cpu {
@@ -137,7 +137,7 @@ pub fn ipi_broadcast_flush_all() {
         req.ack.store(false, Ordering::Release);
         req.pending.store(true, Ordering::Release);
 
-        crate::hal::rv64::ipi::send_ipi(cpu);
+        crate::hal::send_ipi(cpu);
 
         while !req.ack.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -159,6 +159,6 @@ fn adaptive_flush(va_start: usize, va_end: usize, asid: usize) {
             va += crate::hal_common::PAGE_SIZE;
         }
     } else {
-        crate::hal::rv64::tlb::flush_asid(asid);
+        crate::hal::flush_asid(asid);
     }
 }

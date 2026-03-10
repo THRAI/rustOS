@@ -4,7 +4,7 @@
 //! ranges. Each VmArea has a monotonic `AtomicU64` ID that is unique across
 //! all VMAs, providing TOCTOU defense.
 
-use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::VirtPageNum;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -14,9 +14,9 @@ use spin::RwLock;
 
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
-use crate::mm::vm::vm_object::VObjIndex;
+use crate::mm::vm::VObjIndex;
 
-use super::vm_object::VmObject;
+use crate::mm::vm::VmObject;
 
 use crate::fs::Vnode;
 
@@ -34,7 +34,7 @@ fn next_vma_id() -> u64 {
 // MapPerm — page protection flags
 // ---------------------------------------------------------------------------
 
-pub use crate::mm::vm::map::entry::MapPerm;
+pub use crate::mm::vm::MapPerm;
 
 // ---------------------------------------------------------------------------
 // EntryFlags — VmMapEntry state flags
@@ -56,9 +56,9 @@ bitflags::bitflags! {
 /// Usage: `map_perm!(R, W, U)`
 #[macro_export]
 macro_rules! map_perm {
-    () => { $crate::mm::vm::vm_map::MapPerm::empty() };
+    () => { $crate::mm::vm::MapPerm::empty() };
     ($($flag:ident),+) => {
-        $($crate::mm::vm::vm_map::MapPerm::$flag)|+
+        $($crate::mm::vm::MapPerm::$flag)|+
     };
 }
 
@@ -738,8 +738,8 @@ impl VmMap {
 
 #[cfg(all(test, feature = "qemu-test"))]
 mod tests {
-    use super::super::vm_object::VmObject;
     use super::*;
+    use crate::mm::vm::{VmObject, VmPage};
 
     fn make_vma(start: usize, end: usize) -> VmArea {
         let obj = VmObject::new((end - start) as usize);
@@ -826,7 +826,7 @@ mod tests {
             let mut w = obj.write();
             w.insert_page(
                 VirtPageNum(0),
-                Arc::new(crate::mm::vm::page::VmPage::new_test(
+                Arc::new(crate::mm::vm::VmPage::new_test(
                     crate::hal_common::PhysAddr::new(0xA000),
                 )),
             );
@@ -880,15 +880,11 @@ mod tests {
             let mut w = obj.write();
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
-                    0xDEAD_0000,
-                )),
+                Arc::new(VmPage::new_test(hal_common::PhysAddr::new(0xDEAD_0000))),
             );
             w.insert_page(
                 VirtPageNum(0),
-                super::super::vm_object::OwnedPage::new_test(hal_common::PhysAddr::new(
-                    0xBEEF_0000,
-                )),
+                Arc::new(VmPage::new_test(hal_common::PhysAddr::new(0xBEEF_0000))),
             );
         }
         let vma = VmArea::new(

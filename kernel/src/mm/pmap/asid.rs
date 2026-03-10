@@ -4,8 +4,8 @@
 //! generation is stale, a new ASID is allocated. When the ASID space is
 //! exhausted, the generation increments and all CPUs flush their TLBs.
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use crate::hal_common::IrqSafeSpinLock;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum ASID value. Sv39/Sv48 on RV64 supports 16-bit ASIDs.
 /// ASID 0 is reserved for the kernel.
@@ -47,8 +47,8 @@ pub fn alloc_asid() -> (u16, u64) {
     // remote CPUs are flushed via IPI broadcast.
     #[cfg(target_arch = "riscv64")]
     {
-        super::shootdown::ipi_broadcast_flush_all();
-        crate::hal::rv64::tlb::flush_all();
+        super::ipi_broadcast_flush_all();
+        crate::hal::flush_all();
     }
 
     state.next = 2; // 1 is returned now

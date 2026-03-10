@@ -1,4 +1,7 @@
-use core::{fmt::Display, ops::{Add, AddAssign, Sub}};
+use core::{
+    fmt::Display,
+    ops::{Add, AddAssign, Sub},
+};
 
 /// Page size constant
 pub const PAGE_SIZE: usize = 4096;
@@ -36,7 +39,6 @@ macro_rules! implement_affine_space {
 /// Physical address newtype
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PhysAddr(pub usize);
-
 
 /// Virtual address newtype
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -187,7 +189,6 @@ impl VirtAddr {
         unsafe { core::slice::from_raw_parts(self.as_ptr(), PAGE_SIZE) }
     }
 }
-
 
 impl From<VirtPageNum> for VirtAddr {
     fn from(v: VirtPageNum) -> Self {

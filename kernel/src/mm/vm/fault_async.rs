@@ -5,11 +5,12 @@
 
 use alloc::sync::Arc;
 
-use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::VirtPageNum;
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
-use crate::mm::vm::fault::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
-use crate::proc::task::Task;
+use crate::mm::vm::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
+use crate::mm::{pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page, PteFlags};
+use crate::proc::Task;
 
 /// Unified fault resolution: sync path first, async fallback for file-backed.
 pub async fn resolve_user_fault(
@@ -23,10 +24,7 @@ pub async fn resolve_user_fault(
         let vm_map = task.vm_map.lock();
         let pmap = vm_map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-        if let Some((_pa, flags)) =
-            crate::mm::pmap::pmap_extract_with_flags(&pmap, fault_va_aligned)
-        {
-            use crate::mm::pmap::pte::PteFlags;
+        if let Some((_pa, flags)) = pmap_extract_with_flags(&pmap, fault_va_aligned) {
             let mut ok = true;
             if access_type.write && !flags.contains(PteFlags::W) {
                 ok = false; // COW page — must go through fault handler
@@ -139,7 +137,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
         match &vma.store {
-            crate::mm::vm::map::entry::BackingStore::Object { object, offset } => {
+            crate::mm::vm::BackingStore::Object { object, offset } => {
                 let obj_offset_bytes = offset + (fault_va_aligned.as_usize() as u64 - vma.start);
                 let obj_offset = VirtPageNum((obj_offset_bytes / PAGE_SIZE as u64) as usize);
                 (object.clone(), obj_offset, vma.start, vma.protection)
@@ -153,10 +151,8 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let map = task.vm_map.lock();
         let mut pmap = map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-        if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-            if crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false)
-                .is_err()
-            {
+        if pmap_extract(&pmap, fault_va_aligned).is_none() {
+            if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
                 return Err(FaultError::OutOfMemory);
             }
         }
@@ -169,7 +165,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     let frame =
         crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::UserAnon)
             .ok_or(FaultError::OutOfMemory)?;
-    crate::mm::pmap::pmap_zero_page(frame);
+    pmap_zero_page(frame);
 
     // 4. Fetch data via pager
     let pager = { obj.read().pager.clone() };
@@ -198,33 +194,23 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         // Check if another thread raced us
         if let Some(existing_pa) = obj_write.lookup_page(obj_offset) {
             crate::mm::allocator::free_raw_frame(frame);
-            if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-                if crate::mm::pmap::pmap_enter(
-                    &mut pmap,
-                    fault_va_aligned,
-                    existing_pa,
-                    vma_perm,
-                    false,
-                )
-                .is_err()
-                {
+            if pmap_extract(&pmap, fault_va_aligned).is_none() {
+                if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
                     return Err(FaultError::OutOfMemory);
                 }
             }
             return Ok(());
         }
 
-        let vm_page_meta = crate::mm::allocator::types::get_frame_meta(frame).unwrap();
+        let vm_page_meta = crate::mm::allocator::get_frame_meta(frame).unwrap();
         obj_write.insert_page(obj_offset, {
-            let mut page = crate::mm::vm::page::VmPage::new();
+            let mut page = crate::mm::VmPage::new();
             page.phys_addr = vm_page_meta.phys();
             Arc::new(page)
         });
 
-        if crate::mm::pmap::pmap_extract(&pmap, fault_va_aligned).is_none() {
-            if crate::mm::pmap::pmap_enter(&mut pmap, fault_va_aligned, frame, vma_perm, false)
-                .is_err()
-            {
+        if pmap_extract(&pmap, fault_va_aligned).is_none() {
+            if pmap_enter(&mut pmap, fault_va_aligned, frame, vma_perm, false).is_err() {
                 return Err(FaultError::OutOfMemory);
             }
         }

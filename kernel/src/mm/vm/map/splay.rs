@@ -1,4 +1,4 @@
-use crate::mm::vm::map::entry::VmMapEntry;
+use crate::mm::vm::VmMapEntry;
 use core::ptr::NonNull;
 
 pub struct SplayTree {
@@ -58,9 +58,9 @@ impl SplayTree {
         let mut dummy = VmMapEntry::new(
             0,
             0,
-            crate::mm::vm::map::entry::BackingStore::Guard,
-            crate::mm::vm::map::entry::EntryFlags::empty(),
-            crate::mm::vm::map::entry::MapPerm::empty(),
+            crate::mm::vm::BackingStore::Guard,
+            crate::mm::vm::EntryFlags::empty(),
+            crate::mm::vm::MapPerm::empty(),
         );
         let mut left_tail = NonNull::from(&mut dummy);
         let mut right_tail = NonNull::from(&mut dummy);

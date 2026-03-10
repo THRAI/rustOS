@@ -5,15 +5,15 @@
 //! frame_alloc_sync behavior under real kernel conditions.
 use alloc::sync::Arc;
 
-use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::VirtPageNum;
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
 use super::super::allocator::{alloc_anon_sync, frame_free};
 use super::super::pmap;
-use super::map::entry::{BackingStore, VmMapEntry};
-use super::map::VmMap;
-use super::page::VmPage;
-use super::vm_object::VmObject;
+use crate::mm::vm::{
+    sync_fault_handler, BackingStore, FaultResult, PageFaultAccessType, VmMap, VmMapEntry,
+    VmObject, VmPage,
+};
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
 pub fn test_anonymous_page_fault() {
@@ -25,24 +25,22 @@ pub fn test_anonymous_page_fault() {
             object: obj,
             offset: 0,
         },
-        crate::mm::vm::map::entry::EntryFlags::empty(),
+        crate::mm::vm::EntryFlags::empty(),
         crate::map_perm!(R, W),
     );
-    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(
-        pmap::pmap_create(),
-    ));
+    let pmap_arc = Arc::new(crate::hal_common::SpinMutex::new(pmap::pmap_create()));
     let mut map = VmMap::new(Arc::clone(&pmap_arc));
     map.insert_entry(vma).unwrap();
 
     let mut test_pmap = pmap_arc.lock();
-    let result = super::fault::sync_fault_handler(
+    let result = sync_fault_handler(
         &map,
         &mut test_pmap,
         VirtAddr::new(0x1000_0000),
-        super::fault::PageFaultAccessType::READ,
+        PageFaultAccessType::READ,
     );
     match result {
-        super::fault::FaultResult::Resolved => {
+        FaultResult::Resolved => {
             // Verify a page was inserted into the VmObject
             let vma = map.lookup_readonly(0x1000_0000).unwrap();
             let obj = match &vma.store {
@@ -91,24 +89,22 @@ pub fn test_cow_fault() {
             object: shadow,
             offset: 0,
         },
-        crate::mm::vm::map::entry::EntryFlags::empty(),
+        crate::mm::vm::EntryFlags::empty(),
         crate::map_perm!(R, W),
     );
-    let pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(
-        pmap::pmap_create(),
-    ));
+    let pmap_arc = Arc::new(crate::hal_common::SpinMutex::new(pmap::pmap_create()));
     let mut map = VmMap::new(Arc::clone(&pmap_arc));
     map.insert_entry(vma).unwrap();
 
     let mut test_pmap = pmap_arc.lock();
-    let result = super::fault::sync_fault_handler(
+    let result = sync_fault_handler(
         &map,
         &mut test_pmap,
         VirtAddr::new(0x2000_0000),
-        super::fault::PageFaultAccessType::WRITE,
+        PageFaultAccessType::WRITE,
     );
     match result {
-        super::fault::FaultResult::Resolved => {
+        FaultResult::Resolved => {
             let vma = map.lookup_readonly(0x2000_0000).unwrap();
             let obj = match &vma.store {
                 BackingStore::Object { object, .. } => object.read(),

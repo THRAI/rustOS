@@ -14,7 +14,7 @@ use crate::hal_common::{Errno, PhysAddr};
 
 use crate::hal_common::IrqSafeSpinLock;
 
-use crate::proc::task::Task;
+use crate::proc::Task;
 
 /// Global futex wait table: maps physical address to list of waiting wakers.
 static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<Waker>>> =
@@ -23,13 +23,7 @@ static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<Waker>>> =
 /// Park the current task on a futex key (physical address).
 /// Returns a future that completes when woken by futex_wake or interrupted by signal.
 pub async fn futex_wait(pa_key: PhysAddr, task: &Arc<Task>) -> Result<(), Errno> {
-    klog!(
-        proc,
-        debug,
-        "futex_wait pid={} key={:#x}",
-        task.pid,
-        pa_key
-    );
+    klog!(proc, debug, "futex_wait pid={} key={:#x}", task.pid, pa_key);
     FutexWaitFuture {
         pa_key,
         registered: false,

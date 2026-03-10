@@ -74,10 +74,7 @@ impl<T> IrqSafeSpinLock<T> {
             // Spin with a hint to reduce bus contention
             core::hint::spin_loop();
         }
-        IrqSafeGuard {
-            lock: self,
-            saved,
-        }
+        IrqSafeGuard { lock: self, saved }
     }
 }
 
@@ -169,9 +166,9 @@ mod tests {
 /// or: `RUSTFLAGS="--cfg loom" cargo test -p hal-common`
 #[cfg(all(test, not(target_os = "none")))]
 mod loom_tests {
-    use loom::sync::Arc;
-    use loom::sync::atomic::{AtomicBool, Ordering};
     use loom::cell::UnsafeCell;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::sync::Arc;
     use loom::thread;
 
     /// Minimal loom-compatible spinlock (mirrors IrqSafeSpinLock logic

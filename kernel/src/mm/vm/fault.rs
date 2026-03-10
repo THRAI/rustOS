@@ -16,9 +16,8 @@ use alloc::sync::Arc;
 use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
 
 use super::super::pmap::{self, Pmap};
-use super::map::entry::{BackingStore, MapPerm, VmMapEntry};
-use super::map::VmMap;
-use crate::hal_common::addr::VirtPageNum;
+use crate::hal_common::VirtPageNum;
+use crate::mm::vm::{BackingStore, MapPerm, VmMap, VmMapEntry};
 
 /// Result of a synchronous page fault resolution attempt.
 #[derive(Debug)]
@@ -184,7 +183,7 @@ pub fn sync_fault_handler(
 /// Classify the fault and handle it.
 fn classify_and_handle(
     vma: &VmMapEntry,
-    obj: Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>>,
+    obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
     obj_page_offset: VirtPageNum,
     fault_va_aligned: VirtAddr,
     access_type: PageFaultAccessType,
@@ -246,7 +245,7 @@ fn classify_and_handle(
 /// the topmost VmObject, and map it.
 fn handle_anonymous_fault(
     vma: &VmMapEntry,
-    obj: Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>>,
+    obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
     obj_page_offset: VirtPageNum,
     fault_va_aligned: VirtAddr,
     pmap: &mut Pmap,
@@ -296,7 +295,7 @@ fn handle_anonymous_fault(
 /// VmObject and remap with write permission.
 fn handle_cow_fault(
     vma: &VmMapEntry,
-    obj: Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>>,
+    obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
     obj_page_offset: VirtPageNum,
     fault_va_aligned: VirtAddr,
     old_phys: PhysAddr,
@@ -383,9 +382,11 @@ fn handle_cow_fault(
 #[cfg(all(test, feature = "qemu-test"))]
 mod tests {
     use super::super::super::pmap::Pmap;
-    use super::super::vm_map::{MapPerm, VmArea, VmAreaType, VmMap};
-    use super::super::vm_object::VmObject;
     use super::*;
+    use crate::mm::vm::{
+        LegacyMapPerm as MapPerm, LegacyVmArea as VmArea, LegacyVmAreaType as VmAreaType,
+        LegacyVmMap as VmMap, VmObject,
+    };
 
     fn make_anon_map(start: usize, end: usize, prot: MapPerm) -> VmMap {
         let obj = VmObject::new(end - start);

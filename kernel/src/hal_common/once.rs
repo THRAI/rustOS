@@ -33,12 +33,10 @@ impl<T> Once<T> {
         if self.state.load(Ordering::Acquire) == COMPLETE {
             return;
         }
-        match self.state.compare_exchange(
-            INCOMPLETE,
-            RUNNING,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
+        match self
+            .state
+            .compare_exchange(INCOMPLETE, RUNNING, Ordering::Acquire, Ordering::Relaxed)
+        {
             Ok(_) => {
                 let val = f();
                 unsafe { *self.data.get() = Some(val) };

@@ -1,4 +1,4 @@
-use crate::hal_common::addr::{PhysAddr, PAGE_SIZE};
+use crate::hal_common::{PhysAddr, PAGE_SIZE};
 
 /// Compact page role, fitting in a single u8.
 #[repr(u8)]
@@ -36,7 +36,7 @@ impl From<u8> for PageRole {
     }
 }
 
-use crate::mm::vm::page::VmPage;
+use crate::mm::VmPage;
 
 // Global metadata array pointer and length
 // Initialized during boot

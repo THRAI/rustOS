@@ -3,7 +3,7 @@
 //! Output uses a global spinlock so SMP output is not interleaved.
 //! Input is a transparent byte pipe: UART IRQ pushes bytes, ConsoleReadFuture drains them.
 
-use crate::hal::rv64::uart;
+use crate::hal::uart;
 use crate::hal_common::IrqSafeSpinLock;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};

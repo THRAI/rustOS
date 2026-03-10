@@ -397,7 +397,7 @@ pub async fn sys_fstatat_async(
         return Err(Errno::Enoent);
     }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
-    let (ino, ftype, size) = delegate::fs_lookup(0, &path_str).await?;;
+    let (ino, ftype, size) = fs::fs_lookup(0, &path_str).await?;;
 
     let mut st = LinuxStat {
         st_dev: 0,
@@ -710,7 +710,7 @@ pub async fn sys_linkat_async(
     if !crate::fs::same_mount_domain(&old_path, &new_path) {
         return Err(Errno::Einval);
     }
-    delegate::fs_link(&old_path, &new_path)
+    fs::fs_link(&old_path, &new_path)
         .await?;
     Ok(())
 }
@@ -740,7 +740,7 @@ pub async fn sys_renameat2_async(
     if !crate::fs::same_mount_domain(&old_path, &new_path) {
         return Err(Errno::Einval);
     }
-    delegate::fs_rename(&old_path, &new_path)
+    fs::fs_rename(&old_path, &new_path)
         .await?;
     Ok(())
 }
@@ -760,7 +760,7 @@ pub async fn sys_readlinkat_async(
         .await
         .ok_or(Errno::Efault)?;
     let path = absolutize_path(task, dirfd, &raw_path)?;
-    let (mut n, data) = delegate::fs_readlink(&path)
+    let (mut n, data) = fs::fs_readlink(&path)
         .await?;;
     if n > 0 && data[n - 1] == 0 {
         n -= 1;
@@ -806,7 +806,7 @@ pub async fn sys_faccessat_async(
         return Err(Errno::Enoent);
     }
     let path = absolutize_path(task, dirfd, &raw_path)?;
-    let _ = delegate::fs_lookup(0, &path)
+    let _ = fs::fs_lookup(0, &path)
         .await?;
     Ok(())
 }
@@ -822,7 +822,7 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
         FileObject::Vnode(v) => String::from(v.path()),
         _ => return Err(Errno::Einval),
     };
-    delegate::fs_truncate(&path, len)
+    fs::fs_truncate(&path, len)
         .await?;;
     if let FileObject::Vnode(v) = &desc.object {
         v.set_size(len);
@@ -1904,7 +1904,7 @@ pub async fn sys_symlinkat_async(
         normalize_absolute_path(&joined)
     };
 
-    delegate::fs_symlink(&target_abs, &link_abs)
+    fs::fs_symlink(&target_abs, &link_abs)
         .await?;;
     crate::klog!(
         syscall,

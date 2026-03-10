@@ -10,11 +10,9 @@ use crate::fs::{
     ext4_mkdir, ext4_mount, ext4_open, ext4_read, ext4_readlink, ext4_rename, ext4_stat,
     ext4_symlink, ext4_truncate, ext4_unlink, ext4_write, DelegateToken,
 };
-use crate::hal_common::IrqSafeSpinLock;
 use crate::hal_common::PhysAddr;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};

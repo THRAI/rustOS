@@ -31,8 +31,8 @@ fn sbi_call(eid: usize, fid: usize, args: [usize; 3]) -> SbiRet {
 
 // SBI extension IDs
 const EID_TIME: usize = 0x54494D45; // Timer extension
-const EID_SPI: usize = 0x735049;    // s-mode IPI extension
-const EID_HSM: usize = 0x48534D;    // Hart State Management
+const EID_SPI: usize = 0x735049; // s-mode IPI extension
+const EID_HSM: usize = 0x48534D; // Hart State Management
 
 /// Set the next timer interrupt deadline (absolute time value).
 /// EID=TIME, FID=0.

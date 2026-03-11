@@ -56,7 +56,7 @@ pub fn handle_timer_irq() {
     set_oneshot(DEFAULT_INTERVAL);
 
     // Tick the per-CPU timer wheel -- wakes expired sleep futures
-    let pc = crate::executor::per_cpu::current();
+    let pc = crate::executor::current();
     let wt = pc.timer_wheel.lock().current_tick();
     pc.timer_wheel.lock().advance();
 

@@ -38,7 +38,7 @@ static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool =
 #[no_mangle]
 pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     if !BOOT_HART_CLAIMED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        hal::rv64::uart::init();
+        hal::init_uart();
         kprintln!("hello world");
         klog!(boot, info, "hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
 
@@ -48,25 +48,25 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         unsafe {
             core::arch::asm!("csrci sstatus, 0x2");
         }
-        hal::rv64::trap::set_kernel_trap_entry();
+        hal::set_kernel_trap_entry();
 
         // Initialize kernel heap first — everything below may allocate
         alloc_early::init_heap();
 
         // Parse FDT to discover CPUs (before trap/timer — no IRQs yet)
-        let (num_cpus, hartids) = hal::rv64::fdt::parse_cpus(dtb_ptr);
+        let (num_cpus, hartids) = hal::parse_cpus(dtb_ptr);
 
         // Pre-initialize PerCpu for ALL discovered harts.
         // Must happen before trap/timer init because the timer IRQ handler
         // accesses per-CPU data via tp register.
         for (i, &hid) in hartids.iter().enumerate().take(num_cpus) {
-            let cid = hal::rv64::fdt::hart_to_cpu(hid).unwrap_or(i);
+            let cid = hal::hart_to_cpu(hid).unwrap_or(i);
             klog!(boot, info, "init_per_cpu({}, {}) start", cid, hid);
             executor::init_per_cpu(cid, hid);
             klog!(boot, info, "init_per_cpu({}, {}) done", cid, hid);
         }
-        let cpu0 = hal::rv64::fdt::hart_to_cpu(hartid).unwrap_or(0);
-        unsafe { executor::per_cpu::set_tp(cpu0) };
+        let cpu0 = hal::hart_to_cpu(hartid).unwrap_or(0);
+        unsafe { executor::set_tp(cpu0) };
         klog!(
             boot,
             info,
@@ -78,10 +78,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         trap::init();
 
         // Initialize PLIC for UART IRQ on boot hart
-        hal::rv64::plic::init_hart(hartid);
+        hal::init_plic_hart(hartid);
 
         // Arm the first timer interrupt (10ms interval)
-        hal::rv64::timer::init();
+        hal::init_timer();
 
         // Initialize frame allocator with physical memory after kernel image
         {
@@ -108,22 +108,22 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         }
 
         // Initialize VirtIO-blk driver (probes MMIO addresses for block device)
-        drivers::virtio_blk::init();
+        drivers::init_virtio_blk();
 
         // Initialize VFS caches
         klog!(boot, info, "dentry::init...");
-        fs::dentry::init();
+        fs::init_dentry_cache();
         klog!(boot, info, "vnode_cache::init...");
-        fs::vnode::init_vnode_cache();
+        fs::init_vnode_cache();
 
         klog!(boot, info, "delegate::init...");
         // Initialize filesystem delegate (mounts ext4, spawns delegate task)
-        fs::delegate::init();
+        fs::init_delegate();
         klog!(boot, info, "delegate done");
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {
-            hal::rv64::smp::boot_secondary_harts(num_cpus, &hartids, hartid);
+            hal::smp::boot_secondary_harts(num_cpus, &hartids, hartid);
         }
 
         // --- Integration tests: only compiled when `--features qemu-test` ---
@@ -306,7 +306,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             executor::spawn_kernel_task(
                 async {
                     executor::sleep(12_000).await;
-                    hal::rv64::sbi::shutdown();
+                    hal::sbi::shutdown();
                 },
                 cpu0,
             )
@@ -315,7 +315,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Spawn init process: exec /bin/init, then enter user mode
         {
-            let init_task = proc::task::Task::new_init();
+            let init_task = proc::Task::new_init();
             let init_task2 = init_task.clone();
             let init_cpu = cpu0;
             executor::spawn_kernel_task(
@@ -373,8 +373,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
                     let mut launched = false;
                     for (exec_path, argv) in launch_attempts {
-                        match proc::exec::do_execve(&init_task2, exec_path, &argv, &envp).await
-                        {
+                        match proc::exec::do_execve(&init_task2, exec_path, &argv, &envp).await {
                             Ok((entry, sp)) => {
                                 {
                                     let mut tf = init_task2.trap_frame.lock();
@@ -402,7 +401,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         }
 
         // Enable global interrupts
-        hal::rv64::irq::enable();
+        hal::irq::enable();
         klog!(boot, info, "interrupts enabled, entering executor loop");
 
         // Enter the executor loop (never returns)
@@ -412,7 +411,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     // Non-boot harts: return to SBI stopped state so hart_start can restart them
     // at secondary_entry. A wfi loop won't work because hart_start requires
     // the hart to be in SBI "stopped" state.
-    hal::rv64::sbi::hart_stop();
+    hal::sbi::hart_stop();
     // hart_stop should not return, but just in case:
     loop {
         unsafe {
@@ -502,10 +501,9 @@ fn test_uiomove_short_read() {
 #[cfg(feature = "qemu-test")]
 fn test_fork_exit_wait4() {
     use alloc::sync::Arc;
-    use proc::exit_wait::{sys_exit, WaitChildFuture};
-    use proc::fork::fork;
     use proc::syscall_result::SyscallResult;
-    use proc::task::Task;
+    use proc::Task;
+    use proc::{fork, sys_exit, WaitChildFuture, WaitStatus};
 
     // Create init task (pid 1)
     let init = Task::new_init();
@@ -528,14 +526,14 @@ fn test_fork_exit_wait4() {
     // (VmMap::fork creates shadow objects for each VMA — with empty parent, child is also empty)
 
     // Child exits with code 42
-    let result = sys_exit(&child, crate::proc::exit_wait::WaitStatus::exited(42));
+    let result = sys_exit(&child, WaitStatus::exited(42));
     match result {
         SyscallResult::Terminated => {}
         _ => panic!("sys_exit must return Terminated"),
     }
 
     // Verify child is now ZOMBIE
-    assert_eq!(child.state(), proc::task::TaskState::Zombie);
+    assert_eq!(child.state(), proc::TaskState::Zombie);
 
     // Verify exit status is properly encoded
     assert_eq!(
@@ -586,10 +584,10 @@ fn test_fork_exit_wait4() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_delegate_read() {
-    match fs::delegate::fs_open("/hello.txt").await {
+    match fs::fs_open("/hello.txt").await {
         Ok(handle) => {
             let mut buf = [0u8; 64];
-            match fs::delegate::fs_read(handle, &mut buf).await {
+            match fs::fs_read(handle, &mut buf).await {
                 Ok(n) => {
                     let content = core::str::from_utf8(&buf[..n]).unwrap_or("<invalid utf8>");
                     if content.trim_end() == "hello from ext4" {
@@ -600,7 +598,7 @@ async fn test_delegate_read() {
                 }
                 Err(e) => kprintln!("delegate read FAIL (read err={})", e),
             }
-            let _ = fs::delegate::fs_close(handle).await;
+            let _ = fs::fs_close(handle).await;
         }
         Err(e) => kprintln!("delegate read FAIL (open err={})", e),
     }
@@ -608,7 +606,7 @@ async fn test_delegate_read() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_vfs_read() {
-    use fs::fd_table::{FdTable, OpenFlags};
+    use fs::{FdTable, OpenFlags};
     let fd_table = crate::hal_common::SpinMutex::new(FdTable::new());
 
     // First read: goes through delegate
@@ -658,9 +656,7 @@ async fn test_vfs_read() {
 #[cfg(feature = "qemu-test")]
 async fn test_fork_exec_wait4() {
     use alloc::sync::Arc;
-    use proc::exit_wait::{sys_exit, WaitChildFuture};
-    use proc::fork::fork;
-    use proc::task::Task;
+    use proc::{exec, fork, sys_exit, Task, WaitChildFuture, WaitStatus};
 
     // Create init task
     let init = Task::new_init();
@@ -671,7 +667,7 @@ async fn test_fork_exec_wait4() {
 
     // Try exec on the child — use /hello.txt which is NOT an ELF
     // This should fail with ENOEXEC, proving the ELF validation works
-    match proc::exec::exec(&child, "/hello.txt").await {
+    match exec(&child, "/hello.txt").await {
         Err(crate::hal_common::Errno::Enoexec) => {
             // Expected: hello.txt is not an ELF binary
         }
@@ -686,7 +682,7 @@ async fn test_fork_exec_wait4() {
     }
 
     // Child exits with code 7
-    let _ = sys_exit(&child, crate::proc::exit_wait::WaitStatus::exited(7));
+    let _ = sys_exit(&child, WaitStatus::exited(7));
 
     // Parent wait4 collects exit status
     let wait_result = WaitChildFuture::new(Arc::clone(&init), -1).await;
@@ -706,7 +702,7 @@ async fn test_fork_exec_wait4() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_pipe_data_transfer() {
-    use fs::pipe::Pipe;
+    use fs::Pipe;
 
     let pipe = Pipe::new();
     let msg = b"hello pipe";
@@ -762,7 +758,7 @@ async fn test_pipe_data_transfer() {
 #[cfg(feature = "qemu-test")]
 fn test_signal_pending_delivery() {
     use proc::signal::{SA_NOCLDWAIT, SA_RESTART, SIGCHLD, SIGUSR1};
-    use proc::task::Task;
+    use proc::Task;
 
     let task = Task::new_init();
 
@@ -841,14 +837,14 @@ fn test_signal_pending_delivery() {
 fn test_mmap_munmap() {
     use crate::hal_common::{VirtAddr, PAGE_SIZE};
     use mm::vm::vm_map::VmMap;
-    use mm::vm::vm_object::VmObject;
+    use mm::vm::VmObject;
 
-    let task = proc::task::Task::new_init();
+    let task = proc::Task::new_init();
 
     // Insert an anonymous VMA
     let base = VirtAddr::new(0x1000_0000);
     let len = PAGE_SIZE;
-    use crate::mm::vm::map::entry::{BackingStore, EntryFlags, VmMapEntry};
+    use crate::mm::vm::{BackingStore, EntryFlags, VmMapEntry};
     let obj = VmObject::new_anon(1);
     let vma = VmMapEntry::new(
         base.as_usize() as u64,
@@ -887,7 +883,7 @@ fn test_mmap_munmap() {
 
 #[cfg(feature = "qemu-test")]
 async fn test_device_nodes() {
-    use fs::fd_table::{FdTable, OpenFlags};
+    use fs::{FdTable, OpenFlags};
 
     // Test /dev/null behavior directly via FileObject
     // Write to /dev/null: always succeeds (swallowed)
@@ -956,7 +952,7 @@ fn test_futex_wake() {
 
 #[cfg(feature = "qemu-test")]
 fn test_fixup() {
-    use hal::rv64::copy_user::copy_user_chunk;
+    use hal::copy_user::copy_user_chunk;
     let src_buf = [0xABu8; 16];
 
     // Test 1: bad destination pointer

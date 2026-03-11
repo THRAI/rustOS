@@ -5,7 +5,7 @@
 use crate::hal_common::Errno;
 use alloc::sync::Arc;
 
-use crate::proc::task::Task;
+use crate::proc::Task;
 
 /// sys_uname: get system information.
 pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
@@ -30,13 +30,8 @@ pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {
     write_field(&mut utsname, FIELD_LEN * 4, b"riscv64"); // machine
     write_field(&mut utsname, FIELD_LEN * 5, b"(none)"); // domainname
 
-    let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            buf as *mut u8,
-            utsname.as_ptr(),
-            utsname.len(),
-        )
-    };
+    let rc =
+        unsafe { crate::hal::copy_user_chunk(buf as *mut u8, utsname.as_ptr(), utsname.len()) };
     if rc != 0 {
         return Err(Errno::Efault);
     }

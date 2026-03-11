@@ -1,7 +1,7 @@
+use crate::hal_common::VirtAddr;
+use crate::mm::vm::MapPerm;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::hal_common::VirtAddr;
-use crate::mm::vm::map::entry::MapPerm;
 
 /// A single loadable memory region parsed from an ELF PT_LOAD segment.
 #[derive(Debug, Clone)]
@@ -178,12 +178,7 @@ pub fn parse_elf_first_page(page_bytes: &[u8]) -> Result<(Header, Vec<ProgramHea
     let endianness = header.endianness()?;
     let ctx = goblin::container::Ctx::new(container, endianness);
 
-    let phdrs = ProgramHeader::parse(
-        page_bytes,
-        phoff,
-        phnum,
-        ctx,
-    )?;
+    let phdrs = ProgramHeader::parse(page_bytes, phoff, phnum, ctx)?;
 
     Ok((header, phdrs))
 }

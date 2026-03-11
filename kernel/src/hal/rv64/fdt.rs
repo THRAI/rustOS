@@ -167,7 +167,9 @@ fn read_cstr(addr: usize) -> &'static [u8] {
     unsafe {
         while *((addr + len) as *const u8) != 0 {
             len += 1;
-            if len > 256 { break; } // safety limit
+            if len > 256 {
+                break;
+            } // safety limit
         }
         core::slice::from_raw_parts(addr as *const u8, len)
     }

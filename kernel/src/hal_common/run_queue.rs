@@ -4,8 +4,8 @@
 //! uses `async_task::Runnable`.
 
 extern crate alloc;
-use alloc::collections::VecDeque;
 use super::IrqSafeSpinLock;
+use alloc::collections::VecDeque;
 
 /// A FIFO run queue protected by IrqSafeSpinLock.
 ///

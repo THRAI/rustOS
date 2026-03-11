@@ -4,10 +4,10 @@
 //! negotiates features, sets up a single virtqueue, and provides
 //! synchronous read_sector/write_sector with adaptive polling.
 
-use crate::drivers::virtio_mmio::*;
+use crate::drivers::*;
+use crate::hal_common::PAGE_SIZE;
 use crate::mm::allocator::{alloc_raw_frame_sync, PageRole};
 use core::sync::atomic::{fence, Ordering};
-use crate::hal_common::PAGE_SIZE;
 
 /// Align `val` up to `align` (must be power of 2).
 const fn align_up(val: usize, align: usize) -> usize {
@@ -101,7 +101,8 @@ pub struct VirtioBlk {
 }
 
 /// Global driver instance.
-static VIRTIO_BLK: crate::hal_common::Once<crate::hal_common::SpinMutex<VirtioBlk>> = crate::hal_common::Once::new();
+static VIRTIO_BLK: crate::hal_common::Once<crate::hal_common::SpinMutex<VirtioBlk>> =
+    crate::hal_common::Once::new();
 
 impl VirtioBlk {
     /// Probe MMIO addresses and initialize the first block device found.

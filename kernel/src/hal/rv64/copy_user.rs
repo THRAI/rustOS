@@ -4,7 +4,7 @@
 //! exception fixup. On a page fault during the copy, the trap handler
 //! redirects to the landing pad which returns EFAULT (14).
 
-use crate::executor::per_cpu::PerCpu;
+use crate::executor::PerCpu;
 use core::arch::global_asm;
 
 /// Byte offset of `pcb_onfault` within PerCpu, computed at compile time.

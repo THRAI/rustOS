@@ -3,12 +3,12 @@
 //! Simple HashMap-based cache for path component lookup.
 //! Eviction is not implemented (sufficient for competition workloads).
 
+use crate::hal_common::IrqSafeSpinLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use crate::hal_common::IrqSafeSpinLock;
 
-use super::vnode::{Vnode, VnodeId};
+use crate::fs::{Vnode, VnodeId};
 
 /// Dentry cache key: (parent vnode id, child name).
 type DentryKey = (VnodeId, String);

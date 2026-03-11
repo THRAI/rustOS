@@ -2,11 +2,11 @@
 //!
 //! Implements mmap, munmap, brk, mprotect and related memory operations.
 
-use crate::fs::fd_table::FileObject;
+use crate::fs::FileObject;
 use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
 use alloc::sync::Arc;
 
-use crate::proc::task::Task;
+use crate::proc::Task;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -33,8 +33,8 @@ fn align_up_to_page(value: usize) -> Option<usize> {
         .map(|aligned| aligned & !(PAGE_SIZE - 1))
 }
 
-fn prot_bits_to_perm(prot_bits: usize) -> Result<crate::mm::vm::map::entry::MapPerm, Errno> {
-    use crate::mm::vm::map::entry::MapPerm;
+fn prot_bits_to_perm(prot_bits: usize) -> Result<crate::mm::vm::MapPerm, Errno> {
+    use crate::mm::vm::MapPerm;
 
     if prot_bits & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(Errno::Einval);
@@ -53,12 +53,12 @@ fn prot_bits_to_perm(prot_bits: usize) -> Result<crate::mm::vm::map::entry::MapP
     Ok(perm)
 }
 
-fn free_removed_frames(removed: alloc::vec::Vec<crate::mm::vm::map::entry::VmMapEntry>) {
+fn free_removed_frames(removed: alloc::vec::Vec<crate::mm::vm::VmMapEntry>) {
     drop(removed);
 }
 
 fn resolve_mmap_base(
-    vm: &mut crate::mm::vm::map::VmMap,
+    vm: &mut crate::mm::vm::VmMap,
     addr: usize,
     aligned_len: usize,
     map_fixed: bool,
@@ -89,17 +89,14 @@ fn resolve_mmap_base(
 fn build_file_backed_object(
     vnode: &Arc<dyn crate::fs::Vnode>,
     map_private: bool,
-) -> Arc<spin::RwLock<crate::mm::vm::vm_object::VmObject>> {
-    let base_obj = crate::fs::vnode::vnode_object(&**vnode);
+) -> Arc<spin::RwLock<crate::mm::vm::VmObject>> {
+    let base_obj = crate::fs::vnode_object(&**vnode);
 
     if !map_private {
         return base_obj;
     }
 
-    let shadow = crate::mm::vm::vm_object::VmObject::new_shadow(
-        Arc::clone(&base_obj),
-        base_obj.read().size(),
-    );
+    let shadow = crate::mm::vm::VmObject::new_shadow(Arc::clone(&base_obj), base_obj.read().size());
     if let Some(ref pager) = base_obj.read().pager {
         if !pager.is_anon() {
             shadow.write().pager = Some(Arc::clone(pager));
@@ -118,10 +115,10 @@ pub fn sys_mmap(
     fd: u32,
     offset: u64,
 ) -> usize {
-    use crate::fs::vnode::VnodeType;
-    use crate::mm::vm::map::entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
-    use crate::mm::vm::map::VmError;
-    use crate::mm::vm::vm_object::VmObject;
+    use crate::fs::VnodeType;
+    use crate::mm::vm::VmError;
+    use crate::mm::vm::VmObject;
+    use crate::mm::vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
 
     let aligned_len = match align_up_to_page(len) {
         Some(aligned_len) if aligned_len != 0 => aligned_len,
@@ -193,10 +190,7 @@ pub fn sys_mmap(
     let vma = VmMapEntry::new(
         base as u64,
         (base + aligned_len) as u64,
-        BackingStore::Object {
-            object,
-            offset,
-        },
+        BackingStore::Object { object, offset },
         EntryFlags::empty(),
         perm,
     );
@@ -235,7 +229,7 @@ pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> usize {
 
 /// sys_mprotect: change VMA permissions + update PTEs.
 pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize) -> usize {
-    use crate::mm::vm::map::VmError;
+    use crate::mm::vm::VmError;
 
     if len == 0 || !is_page_aligned(addr) {
         return errno_ret(Errno::Einval);

@@ -4,11 +4,11 @@
 //! Layer 2: FileDescription — shared across dup/fork, holds offset + status flags + FileObject
 //! Layer 3: FileObject — enum of Vnode | Pipe{Read,Write} | Device
 
+use crate::fs::{Pipe, Vnode};
+use crate::hal_common::Errno;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::hal_common::Errno;
-use super::vnode::Vnode;
 
 /// Maximum number of file descriptors per process.
 const MAX_FDS: usize = 256;
@@ -69,9 +69,9 @@ pub enum FileObject {
     /// Regular file backed by a vnode (ext4, etc.)
     Vnode(Arc<dyn Vnode>),
     /// Read end of a pipe.
-    PipeRead(Arc<super::pipe::Pipe>),
+    PipeRead(Arc<Pipe>),
     /// Write end of a pipe.
-    PipeWrite(Arc<super::pipe::Pipe>),
+    PipeWrite(Arc<Pipe>),
     /// Static device node.
     Device(DeviceKind),
 }

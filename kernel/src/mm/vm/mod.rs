@@ -17,3 +17,15 @@ pub mod wait_queue;
 pub mod fault_async;
 
 pub mod test_integration;
+
+pub use fault::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
+pub use fault_async::resolve_user_fault;
+pub use map::entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
+pub use map::{VmError, VmMap};
+pub use page::{ExclusiveBusyGuard, SharedBusyGuard, VmPage};
+pub use vm_map::{
+    MapPerm as LegacyMapPerm, VmArea as LegacyVmArea, VmAreaType as LegacyVmAreaType,
+    VmMap as LegacyVmMap,
+};
+pub use vm_object::{AnonPager, Pager, VObjIndex, VmObject, VnodePager};
+pub use wait_queue::{register_waker, remove_waker, wake_all};

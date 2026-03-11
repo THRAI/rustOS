@@ -22,9 +22,12 @@ pub mod types; // <-- Added types module
 #[cfg(not(test))]
 pub mod frame_allocator;
 
+pub use buddy::BuddyAllocator;
 #[cfg(not(test))]
 pub use frame_allocator::*;
+pub use magazine::Magazine;
 pub use types::*; // <-- Export types
+pub(crate) use types::{FRAME_META, FRAME_META_LEN};
 
 /// Test-only stub: alloc_raw_frame_sync backed by a simple atomic counter.
 #[cfg(test)]
@@ -36,28 +39,24 @@ pub fn alloc_raw_frame_sync(_role: PageRole) -> Option<crate::hal_common::PhysAd
 }
 
 #[cfg(test)]
-pub fn frame_free(_frame: &'static mut crate::mm::vm::page::VmPage) {}
+pub fn frame_free(_frame: &'static mut crate::mm::VmPage) {}
 
 #[cfg(test)]
-pub fn frame_free_usage(_frame: &'static mut crate::mm::vm::page::VmPage) {}
+pub fn frame_free_usage(_frame: &'static mut crate::mm::VmPage) {}
 
 #[cfg(test)]
-pub fn frame_alloc_usage(
-    frame: &'static mut crate::mm::vm::page::VmPage,
-) -> &'static mut crate::mm::vm::page::VmPage {
-    crate::mm::allocator::types::get_frame_meta(frame.phys_addr).unwrap()
+pub fn frame_alloc_usage(frame: &'static mut crate::mm::VmPage) -> &'static mut crate::mm::VmPage {
+    get_frame_meta(frame.phys_addr).unwrap()
 }
 
 #[cfg(test)]
 macro_rules! define_test_alloc_wrapper {
     ($name:ident, $name_sync:ident, $role:ident) => {
-        pub async fn $name() -> Option<&'static mut crate::mm::vm::page::VmPage> {
-            alloc_raw_frame_sync(PageRole::$role)
-                .map(|phys| crate::mm::allocator::types::get_frame_meta(phys).unwrap())
+        pub async fn $name() -> Option<&'static mut crate::mm::VmPage> {
+            alloc_raw_frame_sync(PageRole::$role).map(|phys| get_frame_meta(phys).unwrap())
         }
-        pub fn $name_sync() -> Option<&'static mut crate::mm::vm::page::VmPage> {
-            alloc_raw_frame_sync(PageRole::$role)
-                .map(|phys| crate::mm::allocator::types::get_frame_meta(phys).unwrap())
+        pub fn $name_sync() -> Option<&'static mut crate::mm::VmPage> {
+            alloc_raw_frame_sync(PageRole::$role).map(|phys| get_frame_meta(phys).unwrap())
         }
     };
 }
@@ -94,7 +93,10 @@ pub fn free_raw_frame(_addr: crate::hal_common::PhysAddr) {}
 pub fn frame_alloc_contiguous(count: usize) -> Option<crate::hal_common::PhysAddr> {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static NEXT_FRAME_CONTIG: AtomicUsize = AtomicUsize::new(0x9000_0000);
-    let addr = NEXT_FRAME_CONTIG.fetch_add(crate::hal_common::PAGE_SIZE * (1 << count), Ordering::Relaxed);
+    let addr = NEXT_FRAME_CONTIG.fetch_add(
+        crate::hal_common::PAGE_SIZE * (1 << count),
+        Ordering::Relaxed,
+    );
     Some(crate::hal_common::PhysAddr::new(addr))
 }
 
@@ -102,4 +104,8 @@ pub fn frame_alloc_contiguous(count: usize) -> Option<crate::hal_common::PhysAdd
 pub fn frame_free_contiguous(_addr: crate::hal_common::PhysAddr, _order: usize) {}
 
 #[cfg(test)]
-pub fn init_frame_allocator(_start: crate::hal_common::PhysAddr, _end: crate::hal_common::PhysAddr) {}
+pub fn init_frame_allocator(
+    _start: crate::hal_common::PhysAddr,
+    _end: crate::hal_common::PhysAddr,
+) {
+}

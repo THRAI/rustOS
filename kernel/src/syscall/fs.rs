@@ -1,16 +1,14 @@
 //! File system related system calls.
 
-use crate::fs::delegate;
-use crate::fs::fd_table::{FdFlags, FdTable, FileDescription, FileObject, OpenFlags};
-use crate::fs::vnode::{VnodeType, vnode_object, vnode_object_if_exists, vnode_destroy_object};
-use crate::mm::vm::vm_object::VmObject;
-use crate::hal_common::addr::VirtPageNum;
+use crate::fs::{
+    self, vnode_destroy_object, vnode_object, vnode_object_if_exists, FdFlags, FdTable,
+    FileDescription, FileObject, OpenFlags, VnodeType,
+};
+use crate::hal_common::VirtPageNum;
 use crate::hal_common::{Errno, VirtAddr};
-use crate::mm::uio::{uiomove, UioDir};
-use crate::mm::vm::fault::PageFaultAccessType;
-use crate::mm::vm::fault_async::resolve_user_fault;
-use crate::proc::task::Task;
-use crate::proc::user_copy::{copyinstr, fault_in_user_buffer};
+use crate::mm::resolve_user_fault;
+use crate::mm::{uiomove, PageFaultAccessType, UioDir, VmObject};
+use crate::proc::{copyinstr, fault_in_user_buffer, Task, SIGPIPE};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -119,7 +117,7 @@ pub async fn open(
     const O_DIRECTORY: u32 = 0x10000;
 
     if let Some(dev_name) = path_str.strip_prefix("/dev/") {
-        let desc = crate::fs::devfs::open_device(dev_name, flags)?;
+        let desc = crate::fs::open_device(dev_name, flags)?;
         let fd = fd_table.lock().insert(desc, fd_flags)?;
         return Ok(fd);
     }
@@ -129,7 +127,7 @@ pub async fn open(
     let trunc = (raw_flags & O_TRUNC) != 0;
 
     // First resolve to distinguish "exists" from "create path".
-    let first_resolve = crate::fs::path::resolve(path_str).await;
+    let first_resolve = crate::fs::resolve(path_str).await;
     if first_resolve.is_ok() && create && excl {
         return Err(Errno::Eexist);
     }
@@ -142,22 +140,22 @@ pub async fn open(
             }
             // Create by opening once with O_CREAT-compatible flags, then close.
             let create_flags = normalize_delegate_open_flags(raw_flags);
-            let handle = delegate::fs_open_flags(path_str, create_flags)
+            let handle = crate::fs::fs_open_flags(path_str, create_flags)
                 .await
                 .map_err(|_| if excl { Errno::Eexist } else { Errno::Eio })?;
-            let _ = delegate::fs_close(handle).await;
-            crate::fs::path::resolve(path_str).await?
+            let _ = crate::fs::fs_close(handle).await;
+            crate::fs::resolve(path_str).await?
         }
     };
 
     // Handle O_DIRECTORY: verify it's a directory
-    if (raw_flags & O_DIRECTORY) != 0 && vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+    if (raw_flags & O_DIRECTORY) != 0 && vnode.vtype() != crate::fs::VnodeType::Directory {
         return Err(Errno::Enotdir);
     }
 
     // Handle O_TRUNC for regular files.
-    if trunc && flags.write && vnode.vtype() == crate::fs::vnode::VnodeType::Regular {
-        delegate::fs_truncate(path_str, 0)
+    if trunc && flags.write && vnode.vtype() == crate::fs::VnodeType::Regular {
+        crate::fs::fs_truncate(path_str, 0)
             .await
             .map_err(|_| Errno::Eio)?;
         vnode_destroy_object(vnode.vnode_id());
@@ -242,34 +240,9 @@ pub async fn read(
     Ok(total)
 }
 
-#[inline]
-fn map_delegate_errno(code: i32) -> Errno {
-    match code.abs() {
-        1 => Errno::Eperm,
-        2 => Errno::Enoent,
-        5 => Errno::Eio,
-        9 => Errno::Ebadf,
-        12 => Errno::Enomem,
-        13 => Errno::Eperm,
-        17 => Errno::Eexist,
-        19 => Errno::Enodev,
-        20 => Errno::Enotdir,
-        21 => Errno::Eisdir,
-        22 => Errno::Einval,
-        24 => Errno::Emfile,
-        25 => Errno::Enotty,
-        29 => Errno::Espipe,
-        32 => Errno::Epipe,
-        34 => Errno::Erange,
-        38 => Errno::Enosys,
-        39 => Errno::Enotempty,
-        _ => Errno::Eio,
-    }
-}
-
 /// sys_lseek: reposition file offset.
 pub fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<u64, Errno> {
-    use crate::fs::fd_table::FileObject;
+    use crate::fs::FileObject;
     use core::sync::atomic::Ordering;
 
     const SEEK_SET: u32 = 0;
@@ -309,7 +282,7 @@ pub fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<
 
 /// sys_fstat: write stat struct to user memory.
 pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
-    use crate::fs::fd_table::FileObject;
+    use crate::fs::FileObject;
 
     if statbuf == 0 {
         return Err(Errno::Efault);
@@ -347,7 +320,7 @@ pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno>
             let num_blocks = size.div_ceil(512) as i64;
             st.st_blocks = num_blocks;
             st.st_ino = v.vnode_id();
-            use crate::fs::vnode::VnodeType;
+            use crate::fs::VnodeType;
             let ftype = match v.vtype() {
                 VnodeType::Regular => 1u8,
                 VnodeType::Directory => 2u8,
@@ -358,7 +331,7 @@ pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno>
             st.st_mode = 0o010600; // S_IFIFO | rw
         }
         FileObject::Device(dk) => {
-            use crate::fs::fd_table::DeviceKind;
+            use crate::fs::DeviceKind;
             st.st_mode = 0o020666; // S_IFCHR | rw
             st.st_rdev = match dk {
                 DeviceKind::Null => 0x0103,                                   // 1:3
@@ -370,7 +343,7 @@ pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno>
 
     // Copy stat struct to user memory
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
+        crate::hal::copy_user_chunk(
             statbuf as *mut u8,
             &st as *const LinuxStat as *const u8,
             core::mem::size_of::<LinuxStat>(),
@@ -411,7 +384,9 @@ pub async fn sys_fstatat_async(
     if pathname_ptr == 0 {
         return Err(Errno::Efault);
     }
-    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::Efault)?;
+    let raw_path = copyinstr(task, pathname_ptr, 256)
+        .await
+        .ok_or(Errno::Efault)?;
     if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
         if dirfd < 0 {
             return Err(Errno::Ebadf);
@@ -422,7 +397,7 @@ pub async fn sys_fstatat_async(
         return Err(Errno::Enoent);
     }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
-    let (ino, ftype, size) = delegate::fs_lookup(0, &path_str).await.map_err(map_delegate_errno)?;
+    let (ino, ftype, size) = fs::fs_lookup(0, &path_str).await?;;
 
     let mut st = LinuxStat {
         st_dev: 0,
@@ -456,10 +431,11 @@ pub async fn sys_fstatat_async(
         statbuf,
         core::mem::size_of::<LinuxStat>(),
         PageFaultAccessType::WRITE,
-    ).await;
+    )
+    .await;
 
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
+        crate::hal::copy_user_chunk(
             statbuf as *mut u8,
             &st as *const LinuxStat as *const u8,
             core::mem::size_of::<LinuxStat>(),
@@ -502,7 +478,7 @@ pub async fn sys_utimensat_async(
         .await
         .ok_or(Errno::Efault)?;
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
-    let _ = crate::fs::path::resolve(&path_str).await?;
+    let _ = crate::fs::resolve(&path_str).await?;
 
     // If user supplies timestamps, validate user memory accessibility.
     if times_ptr != 0 {
@@ -515,7 +491,7 @@ pub async fn sys_utimensat_async(
         .await;
         let mut ts_buf = [0u8; TIMESPEC_PAIR_SIZE];
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 ts_buf.as_mut_ptr(),
                 times_ptr as *const u8,
                 TIMESPEC_PAIR_SIZE,
@@ -540,7 +516,7 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
     const O_APPEND: usize = 0x0000_0400;
     const O_NONBLOCK: usize = 0x0000_0800;
 
-    use crate::fs::fd_table::FdFlags;
+    use crate::fs::FdFlags;
 
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
@@ -608,8 +584,8 @@ pub async fn sys_chdir_async(task: &Arc<Task>, pathname_ptr: usize) -> Result<()
         .await
         .ok_or(Errno::Efault)?;
     let path = absolutize_path(task, AT_FDCWD, &raw_path)?;
-    let vnode = crate::fs::path::resolve(&path).await?;
-    if vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+    let vnode = crate::fs::resolve(&path).await?;
+    if vnode.vtype() != crate::fs::VnodeType::Directory {
         return Err(Errno::Enotdir);
     }
     *task.cwd.lock() = path;
@@ -628,9 +604,7 @@ pub fn sys_getcwd(task: &Arc<Task>, buf: usize, size: usize) -> Result<usize, Er
     }
     let mut out = cwd.into_bytes();
     out.push(0);
-    let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(buf as *mut u8, out.as_ptr(), out.len())
-    };
+    let rc = unsafe { crate::hal::copy_user_chunk(buf as *mut u8, out.as_ptr(), out.len()) };
     if rc != 0 {
         return Err(Errno::Efault);
     }
@@ -669,11 +643,13 @@ pub async fn sys_mount_async(
     }
 
     let target = absolutize_path(task, AT_FDCWD, &raw_target)?;
-    let target_vnode = crate::fs::path::resolve(&target).await.map_err(|_| Errno::Enoent)?;
-    if target_vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+    let target_vnode = crate::fs::resolve(&target)
+        .await
+        .map_err(|_| Errno::Enoent)?;
+    if target_vnode.vtype() != crate::fs::VnodeType::Directory {
         return Err(Errno::Enotdir);
     }
-    crate::fs::mount::register_mount(&source, &target, &fstype, flags)
+    crate::fs::register_mount(&source, &target, &fstype, flags)
 }
 
 /// sys_umount2: minimal unmount support paired with `sys_mount_async`.
@@ -706,7 +682,7 @@ pub async fn sys_umount2_async(
     if target == "/" {
         return Err(Errno::Einval);
     }
-    crate::fs::mount::unregister_mount(&target)
+    crate::fs::unregister_mount(&target)
 }
 
 /// sys_linkat: create hard link.
@@ -722,17 +698,20 @@ pub async fn sys_linkat_async(
     if (flags & !AT_SYMLINK_FOLLOW) != 0 {
         return Err(Errno::Einval);
     }
-    let old_raw = copyinstr(task, oldpath_ptr, 256).await.ok_or(Errno::Efault)?;
-    let new_raw = copyinstr(task, newpath_ptr, 256).await.ok_or(Errno::Efault)?;
+    let old_raw = copyinstr(task, oldpath_ptr, 256)
+        .await
+        .ok_or(Errno::Efault)?;
+    let new_raw = copyinstr(task, newpath_ptr, 256)
+        .await
+        .ok_or(Errno::Efault)?;
     let old_path = absolutize_path(task, olddirfd, &old_raw)?;
     let new_path = absolutize_path(task, newdirfd, &new_raw)?;
     // Minimal cross-mount guard. Linux reports EXDEV; use EINVAL until EXDEV exists.
-    if !crate::fs::mount::same_mount_domain(&old_path, &new_path) {
+    if !crate::fs::same_mount_domain(&old_path, &new_path) {
         return Err(Errno::Einval);
     }
-    delegate::fs_link(&old_path, &new_path)
-        .await
-        .map_err(map_delegate_errno)?;
+    fs::fs_link(&old_path, &new_path)
+        .await?;
     Ok(())
 }
 
@@ -749,17 +728,20 @@ pub async fn sys_renameat2_async(
     if flags != 0 {
         return Err(Errno::Einval);
     }
-    let old_raw = copyinstr(task, oldpath_ptr, 256).await.ok_or(Errno::Efault)?;
-    let new_raw = copyinstr(task, newpath_ptr, 256).await.ok_or(Errno::Efault)?;
+    let old_raw = copyinstr(task, oldpath_ptr, 256)
+        .await
+        .ok_or(Errno::Efault)?;
+    let new_raw = copyinstr(task, newpath_ptr, 256)
+        .await
+        .ok_or(Errno::Efault)?;
     let old_path = absolutize_path(task, olddirfd, &old_raw)?;
     let new_path = absolutize_path(task, newdirfd, &new_raw)?;
     // Minimal cross-mount guard. Linux reports EXDEV; use EINVAL until EXDEV exists.
-    if !crate::fs::mount::same_mount_domain(&old_path, &new_path) {
+    if !crate::fs::same_mount_domain(&old_path, &new_path) {
         return Err(Errno::Einval);
     }
-    delegate::fs_rename(&old_path, &new_path)
-        .await
-        .map_err(map_delegate_errno)?;
+    fs::fs_rename(&old_path, &new_path)
+        .await?;
     Ok(())
 }
 
@@ -774,19 +756,18 @@ pub async fn sys_readlinkat_async(
     if bufsiz == 0 {
         return Err(Errno::Einval);
     }
-    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::Efault)?;
-    let path = absolutize_path(task, dirfd, &raw_path)?;
-    let (mut n, data) = delegate::fs_readlink(&path)
+    let raw_path = copyinstr(task, pathname_ptr, 256)
         .await
-        .map_err(map_delegate_errno)?;
+        .ok_or(Errno::Efault)?;
+    let path = absolutize_path(task, dirfd, &raw_path)?;
+    let (mut n, data) = fs::fs_readlink(&path)
+        .await?;;
     if n > 0 && data[n - 1] == 0 {
         n -= 1;
     }
     let copy_len = core::cmp::min(n, bufsiz);
     fault_in_user_buffer(task, buf_ptr, copy_len, PageFaultAccessType::WRITE).await;
-    let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(buf_ptr as *mut u8, data.as_ptr(), copy_len)
-    };
+    let rc = unsafe { crate::hal::copy_user_chunk(buf_ptr as *mut u8, data.as_ptr(), copy_len) };
     if rc != 0 {
         return Err(Errno::Efault);
     }
@@ -818,20 +799,21 @@ pub async fn sys_faccessat_async(
     if pathname_ptr == 0 {
         return Err(Errno::Efault);
     }
-    let raw_path = copyinstr(task, pathname_ptr, 256).await.ok_or(Errno::Efault)?;
+    let raw_path = copyinstr(task, pathname_ptr, 256)
+        .await
+        .ok_or(Errno::Efault)?;
     if raw_path.is_empty() {
         return Err(Errno::Enoent);
     }
     let path = absolutize_path(task, dirfd, &raw_path)?;
-    let _ = delegate::fs_lookup(0, &path)
-        .await
-        .map_err(map_delegate_errno)?;
+    let _ = fs::fs_lookup(0, &path)
+        .await?;
     Ok(())
 }
 
 /// sys_ftruncate: truncate regular file by fd.
 pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<(), Errno> {
-    use crate::fs::fd_table::FileObject;
+    use crate::fs::FileObject;
     let desc = {
         let tab = task.fd_table.lock();
         Arc::clone(tab.get(fd).ok_or(Errno::Ebadf)?)
@@ -840,9 +822,8 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
         FileObject::Vnode(v) => String::from(v.path()),
         _ => return Err(Errno::Einval),
     };
-    delegate::fs_truncate(&path, len)
-        .await
-        .map_err(map_delegate_errno)?;
+    fs::fs_truncate(&path, len)
+        .await?;;
     if let FileObject::Vnode(v) = &desc.object {
         v.set_size(len);
     }
@@ -855,7 +836,7 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
 
 /// sys_fsync: flush data and metadata.
 pub async fn sys_fsync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
-    use crate::fs::fd_table::FileObject;
+    use crate::fs::FileObject;
     let path = {
         let tab = task.fd_table.lock();
         let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
@@ -864,9 +845,7 @@ pub async fn sys_fsync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
             _ => return Ok(()),
         }
     };
-    delegate::fs_cache_flush(&path)
-        .await
-        .map_err(map_delegate_errno)
+    crate::fs::fs_cache_flush(&path).await
 }
 
 /// sys_fdatasync: flush data (same as fsync for now).
@@ -876,15 +855,13 @@ pub async fn sys_fdatasync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno>
 
 /// sys_sync: flush all filesystem cache.
 pub async fn sys_sync_async() -> Result<(), Errno> {
-    delegate::fs_cache_flush("/")
-        .await
-        .map_err(map_delegate_errno)
+    crate::fs::fs_cache_flush("/").await
 }
 
 /// sys_pipe2: create a pipe with optional flags.
 pub fn sys_pipe2(task: &Arc<Task>, pipefd_ptr: usize, flags: usize) -> Result<(), Errno> {
-    use crate::fs::fd_table::{FdFlags, FileDescription, FileObject, OpenFlags};
-    use crate::fs::pipe::Pipe;
+    use crate::fs::Pipe;
+    use crate::fs::{FdFlags, FileDescription, FileObject, OpenFlags};
 
     let pipe = Pipe::new();
     let cloexec = (flags & 0o2000000) != 0;
@@ -915,11 +892,7 @@ pub fn sys_pipe2(task: &Arc<Task>, pipefd_ptr: usize, flags: usize) -> Result<()
     if pipefd_ptr != 0 {
         let fds: [i32; 2] = [read_fd as i32, write_fd as i32];
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                pipefd_ptr as *mut u8,
-                fds.as_ptr() as *const u8,
-                8,
-            )
+            crate::hal::copy_user_chunk(pipefd_ptr as *mut u8, fds.as_ptr() as *const u8, 8)
         };
         if rc != 0 {
             return Err(Errno::Efault);
@@ -972,7 +945,14 @@ pub async fn sys_openat_async(
     // Pass full flags to delegate for O_CREAT/O_TRUNC handling
     let delegate_flags = flags as u32;
 
-    open(&task.fd_table, &path_str, open_flags, delegate_flags, fd_flags).await
+    open(
+        &task.fd_table,
+        &path_str,
+        open_flags,
+        delegate_flags,
+        fd_flags,
+    )
+    .await
 }
 
 /// sys_close: close a file descriptor.
@@ -1038,8 +1018,8 @@ pub fn absolutize_path(task: &Arc<Task>, dirfd: isize, raw_path: &str) -> Result
             let tab = task.fd_table.lock();
             let desc = tab.get(dirfd as u32).ok_or(Errno::Ebadf)?;
             match &desc.object {
-                crate::fs::fd_table::FileObject::Vnode(v) => {
-                    if v.vtype() != crate::fs::vnode::VnodeType::Directory {
+                crate::fs::FileObject::Vnode(v) => {
+                    if v.vtype() != crate::fs::VnodeType::Directory {
                         return Err(Errno::Enotdir);
                     }
                     String::from(v.path())
@@ -1069,7 +1049,7 @@ pub async fn sys_read_async(
     user_buf: usize,
     len: usize,
 ) -> Result<usize, Errno> {
-    use crate::fs::fd_table::{DeviceKind, FileObject};
+    use crate::fs::{DeviceKind, FileObject};
 
     if len == 0 {
         return Ok(0);
@@ -1081,7 +1061,7 @@ pub async fn sys_read_async(
             size: u64,
             offset: u64,
         },
-        PipeRead(alloc::sync::Arc<crate::fs::pipe::Pipe>),
+        PipeRead(alloc::sync::Arc<crate::fs::Pipe>),
         DevNull,
         DevZero,
         DevConsole,
@@ -1114,13 +1094,8 @@ pub async fn sys_read_async(
         ReadSource::DevZero => {
             fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::WRITE).await;
             let zeros = alloc::vec![0u8; len];
-            let rc = unsafe {
-                crate::hal::rv64::copy_user::copy_user_chunk(
-                    user_buf as *mut u8,
-                    zeros.as_ptr(),
-                    len,
-                )
-            };
+            let rc =
+                unsafe { crate::hal::copy_user_chunk(user_buf as *mut u8, zeros.as_ptr(), len) };
             if rc != 0 {
                 Err(Errno::Efault)
             } else {
@@ -1201,7 +1176,7 @@ pub async fn sys_write_async(
     user_buf: usize,
     len: usize,
 ) -> Result<usize, Errno> {
-    use crate::fs::fd_table::{DeviceKind, FileObject};
+    use crate::fs::{DeviceKind, FileObject};
 
     if len == 0 {
         return Ok(0);
@@ -1210,7 +1185,7 @@ pub async fn sys_write_async(
     enum WriteTarget {
         DevNull,
         DevConsole,
-        PipeWrite(alloc::sync::Arc<crate::fs::pipe::Pipe>),
+        PipeWrite(alloc::sync::Arc<crate::fs::Pipe>),
         Vnode {
             path: String,
             offset: u64,
@@ -1246,11 +1221,7 @@ pub async fn sys_write_async(
             fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
             let mut kbuf = alloc::vec![0u8; len];
             let rc = unsafe {
-                crate::hal::rv64::copy_user::copy_user_chunk(
-                    kbuf.as_mut_ptr(),
-                    user_buf as *const u8,
-                    len,
-                )
+                crate::hal::copy_user_chunk(kbuf.as_mut_ptr(), user_buf as *const u8, len)
             };
             if rc != 0 {
                 return Err(Errno::Efault);
@@ -1263,11 +1234,7 @@ pub async fn sys_write_async(
             fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
             let mut kbuf = alloc::vec![0u8; len];
             let rc = unsafe {
-                crate::hal::rv64::copy_user::copy_user_chunk(
-                    kbuf.as_mut_ptr(),
-                    user_buf as *const u8,
-                    len,
-                )
+                crate::hal::copy_user_chunk(kbuf.as_mut_ptr(), user_buf as *const u8, len)
             };
             if rc != 0 {
                 return Err(Errno::Efault);
@@ -1280,7 +1247,7 @@ pub async fn sys_write_async(
             }
             .await;
             if let Err(Errno::Epipe) = &result {
-                task.signals.post_signal(crate::proc::signal::SIGPIPE);
+                task.signals.post_signal(crate::proc::SIGPIPE);
             }
             result
         }
@@ -1291,7 +1258,7 @@ pub async fn sys_write_async(
         } => {
             // Handle O_APPEND: write at end of file
             if append {
-                if let Ok((_, _, file_size)) = delegate::fs_lookup(0, &path).await {
+                if let Ok((_, _, file_size)) = crate::fs::fs_lookup(0, &path).await {
                     offset = file_size;
                 }
             }
@@ -1300,18 +1267,14 @@ pub async fn sys_write_async(
             fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
             let mut kbuf = alloc::vec![0u8; len];
             let rc = unsafe {
-                crate::hal::rv64::copy_user::copy_user_chunk(
-                    kbuf.as_mut_ptr(),
-                    user_buf as *const u8,
-                    len,
-                )
+                crate::hal::copy_user_chunk(kbuf.as_mut_ptr(), user_buf as *const u8, len)
             };
             if rc != 0 {
                 return Err(Errno::Efault);
             }
 
             // Write to file via delegate
-            match delegate::fs_write_at(&path, offset, &kbuf).await {
+            match crate::fs::fs_write_at(&path, offset, &kbuf).await {
                 Ok(n) => {
                     // Update file offset
                     desc.offset
@@ -1329,10 +1292,8 @@ pub async fn sys_write_async(
                                     } else {
                                         0
                                     };
-                                    let copy_end = core::cmp::min(
-                                        PAGE_SIZE,
-                                        offset as usize + n - page_base,
-                                    );
+                                    let copy_end =
+                                        core::cmp::min(PAGE_SIZE, offset as usize + n - page_base);
                                     let src_off = page_base + copy_start - offset as usize;
                                     unsafe {
                                         core::ptr::copy_nonoverlapping(
@@ -1375,11 +1336,7 @@ pub async fn sys_readv_async(
     fault_in_user_buffer(task, iov_ptr, iov_size, PageFaultAccessType::READ).await;
     let mut iov_buf = alloc::vec![0u8; iov_size];
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            iov_buf.as_mut_ptr(),
-            iov_ptr as *const u8,
-            iov_size,
-        )
+        crate::hal::copy_user_chunk(iov_buf.as_mut_ptr(), iov_ptr as *const u8, iov_size)
     };
     if rc != 0 {
         return Err(Errno::Efault);
@@ -1431,11 +1388,7 @@ pub async fn sys_writev_async(
     fault_in_user_buffer(task, iov_ptr, iov_size, PageFaultAccessType::READ).await;
     let mut iov_buf = alloc::vec![0u8; iov_size];
     let rc = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
-            iov_buf.as_mut_ptr(),
-            iov_ptr as *const u8,
-            iov_size,
-        )
+        crate::hal::copy_user_chunk(iov_buf.as_mut_ptr(), iov_ptr as *const u8, iov_size)
     };
     if rc != 0 {
         return Err(Errno::Efault);
@@ -1474,7 +1427,7 @@ pub async fn sys_ioctl_async(
     request: usize,
     argp: usize,
 ) -> Result<i32, Errno> {
-    use crate::fs::fd_table::{DeviceKind, FileObject};
+    use crate::fs::{DeviceKind, FileObject};
 
     let is_console = {
         let tab = task.fd_table.lock();
@@ -1506,11 +1459,7 @@ pub async fn sys_ioctl_async(
                 termios[2] = 0o000017;
                 termios[3] = 0o000012;
                 let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
-                        argp as *mut u8,
-                        termios.as_ptr() as *const u8,
-                        60,
-                    )
+                    crate::hal::copy_user_chunk(argp as *mut u8, termios.as_ptr() as *const u8, 60)
                 };
                 if rc != 0 {
                     return Err(Errno::Efault);
@@ -1523,11 +1472,7 @@ pub async fn sys_ioctl_async(
                 fault_in_user_buffer(task, argp, 8, PageFaultAccessType::WRITE).await;
                 let winsize: [u16; 4] = [24, 80, 0, 0];
                 let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
-                        argp as *mut u8,
-                        winsize.as_ptr() as *const u8,
-                        8,
-                    )
+                    crate::hal::copy_user_chunk(argp as *mut u8, winsize.as_ptr() as *const u8, 8)
                 };
                 if rc != 0 {
                     return Err(Errno::Efault);
@@ -1548,7 +1493,7 @@ pub async fn sys_ppoll_async(
     nfds: usize,
     timeout_ptr: usize,
 ) -> Result<usize, Errno> {
-    use crate::fs::fd_table::{DeviceKind, FileObject};
+    use crate::fs::{DeviceKind, FileObject};
 
     if nfds > 256 {
         return Err(Errno::Einval);
@@ -1562,11 +1507,7 @@ pub async fn sys_ppoll_async(
     let mut poll_buf = alloc::vec![0u8; poll_size];
     if nfds > 0 {
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                poll_buf.as_mut_ptr(),
-                fds_ptr as *const u8,
-                poll_size,
-            )
+            crate::hal::copy_user_chunk(poll_buf.as_mut_ptr(), fds_ptr as *const u8, poll_size)
         };
         if rc != 0 {
             return Err(Errno::Efault);
@@ -1577,11 +1518,7 @@ pub async fn sys_ppoll_async(
         fault_in_user_buffer(task, timeout_ptr, 16, PageFaultAccessType::READ).await;
         let mut ts_buf = [0u8; 16];
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                ts_buf.as_mut_ptr(),
-                timeout_ptr as *const u8,
-                16,
-            )
+            crate::hal::copy_user_chunk(ts_buf.as_mut_ptr(), timeout_ptr as *const u8, 16)
         };
         if rc != 0 {
             return Err(Errno::Efault);
@@ -1603,7 +1540,7 @@ pub async fn sys_ppoll_async(
     const POLLNVAL: i16 = 0x020;
 
     let deadline = timeout_ms.map(|ms| {
-        let now = crate::hal::rv64::timer::read_time_ms();
+        let now = crate::hal::read_time_ms();
         now + ms
     });
 
@@ -1671,11 +1608,7 @@ pub async fn sys_ppoll_async(
             if nfds > 0 {
                 fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE).await;
                 let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
-                        fds_ptr as *mut u8,
-                        poll_buf.as_ptr(),
-                        poll_size,
-                    )
+                    crate::hal::copy_user_chunk(fds_ptr as *mut u8, poll_buf.as_ptr(), poll_size)
                 };
                 if rc != 0 {
                     return Err(Errno::Efault);
@@ -1685,13 +1618,13 @@ pub async fn sys_ppoll_async(
         }
 
         if let Some(dl) = deadline {
-            let now = crate::hal::rv64::timer::read_time_ms();
+            let now = crate::hal::read_time_ms();
             if now >= dl {
                 if nfds > 0 {
                     fault_in_user_buffer(task, fds_ptr, poll_size, PageFaultAccessType::WRITE)
                         .await;
                     let rc = unsafe {
-                        crate::hal::rv64::copy_user::copy_user_chunk(
+                        crate::hal::copy_user_chunk(
                             fds_ptr as *mut u8,
                             poll_buf.as_ptr(),
                             poll_size,
@@ -1715,7 +1648,7 @@ pub async fn sys_ppoll_async(
 
 /// Future for async pipe read.
 pub struct PipeReadFuture<'a> {
-    pipe: alloc::sync::Arc<crate::fs::pipe::Pipe>,
+    pipe: alloc::sync::Arc<crate::fs::Pipe>,
     task: &'a Arc<Task>,
     user_buf: usize,
     len: usize,
@@ -1734,11 +1667,7 @@ impl<'a> Future for PipeReadFuture<'a> {
             Ok(0) => Poll::Ready(Ok(0)),
             Ok(n) => {
                 let rc = unsafe {
-                    crate::hal::rv64::copy_user::copy_user_chunk(
-                        this.user_buf as *mut u8,
-                        kbuf.as_ptr(),
-                        n,
-                    )
+                    crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf.as_ptr(), n)
                 };
                 if rc != 0 {
                     Poll::Ready(Err(Errno::Efault))
@@ -1773,13 +1702,8 @@ impl<'a> Future for ConsoleReadFuture<'a> {
         let mut kbuf = alloc::vec![0u8; this.len];
         let n = crate::console::console_read(&mut kbuf);
         if n > 0 {
-            let rc = unsafe {
-                crate::hal::rv64::copy_user::copy_user_chunk(
-                    this.user_buf as *mut u8,
-                    kbuf.as_ptr(),
-                    n,
-                )
-            };
+            let rc =
+                unsafe { crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf.as_ptr(), n) };
             if rc != 0 {
                 Poll::Ready(Err(Errno::Efault))
             } else {
@@ -1794,7 +1718,7 @@ impl<'a> Future for ConsoleReadFuture<'a> {
 
 /// Future for async pipe write.
 pub struct PipeWriteFuture<'a> {
-    pipe: alloc::sync::Arc<crate::fs::pipe::Pipe>,
+    pipe: alloc::sync::Arc<crate::fs::Pipe>,
     task: &'a Arc<Task>,
     data: alloc::vec::Vec<u8>,
     written: usize,
@@ -1829,7 +1753,7 @@ impl<'a> Future for PipeWriteFuture<'a> {
             }
             Err(Errno::Epipe) => {
                 // Post SIGPIPE when writing to a pipe with no readers
-                this.task.signals.post_signal(crate::proc::signal::SIGPIPE);
+                this.task.signals.post_signal(crate::proc::SIGPIPE);
                 Poll::Ready(Err(Errno::Epipe))
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -1862,12 +1786,12 @@ pub async fn sys_mkdirat_async(
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
 
     // Check if already exists
-    let exists = delegate::fs_lookup(0, &path_str).await;
+    let exists = crate::fs::fs_lookup(0, &path_str).await;
     if exists.is_ok() {
         return Err(Errno::Eexist);
     }
 
-    delegate::fs_mkdir(&path_str)
+    crate::fs::fs_mkdir(&path_str)
         .await
         .map_err(|_| Errno::Eio)?;
 
@@ -1893,7 +1817,7 @@ pub async fn sys_unlinkat_async(
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
 
     // Check existence and type
-    let (child_ino, ftype, _) = delegate::fs_lookup(0, &path_str)
+    let (child_ino, ftype, _) = crate::fs::fs_lookup(0, &path_str)
         .await
         .map_err(|_| Errno::Enoent)?;
     let is_dir = ftype == 2;
@@ -1905,7 +1829,7 @@ pub async fn sys_unlinkat_async(
         return Err(Errno::Eisdir);
     }
 
-    delegate::fs_unlink(&path_str, is_dir)
+    crate::fs::fs_unlink(&path_str, is_dir)
         .await
         .map_err(|_| Errno::Eio)?;
 
@@ -1918,8 +1842,8 @@ pub async fn sys_unlinkat_async(
         };
         let child_name = &path_str[last_slash + 1..];
         // Resolve parent vnode id for dentry invalidation
-        if let Ok(vnode) = crate::fs::path::resolve(parent_path).await {
-            crate::fs::dentry::invalidate(vnode.vnode_id(), child_name);
+        if let Ok(vnode) = crate::fs::resolve(parent_path).await {
+            crate::fs::invalidate_dentry(vnode.vnode_id(), child_name);
         }
     }
     if !is_dir {
@@ -1962,10 +1886,10 @@ pub async fn sys_symlinkat_async(
         "/"
     };
 
-    let parent_vnode = crate::fs::path::resolve(parent)
+    let parent_vnode = crate::fs::resolve(parent)
         .await
         .map_err(|_| Errno::Enoent)?;
-    if parent_vnode.vtype() != crate::fs::vnode::VnodeType::Directory {
+    if parent_vnode.vtype() != crate::fs::VnodeType::Directory {
         return Err(Errno::Enotdir);
     }
 
@@ -1980,9 +1904,8 @@ pub async fn sys_symlinkat_async(
         normalize_absolute_path(&joined)
     };
 
-    delegate::fs_symlink(&target_abs, &link_abs)
-        .await
-        .map_err(map_delegate_errno)?;
+    fs::fs_symlink(&target_abs, &link_abs)
+        .await?;;
     crate::klog!(
         syscall,
         debug,
@@ -2031,7 +1954,7 @@ pub async fn sys_getdents64_async(
     let start_idx = desc.offset.load(Ordering::Relaxed) as usize;
 
     // Read a page of directory entries from current logical offset.
-    let (entries, count) = delegate::fs_readdir(&dir_path, start_idx)
+    let (entries, count) = crate::fs::fs_readdir(&dir_path, start_idx)
         .await
         .map_err(|_| Errno::Eio)?;
     if count == 0 {
@@ -2075,7 +1998,7 @@ pub async fn sys_getdents64_async(
         // Write dirent header to user memory
         let dst = (buf_ptr + written) as *mut u8;
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 dst,
                 &dirent as *const LinuxDirent64 as *const u8,
                 LEN_BEFORE_NAME,
@@ -2087,9 +2010,7 @@ pub async fn sys_getdents64_async(
 
         // Write name + null terminator
         let name_dst = (buf_ptr + written + LEN_BEFORE_NAME) as *mut u8;
-        let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(name_dst, name_bytes.as_ptr(), name_len)
-        };
+        let rc = unsafe { crate::hal::copy_user_chunk(name_dst, name_bytes.as_ptr(), name_len) };
         if rc != 0 {
             return Err(Errno::Efault);
         }
@@ -2097,13 +2018,8 @@ pub async fn sys_getdents64_async(
         let pad_start = buf_ptr + written + LEN_BEFORE_NAME + name_len;
         let pad_len = rec_len - LEN_BEFORE_NAME - name_len;
         let zeros = [0u8; 8];
-        let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
-                pad_start as *mut u8,
-                zeros.as_ptr(),
-                pad_len,
-            )
-        };
+        let rc =
+            unsafe { crate::hal::copy_user_chunk(pad_start as *mut u8, zeros.as_ptr(), pad_len) };
         if rc != 0 {
             return Err(Errno::Efault);
         }

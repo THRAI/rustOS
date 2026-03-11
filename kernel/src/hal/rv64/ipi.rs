@@ -24,8 +24,8 @@ pub fn handle_ipi() {
     }
 
     // Check for pending TLB shootdown on this CPU.
-    let cpu_id = crate::executor::per_cpu::current().cpu_id;
-    if crate::mm::pmap::shootdown::has_pending(cpu_id) {
-        crate::mm::pmap::shootdown::handle_shootdown_ipi(cpu_id);
+    let cpu_id = crate::executor::current().cpu_id;
+    if crate::mm::has_pending(cpu_id) {
+        crate::mm::handle_shootdown_ipi(cpu_id);
     }
 }

@@ -12,13 +12,11 @@ use core::task::{Context, Poll};
 
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
-use crate::hal::rv64::user_trap::trap_return;
-use crate::mm::vm::fault::PageFaultAccessType;
-use crate::mm::vm::fault_async::resolve_user_fault;
-use crate::proc::task::Task;
-use crate::proc::user_copy::do_exit;
+use crate::hal::trap_return;
+use crate::mm::{pmap_activate, pmap_deactivate, resolve_user_fault, PageFaultAccessType};
+use crate::proc::{check_pending_signals, do_exit, Task, WaitStatus};
 
-use super::schedule::{spawn_kernel_task, yield_now};
+use crate::executor::{spawn_kernel_task, yield_now};
 
 // Interrupt bit in scause (bit 63 on rv64)
 const SCAUSE_INTERRUPT: usize = 1 << 63;
@@ -61,22 +59,22 @@ async fn run_tasks(task: Arc<Task>) {
         {
             let vm_map = task.vm_map.lock();
             let mut pmap = vm_map.pmap_lock();
-            crate::mm::pmap::pmap_activate(&mut pmap);
+            pmap_activate(&mut pmap);
         }
 
         // Check for pending signals before returning to user mode.
-        match crate::proc::signal::check_pending_signals(&task) {
+        match check_pending_signals(&task) {
             Ok(_) => {} // signal delivered (or none pending), continue
             Err(sig) => {
                 // fatal signal (SIGKILL or unhandled)
                 // Linux wstatus for signal-killed: low 7 bits = signal number
-                let wstatus = crate::proc::exit_wait::WaitStatus::signaled(sig);
+                let wstatus = WaitStatus::signaled(sig);
                 klog!(
                     signal,
                     trace,
                     "run_tasks: FATAL signal pid={} sig={} wstatus={:#x}",
                     task.pid,
-                    crate::proc::signal::Signal::new_unchecked(sig),
+                    crate::proc::Signal::new_unchecked(sig),
                     wstatus.0
                 );
                 do_exit(&task, wstatus);
@@ -119,7 +117,7 @@ async fn run_tasks(task: Arc<Task>) {
         {
             let vm_map = task.vm_map.lock();
             let mut pmap = vm_map.pmap_lock();
-            crate::mm::pmap::pmap_deactivate(&mut pmap);
+            pmap_deactivate(&mut pmap);
         }
 
         match result {
@@ -173,10 +171,10 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
     if is_interrupt {
         match code {
             IRQ_S_TIMER => {
-                crate::hal::rv64::timer::handle_timer_irq();
+                crate::hal::handle_timer_irq();
             }
             IRQ_S_SOFTWARE => {
-                crate::hal::rv64::ipi::handle_ipi();
+                crate::hal::handle_ipi();
             }
             IRQ_S_EXTERNAL => {
                 // External IRQ handling
@@ -219,7 +217,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                 Err(e) => {
                     // Resolution failed. If pcb_onfault is set (copy_user_chunk),
                     // redirect to the EFAULT landing pad instead of killing.
-                    let percpu = crate::executor::per_cpu::current();
+                    let percpu = crate::executor::current();
                     let onfault = percpu
                         .pcb_onfault
                         .load(core::sync::atomic::Ordering::Relaxed);
@@ -242,7 +240,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                         code,
                         e
                     );
-                    task.signals.post_signal(crate::proc::signal::SIGSEGV);
+                    task.signals.post_signal(crate::proc::SIGSEGV);
                     TrapResult::Continue
                 }
             }
@@ -256,7 +254,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                 { task.trap_frame.lock().sepc },
                 stval
             );
-            task.signals.post_signal(crate::proc::signal::SIGSEGV);
+            task.signals.post_signal(crate::proc::SIGSEGV);
             TrapResult::Continue
         }
     }
@@ -317,7 +315,7 @@ impl Future for UserTaskFuture {
         {
             let vm_map = this.task.vm_map.lock();
             let mut pmap = vm_map.pmap_lock();
-            crate::mm::pmap::pmap_activate(&mut pmap);
+            pmap_activate(&mut pmap);
         }
 
         // Poll the persistent inner future.
@@ -327,7 +325,7 @@ impl Future for UserTaskFuture {
         {
             let vm_map = this.task.vm_map.lock();
             let mut pmap = vm_map.pmap_lock();
-            crate::mm::pmap::pmap_deactivate(&mut pmap);
+            pmap_deactivate(&mut pmap);
         }
 
         result

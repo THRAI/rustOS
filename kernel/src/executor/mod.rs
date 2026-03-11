@@ -7,7 +7,7 @@ pub mod per_cpu;
 pub mod schedule;
 pub mod user_task;
 
-pub use per_cpu::init_per_cpu;
+pub use per_cpu::{current, get, init_per_cpu, set_tp, PerCpu, MAX_CPUS};
 pub use schedule::{sleep, spawn_kernel_task, yield_now};
 pub use user_task::spawn_user_task;
 
@@ -31,9 +31,9 @@ pub fn executor_loop() -> ! {
             // Ensure IRQs are enabled so timer ticks advance the timer wheel
             // while tasks run. Without this, the wfi path leaves SIE=0 and
             // IrqSafeSpinLock save/restore preserves that disabled state.
-            crate::hal::rv64::irq::enable();
+            crate::hal::enable();
             if irq_log_count < 5 {
-                let sie = crate::hal::rv64::irq::is_enabled();
+                let sie = crate::hal::is_enabled();
                 crate::klog!(sched, debug, "cpu={} run task, SIE={}", pc.cpu_id, sie);
                 irq_log_count += 1;
             }

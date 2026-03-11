@@ -3,10 +3,10 @@
 //! spawn_kernel_task uses async-task's spawn + schedule_fn to push
 //! Runnables into the target CPU's run queue.
 
+use super::per_cpu;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use super::per_cpu;
 
 /// Spawn a kernel task on the target CPU's run queue.
 ///
@@ -22,7 +22,7 @@ where
         // Send IPI if scheduling to a different CPU to wake it from wfi
         let current_cpu = per_cpu::current().cpu_id;
         if target_cpu != current_cpu {
-            crate::hal::rv64::ipi::send_ipi(target_cpu);
+            crate::hal::send_ipi(target_cpu);
         }
     };
     let (runnable, task) = async_task::spawn(future, schedule_fn);
@@ -84,7 +84,15 @@ pub async fn sleep(ms: u64) {
                 let mut tw = pc.timer_wheel.lock();
                 let id = tw.insert(self.ms, cx.waker().clone());
                 self.timer_id = Some(id);
-                crate::klog!(sched, debug, "sleep reg id={} ms={} tick={} cpu={}", id, self.ms, tw.current_tick(), pc.cpu_id);
+                crate::klog!(
+                    sched,
+                    debug,
+                    "sleep reg id={} ms={} tick={} cpu={}",
+                    id,
+                    self.ms,
+                    tw.current_tick(),
+                    pc.cpu_id
+                );
                 Poll::Pending
             }
         }

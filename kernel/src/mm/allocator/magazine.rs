@@ -4,8 +4,8 @@
 //! on the hot path. When the magazine is empty, it refills from the
 //! buddy allocator in batch. When full, it drains half back to buddy.
 
-use crate::hal_common::addr::PhysAddr;
-use super::buddy::BuddyAllocator;
+use crate::hal_common::PhysAddr;
+use crate::mm::allocator::BuddyAllocator;
 
 /// Number of frames a magazine can hold.
 const MAGAZINE_CAPACITY: usize = 32;
@@ -154,7 +154,10 @@ mod tests {
     #[test]
     fn refill_from_buddy() {
         let mut buddy = BuddyAllocator::new();
-        buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+        buddy.init(
+            PhysAddr::new(0x8000_0000),
+            PhysAddr::new(0x8000_0000 + 64 * 4096),
+        );
         let mut m = Magazine::new();
         m.refill(&mut buddy, 8);
         assert_eq!(m.len(), 8);
@@ -163,7 +166,10 @@ mod tests {
     #[test]
     fn drain_to_buddy() {
         let mut buddy = BuddyAllocator::new();
-        buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+        buddy.init(
+            PhysAddr::new(0x8000_0000),
+            PhysAddr::new(0x8000_0000 + 64 * 4096),
+        );
         let mut m = Magazine::new();
         m.refill(&mut buddy, 8);
         let before = buddy.available_pages();
@@ -175,7 +181,10 @@ mod tests {
     #[test]
     fn drain_half() {
         let mut buddy = BuddyAllocator::new();
-        buddy.init(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0000 + 64 * 4096));
+        buddy.init(
+            PhysAddr::new(0x8000_0000),
+            PhysAddr::new(0x8000_0000 + 64 * 4096),
+        );
         let mut m = Magazine::new();
         m.refill(&mut buddy, 10);
         m.drain_half(&mut buddy);

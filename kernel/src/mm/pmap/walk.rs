@@ -4,7 +4,7 @@
 //! The walk is identity-mapped: PA is used directly as a pointer.
 //! A `phys_to_virt()` indirection will be added for higher-half kernel.
 
-use super::pte::{encode_pte, pte_is_leaf, pte_is_valid, pte_pa, PteFlags};
+use super::{encode_pte, pte_is_leaf, pte_is_valid, pte_pa, PteFlags};
 
 /// Extract VPN index for a given level in an N-level page table.
 ///

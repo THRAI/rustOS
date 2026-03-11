@@ -8,10 +8,9 @@ use bitflags::bitflags;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
-use crate::hal_common::addr::PhysAddr;
-use crate::mm::allocator::types::PageRole;
-use crate::mm::vm::vm_object::VmObject;
-use crate::mm::vm::wait_queue;
+use crate::hal_common::PhysAddr;
+use crate::mm::allocator::PageRole;
+use crate::mm::vm::{register_waker, remove_waker, wake_all, VmObject};
 
 bitflags! {
     /// Readers-Writer Busy Lock state.
@@ -130,14 +129,14 @@ impl VmPage {
         let mut yielded = false;
         core::future::poll_fn(|cx| {
             if !yielded {
-                wait_queue::register_waker(token, cx.waker().clone());
+                register_waker(token, cx.waker().clone());
                 // Mark WANTED so the holder knows to call wake_all
                 self.busy_state
                     .fetch_or(BusyState::WANTED.bits(), Ordering::Relaxed);
                 yielded = true;
                 Poll::Pending
             } else {
-                wait_queue::remove_waker(token, cx.waker());
+                remove_waker(token, cx.waker());
                 Poll::Ready(())
             }
         })
@@ -157,7 +156,7 @@ impl VmPage {
         );
 
         if old & BusyState::WANTED.bits() != 0 {
-            wait_queue::wake_all(self as *const _ as usize);
+            wake_all(self as *const _ as usize);
         }
     }
 
@@ -183,7 +182,7 @@ impl VmPage {
             ) {
                 Ok(_) => {
                     if wake_needed {
-                        wait_queue::wake_all(self as *const _ as usize);
+                        wake_all(self as *const _ as usize);
                     }
                     return;
                 }
@@ -268,15 +267,19 @@ impl VmPage {
 
     /// Access the underlying page as a byte slice.
     #[inline]
-    pub fn as_page_slice(&self) -> &[u8; crate::hal_common::addr::PAGE_SIZE] {
-        unsafe { &*(self.phys_addr.into_kernel_vaddr().as_ptr() as *const [u8; crate::hal_common::addr::PAGE_SIZE]) }
+    pub fn as_page_slice(&self) -> &[u8; crate::hal_common::PAGE_SIZE] {
+        unsafe {
+            &*(self.phys_addr.into_kernel_vaddr().as_ptr()
+                as *const [u8; crate::hal_common::PAGE_SIZE])
+        }
     }
 
     /// Access the underlying page as a mutable byte slice.
     #[inline]
-    pub fn as_page_slice_mut(&mut self) -> &mut [u8; crate::hal_common::addr::PAGE_SIZE] {
+    pub fn as_page_slice_mut(&mut self) -> &mut [u8; crate::hal_common::PAGE_SIZE] {
         unsafe {
-            &mut *(self.phys_addr.into_kernel_vaddr().as_mut_ptr() as *mut [u8; crate::hal_common::addr::PAGE_SIZE])
+            &mut *(self.phys_addr.into_kernel_vaddr().as_mut_ptr()
+                as *mut [u8; crate::hal_common::PAGE_SIZE])
         }
     }
 

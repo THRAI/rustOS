@@ -5,9 +5,9 @@
 //! 2. longest-prefix path translation from namespace path to backend path.
 //! 3. a basic "same mount domain" check for link/rename semantics.
 
+use crate::hal_common::{Errno, SpinMutex};
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::hal_common::{Errno, SpinMutex};
 
 const MAX_MOUNTS: usize = 64;
 
@@ -29,7 +29,9 @@ struct MountTable {
 
 impl MountTable {
     const fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     fn add(&mut self, entry: MountEntry) -> Result<(), Errno> {
@@ -213,7 +215,11 @@ pub fn same_mount_domain(path_a: &str, path_b: &str) -> bool {
     let a = normalize_absolute_path(path_a);
     let b = normalize_absolute_path(path_b);
     let table = MOUNT_TABLE.lock();
-    let a_target = best_match(&table, &a).map(|m| m.target.as_str()).unwrap_or("/");
-    let b_target = best_match(&table, &b).map(|m| m.target.as_str()).unwrap_or("/");
+    let a_target = best_match(&table, &a)
+        .map(|m| m.target.as_str())
+        .unwrap_or("/");
+    let b_target = best_match(&table, &b)
+        .map(|m| m.target.as_str())
+        .unwrap_or("/");
     a_target == b_target
 }

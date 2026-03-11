@@ -18,13 +18,15 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::fs::path;
-use crate::fs::vnode::VnodeType;
-use crate::mm::vm::map::entry::{BackingStore, MapPerm, VmMapEntry};
-use crate::mm::vm::map::{VmError, VmMap};
-use crate::mm::vm::vm_object::VmObject;
+use crate::fs::{resolve, vnode_object, VnodeType};
+use crate::mm::{
+    pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_zero_page, BackingStore, EntryFlags,
+    MapPerm, VmError, VmMap, VmMapEntry, VmObject,
+};
 
-use super::task::Task;
+use crate::proc::{
+    map_sigcode_page, parse_elf_first_page, ExecContext, SigSet, Task, SIG_DFL, SIG_IGN,
+};
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -53,7 +55,6 @@ const AT_RANDOM: usize = 25;
 // ---------------------------------------------------------------------------
 // VMA insert helper
 // ---------------------------------------------------------------------------
-
 
 fn map_insert_err(err: VmError) -> Errno {
     match err {
@@ -85,7 +86,7 @@ pub async fn do_execve(
     // =====================================================================
 
     // 1a. Resolve path to vnode
-    let vnode = path::resolve(elf_path).await?;
+    let vnode = resolve(elf_path).await?;
     if vnode.vtype() != VnodeType::Regular {
         return Err(Errno::Enoexec);
     }
@@ -93,29 +94,26 @@ pub async fn do_execve(
     // 1b. Create a file-backed VmObject for the ELF vnode and fetch page 0
     //     through the pager (not the allocator directly).
     let elf_obj = VmObject::new_file(&*vnode);
-    VmObject::fetch_page_async(
-        Arc::clone(&elf_obj),
-        crate::hal_common::addr::VirtPageNum(0),
-    )
-    .await
-    .map_err(|_| Errno::Enoexec)?;
+    VmObject::fetch_page_async(Arc::clone(&elf_obj), crate::hal_common::VirtPageNum(0))
+        .await
+        .map_err(|_| Errno::Enoexec)?;
 
     // 1c. Parse ELF header + program headers via goblin
     let hdr_phys = elf_obj
         .read()
-        .lookup_page(crate::hal_common::addr::VirtPageNum(0))
+        .lookup_page(crate::hal_common::VirtPageNum(0))
         .ok_or(Errno::Enoexec)?;
 
     let hdr_buf = hdr_phys.as_slice();
 
-    let (ehdr, phdrs) = match super::elf::parse_elf_first_page(hdr_buf) {
+    let (ehdr, phdrs) = match parse_elf_first_page(hdr_buf) {
         Ok(parsed) => parsed,
         Err(_) => return Err(Errno::Enoexec),
     };
 
     // 1d. Build ExecContext (pure function, no side effects)
     let load_base = VirtAddr(0); // ET_EXEC: no bias; TODO: PIE support
-    let exec_ctx = super::elf::ExecContext::build(hdr_buf, &ehdr, &phdrs, load_base);
+    let exec_ctx = ExecContext::build(hdr_buf, &ehdr, &phdrs, load_base);
 
     // =====================================================================
     // STAGE 2: Build new address space in temporary VmMap (can fail, no
@@ -123,8 +121,8 @@ pub async fn do_execve(
     // =====================================================================
 
     // 2a. Create a fresh pmap and VmMap
-    let new_pmap = crate::mm::pmap::pmap_create();
-    let new_pmap_arc = Arc::new(crate::hal_common::spin_mutex::SpinMutex::new(new_pmap));
+    let new_pmap = pmap_create();
+    let new_pmap_arc = Arc::new(crate::hal_common::SpinMutex::new(new_pmap));
     let mut new_vm = VmMap::new(Arc::clone(&new_pmap_arc));
 
     // Some ELF binaries split one page across multiple PT_LOAD segments.
@@ -176,7 +174,7 @@ pub async fn do_execve(
                 object: obj,
                 offset: file_offset_page_aligned as u64,
             },
-            crate::mm::vm::map::entry::EntryFlags::empty(),
+            EntryFlags::empty(),
             region.prot,
         );
 
@@ -233,7 +231,7 @@ pub async fn do_execve(
             object: stack_obj,
             offset: 0,
         },
-        crate::mm::vm::map::entry::EntryFlags::empty(),
+        EntryFlags::empty(),
         crate::map_perm!(R, W, U),
     );
     if new_vm.insert_entry(stack_vma).is_err() {
@@ -244,8 +242,7 @@ pub async fn do_execve(
     let (sp_va, entry_for_auxv) = {
         // Eagerly allocate the top stack page through the stack VmObject
         let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-        let stack_page_idx =
-            crate::hal_common::addr::VirtPageNum((USER_STACK_SIZE / PAGE_SIZE) - 1);
+        let stack_page_idx = crate::hal_common::VirtPageNum((USER_STACK_SIZE / PAGE_SIZE) - 1);
 
         // Allocate and zero the page via VmObject (not the allocator directly)
         let phys = {
@@ -257,7 +254,7 @@ pub async fn do_execve(
         // Map in new pmap
         {
             let mut pmap = new_pmap_arc.lock();
-            let _ = crate::mm::pmap::pmap_enter(
+            let _ = pmap_enter(
                 &mut pmap,
                 VirtAddr::new(stack_page_va),
                 phys,
@@ -267,7 +264,7 @@ pub async fn do_execve(
         }
 
         // Write stack layout into the physical frame (identity-mapped)
-        let mut cursor = crate::hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
+        let mut cursor = crate::hal_common::PageCursor::new(phys, PAGE_SIZE).unwrap();
         let stack_page_vbase = VirtAddr::new(stack_page_va);
 
         // Push 16 random bytes for AT_RANDOM
@@ -353,7 +350,7 @@ pub async fn do_execve(
     // 2f. Map sigcode trampoline page in the new pmap
     {
         let mut pmap = new_pmap_arc.lock();
-        super::signal::map_sigcode_page(&mut pmap);
+        map_sigcode_page(&mut pmap);
     }
 
     // =====================================================================
@@ -367,11 +364,11 @@ pub async fn do_execve(
         let old_vm = core::mem::replace(&mut *vm, new_vm);
         // Destroy old pmap: switch satp first, then free old page tables
         let mut new_pmap_guard = vm.pmap_lock();
-        crate::mm::pmap::pmap_activate(&mut new_pmap_guard);
+        pmap_activate(&mut new_pmap_guard);
         drop(new_pmap_guard);
         // Now satp points to new root -- safe to destroy old
         let mut old_pmap_guard = old_vm.pmap_lock();
-        crate::mm::pmap::pmap_destroy(&mut old_pmap_guard);
+        pmap_destroy(&mut old_pmap_guard);
         // old_vm + old_pmap drop when guards/variables go out of scope
     }
 
@@ -383,23 +380,21 @@ pub async fn do_execve(
     {
         let mut actions = task.signals.actions.lock();
         for act in actions.iter_mut() {
-            if act.handler != super::signal::SIG_DFL && act.handler != super::signal::SIG_IGN {
-                act.handler = super::signal::SIG_DFL;
+            if act.handler != SIG_DFL && act.handler != SIG_IGN {
+                act.handler = SIG_DFL;
                 act.flags = 0;
                 act.mask = 0;
             }
         }
     }
     // Clear pending signals on exec
-    task.signals.pending.store(
-        super::signal::SigSet(0),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    task.signals
+        .pending
+        .store(SigSet(0), core::sync::atomic::Ordering::Relaxed);
     // Clear blocked signal mask
-    task.signals.blocked.store(
-        super::signal::SigSet(0),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    task.signals
+        .blocked
+        .store(SigSet(0), core::sync::atomic::Ordering::Relaxed);
 
     // 3d. Close O_CLOEXEC file descriptors
     task.fd_table.lock().strip_cloexec();
@@ -428,23 +423,20 @@ async fn load_interp_into(
     interp_path: &str,
     offset: usize,
 ) -> Result<usize, Errno> {
-    let vnode = path::resolve(interp_path).await?;
+    let vnode = resolve(interp_path).await?;
     if vnode.vtype() != VnodeType::Regular {
         return Err(Errno::Enoexec);
     }
 
     // Fetch the interpreter's first page through a VmObject
     let interp_obj = VmObject::new_file(&*vnode);
-    VmObject::fetch_page_async(
-        Arc::clone(&interp_obj),
-        crate::hal_common::addr::VirtPageNum(0),
-    )
-    .await
-    .map_err(|_| Errno::Enoexec)?;
+    VmObject::fetch_page_async(Arc::clone(&interp_obj), crate::hal_common::VirtPageNum(0))
+        .await
+        .map_err(|_| Errno::Enoexec)?;
 
     let hdr_phys = interp_obj
         .read()
-        .lookup_page(crate::hal_common::addr::VirtPageNum(0))
+        .lookup_page(crate::hal_common::VirtPageNum(0))
         .ok_or(Errno::Enoexec)?;
     let hdr_buf = hdr_phys.as_slice();
 
@@ -502,7 +494,7 @@ async fn load_interp_into(
                 object: obj,
                 offset: file_offset_page_aligned as u64,
             },
-            crate::mm::vm::map::entry::EntryFlags::empty(),
+            EntryFlags::empty(),
             prot,
         );
 
@@ -526,13 +518,13 @@ mod legacy {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::fs::path;
-    use crate::fs::vnode::VnodeType;
-    use crate::mm::vm::map::entry::{BackingStore, MapPerm, VmMapEntry};
-    use crate::mm::vm::map::{VmError, VmMap};
-    use crate::mm::vm::vm_object::VmObject;
+    use crate::fs::{resolve, vnode_object, VnodeType};
+    use crate::mm::{
+        pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_zero_page, BackingStore,
+        EntryFlags, MapPerm, VmError, VmMap, VmMapEntry, VmObject,
+    };
 
-    use crate::proc::task::Task;
+    use crate::proc::Task;
 
     use super::{
         elf_flags_to_prot, insert_or_merge_file_vma, load_interp, map_insert_err, parse_elf_header,
@@ -544,7 +536,7 @@ mod legacy {
     /// demand-paged VMAs, set up user stack. Returns (entry_point, stack_pointer).
     pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Errno> {
         klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
-        let vnode = path::resolve(elf_path).await?;
+        let vnode = resolve(elf_path).await?;
         if vnode.vtype() != VnodeType::Regular {
             return Err(Errno::Enoexec);
         }
@@ -554,13 +546,14 @@ mod legacy {
             return Err(Errno::Enoexec);
         }
 
-        let obj = crate::fs::vnode::vnode_object(&*vnode);
-        let page0 = crate::mm::vm::vm_object::VmObject::fetch_page_async(
-            obj, crate::hal_common::addr::VirtPageNum(0),
-        ).await.map_err(|_| Errno::Enoexec)?;
+        let obj = vnode_object(&*vnode);
+        let page0 = VmObject::fetch_page_async(obj, crate::hal_common::VirtPageNum(0))
+            .await
+            .map_err(|_| Errno::Enoexec)?;
 
-        let hdr_buf =
-            unsafe { core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE) };
+        let hdr_buf = unsafe {
+            core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE)
+        };
         let elf_hdr = parse_elf_header(hdr_buf)?;
         let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
 
@@ -587,9 +580,9 @@ mod legacy {
             let mut vm = task.vm_map.lock();
             vm.clear();
             let mut pmap = vm.pmap_lock();
-            let mut old_pmap = core::mem::replace(&mut *pmap, crate::mm::pmap::pmap_create());
-            crate::mm::pmap::pmap_activate(&mut pmap);
-            crate::mm::pmap::pmap_destroy(&mut old_pmap);
+            let mut old_pmap = core::mem::replace(&mut *pmap, pmap_create());
+            pmap_activate(&mut pmap);
+            pmap_destroy(&mut old_pmap);
         }
 
         let mut brk_end: usize = 0;
@@ -607,7 +600,7 @@ mod legacy {
 
             let obj_size = (va_end - va_start) / PAGE_SIZE;
             let obj = VmObject::new_anon(obj_size);
-            obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
+            obj.write().pager = Some(Arc::new(crate::mm::vm::VnodePager {
                 vnode_id: vnode.vnode_id() as usize,
                 path: alloc::string::String::from(vnode.path()),
             }));
@@ -619,7 +612,7 @@ mod legacy {
                     object: obj,
                     offset: file_offset_page_aligned as u64,
                 },
-                crate::mm::vm::map::entry::EntryFlags::empty(),
+                EntryFlags::empty(),
                 prot,
             );
 
@@ -680,7 +673,7 @@ mod legacy {
                 object: stack_obj,
                 offset: 0,
             },
-            crate::mm::vm::map::entry::EntryFlags::empty(),
+            EntryFlags::empty(),
             crate::map_perm!(R, W, U),
         );
         {
@@ -695,27 +688,25 @@ mod legacy {
         {
             let vm_map = task.vm_map.lock();
             let mut pmap = vm_map.pmap_lock();
-            crate::proc::signal::map_sigcode_page(&mut pmap);
+            crate::proc::map_sigcode_page(&mut pmap);
         }
 
         {
             let mut actions = task.signals.actions.lock();
             for act in actions.iter_mut() {
-                if act.handler != crate::proc::signal::SIG_DFL
-                    && act.handler != crate::proc::signal::SIG_IGN
-                {
-                    act.handler = crate::proc::signal::SIG_DFL;
+                if act.handler != crate::proc::SIG_DFL && act.handler != crate::proc::SIG_IGN {
+                    act.handler = crate::proc::SIG_DFL;
                     act.flags = 0;
                     act.mask = 0;
                 }
             }
         }
         task.signals.pending.store(
-            crate::proc::signal::SigSet(0),
+            crate::proc::SigSet(0),
             core::sync::atomic::Ordering::Relaxed,
         );
         task.signals.blocked.store(
-            crate::proc::signal::SigSet(0),
+            crate::proc::SigSet(0),
             core::sync::atomic::Ordering::Relaxed,
         );
 
@@ -743,12 +734,12 @@ mod legacy {
         let vm_page =
             crate::mm::allocator::alloc_anon_sync().expect("OOM when allocating user stack");
         let phys = vm_page.phys();
-        crate::mm::pmap::pmap_zero_page(phys);
+        pmap_zero_page(phys);
 
         {
             let mut vm = task.vm_map.lock();
             if let Some(vma) = vm.lookup_mut(stack_page_va as u64) {
-                let page_idx = crate::hal_common::addr::VirtPageNum(
+                let page_idx = crate::hal_common::VirtPageNum(
                     (stack_page_va - vma.start as usize) / PAGE_SIZE
                         + match &vma.store {
                             BackingStore::Object { offset, .. } => *offset as usize / PAGE_SIZE,
@@ -757,7 +748,7 @@ mod legacy {
                 );
                 if let BackingStore::Object { object, .. } = &vma.store {
                     let mut obj = object.write();
-                    let mut page = crate::mm::vm::page::VmPage::new();
+                    let mut page = crate::mm::vm::VmPage::new();
                     page.phys_addr = phys;
                     obj.insert_page(page_idx, Arc::new(page));
                 }
@@ -766,7 +757,7 @@ mod legacy {
             }
 
             let mut pmap = vm.pmap_lock();
-            let _ = crate::mm::pmap::pmap_enter(
+            let _ = pmap_enter(
                 &mut pmap,
                 VirtAddr::new(stack_page_va),
                 phys,
@@ -775,7 +766,7 @@ mod legacy {
             );
         }
 
-        let mut cursor = crate::hal_common::addr::PageCursor::new(phys, PAGE_SIZE).unwrap();
+        let mut cursor = crate::hal_common::PageCursor::new(phys, PAGE_SIZE).unwrap();
         let stack_page_vbase = VirtAddr::new(stack_page_va);
 
         let random_va = {
@@ -993,7 +984,7 @@ fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), V
 pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Errno> {
     klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
     // 1. Resolve path to vnode
-    let vnode = path::resolve(elf_path).await?;
+    let vnode = resolve(elf_path).await?;
     if vnode.vtype() != VnodeType::Regular {
         return Err(Errno::Enoexec);
     }
@@ -1004,12 +995,13 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         return Err(Errno::Enoexec);
     }
 
-    let obj = crate::fs::vnode::vnode_object(&*vnode);
-    let page0 = crate::mm::vm::vm_object::VmObject::fetch_page_async(
-        obj, crate::hal_common::addr::VirtPageNum(0),
-    ).await.map_err(|_| Errno::Enoexec)?;
+    let obj = vnode_object(&*vnode);
+    let page0 = VmObject::fetch_page_async(obj, crate::hal_common::VirtPageNum(0))
+        .await
+        .map_err(|_| Errno::Enoexec)?;
 
-    let hdr_buf = unsafe { core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE) };
+    let hdr_buf =
+        unsafe { core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE) };
     let elf_hdr = parse_elf_header(hdr_buf)?;
     let phdrs = parse_phdrs(hdr_buf, elf_hdr)?;
 
@@ -1044,10 +1036,10 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         // satp to the new root page table before freeing the old root,
         // otherwise any TLB miss would walk freed memory (use-after-free on
         // the page table), causing a cascading fault.
-        let mut old_pmap = core::mem::replace(&mut *pmap, crate::mm::pmap::pmap_create());
-        crate::mm::pmap::pmap_activate(&mut pmap);
+        let mut old_pmap = core::mem::replace(&mut *pmap, pmap_create());
+        pmap_activate(&mut pmap);
         // Now satp points to the new root — safe to free the old page tables.
-        crate::mm::pmap::pmap_destroy(&mut old_pmap);
+        pmap_destroy(&mut old_pmap);
     }
 
     // Some ELF binaries split one page across multiple PT_LOAD segments
@@ -1093,7 +1085,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             .copied()
             .unwrap_or(file_backed_bytes);
         let obj = VmObject::new_anon(obj_size);
-        obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
+        obj.write().pager = Some(Arc::new(crate::mm::vm::VnodePager {
             vnode_id: vnode.vnode_id() as usize,
             path: alloc::string::String::from(vnode.path()),
             base_offset: file_offset_page_aligned,
@@ -1107,7 +1099,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
                 object: obj,
                 offset: file_offset_page_aligned as u64,
             },
-            crate::mm::vm::map::entry::EntryFlags::empty(),
+            EntryFlags::empty(),
             prot,
         );
 
@@ -1171,7 +1163,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             object: stack_obj,
             offset: 0,
         },
-        crate::mm::vm::map::entry::EntryFlags::empty(),
+        EntryFlags::empty(),
         crate::map_perm!(R, W, U),
     );
     {
@@ -1188,31 +1180,29 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     {
         let vm_map = task.vm_map.lock();
         let mut pmap = vm_map.pmap_lock();
-        super::signal::map_sigcode_page(&mut pmap);
+        map_sigcode_page(&mut pmap);
     }
 
     // 8. Reset signal dispositions: handlers reset to SIG_DFL on exec (POSIX)
     {
         let mut actions = task.signals.actions.lock();
         for act in actions.iter_mut() {
-            if act.handler != super::signal::SIG_DFL && act.handler != super::signal::SIG_IGN {
-                act.handler = super::signal::SIG_DFL;
+            if act.handler != SIG_DFL && act.handler != SIG_IGN {
+                act.handler = SIG_DFL;
                 act.flags = 0;
                 act.mask = 0;
             }
         }
     }
     // Clear pending signals on exec
-    task.signals.pending.store(
-        super::signal::SigSet(0),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    task.signals
+        .pending
+        .store(SigSet(0), core::sync::atomic::Ordering::Relaxed);
     // Clear blocked signal mask on exec (POSIX: signal mask preserved, but
     // synchronous signals like SIGSEGV must be deliverable)
-    task.signals.blocked.store(
-        super::signal::SigSet(0),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    task.signals
+        .blocked
+        .store(SigSet(0), core::sync::atomic::Ordering::Relaxed);
 
     klog!(
         exec,
@@ -1229,15 +1219,15 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 // load_interp: 将动态链接器 ELF 加载到 offset 偏移处
 // ---------------------------------------------------------------------------
 async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Result<usize, Errno> {
-    let vnode = path::resolve(interp_path).await?;
+    let vnode = resolve(interp_path).await?;
     if vnode.vtype() != VnodeType::Regular {
         return Err(Errno::Enoexec);
     }
 
-    let obj = crate::fs::vnode::vnode_object(&*vnode);
-    let page0 = crate::mm::vm::vm_object::VmObject::fetch_page_async(
-        obj, crate::hal_common::addr::VirtPageNum(0),
-    ).await.map_err(|_| Errno::Enoexec)?;
+    let obj = vnode_object(&*vnode);
+    let page0 = VmObject::fetch_page_async(obj, crate::hal_common::VirtPageNum(0))
+        .await
+        .map_err(|_| Errno::Enoexec)?;
 
     let hdr_buf =
         unsafe { core::slice::from_raw_parts(page0.phys_addr.as_usize() as *const u8, PAGE_SIZE) };
@@ -1281,7 +1271,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
             .copied()
             .unwrap_or(file_backed_bytes);
         let obj = VmObject::new_anon(obj_size);
-        obj.write().pager = Some(Arc::new(crate::mm::vm::vm_object::VnodePager {
+        obj.write().pager = Some(Arc::new(crate::mm::vm::VnodePager {
             vnode_id: vnode.vnode_id() as usize,
             path: alloc::string::String::from(vnode.path()),
             base_offset: file_offset_page_aligned,
@@ -1294,7 +1284,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
                 object: obj,
                 offset: file_offset_page_aligned as u64,
             },
-            crate::mm::vm::map::entry::EntryFlags::empty(),
+            EntryFlags::empty(),
             prot,
         );
 

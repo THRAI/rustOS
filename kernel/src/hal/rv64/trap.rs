@@ -106,7 +106,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
             | EXC_LOAD_PAGE_FAULT
             | EXC_STORE_PAGE_FAULT => {
                 // Check pcb_onfault for exception fixup (copy_user path)
-                let pc = crate::executor::per_cpu::current();
+                let pc = crate::executor::current();
                 let onfault = pc.pcb_onfault.load(Ordering::Relaxed);
                 if onfault != 0 {
                     // Redirect to landing pad: set sepc to onfault address
@@ -141,7 +141,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
 
 /// Stub: external interrupt handler (expanded in later phases).
 fn handle_external_irq() {
-    let hart = crate::executor::per_cpu::current().hartid;
+    let hart = crate::executor::current().hartid;
     // FreeBSD-style claim loop: handle all pending IRQs per trap entry
     loop {
         let irq = super::plic::claim(hart);

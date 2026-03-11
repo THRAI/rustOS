@@ -1,3 +1,4 @@
+use crate::hal_common::Errno;
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -5,16 +6,26 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub mod entry;
 pub mod splay;
 
-use crate::hal_common::spin_mutex::SpinMutex;
-use crate::mm::pmap::Pmap;
-use crate::mm::vm::map::entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
-use crate::mm::vm::map::splay::{SplayTree, SplayTreeIter};
+use crate::hal_common::SpinMutex;
+use crate::mm::vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
+use crate::mm::{pmap_protect, pmap_remove, Pmap};
+pub(crate) use splay::{SplayTree, SplayTreeIter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
     Overlap,
     NotFound,
     InvalidRange,
+}
+
+impl From<VmError> for Errno {
+    fn from(e: VmError) -> Errno {
+        match e {
+            VmError::Overlap => Errno::Einval,
+            VmError::NotFound => Errno::Einval,
+            VmError::InvalidRange => Errno::Einval,
+        }
+    }
 }
 
 pub struct VmMap {
@@ -54,7 +65,7 @@ impl VmMap {
     }
 
     /// Access the underlying physical map
-    pub fn pmap_lock(&self) -> crate::hal_common::spin_mutex::SpinMutexGuard<'_, Pmap> {
+    pub fn pmap_lock(&self) -> crate::hal_common::SpinMutexGuard<'_, Pmap> {
         self.pmap.lock()
     }
 
@@ -73,7 +84,7 @@ impl VmMap {
         {
             let mut pmap = self.pmap.lock();
             for (start, end) in ranges {
-                crate::mm::pmap::pmap_remove(&mut pmap, start, end);
+                pmap_remove(&mut pmap, start, end);
             }
         }
 
@@ -125,7 +136,7 @@ impl VmMap {
         // Remove hardware page table mappings for this entry's VA range
         {
             let mut pmap = self.pmap.lock();
-            crate::mm::pmap::pmap_remove(
+            pmap_remove(
                 &mut pmap,
                 VirtAddr::new(entry.start as usize),
                 VirtAddr::new(entry.end as usize),
@@ -138,11 +149,7 @@ impl VmMap {
         Some(entry)
     }
 
-    pub fn remove_range(
-        &mut self,
-        start: VirtAddr,
-        end: VirtAddr,
-    ) -> alloc::vec::Vec<VmMapEntry> {
+    pub fn remove_range(&mut self, start: VirtAddr, end: VirtAddr) -> alloc::vec::Vec<VmMapEntry> {
         if start >= end {
             return alloc::vec::Vec::new();
         }
@@ -154,7 +161,7 @@ impl VmMap {
         // Tear down hardware mappings first.
         {
             let mut pmap = self.pmap.lock();
-            crate::mm::pmap::pmap_remove(&mut pmap, start, end);
+            pmap_remove(&mut pmap, start, end);
         }
 
         let mut removed = alloc::vec::Vec::new();
@@ -352,12 +359,16 @@ impl VmMap {
         self.timestamp.fetch_add(1, Ordering::SeqCst);
         {
             let mut pmap = self.pmap.lock();
-            crate::mm::pmap::pmap_protect(&mut pmap, start, end, perm);
+            pmap_protect(&mut pmap, start, end, perm);
         }
         Ok(())
     }
 
-    pub fn grow_heap(&mut self, old_brk_aligned: usize, new_brk_aligned: usize) -> Result<(), VmError> {
+    pub fn grow_heap(
+        &mut self,
+        old_brk_aligned: usize,
+        new_brk_aligned: usize,
+    ) -> Result<(), VmError> {
         if new_brk_aligned <= old_brk_aligned {
             return Err(VmError::InvalidRange);
         }
@@ -392,7 +403,7 @@ impl VmMap {
         }
 
         let grow_len = new_brk_aligned - old_brk_aligned;
-        let obj = crate::mm::vm::vm_object::VmObject::new_anon(grow_len);
+        let obj = crate::mm::vm::VmObject::new_anon(grow_len);
         let vma = VmMapEntry::new(
             old_brk_aligned as u64,
             new_brk_aligned as u64,
@@ -433,10 +444,12 @@ impl VmMap {
                     } else {
                         vma.set_bounds(heap_start as u64, new_heap_end as u64);
                         if let BackingStore::Object { object, .. } = &vma.store {
-                            let new_pages = (new_heap_end - heap_start) / crate::hal_common::PAGE_SIZE;
+                            let new_pages =
+                                (new_heap_end - heap_start) / crate::hal_common::PAGE_SIZE;
                             let mut obj = object.write();
                             obj.set_size(new_heap_end - heap_start);
-                            let dropped = obj.truncate_pages(crate::hal_common::addr::VirtPageNum(new_pages));
+                            let dropped =
+                                obj.truncate_pages(crate::hal_common::VirtPageNum(new_pages));
                             drop(dropped);
                         }
                         unmap_range = Some((new_heap_end, old_brk_aligned));
@@ -456,7 +469,7 @@ impl VmMap {
         if let Some((new_heap_end, old_heap_end)) = unmap_range {
             if new_heap_end < old_heap_end {
                 let mut pmap = self.pmap.lock();
-                crate::mm::pmap::pmap_remove(
+                pmap_remove(
                     &mut pmap,
                     VirtAddr::new(new_heap_end),
                     VirtAddr::new(old_heap_end),

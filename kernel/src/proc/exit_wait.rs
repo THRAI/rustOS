@@ -6,8 +6,7 @@ use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
 
-use super::task::{Task, TaskState};
-use super::syscall_result::SyscallResult;
+use crate::proc::{unregister_task, SyscallResult, Task, TaskState, SA_NOCLDWAIT, SIGCHLD};
 
 /// POSIX wait status wrapper (compatible with Linux waitpid wstatus bitfield).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,16 +38,14 @@ pub fn sys_exit(task: &Arc<Task>, status: WaitStatus) -> SyscallResult {
     task.set_zombie();
 
     // Unregister from global task registry
-    super::signal::unregister_task(task.pid);
+    unregister_task(task.pid);
 
     // Wake parent's WaitChildFuture if registered, and post SIGCHLD
     if let Some(parent) = task.parent.upgrade() {
         // Check SA_NOCLDWAIT flag on parent's SIGCHLD action
         let nocldwait = {
             let actions = parent.signals.actions.lock();
-            actions[(super::signal::SIGCHLD - 1) as usize].flags
-                & super::signal::SA_NOCLDWAIT
-                != 0
+            actions[(SIGCHLD - 1) as usize].flags & SA_NOCLDWAIT != 0
         };
 
         if nocldwait {
@@ -63,7 +60,7 @@ pub fn sys_exit(task: &Arc<Task>, status: WaitStatus) -> SyscallResult {
             // Don't post SIGCHLD when SA_NOCLDWAIT is set
         } else {
             // Normal path: post SIGCHLD and wake parent
-            parent.signals.post_signal(super::signal::SIGCHLD);
+            parent.signals.post_signal(SIGCHLD);
 
             let waker = parent.parent_waker.lock().take();
             if let Some(w) = waker {

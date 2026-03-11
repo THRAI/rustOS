@@ -5,8 +5,8 @@ use core::sync::atomic::Ordering;
 
 // use crate::klog;
 use crate::hal_common::Errno;
-use crate::proc::signal::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
-use crate::proc::task::Task;
+use crate::proc::Task;
+use crate::proc::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
 
 pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     klog!(signal, debug, "sigreturn pid={}", task.pid);
@@ -15,7 +15,7 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     // Copyin the sigframe from user memory
     let mut frame = core::mem::MaybeUninit::<SigFrame>::uninit();
     let ok = unsafe {
-        crate::hal::rv64::copy_user::copy_user_chunk(
+        crate::hal::copy_user_chunk(
             frame.as_mut_ptr() as *mut u8,
             sp as *const u8,
             SIGFRAME_SIZE,
@@ -46,7 +46,7 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
 
     // Restore signal mask
     task.signals.blocked.store(
-        crate::proc::signal::SigSet::from_u64(frame.saved_mask),
+        crate::proc::SigSet::from_u64(frame.saved_mask),
         Ordering::Release,
     );
 
@@ -76,7 +76,7 @@ pub fn sys_sigaction(
         let old = actions[idx];
         let buf: [u64; 4] = [old.handler as u64, old.flags, old.restorer as u64, old.mask];
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 oldact_ptr as *mut u8,
                 buf.as_ptr() as *const u8,
                 SIGACTION_USER_SIZE,
@@ -91,7 +91,7 @@ pub fn sys_sigaction(
     if act_ptr != 0 {
         let mut buf = [0u64; 4];
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 buf.as_mut_ptr() as *mut u8,
                 act_ptr as *const u8,
                 SIGACTION_USER_SIZE,
@@ -127,7 +127,7 @@ pub fn sys_sigprocmask(
         let old = sig_state.blocked.load(Ordering::Relaxed);
         let old_u64 = old.as_u64();
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 oldset_ptr as *mut u8,
                 &old_u64 as *const u64 as *const u8,
                 8,
@@ -141,7 +141,7 @@ pub fn sys_sigprocmask(
     if set_ptr != 0 {
         let mut new_set: u64 = 0;
         let rc = unsafe {
-            crate::hal::rv64::copy_user::copy_user_chunk(
+            crate::hal::copy_user_chunk(
                 &mut new_set as *mut u64 as *mut u8,
                 set_ptr as *const u8,
                 8,
@@ -151,13 +151,13 @@ pub fn sys_sigprocmask(
             return Err(Errno::Efault);
         }
 
-        let unblockable = crate::proc::signal::SigSet::empty()
+        let unblockable = crate::proc::SigSet::empty()
             .add(Signal::new_unchecked(SIGKILL))
             .add(Signal::new_unchecked(SIGSTOP))
             .as_u64();
 
         new_set &= !unblockable;
-        let set = crate::proc::signal::SigSet::from_u64(new_set);
+        let set = crate::proc::SigSet::from_u64(new_set);
 
         match how {
             SIG_BLOCK => {
@@ -190,7 +190,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
     }
 
     if pid > 0 {
-        let target = crate::proc::signal::find_task_by_pid(pid as u32);
+        let target = crate::proc::find_task_by_pid(pid as u32);
         match target {
             Some(t) => {
                 if sig > 0 {
@@ -205,10 +205,10 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         }
     } else if pid == 0 {
         let pgid = sender.pgid.load(Ordering::Relaxed);
-        crate::proc::signal::kill_pgrp(pgid, sig);
+        crate::proc::kill_pgrp(pgid, sig);
         Ok(0)
     } else if pid == -1 {
-        crate::proc::signal::for_each_task(|t| {
+        crate::proc::for_each_task(|t| {
             if t.pid != 1 && sig > 0 {
                 t.signals.post_signal(sig);
                 if let Some(w) = t.top_level_waker.lock().take() {
@@ -219,7 +219,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         Ok(0)
     } else {
         let pgid = (-pid) as u32;
-        crate::proc::signal::kill_pgrp(pgid, sig);
+        crate::proc::kill_pgrp(pgid, sig);
         Ok(0)
     }
 }

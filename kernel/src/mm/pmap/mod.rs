@@ -9,27 +9,31 @@ pub mod shootdown;
 pub mod test_integration;
 pub mod walk;
 
+pub use pte::PteFlags;
+pub(crate) use pte::{
+    encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa,
+};
+pub use shootdown::{
+    handle_shootdown_ipi, has_pending, ipi_broadcast_flush_all, pmap_shootdown, ShootdownRequest,
+};
+
 use alloc::vec::Vec;
 use core::array;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
-use crate::mm::allocator::types::{get_frame_meta, PageRole};
+use crate::mm::allocator::{get_frame_meta, PageRole};
+use crate::mm::VmPage;
 
-use self::pte::{
-    encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa, PteFlags,
-};
-use super::vm::map::entry::MapPerm;
+use super::vm::MapPerm;
 
 #[cfg(target_arch = "riscv64")]
-use crate::executor::per_cpu::MAX_CPUS;
+use crate::executor::MAX_CPUS;
 #[cfg(not(target_arch = "riscv64"))]
 const MAX_CPUS: usize = 8;
 
 /// Sv39: 3-level page table.
 const SV39_LEVELS: usize = 3;
-
-use crate::mm::vm::page::VmPage;
 
 /// Pmap statistics.
 #[derive(Debug, Default)]
@@ -445,7 +449,7 @@ pub fn pmap_activate(pmap: &mut Pmap) {
         pmap.generation = new_gen;
     }
 
-    let cpu_id = crate::executor::per_cpu::current().cpu_id;
+    let cpu_id = crate::executor::current().cpu_id;
     pmap.active[cpu_id].store(true, Ordering::Release);
 
     let satp: usize =
@@ -463,7 +467,7 @@ pub fn pmap_activate(pmap: &mut Pmap) {
 /// Deactivate this pmap on the current CPU: clear pm_active.
 #[cfg(target_arch = "riscv64")]
 pub fn pmap_deactivate(pmap: &mut Pmap) {
-    let cpu_id = crate::executor::per_cpu::current().cpu_id;
+    let cpu_id = crate::executor::current().cpu_id;
     pmap.active[cpu_id].store(false, Ordering::Release);
 }
 

@@ -1,8 +1,8 @@
 //! In-memory symlink table used for compatibility before native ext4 symlink ops.
 
+use crate::hal_common::{Errno, SpinMutex};
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::hal_common::{Errno, SpinMutex};
 
 const MAX_SYMLINKS: usize = 256;
 const MAX_FOLLOW: usize = 8;

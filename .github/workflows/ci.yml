@@ -30,12 +30,22 @@ jobs:
         with:
           targets: riscv64gc-unknown-none-elf
           components: clippy, rust-src
-      - name: Install RISC-V cross-compiler (required by lwext4_rust)
+      - name: Cache RISC-V musl cross-compiler
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: riscv64-linux-musl-cross
+          key: riscv64-linux-musl-cross-v1
+      - name: Install RISC-V musl cross-compiler (required by lwext4_rust)
+        if: steps.cache-musl.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-riscv64-linux-gnu > /dev/null
-          sudo ln -s /usr/bin/riscv64-linux-gnu-gcc /usr/local/bin/riscv64-linux-musl-cc
-          sudo ln -s /usr/bin/riscv64-linux-gnu-ar /usr/local/bin/riscv64-linux-musl-ar
+          curl --retry 5 --retry-delay 10 --retry-all-errors -fsSL \
+            -o riscv64-linux-musl-cross.tgz \
+            https://musl.cc/riscv64-linux-musl-cross.tgz
+          tar xzf riscv64-linux-musl-cross.tgz
+          rm riscv64-linux-musl-cross.tgz
+      - name: Add musl cross-compiler to PATH
+        run: echo "$PWD/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Run Clippy with workspace lints
         run: |
           cargo clippy --target riscv64gc-unknown-none-elf -p kernel -- \
@@ -72,12 +82,22 @@ jobs:
         with:
           targets: riscv64gc-unknown-none-elf
           components: rust-src
-      - name: Install RISC-V cross-compiler (required by lwext4_rust)
+      - name: Cache RISC-V musl cross-compiler
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: riscv64-linux-musl-cross
+          key: riscv64-linux-musl-cross-v1
+      - name: Install RISC-V musl cross-compiler (required by lwext4_rust)
+        if: steps.cache-musl.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-riscv64-linux-gnu > /dev/null
-          sudo ln -s /usr/bin/riscv64-linux-gnu-gcc /usr/local/bin/riscv64-linux-musl-cc
-          sudo ln -s /usr/bin/riscv64-linux-gnu-ar /usr/local/bin/riscv64-linux-musl-ar
+          curl --retry 5 --retry-delay 10 --retry-all-errors -fsSL \
+            -o riscv64-linux-musl-cross.tgz \
+            https://musl.cc/riscv64-linux-musl-cross.tgz
+          tar xzf riscv64-linux-musl-cross.tgz
+          rm riscv64-linux-musl-cross.tgz
+      - name: Add musl cross-compiler to PATH
+        run: echo "$PWD/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Install cargo-udeps
         run: cargo install cargo-udeps --locked
         continue-on-error: true

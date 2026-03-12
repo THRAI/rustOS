@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Pre-commit hook for BSD-Async Rust OS Kernel
+# Install: git config core.hooksPath .githooks
+set -euo pipefail
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+ERRORS=0
+
+# --- Check formatting ---
+if command -v cargo >/dev/null 2>&1; then
+    if ! cargo fmt --check -- --quiet 2>/dev/null; then
+        echo -e "${RED}[pre-commit] cargo fmt check failed. Run 'cargo fmt' to fix.${NC}"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# --- Clippy (workspace lints already configured in Cargo.toml) ---
+# Skipped in pre-commit for speed; runs in CI.
+
+# --- Large file detection (>2MB) ---
+MAX_FILE_SIZE=$((2 * 1024 * 1024))
+for file in $(git diff --cached --name-only --diff-filter=ACM); do
+    if [ -f "$file" ]; then
+        size=$(wc -c < "$file" | tr -d ' ')
+        if [ "$size" -gt "$MAX_FILE_SIZE" ]; then
+            echo -e "${RED}[pre-commit] File too large (${size} bytes): ${file}${NC}"
+            echo "  Max allowed: ${MAX_FILE_SIZE} bytes (2MB). Use Git LFS for large files."
+            ERRORS=$((ERRORS + 1))
+        fi
+    fi
+done
+
+# --- Tech debt tracking: TODO/FIXME must reference an issue ---
+UNLINKED_TODOS=0
+for file in $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(rs|toml|md)$' || true); do
+    if [ -f "$file" ]; then
+        # Match TODO/FIXME/HACK/XXX that don't have a parenthesized reference like TODO(#123) or TODO(ISSUE-45)
+        while IFS= read -r line; do
+            if echo "$line" | grep -qiE '\b(TODO|FIXME|HACK|XXX)\b' && \
+               ! echo "$line" | grep -qiE '\b(TODO|FIXME|HACK|XXX)\s*\('; then
+                echo -e "${YELLOW}[pre-commit] Unlinked tech debt marker in ${file}: ${line}${NC}"
+                UNLINKED_TODOS=$((UNLINKED_TODOS + 1))
+            fi
+        done < <(git diff --cached -p -- "$file" | grep '^+' | grep -v '^+++')
+    fi
+done
+if [ "$UNLINKED_TODOS" -gt 0 ]; then
+    echo -e "${YELLOW}[pre-commit] Found ${UNLINKED_TODOS} TODO/FIXME without issue references.${NC}"
+    echo "  Recommended format: TODO(#123) or FIXME(ISSUE-45)"
+    # Warning only, don't block commit
+fi
+
+# --- Prevent committing secrets ---
+for file in $(git diff --cached --name-only --diff-filter=ACM); do
+    if [ -f "$file" ]; then
+        if grep -qE '(PRIVATE_KEY|SECRET_KEY|password\s*=\s*"[^"]+")' "$file" 2>/dev/null; then
+            echo -e "${RED}[pre-commit] Possible secret detected in: ${file}${NC}"
+            ERRORS=$((ERRORS + 1))
+        fi
+    fi
+done
+
+# --- Prevent committing .env files ---
+for file in $(git diff --cached --name-only --diff-filter=ACM); do
+    if echo "$file" | grep -qE '(^|/)\.env$'; then
+        echo -e "${RED}[pre-commit] Refusing to commit .env file: ${file}${NC}"
+        ERRORS=$((ERRORS + 1))
+    fi
+done
+
+if [ "$ERRORS" -gt 0 ]; then
+    echo -e "${RED}[pre-commit] ${ERRORS} error(s) found. Commit aborted.${NC}"
+    exit 1
+fi
+
+exit 0

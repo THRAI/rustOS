@@ -11,18 +11,18 @@ pub mod task;
 pub mod user_copy;
 
 pub use elf::{parse_elf_first_page, ExecContext};
+pub use exec::do_execve;
+#[cfg(feature = "exec-legacy")]
+pub use exec::exec;
 #[cfg(feature = "exec-legacy")]
 pub use exec::exec_with_args;
-pub use exec::{do_execve, exec};
-pub use exit_wait::{sys_exit, WaitChildFuture, WaitStatus};
+pub use exit_wait::{WaitChildFuture, WaitStatus};
 pub use fork::fork;
 pub use pid::alloc_pid;
 pub use signal::{
-    check_pending_signals, map_sigcode_page, register_task, sendsig, unregister_task, SigAction,
-    SigFrame, SigSet, Signal, SignalState, MAX_SIG, SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER,
-    SA_ONSTACK, SA_RESETHAND, SA_RESTART, SA_RESTORER, SA_SIGINFO, SIGBUS, SIGCHLD, SIGCODE_VA,
-    SIGCONT, SIGFPE, SIGFRAME_SIZE, SIGHUP, SIGILL, SIGINT, SIGKILL, SIGPIPE, SIGSEGV, SIGSTOP,
-    SIGTERM, SIGUSR1, SIGUSR2, SIG_DFL, SIG_IGN,
+    check_pending_signals, map_sigcode_page, unregister_task, SigAction, SigFrame, SigSet, Signal,
+    SignalState, MAX_SIG, SA_NOCLDWAIT, SIGCHLD, SIGCODE_VA, SIGFRAME_SIZE, SIGKILL, SIGPIPE,
+    SIGSEGV, SIGSTOP, SIG_DFL, SIG_IGN,
 };
 pub(crate) use signal::{find_task_by_pid, for_each_task, kill_pgrp};
 pub use syscall_result::SyscallResult;

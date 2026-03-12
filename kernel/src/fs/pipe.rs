@@ -3,10 +3,13 @@
 //! Created by pipe2 syscall. Read/write ends share an Arc<Pipe>.
 //! Full implementation in Task 2.
 
-use crate::hal_common::{Errno, SpinMutex};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::Waker;
+use core::{
+    sync::atomic::{AtomicBool, Ordering},
+    task::Waker,
+};
+
+use crate::hal_common::{Errno, SpinMutex};
 
 /// Pipe buffer size (also PIPE_BUF for atomic write guarantee).
 const PIPE_BUF: usize = 4096;

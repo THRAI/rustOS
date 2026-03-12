@@ -116,10 +116,15 @@ impl TimerWheel {
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     extern crate std;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        task::{Wake, Waker},
+    };
+
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::task::{Wake, Waker};
 
     /// A simple waker that increments a counter when woken.
     struct CountWaker(AtomicUsize);

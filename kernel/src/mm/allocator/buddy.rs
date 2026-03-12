@@ -5,8 +5,9 @@
 
 extern crate alloc;
 
-use crate::hal_common::{PhysAddr, PAGE_SIZE};
 use alloc::vec::Vec;
+
+use crate::hal_common::{PhysAddr, PAGE_SIZE};
 
 /// Maximum buddy order (2^11 = 2048 pages = 8MB).
 pub const MAX_ORDER: usize = 11;

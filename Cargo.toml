@@ -3,6 +3,51 @@ members = ["kernel"]
 exclude = ["user"]
 resolver = "2"
 
+[workspace.lints.clippy]
+# — Correctness & safety (critical for bare-metal kernel code) —
+undocumented_unsafe_blocks   = "warn"
+cast_ptr_alignment           = "warn"
+ptr_as_ptr                   = "warn"
+transmute_ptr_to_ref         = "warn"
+invalid_null_arguments        = "deny"
+
+# — Performance —
+large_enum_variant            = "warn"
+box_collection                = "warn"
+redundant_clone               = "warn"
+manual_memcpy                 = "warn"
+
+# — Code quality & readability —
+cognitive_complexity          = "warn"
+too_many_arguments            = "warn"
+needless_pass_by_value        = "warn"
+redundant_closure             = "warn"
+match_wildcard_for_single_variants = "warn"
+unnested_or_patterns          = "warn"
+manual_let_else               = "warn"
+semicolon_if_nothing_returned = "warn"
+inconsistent_struct_constructor = "warn"
+implicit_clone                = "warn"
+cloned_instead_of_copied      = "warn"
+needless_continue             = "warn"
+single_match_else             = "warn"
+
+# — Suspicious patterns —
+suspicious_arithmetic_impl    = "warn"
+suspicious_assignment_formatting = "warn"
+suspicious_else_formatting    = "warn"
+suspicious_unary_op_formatting = "warn"
+
+# — Style (keep consistent across contributors) —
+enum_glob_use                 = "warn"
+macro_use_imports             = "warn"
+wildcard_imports              = "warn"
+module_name_repetitions       = "allow"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn        = "warn"
+unused_must_use               = "warn"
+
 [workspace.dependencies]
 bitflags = "2"
 lwext4_rust = { git = "https://github.com/PACTHEMAN123/ext4fs.git", default-features = false, branch = "main" }

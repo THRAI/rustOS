@@ -4,10 +4,10 @@
 //! address of a `VmPage`) to a list of async `Waker`s. This avoids bloating the
 //! `VmPage` struct with `Vec<Waker>` directly.
 
-use crate::hal_common::IrqSafeSpinLock;
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::task::Waker;
+
+use crate::hal_common::IrqSafeSpinLock;
 
 /// Global wait queue hash table.
 static WAIT_QUEUES: IrqSafeSpinLock<BTreeMap<usize, Vec<Waker>>> =

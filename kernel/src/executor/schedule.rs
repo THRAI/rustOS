@@ -3,10 +3,13 @@
 //! spawn_kernel_task uses async-task's spawn + schedule_fn to push
 //! Runnables into the target CPU's run queue.
 
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use super::per_cpu;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
 
 /// Spawn a kernel task on the target CPU's run queue.
 ///

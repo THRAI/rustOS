@@ -4,11 +4,13 @@
 //! Layer 2: FileDescription — shared across dup/fork, holds offset + status flags + FileObject
 //! Layer 3: FileObject — enum of Vnode | Pipe{Read,Write} | Device
 
-use crate::fs::{Pipe, Vnode};
-use crate::hal_common::Errno;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use crate::{
+    fs::{Pipe, Vnode},
+    hal_common::Errno,
+};
 
 /// Maximum number of file descriptors per process.
 const MAX_FDS: usize = 256;
@@ -81,7 +83,7 @@ impl Drop for FileObject {
         match self {
             FileObject::PipeRead(pipe) => pipe.close_read(),
             FileObject::PipeWrite(pipe) => pipe.close_write(),
-            _ => {}
+            _ => {},
         }
     }
 }

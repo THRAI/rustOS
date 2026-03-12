@@ -3,13 +3,13 @@
 //! Provides safe wrappers for copying data between kernel and user space,
 //! with automatic page fault handling.
 
-use crate::hal_common::{VirtAddr, PAGE_SIZE};
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::mm::PageFaultAccessType;
-use crate::proc::Task;
+use crate::{
+    hal_common::{VirtAddr, PAGE_SIZE},
+    mm::PageFaultAccessType,
+    proc::Task,
+};
 
 /// Pre-fault all user pages covering [user_ptr, user_ptr+len).
 ///

@@ -5,11 +5,13 @@
 //! - `free_raw_frame()`: returns frame via per-CPU magazine, drains to buddy when full
 //! - `frame_alloc_contiguous()`: multi-page allocation directly from buddy
 
-use crate::hal_common::IrqSafeSpinLock;
-use crate::hal_common::{PhysAddr, PAGE_SIZE};
-use crate::mm::allocator::{get_frame_meta, PageRole, FRAME_META, FRAME_META_LEN};
-use crate::mm::allocator::{BuddyAllocator, Magazine};
-use crate::mm::VmPage;
+use crate::{
+    hal_common::{IrqSafeSpinLock, PhysAddr, PAGE_SIZE},
+    mm::{
+        allocator::{FRAME_META, FRAME_META_LEN},
+        get_frame_meta, BuddyAllocator, Magazine, PageRole, VmPage,
+    },
+};
 
 /// Debug-build poison pattern: written to every u64 in a freed frame.
 #[cfg(debug_assertions)]
@@ -326,10 +328,37 @@ pub fn frame_free_contiguous(addr: PhysAddr, order: usize) {
     buddy.free(addr, order);
 }
 
-/// Emergency synchronous reclaim. Stub for now.
-/// TODO(Phase 5): scan inactive queue for clean cached pages without yielding.
+/// Emergency synchronous reclaim: drain other CPUs' magazines back to buddy,
+/// then retry allocation.
+///
+/// When both the current CPU's magazine and the buddy are empty, pages may
+/// still be hoarded in other CPUs' magazines.  This function iterates over
+/// all magazine slots and drains each one back to the buddy allocator, then
+/// attempts a single order-0 allocation from the now-replenished buddy.
+///
+/// This is a last-resort path — it acquires multiple locks sequentially
+/// (each magazine lock, then the buddy lock inside `drain`), so it has
+/// higher latency than the normal fast path.  It runs synchronously and
+/// never yields, making it safe for trap context.
 pub fn emergency_reclaim_sync() -> Option<PhysAddr> {
-    None
+    let caller_cpu = current_cpu_id();
+
+    // Drain every *other* CPU's magazine back to buddy.
+    // We skip our own because alloc_raw_frame_sync already emptied it.
+    for i in 0..PER_CPU_MAGAZINES.len() {
+        if i == caller_cpu {
+            continue;
+        }
+        let mut mag = PER_CPU_MAGAZINES[i].lock();
+        if !mag.is_empty() {
+            let mut buddy = GLOBAL_BUDDY.lock();
+            mag.drain(&mut buddy);
+        }
+    }
+
+    // Now try buddy again — pages from other magazines should be available.
+    let mut buddy = GLOBAL_BUDDY.lock();
+    buddy.alloc(0)
 }
 
 /// Return the number of free pages available in the buddy allocator.

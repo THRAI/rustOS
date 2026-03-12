@@ -7,7 +7,7 @@ pub mod per_cpu;
 pub mod schedule;
 pub mod user_task;
 
-pub use per_cpu::{current, get, init_per_cpu, set_tp, PerCpu, MAX_CPUS};
+pub use per_cpu::{current, init_per_cpu, set_tp, PerCpu, MAX_CPUS};
 pub use schedule::{sleep, spawn_kernel_task, yield_now};
 pub use user_task::spawn_user_task;
 

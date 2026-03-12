@@ -3,9 +3,11 @@
 //! Uses linked_list_allocator::Heap wrapped in our IrqSafeSpinLock.
 //! Must be initialized (init_heap) before any allocation — call right after UART.
 
-use crate::hal_common::IrqSafeSpinLock;
 use core::alloc::{GlobalAlloc, Layout};
+
 use linked_list_allocator::Heap;
+
+use crate::hal_common::IrqSafeSpinLock;
 
 const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16MB
 static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
@@ -23,8 +25,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        HEAP.lock()
-            .deallocate(core::ptr::NonNull::new_unchecked(ptr), layout);
+        // SAFETY: ptr was allocated by `alloc` above with the same layout.
+        unsafe {
+            HEAP.lock()
+                .deallocate(core::ptr::NonNull::new_unchecked(ptr), layout);
+        }
     }
 }
 

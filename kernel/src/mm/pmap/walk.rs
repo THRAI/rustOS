@@ -5,15 +5,16 @@
 //! A `phys_to_virt()` indirection will be added for higher-half kernel.
 
 use super::{encode_pte, pte_is_leaf, pte_is_valid, pte_pa, PteFlags};
+use crate::hal_common::{PhysAddr, VirtAddr};
 
 /// Extract VPN index for a given level in an N-level page table.
 ///
 /// Level 0 = root (highest VPN bits), Level LEVELS-1 = leaf (lowest VPN bits).
 /// Sv39: shifts are [30, 21, 12] for levels [0, 1, 2].
 #[inline]
-pub fn vpn_index<const LEVELS: usize>(va: usize, level: usize) -> usize {
+pub fn vpn_index<const LEVELS: usize>(va: VirtAddr, level: usize) -> usize {
     let shift = 12 + 9 * (LEVELS - 1 - level);
-    (va >> shift) & 0x1FF
+    (va.as_usize() >> shift) & 0x1FF
 }
 
 /// Walk an N-level page table, optionally allocating intermediate pages.
@@ -27,41 +28,45 @@ pub fn vpn_index<const LEVELS: usize>(va: usize, level: usize) -> usize {
 /// - The kernel must be identity-mapped (PA == VA for page table pages).
 /// - `allocator` must return zeroed, page-aligned physical pages.
 pub unsafe fn walk<const LEVELS: usize>(
-    root_pa: usize,
-    va: usize,
+    root_pa: PhysAddr,
+    va: VirtAddr,
     alloc: bool,
-    allocator: &mut dyn FnMut(usize) -> Option<usize>,
+    allocator: &mut dyn FnMut(usize) -> Option<PhysAddr>,
 ) -> Option<*mut u64> {
-    let mut table_pa = root_pa;
+    // SAFETY: Caller guarantees root_pa is a valid page table PA and
+    // the kernel is identity-mapped (PA == VA for page table pages).
+    unsafe {
+        let mut table_pa = root_pa.as_usize();
 
-    for level in 0..LEVELS {
-        let idx = vpn_index::<LEVELS>(va, level);
-        let pte_ptr = (table_pa as *mut u64).add(idx);
-        let pte = pte_ptr.read_volatile();
+        for level in 0..LEVELS {
+            let idx = vpn_index::<LEVELS>(va, level);
+            let pte_ptr = (table_pa as *mut u64).add(idx);
+            let pte = pte_ptr.read_volatile();
 
-        // Last level: return pointer to this PTE slot.
-        if level == LEVELS - 1 {
-            return Some(pte_ptr);
+            // Last level: return pointer to this PTE slot.
+            if level == LEVELS - 1 {
+                return Some(pte_ptr);
+            }
+
+            // Superpage (leaf at non-last level): return pointer to this PTE.
+            if pte_is_valid(pte) && pte_is_leaf(pte) {
+                return Some(pte_ptr);
+            }
+
+            if pte_is_valid(pte) {
+                // Non-leaf, valid: descend to next level.
+                table_pa = pte_pa(pte);
+            } else if alloc {
+                // Invalid and alloc requested: allocate a new page table page.
+                let new_page = allocator(level)?;
+                // Write non-leaf PTE (V bit only, no R/W/X).
+                pte_ptr.write_volatile(encode_pte(new_page.as_usize(), PteFlags::V));
+                table_pa = new_page.as_usize();
+            } else {
+                return None;
+            }
         }
 
-        // Superpage (leaf at non-last level): return pointer to this PTE.
-        if pte_is_valid(pte) && pte_is_leaf(pte) {
-            return Some(pte_ptr);
-        }
-
-        if pte_is_valid(pte) {
-            // Non-leaf, valid: descend to next level.
-            table_pa = pte_pa(pte);
-        } else if alloc {
-            // Invalid and alloc requested: allocate a new page table page.
-            let new_page = allocator(level)?;
-            // Write non-leaf PTE (V bit only, no R/W/X).
-            pte_ptr.write_volatile(encode_pte(new_page, PteFlags::V));
-            table_pa = new_page;
-        } else {
-            return None;
-        }
+        None
     }
-
-    None
 }

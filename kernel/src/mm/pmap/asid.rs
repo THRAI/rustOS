@@ -4,8 +4,9 @@
 //! generation is stale, a new ASID is allocated. When the ASID space is
 //! exhausted, the generation increments and all CPUs flush their TLBs.
 
-use crate::hal_common::IrqSafeSpinLock;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::hal_common::IrqSafeSpinLock;
 
 /// Maximum ASID value. Sv39/Sv48 on RV64 supports 16-bit ASIDs.
 /// ASID 0 is reserved for the kernel.

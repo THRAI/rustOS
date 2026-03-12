@@ -3,16 +3,43 @@
 //! Output uses a global spinlock so SMP output is not interleaved.
 //! Input is a transparent byte pipe: UART IRQ pushes bytes, ConsoleReadFuture drains them.
 
-use crate::hal::uart;
-use crate::hal_common::IrqSafeSpinLock;
-use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::Waker;
+use core::{
+    fmt::{self, Write},
+    sync::atomic::{AtomicBool, Ordering},
+    task::Waker,
+};
+
+use crate::{hal::uart, hal_common::IrqSafeSpinLock};
 
 /// Global print lock — ensures only one hart writes at a time.
 /// We use a raw AtomicBool instead of IrqSafeSpinLock to avoid
 /// circular dependencies (print is used inside lock debug paths).
 static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Acquire the print lock with IRQs disabled, run `f`, then release.
+///
+/// This is intentionally a raw AtomicBool (not IrqSafeSpinLock) because
+/// `_print` is called from inside IrqSafeSpinLock debug paths — using
+/// IrqSafeSpinLock here would create a recursive deadlock.
+#[inline(always)]
+fn with_print_lock<F: FnOnce()>(f: F) {
+    // SAFETY: disable SIE bit in sstatus, saving previous value.
+    let saved: usize;
+    unsafe {
+        core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
+    }
+    while PRINT_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    f();
+    PRINT_LOCK.store(false, Ordering::Release);
+    // SAFETY: restore SIE bit if it was set before.
+    if saved & 0x2 != 0 {
+        unsafe {
+            core::arch::asm!("csrsi sstatus, 0x2");
+        }
+    }
+}
 
 struct LockedUartWriter;
 
@@ -29,70 +56,25 @@ impl Write for LockedUartWriter {
 }
 
 pub fn _print(args: fmt::Arguments) {
-    // Disable IRQs on this hart
-    let saved: usize;
-    unsafe {
-        core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
-    }
-    // Acquire cross-hart spinlock
-    while PRINT_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    let _ = LockedUartWriter.write_fmt(args);
-    // Release
-    PRINT_LOCK.store(false, Ordering::Release);
-    // Restore IRQs
-    if saved & 0x2 != 0 {
-        unsafe {
-            core::arch::asm!("csrsi sstatus, 0x2");
-        }
-    }
+    with_print_lock(|| {
+        let _ = LockedUartWriter.write_fmt(args);
+    });
 }
 
 /// Write a single byte to the UART (with locking for atomic output).
 pub fn putchar(c: u8) {
-    // Disable IRQs on this hart
-    let saved: usize;
-    unsafe {
-        core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
-    }
-    // Acquire cross-hart spinlock
-    while PRINT_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    uart::putchar(c);
-    // Release
-    PRINT_LOCK.store(false, Ordering::Release);
-    // Restore IRQs
-    if saved & 0x2 != 0 {
-        unsafe {
-            core::arch::asm!("csrsi sstatus, 0x2");
-        }
-    }
+    with_print_lock(|| {
+        uart::putchar(c);
+    });
 }
 
 /// Write multiple bytes to the UART atomically (with locking).
 pub fn putchars(bytes: &[u8]) {
-    // Disable IRQs on this hart
-    let saved: usize;
-    unsafe {
-        core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
-    }
-    // Acquire cross-hart spinlock
-    while PRINT_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    for &b in bytes {
-        uart::putchar(b);
-    }
-    // Release
-    PRINT_LOCK.store(false, Ordering::Release);
-    // Restore IRQs
-    if saved & 0x2 != 0 {
-        unsafe {
-            core::arch::asm!("csrsi sstatus, 0x2");
+    with_print_lock(|| {
+        for &b in bytes {
+            uart::putchar(b);
         }
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------

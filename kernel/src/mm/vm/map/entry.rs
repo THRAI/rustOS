@@ -1,8 +1,10 @@
-use super::VmMap;
-use crate::mm::vm::VmObject;
 use alloc::sync::Arc;
-use bitflags::bitflags;
 use core::ptr::NonNull;
+
+use bitflags::bitflags;
+
+use super::VmMap;
+use crate::{hal_common::VirtAddrRange, mm::vm::VmObject};
 
 bitflags! {
     /// VmMapEntry state flags for COW and concurrency control.
@@ -73,9 +75,8 @@ impl Node {
 }
 
 pub struct VmMapEntry {
-    /// [Private Fields] Protected topology boundaries
-    pub(crate) start: u64,
-    pub(crate) end: u64,
+    /// Half-open virtual address range [start, end).
+    pub(crate) range: VirtAddrRange,
     pub(crate) max_free: u64,
 
     /// Intrusive Splay Node
@@ -98,8 +99,7 @@ impl VmMapEntry {
         protection: MapPerm,
     ) -> Self {
         Self {
-            start,
-            end,
+            range: VirtAddrRange::from_raw(start as usize, end as usize),
             max_free: 0,
             splay_node: Node::new(),
             store,
@@ -110,14 +110,6 @@ impl VmMapEntry {
         }
     }
 
-    //va_start as u64,
-    //va_end as u64,
-    //BackingStore::Object {
-    //    object: obj,
-    //    offset: file_offset_page_aligned as u64,
-    //},
-    //crate::mm::vm::EntryFlags::empty(),
-    //region.prot,
     pub fn new_file_backed(
         start: u64,
         end: u64,
@@ -128,14 +120,24 @@ impl VmMapEntry {
         Self::new(start, end, store, flags, protection)
     }
 
+    /// Start address as u64 (for splay tree key compatibility).
     pub fn start(&self) -> u64 {
-        self.start
+        self.range.start().as_usize() as u64
     }
+
+    /// End address as u64 (for splay tree key compatibility).
     pub fn end(&self) -> u64 {
-        self.end
+        self.range.end().as_usize() as u64
     }
+
+    /// Size in bytes.
     pub fn size(&self) -> u64 {
-        self.end - self.start
+        self.range.len() as u64
+    }
+
+    /// Get the typed address range.
+    pub fn addr_range(&self) -> VirtAddrRange {
+        self.range
     }
 
     pub fn is_mergeable_with(&self, next: &VmMapEntry) -> bool {
@@ -168,8 +170,7 @@ impl VmMapEntry {
 
     pub fn clone_for_split(&self, split_addr: u64) -> Self {
         let mut new_entry = Self {
-            start: self.start,
-            end: self.end,
+            range: self.range,
             max_free: 0,
             splay_node: Node::new(),
             store: self.store.clone(),
@@ -180,27 +181,22 @@ impl VmMapEntry {
         };
 
         if let BackingStore::Object { offset, .. } = &mut new_entry.store {
-            *offset += split_addr - self.start;
+            *offset += split_addr - self.start();
         }
         new_entry
     }
 
     pub(crate) fn set_bounds(&mut self, new_start: u64, new_end: u64) {
-        self.start = new_start;
-        self.end = new_end;
+        self.range = VirtAddrRange::from_raw(new_start as usize, new_end as usize);
     }
 }
 
 impl Drop for VmMapEntry {
     fn drop(&mut self) {
-        // Rust's default drop behavior handles BackingStore dropping automatically,
-        // reducing VmObject reference counts and triggering their teardown.
         if self.flags.contains(EntryFlags::IN_TRANSITION) {
-            // Usually we shouldn't drop an IN_TRANSITION entry, but panic here may be unsafe in panicking contexts.
-            // A well-behaved kernel shouldn't reach here.
             crate::kprintln!(
                 "WARNING: Dropping VmMapEntry that is IN_TRANSITION! start={:#x}",
-                self.start
+                self.start()
             );
         }
     }

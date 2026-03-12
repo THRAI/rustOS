@@ -1,21 +1,22 @@
 //! File system related system calls.
 
-use crate::fs::{
-    self, vnode_destroy_object, vnode_object, vnode_object_if_exists, FdFlags, FdTable,
-    FileDescription, FileObject, OpenFlags, VnodeType,
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::Ordering,
+    task::{Context, Poll},
 };
-use crate::hal_common::VirtPageNum;
-use crate::hal_common::{Errno, VirtAddr};
-use crate::mm::resolve_user_fault;
-use crate::mm::{uiomove, PageFaultAccessType, UioDir, VmObject};
-use crate::proc::{copyinstr, fault_in_user_buffer, Task, SIGPIPE};
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::future::Future;
-use core::pin::Pin;
-use core::sync::atomic::Ordering;
-use core::task::{Context, Poll};
+
+use crate::{
+    fs::{
+        self, vnode_destroy_object, vnode_object, vnode_object_if_exists, FdFlags, FdTable,
+        FileDescription, FileObject, OpenFlags, VnodeType,
+    },
+    hal_common::{Errno, VirtAddr},
+    mm::{resolve_user_fault, uiomove, PageFaultAccessType, UioDir, VmObject},
+    proc::{copyinstr, fault_in_user_buffer, Task},
+};
 
 const AT_FDCWD: isize = -100;
 const PAGE_SIZE: usize = 4096;
@@ -145,7 +146,7 @@ pub async fn open(
                 .map_err(|_| if excl { Errno::Eexist } else { Errno::Eio })?;
             let _ = crate::fs::fs_close(handle).await;
             crate::fs::resolve(path_str).await?
-        }
+        },
     };
 
     // Handle O_DIRECTORY: verify it's a directory
@@ -185,7 +186,7 @@ pub fn stat(fd_table: &crate::hal_common::SpinMutex<FdTable>, fd: u32) -> Result
                 VnodeType::Directory => 2u8,
             };
             Ok((size, vtype))
-        }
+        },
         FileObject::Device(_) => Ok((0, 3)),
         FileObject::PipeRead(_) | FileObject::PipeWrite(_) => Ok((0, 4)),
     }
@@ -222,7 +223,7 @@ pub async fn read(
 
     while total < to_read {
         let byte_off = offset + total as u64;
-        let page_idx = VirtPageNum(byte_off as usize / PAGE_SIZE);
+        let page_idx = crate::mm::vm::VObjIndex::from_bytes_floor(byte_off as usize);
         let in_page = (byte_off % PAGE_SIZE as u64) as usize;
         let chunk = core::cmp::min(PAGE_SIZE - in_page, to_read - total);
 
@@ -242,8 +243,9 @@ pub async fn read(
 
 /// sys_lseek: reposition file offset.
 pub fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<u64, Errno> {
-    use crate::fs::FileObject;
     use core::sync::atomic::Ordering;
+
+    use crate::fs::FileObject;
 
     const SEEK_SET: u32 = 0;
     const SEEK_CUR: u32 = 1;
@@ -256,7 +258,7 @@ pub fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<
     match &desc.object {
         FileObject::PipeRead(_) | FileObject::PipeWrite(_) => return Err(Errno::Espipe),
         FileObject::Device(_) => return Err(Errno::Espipe),
-        FileObject::Vnode(_) => {}
+        FileObject::Vnode(_) => {},
     }
 
     let size = match &desc.object {
@@ -326,10 +328,10 @@ pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno>
                 VnodeType::Directory => 2u8,
             };
             st.st_mode = stat_mode_from_type(ftype);
-        }
+        },
         FileObject::PipeRead(_) | FileObject::PipeWrite(_) => {
             st.st_mode = 0o010600; // S_IFIFO | rw
-        }
+        },
         FileObject::Device(dk) => {
             use crate::fs::DeviceKind;
             st.st_mode = 0o020666; // S_IFCHR | rw
@@ -338,7 +340,7 @@ pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno>
                 DeviceKind::Zero => 0x0105,                                   // 1:5
                 DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite => 0x0501, // 5:1
             };
-        }
+        },
     }
 
     // Copy stat struct to user memory
@@ -397,7 +399,7 @@ pub async fn sys_fstatat_async(
         return Err(Errno::Enoent);
     }
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
-    let (ino, ftype, size) = fs::fs_lookup(0, &path_str).await?;;
+    let (ino, ftype, size) = fs::fs_lookup(0, &path_str).await?;
 
     let mut st = LinuxStat {
         st_dev: 0,
@@ -530,7 +532,7 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
             // Find lowest fd >= arg
             let new_fd = tab.insert_from(arg as u32, desc, flags)?;
             Ok(new_fd as usize)
-        }
+        },
         F_GETFD => {
             let tab = task.fd_table.lock();
             let flags = tab.get_flags(fd).ok_or(Errno::Ebadf)?;
@@ -539,7 +541,7 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
             } else {
                 0
             })
-        }
+        },
         F_SETFD => {
             let mut tab = task.fd_table.lock();
             let _ = tab.get(fd).ok_or(Errno::Ebadf)?;
@@ -550,7 +552,7 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
             };
             tab.set_flags(fd, new_flags)?;
             Ok(0)
-        }
+        },
         F_GETFL => {
             let tab = task.fd_table.lock();
             let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
@@ -564,7 +566,7 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
             let status = desc.get_status_flags() as usize;
             fl |= status & (O_APPEND | O_NONBLOCK);
             Ok(fl)
-        }
+        },
         F_SETFL => {
             let tab = task.fd_table.lock();
             let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
@@ -573,7 +575,7 @@ pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usiz
             let next = (cur & !settable_mask) | ((arg as u32) & settable_mask);
             desc.set_status_flags(next);
             Ok(0)
-        }
+        },
         _ => Err(Errno::Einval),
     }
 }
@@ -710,8 +712,7 @@ pub async fn sys_linkat_async(
     if !crate::fs::same_mount_domain(&old_path, &new_path) {
         return Err(Errno::Einval);
     }
-    fs::fs_link(&old_path, &new_path)
-        .await?;
+    fs::fs_link(&old_path, &new_path).await?;
     Ok(())
 }
 
@@ -740,8 +741,7 @@ pub async fn sys_renameat2_async(
     if !crate::fs::same_mount_domain(&old_path, &new_path) {
         return Err(Errno::Einval);
     }
-    fs::fs_rename(&old_path, &new_path)
-        .await?;
+    fs::fs_rename(&old_path, &new_path).await?;
     Ok(())
 }
 
@@ -760,8 +760,7 @@ pub async fn sys_readlinkat_async(
         .await
         .ok_or(Errno::Efault)?;
     let path = absolutize_path(task, dirfd, &raw_path)?;
-    let (mut n, data) = fs::fs_readlink(&path)
-        .await?;;
+    let (mut n, data) = fs::fs_readlink(&path).await?;
     if n > 0 && data[n - 1] == 0 {
         n -= 1;
     }
@@ -806,8 +805,7 @@ pub async fn sys_faccessat_async(
         return Err(Errno::Enoent);
     }
     let path = absolutize_path(task, dirfd, &raw_path)?;
-    let _ = fs::fs_lookup(0, &path)
-        .await?;
+    let _ = fs::fs_lookup(0, &path).await?;
     Ok(())
 }
 
@@ -822,8 +820,7 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
         FileObject::Vnode(v) => String::from(v.path()),
         _ => return Err(Errno::Einval),
     };
-    fs::fs_truncate(&path, len)
-        .await?;;
+    fs::fs_truncate(&path, len).await?;
     if let FileObject::Vnode(v) = &desc.object {
         v.set_size(len);
     }
@@ -860,8 +857,7 @@ pub async fn sys_sync_async() -> Result<(), Errno> {
 
 /// sys_pipe2: create a pipe with optional flags.
 pub fn sys_pipe2(task: &Arc<Task>, pipefd_ptr: usize, flags: usize) -> Result<(), Errno> {
-    use crate::fs::Pipe;
-    use crate::fs::{FdFlags, FileDescription, FileObject, OpenFlags};
+    use crate::fs::{FdFlags, FileDescription, FileObject, OpenFlags, Pipe};
 
     let pipe = Pipe::new();
     let cloexec = (flags & 0o2000000) != 0;
@@ -883,7 +879,7 @@ pub fn sys_pipe2(task: &Arc<Task>, pipefd_ptr: usize, flags: usize) -> Result<()
             Err(e) => {
                 tab.remove(rfd); // rollback
                 return Err(e);
-            }
+            },
         };
         (rfd, wfd)
     };
@@ -966,10 +962,10 @@ pub fn normalize_absolute_path(path: &str) -> String {
     let mut comps: Vec<&str> = Vec::new();
     for comp in path.split('/') {
         match comp {
-            "" | "." => {}
+            "" | "." => {},
             ".." => {
                 let _ = comps.pop();
-            }
+            },
             _ => comps.push(comp),
         }
     }
@@ -1023,7 +1019,7 @@ pub fn absolutize_path(task: &Arc<Task>, dirfd: isize, raw_path: &str) -> Result
                         return Err(Errno::Enotdir);
                     }
                     String::from(v.path())
-                }
+                },
                 _ => return Err(Errno::Enotdir),
             }
         };
@@ -1101,7 +1097,7 @@ pub async fn sys_read_async(
             } else {
                 Ok(len)
             }
-        }
+        },
         ReadSource::DevConsole => {
             ConsoleReadFuture {
                 task,
@@ -1109,7 +1105,7 @@ pub async fn sys_read_async(
                 len,
             }
             .await
-        }
+        },
         ReadSource::PipeRead(pipe) => {
             PipeReadFuture {
                 pipe,
@@ -1118,7 +1114,7 @@ pub async fn sys_read_async(
                 len,
             }
             .await
-        }
+        },
         ReadSource::Vnode {
             vnode,
             size,
@@ -1132,7 +1128,7 @@ pub async fn sys_read_async(
             let obj = vnode_object(&*vnode);
 
             while total < to_read {
-                let page_idx = VirtPageNum(offset as usize / PAGE_SIZE);
+                let page_idx = crate::mm::vm::VObjIndex::from_bytes_floor(offset as usize);
                 let offset_in_page = (offset % PAGE_SIZE as u64) as usize;
                 let chunk = core::cmp::min(PAGE_SIZE - offset_in_page, to_read - total);
 
@@ -1147,7 +1143,7 @@ pub async fn sys_read_async(
                     Ok(result) => {
                         total += result.done;
                         offset += result.done as u64;
-                    }
+                    },
                     Err(Errno::Efault) => {
                         resolve_user_fault(
                             task,
@@ -1157,7 +1153,7 @@ pub async fn sys_read_async(
                         .await
                         .map_err(|_| Errno::Efault)?;
                         continue;
-                    }
+                    },
                     Err(e) => return Err(e),
                 }
             }
@@ -1165,7 +1161,7 @@ pub async fn sys_read_async(
             desc.offset
                 .store(offset, core::sync::atomic::Ordering::Relaxed);
             Ok(total)
-        }
+        },
     }
 }
 
@@ -1202,8 +1198,9 @@ pub async fn sys_write_async(
         let tgt = match &d.object {
             FileObject::Device(DeviceKind::Null) => WriteTarget::DevNull,
             FileObject::Device(DeviceKind::Zero) => WriteTarget::DevNull,
-            FileObject::Device(DeviceKind::ConsoleWrite)
-            | FileObject::Device(DeviceKind::ConsoleRead) => WriteTarget::DevConsole,
+            FileObject::Device(DeviceKind::ConsoleWrite | DeviceKind::ConsoleRead) => {
+                WriteTarget::DevConsole
+            },
             FileObject::PipeWrite(p) => WriteTarget::PipeWrite(Arc::clone(p)),
             FileObject::PipeRead(_) => return Err(Errno::Ebadf),
             FileObject::Vnode(v) => WriteTarget::Vnode {
@@ -1229,7 +1226,7 @@ pub async fn sys_write_async(
             // Use atomic batch write to prevent output interleaving
             crate::console::putchars(&kbuf);
             Ok(len)
-        }
+        },
         WriteTarget::PipeWrite(pipe) => {
             fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
             let mut kbuf = alloc::vec![0u8; len];
@@ -1250,7 +1247,7 @@ pub async fn sys_write_async(
                 task.signals.post_signal(crate::proc::SIGPIPE);
             }
             result
-        }
+        },
         WriteTarget::Vnode {
             path,
             mut offset,
@@ -1285,7 +1282,9 @@ pub async fn sys_write_async(
                             let start_page = offset as usize / PAGE_SIZE;
                             let end_page = (offset as usize + n - 1) / PAGE_SIZE;
                             for pi in start_page..=end_page {
-                                if let Some(page) = obj_r.get_page(VirtPageNum(pi)) {
+                                if let Some(page) =
+                                    obj_r.get_page(crate::mm::vm::VObjIndex::new(pi))
+                                {
                                     let page_base = pi * PAGE_SIZE;
                                     let copy_start = if offset as usize > page_base {
                                         offset as usize - page_base
@@ -1311,10 +1310,10 @@ pub async fn sys_write_async(
                         v.set_size(new_size);
                     }
                     Ok(n)
-                }
+                },
                 Err(_) => Err(Errno::Eio),
             }
-        }
+        },
     }
 }
 
@@ -1358,13 +1357,13 @@ pub async fn sys_readv_async(
                 if n < len {
                     break;
                 }
-            }
+            },
             Err(e) => {
                 if total_read > 0 {
                     return Ok(total_read);
                 }
                 return Err(e);
-            }
+            },
         }
     }
     Ok(total_read)
@@ -1408,13 +1407,13 @@ pub async fn sys_writev_async(
                 if n < len {
                     break;
                 }
-            }
+            },
             Err(e) => {
                 if total > 0 {
                     return Ok(total);
                 }
                 return Err(e);
-            }
+            },
         }
     }
     Ok(total)
@@ -1434,8 +1433,7 @@ pub async fn sys_ioctl_async(
         let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
         matches!(
             &desc.object,
-            FileObject::Device(DeviceKind::ConsoleRead)
-                | FileObject::Device(DeviceKind::ConsoleWrite)
+            FileObject::Device(DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite)
         )
     };
     if !is_console {
@@ -1466,7 +1464,7 @@ pub async fn sys_ioctl_async(
                 }
             }
             Ok(0)
-        }
+        },
         TIOCGWINSZ => {
             if argp != 0 {
                 fault_in_user_buffer(task, argp, 8, PageFaultAccessType::WRITE).await;
@@ -1479,7 +1477,7 @@ pub async fn sys_ioctl_async(
                 }
             }
             Ok(0)
-        }
+        },
         TCSETS | TCSETSW | TCSETSF => Ok(0),
         FIONBIO => Ok(0),
         _ => Err(Errno::Enotty),
@@ -1562,21 +1560,21 @@ pub async fn sys_ppoll_async(
             match tab.get(fd as u32) {
                 None => {
                     revents = POLLNVAL;
-                }
+                },
                 Some(desc) => match &desc.object {
                     FileObject::Device(DeviceKind::ConsoleRead) => {
                         if events & POLLIN != 0 {
                             revents |= POLLIN;
                         }
-                    }
+                    },
                     FileObject::Device(DeviceKind::ConsoleWrite) => {
                         if events & POLLOUT != 0 {
                             revents |= POLLOUT;
                         }
-                    }
-                    FileObject::Device(DeviceKind::Null) | FileObject::Device(DeviceKind::Zero) => {
+                    },
+                    FileObject::Device(DeviceKind::Null | DeviceKind::Zero) => {
                         revents |= events & (POLLIN | POLLOUT);
-                    }
+                    },
                     FileObject::PipeRead(pipe) => {
                         if pipe.readable_len() > 0 {
                             revents |= POLLIN;
@@ -1584,17 +1582,17 @@ pub async fn sys_ppoll_async(
                         if pipe.is_writer_closed() {
                             revents |= POLLHUP;
                         }
-                    }
+                    },
                     FileObject::PipeWrite(pipe) => {
                         if pipe.is_reader_closed() {
                             revents |= POLLERR;
                         } else if events & POLLOUT != 0 {
                             revents |= POLLOUT;
                         }
-                    }
+                    },
                     FileObject::Vnode(_) => {
                         revents |= events & (POLLIN | POLLOUT);
-                    }
+                    },
                 },
             }
 
@@ -1674,11 +1672,11 @@ impl<'a> Future for PipeReadFuture<'a> {
                 } else {
                     Poll::Ready(Ok(n))
                 }
-            }
+            },
             Err(Errno::Eagain) => {
                 this.pipe.register_reader_waker(cx.waker());
                 Poll::Pending
-            }
+            },
             Err(e) => Poll::Ready(Err(e)),
         }
     }
@@ -1746,16 +1744,16 @@ impl<'a> Future for PipeWriteFuture<'a> {
                 }
                 this.pipe.register_writer_waker(cx.waker());
                 Poll::Pending
-            }
+            },
             Err(Errno::Eagain) => {
                 this.pipe.register_writer_waker(cx.waker());
                 Poll::Pending
-            }
+            },
             Err(Errno::Epipe) => {
                 // Post SIGPIPE when writing to a pipe with no readers
                 this.task.signals.post_signal(crate::proc::SIGPIPE);
                 Poll::Ready(Err(Errno::Epipe))
-            }
+            },
             Err(e) => Poll::Ready(Err(e)),
         }
     }
@@ -1904,15 +1902,8 @@ pub async fn sys_symlinkat_async(
         normalize_absolute_path(&joined)
     };
 
-    fs::fs_symlink(&target_abs, &link_abs)
-        .await?;;
-    crate::klog!(
-        syscall,
-        debug,
-        "symlinkat: {} -> {}",
-        link_abs,
-        target_abs
-    );
+    fs::fs_symlink(&target_abs, &link_abs).await?;
+    crate::klog!(syscall, debug, "symlinkat: {} -> {}", link_abs, target_abs);
     Ok(())
 }
 
@@ -1939,7 +1930,7 @@ pub async fn sys_getdents64_async(
                     return Err(Errno::Enotdir);
                 }
                 (String::from(v.path()), Arc::clone(d))
-            }
+            },
             _ => return Err(Errno::Enotdir),
         }
     };

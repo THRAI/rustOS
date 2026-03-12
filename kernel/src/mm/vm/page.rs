@@ -4,13 +4,20 @@
 //! referencing. Aligned to FreeBSD's definition.
 
 use alloc::sync::Arc;
-use bitflags::bitflags;
-use core::ops::Deref;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use core::{
+    ops::Deref,
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering},
+};
 
-use crate::hal_common::PhysAddr;
-use crate::mm::allocator::PageRole;
-use crate::mm::vm::{register_waker, remove_waker, wake_all, VmObject};
+use bitflags::bitflags;
+
+use crate::{
+    hal_common::PhysAddr,
+    mm::{
+        vm::{register_waker, remove_waker, wake_all, VmObject},
+        PageRole,
+    },
+};
 
 bitflags! {
     /// Readers-Writer Busy Lock state.
@@ -185,7 +192,7 @@ impl VmPage {
                         wake_all(self as *const _ as usize);
                     }
                     return;
-                }
+                },
                 Err(val) => current = val,
             }
         }
@@ -347,7 +354,7 @@ impl VmPage {
     }
 
     fn free_to_allocator(&self) {
-        crate::mm::allocator::free_raw_frame(self.phys_addr);
+        crate::mm::free_raw_frame(self.phys_addr);
     }
 }
 

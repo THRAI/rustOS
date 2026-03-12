@@ -1,32 +1,21 @@
-use crate::hal_common::Errno;
-use crate::hal_common::{VirtAddr, PAGE_SIZE};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
 
 pub mod entry;
 pub mod splay;
 
-use crate::hal_common::SpinMutex;
-use crate::mm::vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
-use crate::mm::{pmap_protect, pmap_remove, Pmap};
 pub(crate) use splay::{SplayTree, SplayTreeIter};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VmError {
-    Overlap,
-    NotFound,
-    InvalidRange,
-}
-
-impl From<VmError> for Errno {
-    fn from(e: VmError) -> Errno {
-        match e {
-            VmError::Overlap => Errno::Einval,
-            VmError::NotFound => Errno::Einval,
-            VmError::InvalidRange => Errno::Einval,
-        }
-    }
-}
+use crate::{
+    hal_common::SpinMutex,
+    mm::{
+        pmap_protect, pmap_remove,
+        vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry},
+        Pmap,
+    },
+};
 
 pub struct VmMap {
     /// Intrusive Splay tree of VmMapEntries
@@ -76,8 +65,8 @@ impl VmMap {
             .iter()
             .map(|e| {
                 (
-                    VirtAddr::new(e.start as usize),
-                    VirtAddr::new(e.end as usize),
+                    VirtAddr::new(e.start() as usize),
+                    VirtAddr::new(e.end() as usize),
                 )
             })
             .collect();
@@ -104,19 +93,19 @@ impl VmMap {
         }
     }
 
-    pub fn insert_entry(&mut self, entry: VmMapEntry) -> Result<(), VmError> {
+    pub fn insert_entry(&mut self, entry: VmMapEntry) -> Result<(), Errno> {
         if entry.start() >= entry.end() {
-            return Err(VmError::InvalidRange);
+            return Err(Errno::Einval);
         }
 
         let page_size = PAGE_SIZE as u64;
         if entry.start() % page_size != 0 || entry.end() % page_size != 0 {
-            return Err(VmError::InvalidRange);
+            return Err(Errno::Einval);
         }
 
         for existing in self.iter() {
-            if existing.start < entry.end() && existing.end > entry.start() {
-                return Err(VmError::Overlap);
+            if existing.start() < entry.end() && existing.end() > entry.start() {
+                return Err(Errno::Einval);
             }
         }
 
@@ -138,8 +127,8 @@ impl VmMap {
             let mut pmap = self.pmap.lock();
             pmap_remove(
                 &mut pmap,
-                VirtAddr::new(entry.start as usize),
-                VirtAddr::new(entry.end as usize),
+                VirtAddr::new(entry.start() as usize),
+                VirtAddr::new(entry.end() as usize),
             );
         }
 
@@ -169,8 +158,8 @@ impl VmMap {
         // Collect all entries that overlap [start_addr, end_addr).
         let mut to_remove = alloc::vec::Vec::new();
         for entry in self.iter() {
-            if entry.start < end_addr && entry.end > start_addr {
-                to_remove.push(entry.start);
+            if entry.start() < end_addr && entry.end() > start_addr {
+                to_remove.push(entry.start());
             }
         }
 
@@ -233,7 +222,7 @@ impl VmMap {
 
     pub fn is_range_free(&self, start: u64, end: u64) -> bool {
         for vma in self.iter() {
-            if core::cmp::max(vma.start, start) < core::cmp::min(vma.end, end) {
+            if core::cmp::max(vma.start(), start) < core::cmp::min(vma.end(), end) {
                 return false;
             }
         }
@@ -246,7 +235,7 @@ impl VmMap {
 
         let mut occupied = alloc::vec::Vec::new();
         for vma in self.iter() {
-            occupied.push((vma.start, vma.end));
+            occupied.push((vma.start(), vma.end()));
         }
         occupied.sort_unstable_by_key(|&(s, _)| s);
 
@@ -269,9 +258,9 @@ impl VmMap {
         start: VirtAddr,
         end: VirtAddr,
         perm: MapPerm,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), Errno> {
         if start >= end {
-            return Err(VmError::InvalidRange);
+            return Err(Errno::Einval);
         }
 
         let start_addr = start.as_usize() as u64;
@@ -279,13 +268,13 @@ impl VmMap {
 
         let mut overlapping = alloc::vec::Vec::new();
         for entry in self.iter() {
-            if entry.start < end_addr && entry.end > start_addr {
-                overlapping.push((entry.start, entry.end, entry.max_protection));
+            if entry.start() < end_addr && entry.end() > start_addr {
+                overlapping.push((entry.start(), entry.end(), entry.max_protection));
             }
         }
 
         if overlapping.is_empty() {
-            return Err(VmError::NotFound);
+            return Err(Errno::Enomem);
         }
 
         overlapping.sort_unstable_by_key(|&(entry_start, _, _)| entry_start);
@@ -293,10 +282,10 @@ impl VmMap {
         let mut covered_until = start_addr;
         for &(entry_start, entry_end, max_protection) in &overlapping {
             if entry_start > covered_until {
-                return Err(VmError::NotFound);
+                return Err(Errno::Enomem);
             }
             if !max_protection.contains(perm) {
-                return Err(VmError::InvalidRange);
+                return Err(Errno::Einval);
             }
             if entry_end > covered_until {
                 covered_until = entry_end;
@@ -307,7 +296,7 @@ impl VmMap {
         }
 
         if covered_until < end_addr {
-            return Err(VmError::NotFound);
+            return Err(Errno::Enomem);
         }
 
         let keys: alloc::vec::Vec<u64> = overlapping
@@ -368,18 +357,17 @@ impl VmMap {
         &mut self,
         old_brk_aligned: usize,
         new_brk_aligned: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), Errno> {
         if new_brk_aligned <= old_brk_aligned {
-            return Err(VmError::InvalidRange);
+            return Err(Errno::Einval);
         }
 
         if old_brk_aligned > 0 {
-            let mut heap_start = 0usize;
             let mut extended = false;
             {
                 if let Some(vma) = self.lookup_mut((old_brk_aligned - 1) as u64) {
                     if vma.end() == old_brk_aligned as u64 && vma.flags.contains(EntryFlags::HEAP) {
-                        heap_start = vma.start() as usize;
+                        let heap_start = vma.start() as usize;
                         vma.set_bounds(heap_start as u64, new_brk_aligned as u64);
                         if let BackingStore::Object { object, .. } = &vma.store {
                             object.write().set_size(new_brk_aligned - heap_start);
@@ -399,7 +387,7 @@ impl VmMap {
         }
 
         if !self.is_range_free(old_brk_aligned as u64, new_brk_aligned as u64) {
-            return Err(VmError::Overlap);
+            return Err(Errno::Einval);
         }
 
         let grow_len = new_brk_aligned - old_brk_aligned;
@@ -421,9 +409,9 @@ impl VmMap {
         &mut self,
         old_brk_aligned: usize,
         new_brk_aligned: usize,
-    ) -> Result<alloc::vec::Vec<VmMapEntry>, VmError> {
+    ) -> Result<alloc::vec::Vec<VmMapEntry>, Errno> {
         if new_brk_aligned >= old_brk_aligned {
-            return Err(VmError::InvalidRange);
+            return Err(Errno::Einval);
         }
 
         if old_brk_aligned == 0 {
@@ -449,7 +437,7 @@ impl VmMap {
                             let mut obj = object.write();
                             obj.set_size(new_heap_end - heap_start);
                             let dropped =
-                                obj.truncate_pages(crate::hal_common::VirtPageNum(new_pages));
+                                obj.truncate_pages(crate::mm::vm::VObjIndex::new(new_pages));
                             drop(dropped);
                         }
                         unmap_range = Some((new_heap_end, old_brk_aligned));

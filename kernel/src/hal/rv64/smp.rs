@@ -4,8 +4,7 @@
 //! then calls secondary_rust_main which initializes PerCpu, trap vectors,
 //! timer, and enters the executor loop.
 
-use super::fdt;
-use super::sbi;
+use super::{fdt, sbi};
 
 /// Boot all secondary harts. Called by hart 0 after its own init is complete.
 pub fn boot_secondary_harts(num_cpus: usize, hartids: &[usize], boot_hartid: usize) {

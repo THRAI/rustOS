@@ -25,10 +25,14 @@ pub enum Errno {
     Enotdir,
     Eisdir,
     Enotempty,
+    Enametoolong,
 }
 
 impl Errno {
-    /// Convert to negative errno value (Linux convention for syscall returns).
+    /// Convert to positive errno value (POSIX numbering).
+    ///
+    /// Callers that need the Linux negative-return convention should
+    /// negate the result themselves (e.g. `-(errno.as_i32() as isize)`).
     pub fn as_i32(self) -> i32 {
         match self {
             Errno::Eperm => 1,
@@ -55,9 +59,7 @@ impl Errno {
             Errno::Enotdir => 20,
             Errno::Eisdir => 21,
             Errno::Enotempty => 39,
+            Errno::Enametoolong => 36,
         }
     }
 }
-
-/// Kernel-wide result type: error is always an errno code.
-pub type KernelResult<T> = core::result::Result<T, Errno>;

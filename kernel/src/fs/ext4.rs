@@ -5,10 +5,12 @@
 //! Metadata queries (`stat`, `exists`) use the native C APIs
 //! (`ext4_raw_inode_fill`, `ext4_inode_exist`) instead of file-open hacks.
 
-use crate::fs::Disk;
-use crate::hal_common::Errno;
-use lwext4_rust::bindings::{self, ext4_dir, ext4_direntry, ext4_inode, EOK};
-use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes};
+use lwext4_rust::{
+    bindings::{self, ext4_dir, ext4_direntry, ext4_inode, EOK},
+    Ext4BlockWrapper, Ext4File, InodeTypes,
+};
+
+use crate::{fs::Disk, hal_common::Errno};
 
 /// Map a raw lwext4 C error code (positive integer) to an `Errno`.
 fn lwext4_err(rc: i32) -> Errno {
@@ -25,6 +27,7 @@ fn lwext4_err(rc: i32) -> Errno {
         22 => Errno::Einval,
         24 => Errno::Emfile,
         34 => Errno::Erange,
+        36 => Errno::Enametoolong,
         39 => Errno::Enotempty,
         _ => Errno::Eio,
     }
@@ -58,14 +61,16 @@ impl DelegateToken {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Convert a `&str` path to a stack-allocated null-terminated buffer.
-/// Returns `(buf, len_with_nul)`. Panics if path >= 256 bytes.
-fn path_to_cstr(path: &str) -> [u8; 257] {
+/// Returns `Err(Enametoolong)` if path >= 256 bytes.
+fn path_to_cstr(path: &str) -> Result<[u8; 257], Errno> {
     let bytes = path.as_bytes();
-    assert!(bytes.len() < 257, "path too long for ext4 cstr buffer");
+    if bytes.len() >= 257 {
+        return Err(Errno::Enametoolong);
+    }
     let mut buf = [0u8; 257];
     buf[..bytes.len()].copy_from_slice(bytes);
     // buf[bytes.len()] is already 0 (null terminator)
-    buf
+    Ok(buf)
 }
 
 // ── VFS Flags (Phase 3) ─────────────────────────────────────────────
@@ -142,7 +147,7 @@ pub fn close(_tok: &mut DelegateToken, file: &mut Ext4File) -> Result<(), Errno>
 ///
 /// Uses the native `ext4_raw_inode_fill` C API — no file_open needed.
 pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u32, u64, u8), Errno> {
-    let cpath = path_to_cstr(path);
+    let cpath = path_to_cstr(path)?;
     let mut ino: u32 = 0;
     let mut inode: ext4_inode = unsafe { core::mem::zeroed() };
 
@@ -170,7 +175,10 @@ pub fn stat(_tok: &mut DelegateToken, path: &str) -> Result<(u32, u64, u8), Errn
 
 /// Check if an inode exists at the given path.
 pub fn exists(_tok: &mut DelegateToken, path: &str) -> bool {
-    let cpath = path_to_cstr(path);
+    let cpath = match path_to_cstr(path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
     let ptr = cpath.as_ptr() as *const core::ffi::c_char;
     let rc = unsafe { bindings::ext4_inode_exist(ptr, 1) }; // EXT4_DE_REG_FILE
     if rc == EOK as i32 {
@@ -184,7 +192,7 @@ pub fn exists(_tok: &mut DelegateToken, path: &str) -> bool {
 
 /// Open a directory for iteration. Returns an opaque `ext4_dir` handle.
 pub fn dir_open(_tok: &mut DelegateToken, path: &str) -> Result<ext4_dir, Errno> {
-    let cpath = path_to_cstr(path);
+    let cpath = path_to_cstr(path)?;
     let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
     let rc =
         unsafe { bindings::ext4_dir_open(&mut dir, cpath.as_ptr() as *const core::ffi::c_char) };
@@ -260,7 +268,7 @@ pub fn readlink(_tok: &mut DelegateToken, path: &str, buf: &mut [u8]) -> Result<
 
 /// Flush filesystem cache for the mount point that contains `path`.
 pub fn cache_flush(_tok: &mut DelegateToken, path: &str) -> Result<(), Errno> {
-    let cpath = path_to_cstr(path);
+    let cpath = path_to_cstr(path)?;
     let rc = unsafe { bindings::ext4_cache_flush(cpath.as_ptr() as *const core::ffi::c_char) };
     if rc != EOK as i32 {
         return Err(lwext4_err(rc));

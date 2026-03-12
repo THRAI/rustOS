@@ -8,20 +8,20 @@
 //! Per-task kernel stack (8KB, 2 pages from frame allocator) is used by
 //! __user_trap / trap_return for the setjmp/longjmp trap mechanism.
 
-use crate::hal_common::SpinMutex as Mutex;
-use crate::hal_common::{PhysAddr, TrapFrame, PAGE_SIZE};
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
-use crate::fs::FdTable;
-use crate::mm::allocator::{frame_alloc_contiguous, frame_free_contiguous};
-use crate::mm::pmap;
-use crate::mm::vm::VmMap;
 // use crate::hal_common::IrqSafeSpinLock;
-
 use crate::proc::{alloc_pid, SignalState};
+use crate::{
+    fs::FdTable,
+    hal_common::{PhysAddr, SpinMutex as Mutex, TrapFrame, PAGE_SIZE},
+    mm::{frame_alloc_contiguous, frame_free_contiguous, pmap, vm::VmMap},
+};
 
 /// Kernel stack size: 4 pages (16KB).
 const KSTACK_ORDER: usize = 2; // 2^2 = 4 pages
@@ -62,6 +62,13 @@ pub struct Task {
     /// Child processes.
     pub children: Mutex<Vec<Arc<Task>>>,
     /// Virtual address space.
+    ///
+    // SAFETY: SpinMutex (no IRQ disable). Currently safe because the timer
+    // IRQ handler only sets `needs_reschedule` and advances TimerWheel —
+    // it never accesses any VmMap. Page faults are synchronous traps on the
+    // faulting hart, not asynchronous IRQs, so they cannot preempt a holder
+    // on the same hart. Must be upgraded to IrqSafeSpinLock if any future
+    // IRQ/IPI path needs to inspect or modify a VmMap.
     pub vm_map: Mutex<VmMap>,
     /// File descriptor table placeholder (expanded in VFS plan).
     pub fd_table: Mutex<FdTable>,

@@ -29,3 +29,20 @@ kernel-rv
 */__pycache__/
 ai/
 runtest.sh
+
+# IDE / editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets / environment
+.env
+.env.local
+.env.*.local
+!.env.example

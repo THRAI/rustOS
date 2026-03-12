@@ -3,8 +3,9 @@
 //! Each CPU has a PerCpu holding its run queue, timer wheel, and identity.
 //! Accessed via the tp register (hot path) or global array (cross-CPU).
 
-use crate::hal_common::{IrqSafeSpinLock, RunQueue, TimerWheel};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+
+use crate::hal_common::{IrqSafeSpinLock, RunQueue, TimerWheel};
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -80,5 +81,9 @@ pub fn current() -> &'static PerCpu {
 /// Set the tp register to point to the PerCpu for the given CPU.
 pub unsafe fn set_tp(cpu_id: usize) {
     let per_cpu = get(cpu_id) as *const PerCpu as usize;
-    core::arch::asm!("mv tp, {}", in(reg) per_cpu);
+    // SAFETY: Caller guarantees cpu_id is valid and this runs during
+    // single-threaded boot or with interrupts disabled.
+    unsafe {
+        core::arch::asm!("mv tp, {}", in(reg) per_cpu);
+    }
 }

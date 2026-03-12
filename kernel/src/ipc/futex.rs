@@ -3,18 +3,17 @@
 //! Process-private futexes keyed by physical address.
 //! Global HashMap<PhysAddr, Vec<Waker>> for wait/wake.
 
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll, Waker},
+};
 
-use crate::hal_common::{Errno, PhysAddr};
-
-use crate::hal_common::IrqSafeSpinLock;
-
-use crate::proc::Task;
+use crate::{
+    hal_common::{Errno, IrqSafeSpinLock, PhysAddr},
+    proc::Task,
+};
 
 /// Global futex wait table: maps physical address to list of waiting wakers.
 static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<Waker>>> =

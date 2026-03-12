@@ -1,0 +1,25 @@
+# Rustfmt configuration for BSD-Async Rust OS Kernel
+# Applies to all workspace members (kernel, user)
+#
+# Run: cargo fmt --check   (CI)
+#      cargo fmt            (auto-fix)
+
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+use_field_init_shorthand = true
+use_try_shorthand = true
+newline_style = "Unix"
+
+# Imports
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+# Formatting choices
+fn_params_layout = "Tall"
+match_block_trailing_comma = true
+trailing_comma = "Vertical"
+trailing_semicolon = true
+force_multiline_blocks = false

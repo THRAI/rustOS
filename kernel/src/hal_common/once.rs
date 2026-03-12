@@ -4,8 +4,10 @@
 //! Sub-word atomics (AtomicBool, AtomicU8) are emulated by LLVM with
 //! lr/sc + masking, which can hang on bare metal.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 const INCOMPLETE: usize = 0;
 const RUNNING: usize = 1;
@@ -41,13 +43,13 @@ impl<T> Once<T> {
                 let val = f();
                 unsafe { *self.data.get() = Some(val) };
                 self.state.store(COMPLETE, Ordering::Release);
-            }
+            },
             Err(_) => {
                 // Another thread is running or already complete — spin until complete
                 while self.state.load(Ordering::Acquire) != COMPLETE {
                     core::hint::spin_loop();
                 }
-            }
+            },
         }
     }
 

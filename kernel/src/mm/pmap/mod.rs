@@ -9,26 +9,25 @@ pub mod shootdown;
 pub mod test_integration;
 pub mod walk;
 
+use alloc::vec::Vec;
+use core::{
+    array,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
 pub use pte::PteFlags;
 pub(crate) use pte::{
     encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa,
 };
-pub use shootdown::{
-    handle_shootdown_ipi, has_pending, ipi_broadcast_flush_all, pmap_shootdown, ShootdownRequest,
-};
-
-use alloc::vec::Vec;
-use core::array;
-use core::sync::atomic::{AtomicBool, Ordering};
-
-use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
-use crate::mm::allocator::{get_frame_meta, PageRole};
-use crate::mm::VmPage;
+pub use shootdown::{handle_shootdown_ipi, has_pending, ipi_broadcast_flush_all};
 
 use super::vm::MapPerm;
-
 #[cfg(target_arch = "riscv64")]
 use crate::executor::MAX_CPUS;
+use crate::{
+    hal_common::{PhysAddr, VirtAddr, PAGE_SIZE},
+    mm::{get_frame_meta, PageRole, VmPage},
+};
 #[cfg(not(target_arch = "riscv64"))]
 const MAX_CPUS: usize = 8;
 
@@ -85,7 +84,7 @@ impl Pmap {
     }
 
     /// Allocate a page table page via `alloc_pte_lX_sync` and track it.
-    fn alloc_pt_page(&mut self, level: usize) -> Option<usize> {
+    fn alloc_pt_page(&mut self, level: usize) -> Option<PhysAddr> {
         #[cfg(target_arch = "riscv64")]
         {
             if level == 0 {
@@ -95,7 +94,7 @@ impl Pmap {
                 pmap_zero_page(pa);
                 crate::klog!(vm, debug, "STUB: TraceEvent::Alloc {{ usage: PteL1 }}");
                 self.l1_directories.push(frame);
-                Some(pa.as_usize())
+                Some(pa)
             } else if level == 1 {
                 let frame =
                     super::allocator::alloc_pte_l0_sync().expect("failed to allocate L0 map");
@@ -103,7 +102,7 @@ impl Pmap {
                 pmap_zero_page(pa);
                 crate::klog!(vm, debug, "STUB: TraceEvent::Alloc {{ usage: PteL0 }}");
                 self.l0_tables.push(frame);
-                Some(pa.as_usize())
+                Some(pa)
             } else {
                 None
             }
@@ -227,10 +226,10 @@ pub fn pmap_create() -> Pmap {
 /// Free all page table pages and release the ASID.
 pub fn pmap_destroy(pmap: &mut Pmap) {
     for frame in pmap.l0_tables.drain(..) {
-        crate::mm::allocator::frame_free(frame);
+        crate::mm::frame_free(frame);
     }
     for frame in pmap.l1_directories.drain(..) {
-        crate::mm::allocator::frame_free(frame);
+        crate::mm::frame_free(frame);
     }
     // Note: root is dropped explicitly. To ensure we don't double drop it if pmap is used,
     // we would need it wrapped in Option. However, pmap_destroy is typically only called right before Pmap is dropped natively.
@@ -242,11 +241,11 @@ impl Drop for Pmap {
     fn drop(&mut self) {
         let l0s = core::mem::take(&mut self.l0_tables);
         for frame in l0s {
-            crate::mm::allocator::frame_free(frame);
+            crate::mm::frame_free(frame);
         }
         let l1s = core::mem::take(&mut self.l1_directories);
         for frame in l1s {
-            crate::mm::allocator::frame_free(frame);
+            crate::mm::frame_free(frame);
         }
         // Since root is &'static mut, we can't nicely "take" it without Option or unsafe.
         // We will just fetch its phys address and free it directly to buddy allocator.
@@ -259,7 +258,7 @@ impl Drop for Pmap {
                 debug_assert!(old_ref > 0, "pmap root frame refcount underflow");
                 if old_ref == 1 {
                     meta.set_role(PageRole::Free);
-                    crate::mm::allocator::free_raw_frame(phys);
+                    crate::mm::free_raw_frame(phys);
                 }
             }
         }
@@ -283,12 +282,9 @@ pub fn pmap_enter(
     }
 
     unsafe {
-        let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.phys().as_usize(),
-            va.as_usize(),
-            true,
-            &mut |level| pmap.alloc_pt_page(level),
-        )
+        let pte_ptr = walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, true, &mut |level| {
+            pmap.alloc_pt_page(level)
+        })
         .ok_or(())?;
 
         let old = pte_ptr.read_volatile();
@@ -334,7 +330,7 @@ pub fn pmap_remove(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr) {
     while va < va_end.as_usize() {
         unsafe {
             if let Some(pte_ptr) =
-                walk::walk::<SV39_LEVELS>(pmap.root.phys().as_usize(), va, false, &mut |_| None)
+                walk::walk::<SV39_LEVELS>(pmap.root.phys(), VirtAddr::new(va), false, &mut |_| None)
             {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) {
@@ -370,7 +366,7 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
     while va < va_end.as_usize() {
         unsafe {
             if let Some(pte_ptr) =
-                walk::walk::<SV39_LEVELS>(pmap.root.phys().as_usize(), va, false, &mut |_| None)
+                walk::walk::<SV39_LEVELS>(pmap.root.phys(), VirtAddr::new(va), false, &mut |_| None)
             {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) && pte_is_leaf(old) {
@@ -400,12 +396,7 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
 pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
     unsafe {
         let mut no_alloc = |_| None;
-        let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.phys().as_usize(),
-            va.as_usize(),
-            false,
-            &mut no_alloc,
-        )?;
+        let pte_ptr = walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, false, &mut no_alloc)?;
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) && pte_is_leaf(raw) {
             Some(PhysAddr::new(pte_pa(raw) | va.page_offset()))
@@ -419,12 +410,7 @@ pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
 /// Returns None if the page is not mapped (no valid leaf PTE).
 pub fn pmap_extract_with_flags(pmap: &Pmap, va: VirtAddr) -> Option<(PhysAddr, PteFlags)> {
     unsafe {
-        let pte_ptr = walk::walk::<SV39_LEVELS>(
-            pmap.root.phys().as_usize(),
-            va.as_usize(),
-            false,
-            &mut |_| None,
-        )?;
+        let pte_ptr = walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, false, &mut |_| None)?;
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) && pte_is_leaf(raw) {
             Some((
@@ -475,12 +461,7 @@ pub fn pmap_deactivate(pmap: &mut Pmap) {
 /// Returns true if the fault was resolved (PTE updated), false otherwise.
 pub fn pmap_fault(pmap: &Pmap, va: VirtAddr, write: bool) -> bool {
     unsafe {
-        let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.phys().as_usize(),
-            va.as_usize(),
-            false,
-            &mut |_| None,
-        ) {
+        let pte_ptr = match walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, false, &mut |_| None) {
             Some(p) => p,
             None => return false,
         };
@@ -563,12 +544,7 @@ pub fn pmap_enter_range(pmap: &mut Pmap, pa_start: usize, pa_end: usize, prot: M
 
 fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
     unsafe {
-        let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.phys().as_usize(),
-            va.as_usize(),
-            false,
-            &mut |_| None,
-        ) {
+        let pte_ptr = match walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, false, &mut |_| None) {
             Some(p) => p,
             None => return false,
         };
@@ -579,12 +555,7 @@ fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
 
 fn pte_bit_clear(pmap: &mut Pmap, va: VirtAddr, bit: PteFlags) {
     unsafe {
-        let pte_ptr = match walk::walk::<SV39_LEVELS>(
-            pmap.root.phys().as_usize(),
-            va.as_usize(),
-            false,
-            &mut |_| None,
-        ) {
+        let pte_ptr = match walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, false, &mut |_| None) {
             Some(p) => p,
             None => return,
         };

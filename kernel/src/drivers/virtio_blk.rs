@@ -4,10 +4,13 @@
 //! negotiates features, sets up a single virtqueue, and provides
 //! synchronous read_sector/write_sector with adaptive polling.
 
-use crate::drivers::*;
-use crate::hal_common::PAGE_SIZE;
-use crate::mm::allocator::{alloc_raw_frame_sync, PageRole};
 use core::sync::atomic::{fence, Ordering};
+
+use crate::{
+    drivers::*,
+    hal_common::PAGE_SIZE,
+    mm::{alloc_raw_frame_sync, PageRole},
+};
 
 /// Align `val` up to `align` (must be power of 2).
 const fn align_up(val: usize, align: usize) -> usize {
@@ -101,6 +104,10 @@ pub struct VirtioBlk {
 }
 
 /// Global driver instance.
+// SAFETY: SpinMutex (no IRQ disable). Currently safe because the VirtIO
+// driver uses polled I/O only — there is no completion IRQ handler that
+// could re-enter this lock. Must be upgraded to IrqSafeSpinLock if
+// interrupt-driven I/O is added.
 static VIRTIO_BLK: crate::hal_common::Once<crate::hal_common::SpinMutex<VirtioBlk>> =
     crate::hal_common::Once::new();
 
@@ -174,8 +181,7 @@ impl VirtioBlk {
 
         let num_pages = align_up(total_size, PAGE_SIZE) / PAGE_SIZE;
         let order = num_pages.next_power_of_two().trailing_zeros() as usize;
-        let base_frame =
-            crate::mm::allocator::frame_alloc_contiguous(order).expect("virtio-blk: queue alloc");
+        let base_frame = crate::mm::frame_alloc_contiguous(order).expect("virtio-blk: queue alloc");
         let base_pa = base_frame.as_usize();
 
         // Zero the entire region

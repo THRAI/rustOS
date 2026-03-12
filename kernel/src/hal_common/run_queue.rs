@@ -4,8 +4,9 @@
 //! uses `async_task::Runnable`.
 
 extern crate alloc;
-use super::IrqSafeSpinLock;
 use alloc::collections::VecDeque;
+
+use super::IrqSafeSpinLock;
 
 /// A FIFO run queue protected by IrqSafeSpinLock.
 ///
@@ -52,10 +53,9 @@ unsafe impl<R: Send> Sync for RunQueue<R> {}
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     extern crate std;
+    use std::{sync::Arc, thread, vec::Vec};
+
     use super::*;
-    use std::sync::Arc;
-    use std::thread;
-    use std::vec::Vec;
 
     #[test]
     fn push_pop_fifo_order() {

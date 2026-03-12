@@ -3,8 +3,7 @@
 //! send_ipi wakes a remote CPU from wfi. handle_ipi clears the
 //! pending bit -- the actual work happens in the executor loop.
 
-use super::fdt;
-use super::sbi;
+use super::{fdt, sbi};
 
 /// Send an IPI to the target logical CPU, waking it from wfi.
 pub fn send_ipi(target_cpu: usize) {

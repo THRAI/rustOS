@@ -3,9 +3,11 @@
 //! On rv64, disable_and_save/restore use real CSR ops.
 //! On host (for testing), they are no-ops.
 
-use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// Arch-specific IRQ control.
 /// On host targets (x86_64, aarch64), these are no-ops for testability.
@@ -129,8 +131,7 @@ mod tests {
     #[test]
     fn mutual_exclusion_two_threads() {
         extern crate std;
-        use std::sync::Arc;
-        use std::thread;
+        use std::{sync::Arc, thread};
 
         let lock = Arc::new(IrqSafeSpinLock::new(0u64));
         let iterations = 1000;
@@ -166,10 +167,14 @@ mod tests {
 /// or: `RUSTFLAGS="--cfg loom" cargo test -p hal-common`
 #[cfg(all(test, not(target_os = "none")))]
 mod loom_tests {
-    use loom::cell::UnsafeCell;
-    use loom::sync::atomic::{AtomicBool, Ordering};
-    use loom::sync::Arc;
-    use loom::thread;
+    use loom::{
+        cell::UnsafeCell,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+    };
 
     /// Minimal loom-compatible spinlock (mirrors IrqSafeSpinLock logic
     /// but uses loom primitives so loom can explore interleavings).

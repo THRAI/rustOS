@@ -12,20 +12,16 @@
 //! The old exec()/exec_with_args() functions are preserved behind the
 //! "exec-legacy" feature flag for debugging.
 
-use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
-use crate::fs::{resolve, vnode_object, VnodeType};
-use crate::mm::{
-    pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_zero_page, BackingStore, EntryFlags,
-    MapPerm, VmError, VmMap, VmMapEntry, VmObject,
-};
-
-use crate::proc::{
-    map_sigcode_page, parse_elf_first_page, ExecContext, SigSet, Task, SIG_DFL, SIG_IGN,
+use crate::{
+    fs::{resolve, vnode_object, VnodeType},
+    hal_common::{Errno, VirtAddr, PAGE_SIZE},
+    mm::{
+        pmap_activate, pmap_create, pmap_destroy, pmap_enter, BackingStore, EntryFlags, MapPerm,
+        VmMap, VmMapEntry, VmObject,
+    },
+    proc::{map_sigcode_page, parse_elf_first_page, ExecContext, SigSet, Task, SIG_DFL, SIG_IGN},
 };
 
 // ---------------------------------------------------------------------------
@@ -56,11 +52,10 @@ const AT_RANDOM: usize = 25;
 // VMA insert helper
 // ---------------------------------------------------------------------------
 
-fn map_insert_err(err: VmError) -> Errno {
-    match err {
-        VmError::Overlap | VmError::InvalidRange => Errno::Enoexec,
-        VmError::NotFound => Errno::Enomem,
-    }
+/// Map a VM insert error to an exec-appropriate errno.
+/// During exec, overlap/invalid-range means the ELF binary is malformed.
+fn map_insert_err(_err: Errno) -> Errno {
+    Errno::Enoexec
 }
 
 // ---------------------------------------------------------------------------
@@ -94,14 +89,14 @@ pub async fn do_execve(
     // 1b. Create a file-backed VmObject for the ELF vnode and fetch page 0
     //     through the pager (not the allocator directly).
     let elf_obj = VmObject::new_file(&*vnode);
-    VmObject::fetch_page_async(Arc::clone(&elf_obj), crate::hal_common::VirtPageNum(0))
+    VmObject::fetch_page_async(Arc::clone(&elf_obj), crate::mm::vm::VObjIndex::new(0))
         .await
         .map_err(|_| Errno::Enoexec)?;
 
     // 1c. Parse ELF header + program headers via goblin
     let hdr_phys = elf_obj
         .read()
-        .lookup_page(crate::hal_common::VirtPageNum(0))
+        .lookup_page(crate::mm::vm::VObjIndex::new(0))
         .ok_or(Errno::Enoexec)?;
 
     let hdr_buf = hdr_phys.as_slice();
@@ -203,7 +198,7 @@ pub async fn do_execve(
                     interp_entry
                 );
                 interp_entry
-            }
+            },
             Err(e) => {
                 klog!(
                     exec,
@@ -214,7 +209,7 @@ pub async fn do_execve(
                     e
                 );
                 return Err(e);
-            }
+            },
         }
     } else {
         exec_ctx.user_entry.0
@@ -222,7 +217,7 @@ pub async fn do_execve(
 
     // 2d. Create user stack VMA (anonymous, RW)
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
-    let stack_obj = VmObject::new_anon(USER_STACK_SIZE / PAGE_SIZE);
+    let stack_obj = VmObject::new_anon(USER_STACK_SIZE);
     let stack_obj_ref = Arc::clone(&stack_obj);
     let stack_vma = VmMapEntry::new(
         stack_bottom as u64,
@@ -242,7 +237,7 @@ pub async fn do_execve(
     let (sp_va, entry_for_auxv) = {
         // Eagerly allocate the top stack page through the stack VmObject
         let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-        let stack_page_idx = crate::hal_common::VirtPageNum((USER_STACK_SIZE / PAGE_SIZE) - 1);
+        let stack_page_idx = crate::mm::vm::VObjIndex::new((USER_STACK_SIZE / PAGE_SIZE) - 1);
 
         // Allocate and zero the page via VmObject (not the allocator directly)
         let phys = {
@@ -430,13 +425,13 @@ async fn load_interp_into(
 
     // Fetch the interpreter's first page through a VmObject
     let interp_obj = VmObject::new_file(&*vnode);
-    VmObject::fetch_page_async(Arc::clone(&interp_obj), crate::hal_common::VirtPageNum(0))
+    VmObject::fetch_page_async(Arc::clone(&interp_obj), crate::mm::vm::VObjIndex::new(0))
         .await
         .map_err(|_| Errno::Enoexec)?;
 
     let hdr_phys = interp_obj
         .read()
-        .lookup_page(crate::hal_common::VirtPageNum(0))
+        .lookup_page(crate::mm::vm::VObjIndex::new(0))
         .ok_or(Errno::Enoexec)?;
     let hdr_buf = hdr_phys.as_slice();
 
@@ -513,23 +508,21 @@ async fn load_interp_into(
 #[cfg(feature = "exec-legacy")]
 mod legacy {
 
-    use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
-    use alloc::string::String;
-    use alloc::sync::Arc;
-    use alloc::vec::Vec;
-
-    use crate::fs::{resolve, vnode_object, VnodeType};
-    use crate::mm::{
-        pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_zero_page, BackingStore,
-        EntryFlags, MapPerm, VmError, VmMap, VmMapEntry, VmObject,
-    };
-
-    use crate::proc::Task;
+    use alloc::{string::String, sync::Arc, vec::Vec};
 
     use super::{
         elf_flags_to_prot, insert_or_merge_file_vma, load_interp, map_insert_err, parse_elf_header,
         parse_phdrs, Elf64Header, AT_ENTRY, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM,
         AT_RANDOM, DL_INTERP_OFFSET, PT_INTERP, PT_LOAD, USER_STACK_SIZE, USER_STACK_TOP,
+    };
+    use crate::{
+        fs::{resolve, vnode_object, VnodeType},
+        hal_common::{Errno, VirtAddr, PAGE_SIZE},
+        mm::{
+            pmap_activate, pmap_create, pmap_destroy, pmap_enter, BackingStore, EntryFlags,
+            MapPerm, VmMap, VmMapEntry, VmObject,
+        },
+        proc::Task,
     };
 
     /// Execute an ELF binary: resolve path, parse ELF, reset vm_map, create
@@ -547,7 +540,7 @@ mod legacy {
         }
 
         let obj = vnode_object(&*vnode);
-        let page0 = VmObject::fetch_page_async(obj, crate::hal_common::VirtPageNum(0))
+        let page0 = VmObject::fetch_page_async(obj, crate::hal_common::PageNum::new(0))
             .await
             .map_err(|_| Errno::Enoexec)?;
 
@@ -598,7 +591,7 @@ mod legacy {
             let prot = elf_flags_to_prot(phdr.p_flags);
             let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
 
-            let obj_size = (va_end - va_start) / PAGE_SIZE;
+            let obj_size = va_end - va_start;
             let obj = VmObject::new_anon(obj_size);
             obj.write().pager = Some(Arc::new(crate::mm::vm::VnodePager {
                 vnode_id: vnode.vnode_id() as usize,
@@ -647,7 +640,7 @@ mod legacy {
                         interp_entry
                     );
                     interp_entry
-                }
+                },
                 Err(e) => {
                     klog!(
                         exec,
@@ -658,14 +651,14 @@ mod legacy {
                         e
                     );
                     return Err(e);
-                }
+                },
             }
         } else {
             entry
         };
 
         let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
-        let stack_obj = VmObject::new_anon(USER_STACK_SIZE / PAGE_SIZE);
+        let stack_obj = VmObject::new_anon(USER_STACK_SIZE);
         let stack_vma = VmMapEntry::new(
             stack_bottom as u64,
             USER_STACK_TOP as u64,
@@ -950,10 +943,10 @@ fn elf_flags_to_prot(flags: u32) -> MapPerm {
 /// match on identical file offset — sufficient because this function is
 /// only called during exec where all segments originate from the same
 /// vnode.
-fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), VmError> {
+fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), Errno> {
     if let BackingStore::Object { .. } = new_vma.store {
-        if let Some(existing) = vm.lookup_mut(new_vma.start) {
-            if existing.start == new_vma.start && existing.end == new_vma.end {
+        if let Some(existing) = vm.lookup_mut(new_vma.start()) {
+            if existing.start() == new_vma.start() && existing.end() == new_vma.end() {
                 let same_backing = match (&existing.store, &new_vma.store) {
                     (
                         BackingStore::Object { offset: f1, .. },
@@ -973,7 +966,7 @@ fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), V
 }
 
 // ---------------------------------------------------------------------------
-// exec()
+// exec() — legacy non-atomic exec (destructive: clears vm_map before build)
 // ---------------------------------------------------------------------------
 
 /// Execute an ELF binary: resolve path, parse ELF, reset vm_map, create
@@ -981,6 +974,12 @@ fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), V
 ///
 /// This is an async function because path resolution and ELF header reading
 /// go through the delegate channel.
+///
+/// **WARNING**: Unlike `do_execve()`, this function is NOT two-phase-commit
+/// safe — it clears the old address space before building the new one.  A
+/// failure after the clear leaves the process in a broken state.  Prefer
+/// `do_execve()` for production use.
+#[cfg(feature = "exec-legacy")]
 pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Errno> {
     klog!(exec, debug, "exec pid={} path={}", task.pid, elf_path);
     // 1. Resolve path to vnode
@@ -996,7 +995,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
     }
 
     let obj = vnode_object(&*vnode);
-    let page0 = VmObject::fetch_page_async(obj, crate::hal_common::VirtPageNum(0))
+    let page0 = VmObject::fetch_page_async(obj, crate::mm::vm::VObjIndex::new(0))
         .await
         .map_err(|_| Errno::Enoexec)?;
 
@@ -1077,7 +1076,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
         // Adjustment for non-page-aligned p_vaddr
 
-        let obj_size = (va_end - va_start) / PAGE_SIZE;
+        let obj_size = va_end - va_start;
         let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
         let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
         let merged_backed_bytes = merged_file_bytes
@@ -1136,7 +1135,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
                     interp_entry
                 );
                 interp_entry
-            }
+            },
             Err(e) => {
                 klog!(
                     exec,
@@ -1147,7 +1146,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
                     e
                 );
                 return Err(e);
-            }
+            },
         }
     } else {
         entry
@@ -1155,7 +1154,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 
     // 5. Create user stack VMA (anonymous, RW)
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
-    let stack_obj = VmObject::new_anon(USER_STACK_SIZE / PAGE_SIZE);
+    let stack_obj = VmObject::new_anon(USER_STACK_SIZE);
     let stack_vma = VmMapEntry::new(
         stack_bottom as u64,
         USER_STACK_TOP as u64,
@@ -1216,8 +1215,9 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 }
 
 // ---------------------------------------------------------------------------
-// load_interp: 将动态链接器 ELF 加载到 offset 偏移处
+// load_interp: legacy interpreter loader (operates on task's live vm_map)
 // ---------------------------------------------------------------------------
+#[cfg(feature = "exec-legacy")]
 async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Result<usize, Errno> {
     let vnode = resolve(interp_path).await?;
     if vnode.vtype() != VnodeType::Regular {
@@ -1225,7 +1225,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
     }
 
     let obj = vnode_object(&*vnode);
-    let page0 = VmObject::fetch_page_async(obj, crate::hal_common::VirtPageNum(0))
+    let page0 = VmObject::fetch_page_async(obj, crate::mm::vm::VObjIndex::new(0))
         .await
         .map_err(|_| Errno::Enoexec)?;
 
@@ -1263,7 +1263,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
         let prot = elf_flags_to_prot(phdr.p_flags);
         let file_offset_page_aligned = (phdr.p_offset as usize) & !(PAGE_SIZE - 1);
 
-        let obj_size = (va_end - va_start) / PAGE_SIZE;
+        let obj_size = va_end - va_start;
         let file_prefix = (phdr.p_offset as usize).saturating_sub(file_offset_page_aligned);
         let file_backed_bytes = file_prefix + phdr.p_filesz as usize;
         let merged_backed_bytes = merged_file_bytes

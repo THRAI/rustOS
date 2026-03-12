@@ -13,11 +13,11 @@
 
 use alloc::sync::Arc;
 
-use crate::hal_common::{PhysAddr, VirtAddr, PAGE_SIZE};
-
 use super::super::pmap::{self, Pmap};
-use crate::hal_common::VirtPageNum;
-use crate::mm::vm::{BackingStore, MapPerm, VmMap, VmMapEntry};
+use crate::{
+    hal_common::{PhysAddr, VirtAddr, PAGE_SIZE},
+    mm::vm::{BackingStore, MapPerm, VObjIndex, VmMap, VmMapEntry},
+};
 
 /// Result of a synchronous page fault resolution attempt.
 #[derive(Debug)]
@@ -117,7 +117,7 @@ pub fn sync_fault_handler(
         None => {
             crate::klog!(vm, debug, "fault NOT_MAPPED va={:#x}", fault_va.0);
             return FaultResult::Error(FaultError::NotMapped);
-        }
+        },
         Some(vma) => vma,
     };
 
@@ -128,8 +128,8 @@ pub fn sync_fault_handler(
         fault_va.0,
         fault_va_aligned.0,
         vma.protection,
-        vma.start,
-        vma.end
+        vma.start(),
+        vma.end()
     );
 
     // 2. Check permissions.
@@ -150,15 +150,15 @@ pub fn sync_fault_handler(
     // 3. Compute object offset.
     let (obj, obj_page_offset) = match &vma.store {
         BackingStore::Object { object, offset } => {
-            let offset_bytes = offset + ((fault_va_aligned.0 as u64) - vma.start);
+            let offset_bytes = offset + ((fault_va_aligned.0 as u64) - vma.start());
             (
                 object.clone(),
-                VirtPageNum((offset_bytes / PAGE_SIZE as u64) as usize),
+                VObjIndex::from_bytes_floor(offset_bytes as usize),
             )
-        }
+        },
         BackingStore::SubMap { .. } | BackingStore::Guard => {
             return FaultResult::Error(FaultError::InvalidAccess);
-        }
+        },
     };
 
     // 4. Classify and handle the fault.
@@ -184,7 +184,7 @@ pub fn sync_fault_handler(
 fn classify_and_handle(
     vma: &VmMapEntry,
     obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
-    obj_page_offset: VirtPageNum,
+    obj_page_offset: VObjIndex,
     fault_va_aligned: VirtAddr,
     access_type: PageFaultAccessType,
     pmap: &mut Pmap,
@@ -211,10 +211,10 @@ fn classify_and_handle(
             } else {
                 handle_anonymous_fault(vma, obj, obj_page_offset, fault_va_aligned, pmap)
             }
-        }
+        },
         Some(_old_phys) if access_type.write && vma.protection.contains(MapPerm::W) => {
             handle_cow_fault(vma, obj, obj_page_offset, fault_va_aligned, _old_phys, pmap)
-        }
+        },
         Some(phys) => {
             if pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.protection, false).is_err() {
                 crate::klog!(
@@ -237,7 +237,7 @@ fn classify_and_handle(
                 return FaultResult::Error(FaultError::NotMapped);
             }
             FaultResult::Resolved
-        }
+        },
     }
 }
 
@@ -246,7 +246,7 @@ fn classify_and_handle(
 fn handle_anonymous_fault(
     vma: &VmMapEntry,
     obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
-    obj_page_offset: VirtPageNum,
+    obj_page_offset: VObjIndex,
     fault_va_aligned: VirtAddr,
     pmap: &mut Pmap,
 ) -> FaultResult {
@@ -296,7 +296,7 @@ fn handle_anonymous_fault(
 fn handle_cow_fault(
     vma: &VmMapEntry,
     obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
-    obj_page_offset: VirtPageNum,
+    obj_page_offset: VObjIndex,
     fault_va_aligned: VirtAddr,
     old_phys: PhysAddr,
     pmap: &mut Pmap,
@@ -381,8 +381,7 @@ fn handle_cow_fault(
 
 #[cfg(all(test, feature = "qemu-test"))]
 mod tests {
-    use super::super::super::pmap::Pmap;
-    use super::*;
+    use super::{super::super::pmap::Pmap, *};
     use crate::mm::vm::{
         LegacyMapPerm as MapPerm, LegacyVmArea as VmArea, LegacyVmAreaType as VmAreaType,
         LegacyVmMap as VmMap, VmObject,

@@ -4,21 +4,19 @@
 //! ranges. Each VmArea has a monotonic `AtomicU64` ID that is unique across
 //! all VMAs, providing TOCTOU defense.
 
-use crate::hal_common::VirtPageNum;
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::ops::Range;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
+
 use spin::RwLock;
 
-use crate::hal_common::{VirtAddr, PAGE_SIZE};
-
-use crate::mm::vm::VObjIndex;
-
-use crate::mm::vm::VmObject;
-
-use crate::fs::Vnode;
+use crate::{
+    fs::Vnode,
+    hal_common::{Errno, VirtAddr, PAGE_SIZE},
+    mm::vm::{VObjIndex, VmObject},
+};
 
 // ---------------------------------------------------------------------------
 // Monotonic VMA ID
@@ -79,32 +77,6 @@ pub enum VmAreaType {
 }
 
 // ---------------------------------------------------------------------------
-// VmError
-// ---------------------------------------------------------------------------
-
-/// Errors from VM map operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VmError {
-    /// New VMA overlaps an existing one.
-    Overlap,
-    /// No VMA found at the given address.
-    NotFound,
-    /// The requested range is invalid (e.g., start >= end).
-    InvalidRange,
-}
-
-impl From<VmError> for crate::hal_common::Errno {
-    fn from(e: VmError) -> crate::hal_common::Errno {
-        use crate::hal_common::Errno;
-        match e {
-            VmError::Overlap => Errno::Einval,
-            VmError::NotFound => Errno::Einval,
-            VmError::InvalidRange => Errno::Einval,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // VmArea
 // ---------------------------------------------------------------------------
 
@@ -121,7 +93,7 @@ pub struct VmArea {
     /// Backing VmObject.
     pub object: Arc<RwLock<VmObject>>,
     /// Offset into the VmObject where this mapping starts (in pages).
-    pub obj_offset: VirtPageNum,
+    pub obj_offset: VObjIndex,
     /// Type of this VMA.
     pub vma_type: VmAreaType,
     /// Entry state flags (COW, IN_TRANSITION, etc.).
@@ -142,7 +114,7 @@ impl VmArea {
         range: Range<VirtAddr>,
         prot: MapPerm,
         object: Arc<RwLock<VmObject>>,
-        obj_offset: VirtPageNum,
+        obj_offset: VObjIndex,
         vma_type: VmAreaType,
     ) -> Self {
         Self {
@@ -164,7 +136,7 @@ impl VmArea {
         range: Range<VirtAddr>,
         prot: MapPerm,
         object: Arc<RwLock<VmObject>>,
-        obj_offset: VirtPageNum,
+        obj_offset: VObjIndex,
         vnode: Arc<dyn Vnode>,
         file_offset: usize,
         file_size: usize,
@@ -193,13 +165,6 @@ impl VmArea {
     pub fn translate_to_obj_index(&self, va: VirtAddr) -> VObjIndex {
         debug_assert!(self.contains(va));
         let delta_in_pages = (va - self.range.start).div_ceil(PAGE_SIZE);
-        self.obj_offset + delta_in_pages
-    }
-
-    /// Coordinate transform: compute page index for a given virtual address.
-    pub fn pindex_for(&self, vaddr: VirtAddr) -> VirtPageNum {
-        debug_assert!(self.contains(vaddr));
-        let delta_in_pages = (vaddr - self.range.start).div_ceil(PAGE_SIZE);
         self.obj_offset + delta_in_pages
     }
 
@@ -283,15 +248,15 @@ impl VmMap {
     }
 
     /// Insert a VMA, checking for overlap with existing areas.
-    pub fn insert(&mut self, area: VmArea) -> Result<(), VmError> {
+    pub fn insert(&mut self, area: VmArea) -> Result<(), Errno> {
         if area.range.start >= area.range.end {
-            return Err(VmError::InvalidRange);
+            return Err(Errno::Einval);
         }
         // Check overlap: any existing VMA that starts before our end
         // and ends after our start.
         for (_, existing) in self.areas.range(..area.range.end) {
             if existing.range.end > area.range.start {
-                return Err(VmError::Overlap);
+                return Err(Errno::Einval);
             }
         }
         self.areas.insert(area.range.start, area);
@@ -781,7 +746,7 @@ mod tests {
         let mut map = VmMap::new();
         map.insert(make_vma(0x1000, 0x3000)).unwrap();
         let result = map.insert(make_vma(0x2000, 0x4000));
-        assert_eq!(result, Err(VmError::Overlap));
+        assert_eq!(result, Err(Errno::Einval));
     }
 
     #[test]

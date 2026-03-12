@@ -4,8 +4,7 @@
 //! on the hot path. When the magazine is empty, it refills from the
 //! buddy allocator in batch. When full, it drains half back to buddy.
 
-use crate::hal_common::PhysAddr;
-use crate::mm::allocator::BuddyAllocator;
+use crate::{hal_common::PhysAddr, mm::BuddyAllocator};
 
 /// Number of frames a magazine can hold.
 const MAGAZINE_CAPACITY: usize = 32;

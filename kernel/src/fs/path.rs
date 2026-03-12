@@ -3,11 +3,12 @@
 //! Splits path on '/', calls delegate lookup for each component,
 //! caches results in the dentry cache.
 
-use crate::hal_common::Errno;
-use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc};
 
-use crate::fs::{fs_lookup, insert_dentry, lookup_dentry, Ext4Vnode, Vnode, VnodeType};
+use crate::{
+    fs::{fs_lookup, insert_dentry, lookup_dentry, Ext4Vnode, Vnode, VnodeType},
+    hal_common::Errno,
+};
 
 /// Root inode number for ext4.
 const EXT4_ROOT_INO: u32 = 2;
@@ -62,7 +63,7 @@ pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
                     Ext4Vnode::new_with_path(child_ino, vtype, child_size, built_path.clone());
                 insert_dentry(parent_id, component, Arc::clone(&child));
                 current = child;
-            }
+            },
             Err(_) => return Err(Errno::Enoent),
         }
     }

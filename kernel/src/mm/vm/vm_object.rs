@@ -7,20 +7,23 @@
 //! The `Drop` implementation uses iterative `Arc::try_unwrap` unwinding
 //! to handle arbitrarily deep shadow chains (500+) without stack overflow.
 
-use crate::hal_common::VirtPageNum;
-use crate::hal_common::{PhysAddr, PAGE_SIZE};
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
-use core::marker::{Send, Sync};
-use core::sync::atomic::AtomicU32;
+use alloc::{collections::BTreeMap, sync::Arc};
+use core::{
+    marker::{Send, Sync},
+    sync::atomic::AtomicU32,
+};
+
 use spin::RwLock;
 
-use crate::fs::Vnode;
-use crate::hal_common::Errno;
-use crate::mm::allocator::{get_frame_meta, PageRole};
-use crate::mm::vm::{ExclusiveBusyGuard, SharedBusyGuard};
-use crate::mm::VmPage;
-use crate::mm::{pmap_copy_page, pmap_zero_page};
+use crate::{
+    fs::Vnode,
+    hal_common::{Errno, PageNum, PhysAddr, PAGE_SIZE},
+    mm::{
+        get_frame_meta, pmap_copy_page, pmap_zero_page,
+        vm::{ExclusiveBusyGuard, SharedBusyGuard},
+        PageRole, VmPage,
+    },
+};
 /// Pager trait for clustered I/O operations (BSD vm_pager interface).
 /// Supports fetching multiple pages in a single operation for efficiency.
 pub trait Pager: core::fmt::Debug + Send + Sync {
@@ -179,8 +182,79 @@ pub struct VmObject {
     clean_generation: AtomicU32,
 }
 
-/// Index into VmObject, in units of pages (not bytes)
-pub type VObjIndex = VirtPageNum;
+/// Index into VmObject, in units of pages (not bytes).
+///
+/// This is a proper newtype — distinct from `PageNum`, `PhysPageNum`,
+/// and `VirtPageNum` at the type level. A physical frame number or
+/// virtual page number cannot be silently passed where a `VObjIndex`
+/// is expected.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VObjIndex(usize);
+
+impl VObjIndex {
+    pub const fn new(n: usize) -> Self {
+        Self(n)
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+
+    /// Convert a `PageNum` to `VObjIndex` — explicit, never implicit.
+    pub const fn from_page_num(pn: PageNum) -> Self {
+        Self(pn.as_usize())
+    }
+
+    /// Convert byte offset to object page index (floor division).
+    pub const fn from_bytes_floor(bytes: usize) -> Self {
+        Self(bytes / PAGE_SIZE)
+    }
+
+    /// Convert byte offset to object page index (ceiling division).
+    pub const fn from_bytes_ceil(bytes: usize) -> Self {
+        Self((bytes + PAGE_SIZE - 1) / PAGE_SIZE)
+    }
+
+    /// Convert object page index to byte offset.
+    pub const fn to_bytes(self) -> usize {
+        self.0 * PAGE_SIZE
+    }
+}
+
+impl core::ops::Add<usize> for VObjIndex {
+    type Output = Self;
+    fn add(self, rhs: usize) -> Self {
+        Self(self.0 + rhs)
+    }
+}
+
+impl core::ops::AddAssign<usize> for VObjIndex {
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs;
+    }
+}
+
+impl core::ops::Sub<usize> for VObjIndex {
+    type Output = Self;
+    fn sub(self, rhs: usize) -> Self {
+        assert!(self.0 >= rhs, "VObjIndex underflow");
+        Self(self.0 - rhs)
+    }
+}
+
+impl core::ops::Sub<VObjIndex> for VObjIndex {
+    type Output = usize;
+    fn sub(self, rhs: VObjIndex) -> usize {
+        assert!(self.0 >= rhs.0, "VObjIndex underflow");
+        self.0 - rhs.0
+    }
+}
+
+impl core::fmt::Display for VObjIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl VmObject {
     fn release_unmapped_page(page: Arc<VmPage>) {
@@ -195,7 +269,7 @@ impl VmObject {
             );
             if old_ref == 1 {
                 meta.set_role(PageRole::Free);
-                crate::mm::allocator::free_raw_frame(phys);
+                crate::mm::free_raw_frame(phys);
             }
         }
     }
@@ -308,7 +382,7 @@ impl VmObject {
     }
 
     /// Traverse shadow chain to find a page (BSD-style backing traversal).
-    pub fn lookup_page_in_chain(&self, pindex: VirtPageNum) -> Option<PhysAddr> {
+    pub fn lookup_page_in_chain(&self, pindex: VObjIndex) -> Option<PhysAddr> {
         self.lookup_page(pindex)
     }
 
@@ -317,7 +391,7 @@ impl VmObject {
     /// lock during sleeps to avoid deadlocking the object tree.
     pub async fn grab_for_fault(
         top_object: Arc<RwLock<Self>>,
-        pindex: VirtPageNum,
+        pindex: VObjIndex,
     ) -> Result<Arc<VmPage>, Errno> {
         loop {
             // Quick pass: look for page in the shadow chain.
@@ -359,7 +433,7 @@ impl VmObject {
                 }
 
                 // Allocate born locked.
-                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(Errno::Enomem)?;
+                let frame = crate::mm::alloc_anon_sync().ok_or(Errno::Enomem)?;
 
                 let mut new_page = VmPage::new();
                 new_page.phys_addr = frame.phys();
@@ -374,7 +448,7 @@ impl VmObject {
 
                 new_page.object =
                     core::sync::atomic::AtomicPtr::new(Arc::as_ptr(&top_object) as *mut _);
-                new_page.pindex = pindex.0 as u64;
+                new_page.pindex = pindex.as_usize() as u64;
 
                 let arc_page = Arc::new(new_page);
                 // Born locked:
@@ -393,7 +467,7 @@ impl VmObject {
     /// fetch a filled page. When kernel needs a page from uvm, it calls this function.
     pub async fn fetch_page_async(
         obj_arc: Arc<RwLock<Self>>,
-        pindex: VirtPageNum,
+        pindex: VObjIndex,
     ) -> Result<Arc<VmPage>, Errno> {
         let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex).await?;
         // If the page is new (resident_count just increased), we need to fill it.
@@ -408,7 +482,7 @@ impl VmObject {
             };
 
             if let Some(pager) = pager {
-                let offset_bytes = pindex.0 * PAGE_SIZE;
+                let offset_bytes = pindex.to_bytes();
 
                 if pager.page_in(offset_bytes, page.phys_addr).await.is_err() {
                     page.release_exclusive();
@@ -419,7 +493,7 @@ impl VmObject {
                 page.release_exclusive();
                 kprintln!(
                     "[ERROR]VmObject fetch_page_async: no pager for new page at index {}",
-                    pindex.0
+                    pindex
                 );
                 panic!();
             }
@@ -435,7 +509,7 @@ impl VmObject {
         match self.pages.entry(index) {
             alloc::collections::btree_map::Entry::Occupied(e) => Ok(e.get().phys_addr),
             alloc::collections::btree_map::Entry::Vacant(e) => {
-                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(Errno::Enomem)?;
+                let frame = crate::mm::alloc_anon_sync().ok_or(Errno::Enomem)?;
                 let phys = frame.phys();
                 pmap_zero_page(phys);
                 crate::klog!(
@@ -449,7 +523,7 @@ impl VmObject {
                 e.insert(Arc::new(new_page));
                 self.resident_count += 1;
                 Ok(phys)
-            }
+            },
         }
     }
 
@@ -459,7 +533,7 @@ impl VmObject {
         match self.pages.entry(index) {
             alloc::collections::btree_map::Entry::Occupied(e) => Ok(e.get().phys_addr),
             alloc::collections::btree_map::Entry::Vacant(e) => {
-                let frame = crate::mm::allocator::alloc_anon_sync().ok_or(Errno::Enomem)?;
+                let frame = crate::mm::alloc_anon_sync().ok_or(Errno::Enomem)?;
                 let phys = frame.phys();
                 pmap_copy_page(old_phys, phys);
                 crate::klog!(
@@ -473,7 +547,7 @@ impl VmObject {
                 e.insert(Arc::new(new_page));
                 self.resident_count += 1;
                 Ok(phys)
-            }
+            },
         }
     }
 
@@ -697,7 +771,7 @@ impl Drop for VmObject {
                         drop(next); // release before taking Arc
                     }
                     current = obj.backing.take();
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -706,9 +780,9 @@ impl Drop for VmObject {
 
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
-    use alloc::vec;
-    use alloc::vec::Vec;
 
     #[test]
     fn new_object_is_empty() {

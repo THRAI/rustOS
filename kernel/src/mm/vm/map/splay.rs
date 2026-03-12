@@ -1,5 +1,6 @@
-use crate::mm::vm::VmMapEntry;
 use core::ptr::NonNull;
+
+use crate::mm::vm::VmMapEntry;
 
 pub struct SplayTree {
     root: Option<NonNull<VmMapEntry>>,
@@ -20,121 +21,128 @@ impl SplayTree {
 
     /// Internal helper: Update max_free for a node
     unsafe fn update_max_free(mut node: NonNull<VmMapEntry>) {
-        let n = node.as_ref();
-        let mut max = 0;
-        let mut gap_left = 0;
-        let mut gap_right = 0;
+        // SAFETY: Caller guarantees `node` is a valid, exclusively accessible VmMapEntry.
+        unsafe {
+            let n = node.as_ref();
+            let mut max = 0;
+            let mut gap_left = 0;
+            let mut gap_right = 0;
 
-        if let Some(left) = n.splay_node.left {
-            let l = left.as_ref();
-            max = core::cmp::max(max, l.max_free);
-            gap_left = n.start.saturating_sub(l.end);
-        } else {
-            // Gap between 0 (or start of map) and n.start handled generically outside?
-            // Actually, gap between node and its children. If no left child, gap is 0 towards children.
+            if let Some(left) = n.splay_node.left {
+                let l = left.as_ref();
+                max = core::cmp::max(max, l.max_free);
+                gap_left = n.start().saturating_sub(l.end());
+            } else {
+                // Gap between 0 (or start of map) and n.start() handled generically outside?
+                // Actually, gap between node and its children. If no left child, gap is 0 towards children.
+            }
+
+            if let Some(right) = n.splay_node.right {
+                let r = right.as_ref();
+                max = core::cmp::max(max, r.max_free);
+                gap_right = r.start().saturating_sub(n.end());
+            }
+
+            max = core::cmp::max(max, gap_left);
+            max = core::cmp::max(max, gap_right);
+
+            node.as_mut().max_free = max;
         }
-
-        if let Some(right) = n.splay_node.right {
-            let r = right.as_ref();
-            max = core::cmp::max(max, r.max_free);
-            gap_right = r.start.saturating_sub(n.end);
-        }
-
-        max = core::cmp::max(max, gap_left);
-        max = core::cmp::max(max, gap_right);
-
-        node.as_mut().max_free = max;
     }
 
     /// Splay the tree around the target address `addr`.
     /// Brings the node containing or closest to `addr` to the root.
     unsafe fn splay(&mut self, addr: u64) {
-        if self.root.is_none() {
-            return;
-        }
-
-        // Standard Top-Down Splay
-        let mut n = self.root.take().unwrap();
-        let mut dummy = VmMapEntry::new(
-            0,
-            0,
-            crate::mm::vm::BackingStore::Guard,
-            crate::mm::vm::EntryFlags::empty(),
-            crate::mm::vm::MapPerm::empty(),
-        );
-        let mut left_tail = NonNull::from(&mut dummy);
-        let mut right_tail = NonNull::from(&mut dummy);
-
-        loop {
-            let n_ref = n.as_ref();
-            if addr < n_ref.start {
-                if let Some(mut left) = n_ref.splay_node.left {
-                    if addr < left.as_ref().start {
-                        // Zig-Zig
-                        n.as_mut().splay_node.left = left.as_ref().splay_node.right;
-                        Self::update_max_free(n);
-                        left.as_mut().splay_node.right = Some(n);
-                        n = left;
-                        if n.as_ref().splay_node.left.is_none() {
-                            break;
-                        }
-                        left = n.as_ref().splay_node.left.unwrap();
-                    }
-                    // Zig
-                    right_tail.as_mut().splay_node.left = Some(n);
-                    right_tail = n;
-                    n = left;
-                } else {
-                    break;
-                }
-            } else if addr >= n_ref.end {
-                if let Some(mut right) = n_ref.splay_node.right {
-                    if addr >= right.as_ref().end {
-                        // Zag-Zag
-                        n.as_mut().splay_node.right = right.as_ref().splay_node.left;
-                        Self::update_max_free(n);
-                        right.as_mut().splay_node.left = Some(n);
-                        n = right;
-                        if n.as_ref().splay_node.right.is_none() {
-                            break;
-                        }
-                        right = n.as_ref().splay_node.right.unwrap();
-                    }
-                    // Zag
-                    left_tail.as_mut().splay_node.right = Some(n);
-                    left_tail = n;
-                    n = right;
-                } else {
-                    break;
-                }
-            } else {
-                // Hit
-                break;
+        // SAFETY: Caller guarantees all NonNull nodes in the tree are valid
+        // and exclusively accessible through the SplayTree.
+        unsafe {
+            if self.root.is_none() {
+                return;
             }
+
+            // Standard Top-Down Splay
+            let mut n = self.root.take().unwrap();
+            let mut dummy = VmMapEntry::new(
+                0,
+                0,
+                crate::mm::vm::BackingStore::Guard,
+                crate::mm::vm::EntryFlags::empty(),
+                crate::mm::vm::MapPerm::empty(),
+            );
+            let mut left_tail = NonNull::from(&mut dummy);
+            let mut right_tail = NonNull::from(&mut dummy);
+
+            loop {
+                let n_ref = n.as_ref();
+                if addr < n_ref.start() {
+                    if let Some(mut left) = n_ref.splay_node.left {
+                        if addr < left.as_ref().start() {
+                            // Zig-Zig
+                            n.as_mut().splay_node.left = left.as_ref().splay_node.right;
+                            Self::update_max_free(n);
+                            left.as_mut().splay_node.right = Some(n);
+                            n = left;
+                            if n.as_ref().splay_node.left.is_none() {
+                                break;
+                            }
+                            left = n.as_ref().splay_node.left.unwrap();
+                        }
+                        // Zig
+                        right_tail.as_mut().splay_node.left = Some(n);
+                        right_tail = n;
+                        n = left;
+                    } else {
+                        break;
+                    }
+                } else if addr >= n_ref.end() {
+                    if let Some(mut right) = n_ref.splay_node.right {
+                        if addr >= right.as_ref().end() {
+                            // Zag-Zag
+                            n.as_mut().splay_node.right = right.as_ref().splay_node.left;
+                            Self::update_max_free(n);
+                            right.as_mut().splay_node.left = Some(n);
+                            n = right;
+                            if n.as_ref().splay_node.right.is_none() {
+                                break;
+                            }
+                            right = n.as_ref().splay_node.right.unwrap();
+                        }
+                        // Zag
+                        left_tail.as_mut().splay_node.right = Some(n);
+                        left_tail = n;
+                        n = right;
+                    } else {
+                        break;
+                    }
+                } else {
+                    // Hit
+                    break;
+                }
+            }
+
+            // Assemble
+            left_tail.as_mut().splay_node.right = n.as_ref().splay_node.left;
+            right_tail.as_mut().splay_node.left = n.as_ref().splay_node.right;
+
+            // The dummy children are the actual subtrees
+            n.as_mut().splay_node.left = dummy.splay_node.right;
+            n.as_mut().splay_node.right = dummy.splay_node.left;
+
+            // Update max_free for the subtrees if they exist
+            if let Some(l) = n.as_ref().splay_node.left {
+                Self::update_max_free(l);
+            }
+            if let Some(r) = n.as_ref().splay_node.right {
+                Self::update_max_free(r);
+            }
+            Self::update_max_free(n);
+
+            self.root = Some(n);
         }
-
-        // Assemble
-        left_tail.as_mut().splay_node.right = n.as_ref().splay_node.left;
-        right_tail.as_mut().splay_node.left = n.as_ref().splay_node.right;
-
-        // The dummy children are the actual subtrees
-        n.as_mut().splay_node.left = dummy.splay_node.right;
-        n.as_mut().splay_node.right = dummy.splay_node.left;
-
-        // Update max_free for the subtrees if they exist
-        if let Some(l) = n.as_ref().splay_node.left {
-            Self::update_max_free(l);
-        }
-        if let Some(r) = n.as_ref().splay_node.right {
-            Self::update_max_free(r);
-        }
-        Self::update_max_free(n);
-
-        self.root = Some(n);
     }
 
     pub fn insert(&mut self, entry_box: alloc::boxed::Box<VmMapEntry>) {
-        let addr = entry_box.start;
+        let addr = entry_box.start();
         let mut new_node = NonNull::from(alloc::boxed::Box::leak(entry_box));
 
         unsafe {
@@ -148,7 +156,7 @@ impl SplayTree {
             let mut root = self.root.unwrap();
             let root_ref = root.as_ref();
 
-            if addr < root_ref.start {
+            if addr < root_ref.start() {
                 new_node.as_mut().splay_node.left = root_ref.splay_node.left;
                 new_node.as_mut().splay_node.right = Some(root);
                 root.as_mut().splay_node.left = None;
@@ -169,7 +177,7 @@ impl SplayTree {
             self.splay(addr);
             if let Some(root) = self.root {
                 let r = root.as_ref();
-                if addr >= r.start && addr < r.end {
+                if addr >= r.start() && addr < r.end() {
                     return Some(r);
                 }
             }
@@ -181,9 +189,9 @@ impl SplayTree {
         let mut curr = self.root;
         while let Some(n) = curr {
             let n_ref = unsafe { n.as_ref() };
-            if addr >= n_ref.start && addr < n_ref.end {
+            if addr >= n_ref.start() && addr < n_ref.end() {
                 return Some(n_ref);
-            } else if addr < n_ref.start {
+            } else if addr < n_ref.start() {
                 curr = n_ref.splay_node.left;
             } else {
                 curr = n_ref.splay_node.right;
@@ -197,7 +205,7 @@ impl SplayTree {
             self.splay(addr);
             if let Some(mut root) = self.root {
                 let r = root.as_mut();
-                if addr >= r.start && addr < r.end {
+                if addr >= r.start() && addr < r.end() {
                     return Some(r);
                 }
             }
@@ -210,7 +218,7 @@ impl SplayTree {
             self.splay(addr);
             if let Some(mut root) = self.root {
                 let r = root.as_mut();
-                if addr >= r.start && addr < r.end {
+                if addr >= r.start() && addr < r.end() {
                     // Match found, remove it.
                     let left = r.splay_node.left;
                     let right = r.splay_node.right;

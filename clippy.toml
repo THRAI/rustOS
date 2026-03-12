@@ -1,0 +1,28 @@
+# Clippy configuration for BSD-Async Rust OS Kernel
+#
+# This is a bare-metal kernel targeting riscv64gc-unknown-none-elf.
+# Rules are tuned for safety-critical, no_std, embedded/kernel code.
+
+# Cognitive complexity threshold – kernel syscall handlers can be complex,
+# but flag anything truly gnarly so it gets refactored.
+cognitive-complexity-threshold = 35
+
+# Warn on functions with too many arguments (code smell in kernel APIs).
+too-many-arguments-threshold = 10
+
+# Struct fields – large structs hint at missing abstractions.
+too-many-lines-threshold = 200
+
+# Maximum number of enum variants before triggering a lint.
+enum-variant-size-threshold = 200
+
+# Type complexity threshold (nested generics, etc.).
+type-complexity-threshold = 350
+
+# Allow names common in OS / hardware code that would otherwise trigger
+# single-char or short-name lints.
+allowed-idents-below-min-chars = ["x", "n", "i", "j", "k", "v", "e", "s", "a", "b", "c", "f", "p", "r", "va", "sp", "pc", "tp", "ra", "gp", "fp"]
+
+# Documentation requirement: don't enforce on private items in a kernel
+# where internal docs are often inline comments.
+missing-docs-in-crate-items = false

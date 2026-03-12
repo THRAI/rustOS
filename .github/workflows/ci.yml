@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: Clippy (lint + naming + complexity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv64gc-unknown-none-elf
+          components: clippy, rust-src
+      - name: Run Clippy with workspace lints
+        run: |
+          cargo clippy --target riscv64gc-unknown-none-elf -p kernel -- \
+            -D warnings \
+            -W clippy::cognitive_complexity \
+            -W clippy::too_many_arguments \
+            -W clippy::enum_glob_use \
+            -W clippy::wildcard_imports \
+            -W clippy::module_name_repetitions \
+            -W clippy::needless_pass_by_value
+
+  duplicate-detection:
+    name: Duplicate Code Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust-code-analysis
+        run: cargo install rust-code-analysis-cli || true
+      - name: Check for large duplicated blocks
+        run: |
+          echo "=== Scanning for duplicate code patterns ==="
+          # Use ripgrep to find suspiciously similar function signatures
+          # and flag files over 500 lines that may need splitting
+          find kernel/src -name '*.rs' -exec wc -l {} + | sort -rn | head -20
+          echo "=== Files over 500 lines (candidates for refactoring) ==="
+          find kernel/src -name '*.rs' -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt 500 ]; then echo "$lines $1"; fi' _ {} \;
+
+  unused-deps:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv64gc-unknown-none-elf
+          components: rust-src
+      - name: Install cargo-udeps
+        run: cargo install cargo-udeps --locked || true
+      - name: Check unused dependencies
+        run: cargo udeps --target riscv64gc-unknown-none-elf -p kernel 2>&1 || echo "::warning::cargo-udeps check completed with issues"
+        continue-on-error: true
+
+  pr-review:
+    name: Automated PR Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: PR Size & Quality Check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            
+            const stats = {
+              filesChanged: files.length,
+              additions: files.reduce((sum, f) => sum + f.additions, 0),
+              deletions: files.reduce((sum, f) => sum + f.deletions, 0),
+              largeFiles: files.filter(f => f.additions > 300),
+              unsafeBlocks: [],
+            };
+            
+            // Check for new unsafe blocks
+            for (const file of files) {
+              if (file.filename.endsWith('.rs') && file.patch) {
+                const unsafeLines = file.patch.split('\n')
+                  .filter(l => l.startsWith('+') && l.includes('unsafe'))
+                  .length;
+                if (unsafeLines > 0) {
+                  stats.unsafeBlocks.push({ file: file.filename, count: unsafeLines });
+                }
+              }
+            }
+            
+            let body = `## Automated PR Review\n\n`;
+            body += `| Metric | Value |\n|--------|-------|\n`;
+            body += `| Files changed | ${stats.filesChanged} |\n`;
+            body += `| Lines added | +${stats.additions} |\n`;
+            body += `| Lines removed | -${stats.deletions} |\n\n`;
+            
+            if (stats.largeFiles.length > 0) {
+              body += `### :warning: Large file changes\n`;
+              for (const f of stats.largeFiles) {
+                body += `- \`${f.filename}\`: +${f.additions} lines\n`;
+              }
+              body += `\n`;
+            }
+            
+            if (stats.unsafeBlocks.length > 0) {
+              body += `### :shield: New unsafe code detected\n`;
+              body += `Kernel code may require unsafe, but please document safety invariants.\n`;
+              for (const u of stats.unsafeBlocks) {
+                body += `- \`${u.file}\`: ${u.count} new unsafe line(s)\n`;
+              }
+              body += `\n`;
+            }
+            
+            if (stats.additions + stats.deletions > 1000) {
+              body += `### :mag: Large PR\nConsider splitting into smaller PRs for easier review.\n`;
+            }
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });

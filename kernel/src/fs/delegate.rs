@@ -5,21 +5,23 @@
 //! from a bounded channel. Callers use async functions (fs_open, fs_read, etc.)
 //! that send requests and await replies via oneshot channels.
 
-use crate::fs::{
-    ext4_cache_flush, ext4_close, ext4_dir_close, ext4_dir_next, ext4_dir_open, ext4_link,
-    ext4_mkdir, ext4_mount, ext4_open, ext4_read, ext4_readlink, ext4_rename, ext4_stat,
-    ext4_symlink, ext4_truncate, ext4_unlink, ext4_write, DelegateToken,
+use alloc::{collections::VecDeque, string::String};
+use core::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    task::{Poll, Waker},
 };
-use crate::hal_common::PhysAddr;
-use alloc::collections::VecDeque;
-use alloc::string::String;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use core::task::{Poll, Waker};
-use core::future::Future;
-use crate::hal_common::IrqSafeSpinLock;
-use crate::hal_common::Errno;
+
 use lwext4_rust::Ext4File;
+
+use crate::{
+    fs::{
+        ext4_close, ext4_dir_close, ext4_dir_next, ext4_dir_open, ext4_open, ext4_read,
+        ext4_readlink, ext4_stat, ext4_truncate, ext4_unlink, ext4_write, DelegateToken,
+    },
+    hal_common::{Errno, IrqSafeSpinLock, PhysAddr},
+};
 // SAFETY: Ext4File contains raw pointers from lwext4 C code.
 // All access is serialized in the single delegate_task — never shared across threads.
 struct SendExt4File(Ext4File);
@@ -32,6 +34,20 @@ fn map_backend_path(path: &str) -> String {
 
 /// Maximum pending requests in the channel.
 const CHANNEL_CAPACITY: usize = 256;
+
+/// Maximum path length that fits in a delegate request buffer.
+const MAX_PATH_LEN: usize = 256;
+
+/// Validate a path fits in the delegate buffer, returning ENAMETOOLONG if not.
+fn check_path(path: &str) -> Result<(usize, [u8; 256]), Errno> {
+    let len = path.len();
+    if len >= MAX_PATH_LEN {
+        return Err(Errno::Enametoolong);
+    }
+    let mut buf = [0u8; 256];
+    buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    Ok((len, buf))
+}
 
 /// File handle (index into delegate's open file table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,6 +194,7 @@ pub struct ReplySlot<T: 'static> {
 
 struct ReplyInner<T> {
     done: AtomicBool,
+    in_use: AtomicBool,
     waker: IrqSafeSpinLock<Option<Waker>>,
     value: IrqSafeSpinLock<Option<T>>,
 }
@@ -207,15 +224,27 @@ impl<T: Copy + 'static> Future for ReplyFuture<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> Poll<T> {
         if self.inner.done.load(Ordering::Acquire) {
             let val = self.inner.value.lock().take().unwrap();
+            self.inner.in_use.store(false, Ordering::Release);
             return Poll::Ready(val);
         }
         *self.inner.waker.lock() = Some(cx.waker().clone());
         // Double-check after registering waker
         if self.inner.done.load(Ordering::Acquire) {
             let val = self.inner.value.lock().take().unwrap();
+            self.inner.in_use.store(false, Ordering::Release);
             return Poll::Ready(val);
         }
         Poll::Pending
+    }
+}
+
+impl<T: Copy + 'static> Drop for ReplyFuture<T> {
+    fn drop(&mut self) {
+        // If the future is dropped before completion (cancelled),
+        // release the slot so it can be reused.
+        if !self.inner.done.load(Ordering::Acquire) {
+            self.inner.in_use.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -228,6 +257,7 @@ macro_rules! define_reply_pool {
             #[allow(clippy::declare_interior_mutable_const)]
             const INIT: ReplyInner<$T> = ReplyInner {
                 done: AtomicBool::new(false),
+                in_use: AtomicBool::new(false),
                 waker: IrqSafeSpinLock::new(None),
                 value: IrqSafeSpinLock::new(None),
             };
@@ -274,13 +304,24 @@ static READDIR_REPLY_IDX: AtomicUsize = AtomicUsize::new(0);
 
 macro_rules! define_alloc_reply {
     ($fn_name:ident, $pool:ident, $idx:ident, $T:ty) => {
-        fn $fn_name() -> &'static ReplyInner<$T> {
-            let idx = $idx.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
-            let r = &$pool[idx];
-            r.done.store(false, Ordering::Relaxed);
-            *r.waker.lock() = None;
-            *r.value.lock() = None;
-            r
+        fn $fn_name() -> Result<&'static ReplyInner<$T>, Errno> {
+            // Try each slot starting from the current index.
+            // Use CAS on in_use to prevent reusing a slot still awaited.
+            for _ in 0..REPLY_POOL_SIZE {
+                let idx = $idx.fetch_add(1, Ordering::Relaxed) % REPLY_POOL_SIZE;
+                let r = &$pool[idx];
+                if r.in_use
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    r.done.store(false, Ordering::Relaxed);
+                    *r.waker.lock() = None;
+                    *r.value.lock() = None;
+                    return Ok(r);
+                }
+            }
+            // All slots occupied — pool exhausted.
+            Err(Errno::Eagain)
         }
     };
 }
@@ -309,15 +350,20 @@ static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DELEGATE_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
 
 /// Send a request to the delegate channel.
-fn send_request(req: FsRequest) {
+/// Returns `Err(Eagain)` if the channel is full.
+fn send_request(req: FsRequest) -> Result<(), Errno> {
     {
         let mut q = REQUEST_QUEUE.lock();
+        if q.len() >= CHANNEL_CAPACITY {
+            return Err(Errno::Eagain);
+        }
         q.push_back(req);
     }
     REQUEST_COUNT.fetch_add(1, Ordering::Release);
     if let Some(w) = DELEGATE_WAKER.lock().take() {
         w.wake();
     }
+    Ok(())
 }
 
 /// Maximum open files.
@@ -371,13 +417,13 @@ async fn delegate_task() {
                             Some(i) => {
                                 open_files[i] = Some(SendExt4File(file));
                                 reply.complete(Ok(FsFileHandle(i as u16)));
-                            }
+                            },
                             None => reply.complete(Err(Errno::Emfile)), // EMFILE
                         }
-                    }
+                    },
                     Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
             FsRequest::Read {
                 handle,
                 buf_ptr,
@@ -396,7 +442,7 @@ async fn delegate_task() {
                     Ok(n) => reply.complete(Ok(n)),
                     Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
             FsRequest::Write {
                 handle,
                 buf_ptr,
@@ -415,7 +461,7 @@ async fn delegate_task() {
                     Ok(n) => reply.complete(Ok(n)),
                     Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
             FsRequest::Close { handle, reply } => {
                 let idx = handle.0 as usize;
                 if idx < MAX_OPEN_FILES {
@@ -425,7 +471,7 @@ async fn delegate_task() {
                     open_files[idx] = None;
                 }
                 reply.complete(Ok(()));
-            }
+            },
             FsRequest::Lookup {
                 parent_ino: _,
                 name,
@@ -439,15 +485,15 @@ async fn delegate_task() {
                 match ext4_stat(&mut tok, &backend_path) {
                     Ok((ino, size, ftype)) => {
                         reply.complete(Ok((ino, ftype, size)));
-                    }
-                    Err(_) => reply.complete(Err(Errno::Enoent)), // ENOENT
+                    },
+                    Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
             FsRequest::Stat { ino: _, reply } => {
                 // Stat not directly usable without a path in lwext4.
                 // Callers should use Lookup which returns size+type.
                 reply.complete(Err(Errno::Enosys)); // ENOSYS
-            }
+            },
             FsRequest::ReadPage {
                 path,
                 path_len,
@@ -466,10 +512,10 @@ async fn delegate_task() {
                         let _ = ext4_read(&mut tok, &mut file, buf);
                         let _ = ext4_close(&mut tok, &mut file);
                         reply.complete(Ok(()));
-                    }
-                    Err(_) => reply.complete(Err(Errno::Enomem)), //Enomem
+                    },
+                    Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
             FsRequest::WriteAt {
                 path,
                 path_len,
@@ -489,16 +535,16 @@ async fn delegate_task() {
                             Ok(n) => {
                                 let _ = ext4_close(&mut tok, &mut file);
                                 reply.complete(Ok(n));
-                            }
+                            },
                             Err(e) => {
                                 let _ = ext4_close(&mut tok, &mut file);
                                 reply.complete(Err(e));
-                            }
+                            },
                         }
-                    }
+                    },
                     Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
             FsRequest::Truncate {
                 path,
                 path_len,
@@ -508,7 +554,7 @@ async fn delegate_task() {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
                 reply.complete(ext4_truncate(&mut tok, &backend_path, size));
-            }
+            },
             FsRequest::Mkdir {
                 path,
                 path_len,
@@ -517,7 +563,7 @@ async fn delegate_task() {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
                 reply.complete(crate::fs::ext4::mkdir(&mut tok, &backend_path));
-            }
+            },
             FsRequest::Unlink {
                 path,
                 path_len,
@@ -533,7 +579,7 @@ async fn delegate_task() {
                     ext4_unlink(&mut tok, &backend_path)
                 };
                 reply.complete(result);
-            }
+            },
             FsRequest::Link {
                 old_path,
                 old_len,
@@ -545,10 +591,8 @@ async fn delegate_task() {
                 let new_path_str = core::str::from_utf8(&new_path[..new_len]).unwrap_or("");
                 let old_backend = map_backend_path(old_path_str);
                 let new_backend = map_backend_path(new_path_str);
-                reply.complete(
-                    crate::fs::ext4::link(&mut tok, &old_backend, &new_backend),
-                );
-            }
+                reply.complete(crate::fs::ext4::link(&mut tok, &old_backend, &new_backend));
+            },
             FsRequest::Rename {
                 old_path,
                 old_len,
@@ -560,10 +604,12 @@ async fn delegate_task() {
                 let new_path_str = core::str::from_utf8(&new_path[..new_len]).unwrap_or("");
                 let old_backend = map_backend_path(old_path_str);
                 let new_backend = map_backend_path(new_path_str);
-                reply.complete(
-                    crate::fs::ext4::rename(&mut tok, &old_backend, &new_backend),
-                );
-            }
+                reply.complete(crate::fs::ext4::rename(
+                    &mut tok,
+                    &old_backend,
+                    &new_backend,
+                ));
+            },
             FsRequest::Symlink {
                 target,
                 target_len,
@@ -574,10 +620,12 @@ async fn delegate_task() {
                 let target_str = core::str::from_utf8(&target[..target_len]).unwrap_or("");
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                reply.complete(
-                    crate::fs::ext4::symlink(&mut tok, target_str, &backend_path),
-                );
-            }
+                reply.complete(crate::fs::ext4::symlink(
+                    &mut tok,
+                    target_str,
+                    &backend_path,
+                ));
+            },
             FsRequest::ReadLink {
                 path,
                 path_len,
@@ -590,7 +638,7 @@ async fn delegate_task() {
                     Ok(n) => reply.complete(Ok((n, out))),
                     Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
             FsRequest::CacheFlush {
                 path,
                 path_len,
@@ -599,7 +647,7 @@ async fn delegate_task() {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
                 reply.complete(crate::fs::ext4::cache_flush(&mut tok, &backend_path));
-            }
+            },
             FsRequest::ReadDir {
                 path,
                 path_len,
@@ -634,16 +682,16 @@ async fn delegate_task() {
                                         inode: ino,
                                     };
                                     count += 1;
-                                }
+                                },
                                 None => break,
                             }
                         }
                         let _ = ext4_dir_close(&mut tok, &mut dir);
                         reply.complete(Ok((entries, count)));
-                    }
+                    },
                     Err(e) => reply.complete(Err(e)),
                 }
-            }
+            },
         }
 
         // Yield to let other tasks run
@@ -687,86 +735,82 @@ pub async fn fs_open(path: &str) -> Result<FsFileHandle, Errno> {
 
 /// Open a file by path with flags. Returns a file handle.
 pub async fn fs_open_flags(path: &str, flags: u32) -> Result<FsFileHandle, Errno> {
-    let reply_inner = alloc_open_reply();
-    let mut path_buf = [0u8; 256];
-    let len = path.len().min(256);
-    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let reply_inner = alloc_open_reply()?;
+    let (len, path_buf) = check_path(path)?;
 
     send_request(FsRequest::Open {
         path: path_buf,
         path_len: len,
         flags,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Read from an open file into buf. Returns bytes read.
 pub async fn fs_read(handle: FsFileHandle, buf: &mut [u8]) -> Result<usize, Errno> {
-    let reply_inner = alloc_read_reply();
+    let reply_inner = alloc_read_reply()?;
 
     send_request(FsRequest::Read {
         handle,
         buf_ptr: buf.as_mut_ptr() as usize,
         len: buf.len(),
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Write to an open file from buf. Returns bytes written.
 pub async fn fs_write(handle: FsFileHandle, buf: &[u8]) -> Result<usize, Errno> {
-    let reply_inner = alloc_write_reply();
+    let reply_inner = alloc_write_reply()?;
 
     send_request(FsRequest::Write {
         handle,
         buf_ptr: buf.as_ptr() as usize,
         len: buf.len(),
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Close an open file handle.
 pub async fn fs_close(handle: FsFileHandle) -> Result<(), Errno> {
-    let reply_inner = alloc_close_reply();
+    let reply_inner = alloc_close_reply()?;
 
     send_request(FsRequest::Close {
         handle,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Look up a child entry in a directory. Returns (child_ino, file_type, file_size).
 pub async fn fs_lookup(parent_ino: u32, name: &str) -> Result<(u32, u8, u64), Errno> {
-    let reply_inner = alloc_lookup_reply();
-    let mut name_buf = [0u8; 256];
-    let len = name.len().min(256);
-    name_buf[..len].copy_from_slice(&name.as_bytes()[..len]);
+    let reply_inner = alloc_lookup_reply()?;
+    let (len, name_buf) = check_path(name)?;
 
     send_request(FsRequest::Lookup {
         parent_ino,
         name: name_buf,
         name_len: len,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Stat an inode. Returns (size, file_type_u8).
 pub async fn fs_stat(ino: u32) -> Result<(u64, u8), Errno> {
-    let reply_inner = alloc_stat_reply();
+    let reply_inner = alloc_stat_reply()?;
 
     send_request(FsRequest::Stat {
         ino,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
@@ -781,10 +825,8 @@ pub async fn fs_read_page(path: &str, offset: u64, pa: PhysAddr) -> Result<(), E
         offset,
         pa.0
     );
-    let reply_inner = alloc_readpage_reply();
-    let mut path_buf = [0u8; 256];
-    let len = path.len().min(256);
-    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let reply_inner = alloc_readpage_reply()?;
+    let (len, path_buf) = check_path(path)?;
 
     send_request(FsRequest::ReadPage {
         path: path_buf,
@@ -792,7 +834,7 @@ pub async fn fs_read_page(path: &str, offset: u64, pa: PhysAddr) -> Result<(), E
         offset,
         pa: pa.0,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
@@ -800,10 +842,8 @@ pub async fn fs_read_page(path: &str, offset: u64, pa: PhysAddr) -> Result<(), E
 /// Write data to a file at the given byte offset.
 /// Opens file, seeks, writes, closes. Returns bytes written.
 pub async fn fs_write_at(path: &str, offset: u64, data: &[u8]) -> Result<usize, Errno> {
-    let reply_inner = alloc_writeat_reply();
-    let mut path_buf = [0u8; 256];
-    let len = path.len().min(256);
-    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let reply_inner = alloc_writeat_reply()?;
+    let (len, path_buf) = check_path(path)?;
 
     send_request(FsRequest::WriteAt {
         path: path_buf,
@@ -812,143 +852,121 @@ pub async fn fs_write_at(path: &str, offset: u64, data: &[u8]) -> Result<usize, 
         data_ptr: data.as_ptr() as usize,
         data_len: data.len(),
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Truncate file at path to `size`.
 pub async fn fs_truncate(path: &str, size: u64) -> Result<(), Errno> {
-    let reply_inner = alloc_truncate_reply();
-    let mut path_buf = [0u8; 256];
-    let len = path.len().min(256);
-    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let reply_inner = alloc_truncate_reply()?;
+    let (len, path_buf) = check_path(path)?;
 
     send_request(FsRequest::Truncate {
         path: path_buf,
         path_len: len,
         size,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Create a directory at the given path.
 pub async fn fs_mkdir(path: &str) -> Result<(), Errno> {
-    let reply_inner = alloc_mkdir_reply();
-    let mut path_buf = [0u8; 256];
-    let len = path.len().min(256);
-    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let reply_inner = alloc_mkdir_reply()?;
+    let (len, path_buf) = check_path(path)?;
 
     send_request(FsRequest::Mkdir {
         path: path_buf,
         path_len: len,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Remove a file or directory at the given path.
 pub async fn fs_unlink(path: &str, is_dir: bool) -> Result<(), Errno> {
-    let reply_inner = alloc_unlink_reply();
-    let mut path_buf = [0u8; 256];
-    let len = path.len().min(256);
-    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let reply_inner = alloc_unlink_reply()?;
+    let (len, path_buf) = check_path(path)?;
 
     send_request(FsRequest::Unlink {
         path: path_buf,
         path_len: len,
         is_dir,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Create hard link `new_path` -> `old_path`.
 pub async fn fs_link(old_path: &str, new_path: &str) -> Result<(), Errno> {
-    let reply_inner = alloc_link_reply();
-    let mut old_buf = [0u8; 256];
-    let mut new_buf = [0u8; 256];
-    let old_len = old_path.len().min(256);
-    let new_len = new_path.len().min(256);
-    old_buf[..old_len].copy_from_slice(&old_path.as_bytes()[..old_len]);
-    new_buf[..new_len].copy_from_slice(&new_path.as_bytes()[..new_len]);
+    let reply_inner = alloc_link_reply()?;
+    let (old_len, old_buf) = check_path(old_path)?;
+    let (new_len, new_buf) = check_path(new_path)?;
     send_request(FsRequest::Link {
         old_path: old_buf,
         old_len,
         new_path: new_buf,
         new_len,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Rename/move path.
 pub async fn fs_rename(old_path: &str, new_path: &str) -> Result<(), Errno> {
-    let reply_inner = alloc_rename_reply();
-    let mut old_buf = [0u8; 256];
-    let mut new_buf = [0u8; 256];
-    let old_len = old_path.len().min(256);
-    let new_len = new_path.len().min(256);
-    old_buf[..old_len].copy_from_slice(&old_path.as_bytes()[..old_len]);
-    new_buf[..new_len].copy_from_slice(&new_path.as_bytes()[..new_len]);
+    let reply_inner = alloc_rename_reply()?;
+    let (old_len, old_buf) = check_path(old_path)?;
+    let (new_len, new_buf) = check_path(new_path)?;
     send_request(FsRequest::Rename {
         old_path: old_buf,
         old_len,
         new_path: new_buf,
         new_len,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Create symbolic link `path` -> `target`.
 pub async fn fs_symlink(target: &str, path: &str) -> Result<(), Errno> {
-    let reply_inner = alloc_symlink_reply();
-    let mut target_buf = [0u8; 256];
-    let mut path_buf = [0u8; 256];
-    let target_len = target.len().min(256);
-    let path_len = path.len().min(256);
-    target_buf[..target_len].copy_from_slice(&target.as_bytes()[..target_len]);
-    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let reply_inner = alloc_symlink_reply()?;
+    let (target_len, target_buf) = check_path(target)?;
+    let (path_len, path_buf) = check_path(path)?;
     send_request(FsRequest::Symlink {
         target: target_buf,
         target_len,
         path: path_buf,
         path_len,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Read symbolic link content.
 pub async fn fs_readlink(path: &str) -> Result<(usize, [u8; 256]), Errno> {
-    let reply_inner = alloc_readlink_reply();
-    let mut path_buf = [0u8; 256];
-    let path_len = path.len().min(256);
-    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let reply_inner = alloc_readlink_reply()?;
+    let (path_len, path_buf) = check_path(path)?;
     send_request(FsRequest::ReadLink {
         path: path_buf,
         path_len,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
     ReplyFuture { inner: reply_inner }.await
 }
 
 /// Flush cache for the filesystem containing `path`.
 pub async fn fs_cache_flush(path: &str) -> Result<(), Errno> {
-    let reply_inner = alloc_cacheflush_reply();
-    let mut path_buf = [0u8; 256];
-    let path_len = path.len().min(256);
-    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let reply_inner = alloc_cacheflush_reply()?;
+    let (path_len, path_buf) = check_path(path)?;
     send_request(FsRequest::CacheFlush {
         path: path_buf,
         path_len,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
     ReplyFuture { inner: reply_inner }.await
 }
 
@@ -958,17 +976,15 @@ pub async fn fs_readdir(
     path: &str,
     start_idx: usize,
 ) -> Result<([DirEntryRaw; READDIR_BATCH], usize), Errno> {
-    let reply_inner = alloc_readdir_reply();
-    let mut path_buf = [0u8; 256];
-    let len = path.len().min(256);
-    path_buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let reply_inner = alloc_readdir_reply()?;
+    let (len, path_buf) = check_path(path)?;
 
     send_request(FsRequest::ReadDir {
         path: path_buf,
         path_len: len,
         start_idx,
         reply: ReplySlot::new(reply_inner),
-    });
+    })?;
 
     ReplyFuture { inner: reply_inner }.await
 }

@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv64gc-unknown-none-elf
+          components: rust-src, llvm-tools
+
+      - name: Install cargo-binutils
+        run: cargo install cargo-binutils
+
+      - name: Build kernel ELF
+        run: |
+          cargo build --release -p kernel --target riscv64gc-unknown-none-elf --features autotest,log-level-error
+          cp target/riscv64gc-unknown-none-elf/release/kernel kernel-rv
+
+      - name: Build kernel binary
+        run: |
+          rust-objcopy --binary-architecture=riscv64 \
+            target/riscv64gc-unknown-none-elf/release/kernel \
+            --strip-all -O binary kernel-rv64.bin
+
+      - name: Generate Release Notes
+        id: changelog
+        run: |
+          # Get previous tag
+          PREV_TAG=$(git tag --sort=-version:refname | head -2 | tail -1) || true
+          if [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          echo "## What's Changed" > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+
+          # Categorize commits
+          echo "### Features & Improvements" >> RELEASE_NOTES.md
+          git log ${PREV_TAG}..HEAD --oneline --grep='\[feat\]\|feat:\|feature\|add\|implement' -i --format="- %s (%h)" >> RELEASE_NOTES.md || true
+          echo "" >> RELEASE_NOTES.md
+
+          echo "### Bug Fixes" >> RELEASE_NOTES.md
+          git log ${PREV_TAG}..HEAD --oneline --grep='\[fix\]\|fix:\|bug\|修复' -i --format="- %s (%h)" >> RELEASE_NOTES.md || true
+          echo "" >> RELEASE_NOTES.md
+
+          echo "### Other Changes" >> RELEASE_NOTES.md
+          git log ${PREV_TAG}..HEAD --oneline --format="- %s (%h)" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+
+          echo "### Build Info" >> RELEASE_NOTES.md
+          echo "- Target: riscv64gc-unknown-none-elf" >> RELEASE_NOTES.md
+          echo "- Toolchain: $(rustc --version)" >> RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            kernel-rv
+            kernel-rv64.bin
+          generate_release_notes: true

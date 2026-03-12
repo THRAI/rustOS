@@ -2,10 +2,9 @@
 //!
 //! Implements uname and other utility syscalls.
 
-use crate::hal_common::Errno;
 use alloc::sync::Arc;
 
-use crate::proc::Task;
+use crate::{hal_common::Errno, proc::Task};
 
 /// sys_uname: get system information.
 pub fn sys_uname(task: &Arc<Task>, buf: usize) -> Result<(), Errno> {

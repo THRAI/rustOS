@@ -1,9 +1,11 @@
 //! Static device node lookup for /dev/null, /dev/zero, /dev/console.
 
-use crate::hal_common::Errno;
 use alloc::sync::Arc;
 
-use crate::fs::{DeviceKind, FileDescription, FileObject, OpenFlags};
+use crate::{
+    fs::{DeviceKind, FileDescription, FileObject, OpenFlags},
+    hal_common::Errno,
+};
 
 /// Look up a device by path under /dev/.
 /// Returns a FileDescription for the device, or ENOENT.
@@ -20,7 +22,7 @@ pub fn open_device(name: &str, flags: OpenFlags) -> Result<Arc<FileDescription>,
                 // RDWR: treat as write (console is line-oriented)
                 DeviceKind::ConsoleWrite
             }
-        }
+        },
         _ => return Err(Errno::Enoent),
     };
     Ok(FileDescription::new(FileObject::Device(kind), flags))

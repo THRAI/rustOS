@@ -7,8 +7,8 @@ pub mod spin_mutex;
 pub mod timer_wheel;
 pub mod trap_frame;
 
-pub use errno::{Errno, KernelResult};
-pub use addr::{PageCursor, PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, PAGE_SIZE};
+pub use addr::{PageCursor, PageNum, PhysAddr, VirtAddr, VirtAddrRange, PAGE_SIZE};
+pub use errno::Errno;
 pub use irq_lock::IrqSafeSpinLock;
 pub use once::Once;
 pub use run_queue::RunQueue;

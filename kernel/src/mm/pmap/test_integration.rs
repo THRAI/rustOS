@@ -3,10 +3,11 @@
 //! Tier 2.a: Offline PT walk — create/enter/extract/remove without satp switch.
 //! Tier 2.b: satp switch — identity-map kernel, map high VA, activate, read/write.
 
+use super::{
+    super::allocator::{alloc_raw_frame_sync, PageRole},
+    pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove,
+};
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
-
-use super::super::allocator::{alloc_raw_frame_sync, PageRole};
-use super::{pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove};
 
 /// Tier 2.a: Verify pmap walk logic with real allocated frames.
 /// No satp switch — purely tests the radix tree construction.

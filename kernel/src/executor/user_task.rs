@@ -4,19 +4,20 @@
 //! run_tasks is the trap loop: trap_return → user runs → trap back → dispatch.
 //! spawn_user_task creates and detaches the future on a target CPU.
 
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
+use alloc::{boxed::Box, sync::Arc};
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
-use crate::hal_common::{VirtAddr, PAGE_SIZE};
-
-use crate::hal::trap_return;
-use crate::mm::{pmap_activate, pmap_deactivate, resolve_user_fault, PageFaultAccessType};
-use crate::proc::{check_pending_signals, do_exit, Task, WaitStatus};
-
-use crate::executor::{spawn_kernel_task, yield_now};
+use crate::{
+    executor::{spawn_kernel_task, yield_now},
+    hal::trap_return,
+    hal_common::{VirtAddr, PAGE_SIZE},
+    mm::{pmap_activate, pmap_deactivate, resolve_user_fault, PageFaultAccessType},
+    proc::{check_pending_signals, do_exit, Task, WaitStatus},
+};
 
 // Interrupt bit in scause (bit 63 on rv64)
 const SCAUSE_INTERRUPT: usize = 1 << 63;
@@ -64,7 +65,7 @@ async fn run_tasks(task: Arc<Task>) {
 
         // Check for pending signals before returning to user mode.
         match check_pending_signals(&task) {
-            Ok(_) => {} // signal delivered (or none pending), continue
+            Ok(_) => {}, // signal delivered (or none pending), continue
             Err(sig) => {
                 // fatal signal (SIGKILL or unhandled)
                 // Linux wstatus for signal-killed: low 7 bits = signal number
@@ -79,7 +80,7 @@ async fn run_tasks(task: Arc<Task>) {
                 );
                 do_exit(&task, wstatus);
                 break;
-            }
+            },
         }
 
         klog!(
@@ -121,7 +122,7 @@ async fn run_tasks(task: Arc<Task>) {
         }
 
         match result {
-            TrapResult::Continue => {}
+            TrapResult::Continue => {},
             TrapResult::Exit => break,
         }
 
@@ -172,16 +173,16 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
         match code {
             IRQ_S_TIMER => {
                 crate::hal::handle_timer_irq();
-            }
+            },
             IRQ_S_SOFTWARE => {
                 crate::hal::handle_ipi();
-            }
+            },
             IRQ_S_EXTERNAL => {
                 // External IRQ handling
-            }
+            },
             _ => {
                 klog!(trap, debug, "unhandled interrupt: code={}", code);
-            }
+            },
         }
         return TrapResult::Continue;
     }
@@ -191,7 +192,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
         EXC_ECALL_U => {
             // Syscall handling via unified syscall layer
             dispatch_syscall(task).await
-        }
+        },
         EXC_LOAD_ACCESS_FAULT
         | EXC_STORE_ACCESS_FAULT
         | EXC_INST_ACCESS_FAULT
@@ -213,7 +214,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                     // Page resolved — return to the faulting instruction.
                     // pcb_onfault (if set) stays armed for future faults.
                     TrapResult::Continue
-                }
+                },
                 Err(e) => {
                     // Resolution failed. If pcb_onfault is set (copy_user_chunk),
                     // redirect to the EFAULT landing pad instead of killing.
@@ -242,9 +243,9 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                     );
                     task.signals.post_signal(crate::proc::SIGSEGV);
                     TrapResult::Continue
-                }
+                },
             }
-        }
+        },
         _ => {
             klog!(
                 trap,
@@ -256,7 +257,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
             );
             task.signals.post_signal(crate::proc::SIGSEGV);
             TrapResult::Continue
-        }
+        },
     }
 }
 
@@ -276,7 +277,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
             tf.advance_pc();
             tf.set_ret_val(ret);
             TrapResult::Continue
-        }
+        },
         crate::syscall::SyscallAction::Continue => TrapResult::Continue,
         crate::syscall::SyscallAction::Exit => TrapResult::Exit,
     }

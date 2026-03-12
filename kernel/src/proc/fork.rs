@@ -3,14 +3,17 @@
 //! Default path uses COW shadow chains (O(VMAs) instead of O(pages)).
 //! Legacy deep-copy path available behind `#[cfg(feature = "fork-hardcopy")]`.
 
-use crate::hal_common::{VirtAddr, PAGE_SIZE};
-#[cfg(not(feature = "fork-hardcopy"))]
-use crate::mm::vm::{BackingStore, MapPerm};
-use crate::mm::{pmap, pmap_enter, pmap_extract};
-use crate::proc::{map_sigcode_page, Task, SIGCODE_VA};
 use alloc::sync::Arc;
 #[cfg(not(feature = "fork-hardcopy"))]
 use alloc::vec::Vec;
+
+#[cfg(not(feature = "fork-hardcopy"))]
+use crate::mm::vm::{BackingStore, MapPerm};
+use crate::{
+    hal_common::{VirtAddr, PAGE_SIZE},
+    mm::{pmap, pmap_enter, pmap_extract},
+    proc::{map_sigcode_page, Task, SIGCODE_VA},
+};
 
 /// Fork the parent task, creating a child with COW (or deep-copy) VM.
 pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
@@ -132,7 +135,7 @@ fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
                     // Writable mapping: both parent and child must get their own
                     // shadows backed by the original object, otherwise whichever
                     // side writes first will leak modifications to the other side.
-                    let size_bytes = (vma.end - vma.start) as usize;
+                    let size_bytes = (vma.end() - vma.start()) as usize;
                     let parent_obj_shadow =
                         crate::mm::vm::VmObject::new_shadow(Arc::clone(parent_obj), size_bytes);
                     let child_obj_shadow =
@@ -168,26 +171,26 @@ fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
                         },
                     )
                 }
-            }
+            },
             BackingStore::SubMap(_) => {
                 panic!("SubMap not supported in fork");
-            }
+            },
             BackingStore::Guard => (None, BackingStore::Guard),
         };
 
         if let Some(new_store) = parent_new_store {
-            parent_rebinds.push((vma.start, new_store));
+            parent_rebinds.push((vma.start(), new_store));
         };
 
         let child_vma = crate::mm::vm::VmMapEntry::new(
-            vma.start,
-            vma.end,
+            vma.start(),
+            vma.end(),
             child_new_store,
             vma.flags,
             vma.protection,
         );
         child_entries.push(child_vma);
-        pmap_ranges.push((vma.start, vma.end, vma.protection, is_writable));
+        pmap_ranges.push((vma.start(), vma.end(), vma.protection, is_writable));
     }
 
     // Rebind parent VMAs to their new COW shadow heads.
@@ -271,7 +274,7 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
             } => {
                 let size = vma.end - vma.start;
                 // Create a clone of the object for the child (not a shadow)
-                let new_obj = crate::mm::vm::VmObject::new_anon(size as usize / PAGE_SIZE);
+                let new_obj = crate::mm::vm::VmObject::new_anon(size as usize);
                 // Copy pager from parent so child can demand-fault file-backed pages
                 // that the parent hasn't touched yet. Without this, unfaulted pages
                 // get zero-filled (AnonPager) instead of loaded from the ELF vnode.
@@ -287,10 +290,10 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                     object: new_obj,
                     offset: *offset,
                 }
-            }
+            },
             crate::mm::vm::BackingStore::SubMap(_) => {
                 panic!("SubMap not supported in fork");
-            }
+            },
             crate::mm::vm::BackingStore::Guard => crate::mm::vm::BackingStore::Guard,
         };
         let child_vma = crate::mm::vm::VmMapEntry::new(
@@ -317,7 +320,7 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
             let mut va = vma.start as usize;
             while va < vma.end as usize {
                 if let Some(src_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
-                    if let Some(new_frame) = crate::mm::allocator::alloc_anon_sync() {
+                    if let Some(new_frame) = crate::mm::alloc_anon_sync() {
                         new_frame.as_page_slice_mut().copy_from_slice(
                             src_pa.page_align_down().into_kernel_vaddr().as_page_slice(),
                         );
@@ -333,7 +336,7 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                                 let mut page = crate::mm::vm::VmPage::new();
                                 page.phys_addr = new_phys;
                                 child_obj.insert_page(
-                                    crate::hal_common::VirtPageNum(obj_idx as usize),
+                                    crate::hal_common::PageNum::new(obj_idx as usize),
                                     Arc::new(page),
                                 );
                                 let _ = pmap::pmap_enter(

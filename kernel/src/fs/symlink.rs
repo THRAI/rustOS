@@ -1,8 +1,8 @@
 //! In-memory symlink table used for compatibility before native ext4 symlink ops.
 
+use alloc::{string::String, vec::Vec};
+
 use crate::hal_common::{Errno, SpinMutex};
-use alloc::string::String;
-use alloc::vec::Vec;
 
 const MAX_SYMLINKS: usize = 256;
 const MAX_FOLLOW: usize = 8;
@@ -23,10 +23,10 @@ fn normalize_absolute(path: &str) -> String {
     let mut comps: Vec<&str> = Vec::new();
     for comp in path.split('/') {
         match comp {
-            "" | "." => {}
+            "" | "." => {},
             ".." => {
                 let _ = comps.pop();
-            }
+            },
             _ => comps.push(comp),
         }
     }

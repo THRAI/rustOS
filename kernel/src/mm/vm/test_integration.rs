@@ -5,14 +5,16 @@
 //! frame_alloc_sync behavior under real kernel conditions.
 use alloc::sync::Arc;
 
-use crate::hal_common::VirtPageNum;
-use crate::hal_common::{VirtAddr, PAGE_SIZE};
-
-use super::super::allocator::{alloc_anon_sync, frame_free};
-use super::super::pmap;
-use crate::mm::vm::{
-    sync_fault_handler, BackingStore, FaultResult, PageFaultAccessType, VmMap, VmMapEntry,
-    VmObject, VmPage,
+use super::super::{
+    allocator::{alloc_anon_sync, frame_free},
+    pmap,
+};
+use crate::{
+    hal_common::{VirtAddr, PAGE_SIZE},
+    mm::vm::{
+        sync_fault_handler, BackingStore, FaultResult, PageFaultAccessType, VmMap, VmMapEntry,
+        VmObject, VmPage,
+    },
 };
 
 /// Test: anonymous page fault resolves to a new zeroed frame.
@@ -48,14 +50,14 @@ pub fn test_anonymous_page_fault() {
                 _ => panic!("Expected Object store"),
             };
             assert!(
-                obj.lookup_page(VirtPageNum(0)).is_some(),
+                obj.lookup_page(crate::mm::vm::VObjIndex::new(0)).is_some(),
                 "page not inserted after fault"
             );
             crate::kprintln!("vm anonymous fault PASS");
-        }
+        },
         other => {
             crate::kprintln!("vm anonymous fault FAIL: {:?}", other);
-        }
+        },
     }
 }
 
@@ -74,7 +76,7 @@ pub fn test_cow_fault() {
         let mut w = parent_obj.write();
         let mut p = VmPage::new();
         p.phys_addr = parent_page.phys();
-        w.insert_page(VirtPageNum(0), Arc::new(p));
+        w.insert_page(crate::mm::vm::VObjIndex::new(0), Arc::new(p));
     }
 
     // Create shadow (simulates fork)
@@ -111,21 +113,21 @@ pub fn test_cow_fault() {
                 _ => panic!("Expected Object store"),
             };
             let _new_phys = obj
-                .lookup_page(VirtPageNum(0))
+                .lookup_page(crate::mm::vm::VObjIndex::new(0))
                 .expect("COW page not inserted");
             // COW may either:
             // - copy to a new frame (shared backing, no collapse possible), or
             // - rename the page in-place via collapse (sole shadow, zero-copy)
             // Both are correct. Verify the page is accessible in the top-level object.
-            if obj.has_page(VirtPageNum(0)) {
+            if obj.has_page(crate::mm::vm::VObjIndex::new(0)) {
                 crate::kprintln!("vm cow fault PASS");
             } else {
                 crate::kprintln!("vm cow fault FAIL: page not in top-level object");
             }
-        }
+        },
         other => {
             crate::kprintln!("vm cow fault FAIL: {:?}", other);
-        }
+        },
     }
 }
 
@@ -153,15 +155,15 @@ pub fn test_frame_alloc_sync_works() {
                 Some(f2) => {
                     frame_free(f2);
                     crate::kprintln!("vm frame_alloc_sync PASS");
-                }
+                },
                 None => {
                     crate::kprintln!("vm frame_alloc_sync FAIL: second alloc returned None");
-                }
+                },
             }
-        }
+        },
         None => {
             crate::kprintln!("vm frame_alloc_sync FAIL: first alloc returned None");
-        }
+        },
     }
 }
 
@@ -192,7 +194,7 @@ pub fn test_fork_bomb_stress() {
         let mut w = root.write();
         let mut p = VmPage::new();
         p.phys_addr = page.phys();
-        w.insert_page(VirtPageNum(i), Arc::new(p));
+        w.insert_page(crate::mm::vm::VObjIndex::new(i), Arc::new(p));
     }
 
     // Phase 1: Fork bomb -- create N children, each shadowing root.
@@ -235,7 +237,7 @@ pub fn test_fork_bomb_stress() {
         {
             let r = gc.read();
             for p in 0..PAGES_PER_OBJ {
-                if r.lookup_page(VirtPageNum(p)).is_none() {
+                if r.lookup_page(crate::mm::vm::VObjIndex::new(p)).is_none() {
                     crate::kprintln!("vm fork bomb FAIL: gc[{}] can't see page {}", _i, p);
                     return;
                 }
@@ -260,7 +262,7 @@ pub fn test_fork_bomb_stress() {
     {
         let r = root.read();
         for p in 0..PAGES_PER_OBJ {
-            if r.lookup_page(VirtPageNum(p)).is_none() {
+            if r.lookup_page(crate::mm::vm::VObjIndex::new(p)).is_none() {
                 crate::kprintln!("vm fork bomb FAIL: root page {} missing after teardown", p);
                 return;
             }

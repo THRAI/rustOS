@@ -3,12 +3,14 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use crate::executor::{current, spawn_user_task};
-use crate::hal_common::Errno;
-use crate::mm::PageFaultAccessType;
-use crate::proc::{
-    copyin_argv, copyinstr, do_execve, do_exit, fault_in_user_buffer, find_task_by_pid, fork,
-    SigSet, Signal, Task, TaskState, WaitChildFuture, WaitStatus, SIGCHLD,
+use crate::{
+    executor::{current, spawn_user_task},
+    hal_common::Errno,
+    mm::PageFaultAccessType,
+    proc::{
+        copyin_argv, copyinstr, do_execve, do_exit, fault_in_user_buffer, find_task_by_pid, fork,
+        SigSet, Signal, Task, TaskState, WaitChildFuture, WaitStatus, SIGCHLD,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -209,14 +211,14 @@ pub async fn sys_wait4_async(
                 }
             }
             Ok(child_pid)
-        }
+        },
         None => {
             if task.signals.has_actionable_pending() {
                 Err(Errno::Eintr)
             } else {
                 Err(Errno::Echild)
             }
-        }
+        },
     }
 }
 

@@ -2,12 +2,14 @@
 //!
 //! Implements futex, nanosleep, clock_gettime and related operations.
 
-use crate::hal_common::{Errno, VirtAddr};
 use alloc::sync::Arc;
 
-use crate::ipc::{futex_wait, futex_wake};
-use crate::mm::pmap_extract;
-use crate::proc::Task;
+use crate::{
+    hal_common::{Errno, VirtAddr},
+    ipc::{futex_wait, futex_wake},
+    mm::pmap_extract,
+    proc::Task,
+};
 
 /// Timer frequency: QEMU virt = 10 MHz.
 const TIMER_FREQ: u64 = 10_000_000;
@@ -166,7 +168,7 @@ pub async fn sys_futex_async(
             // Park on the futex
             futex_wait(pa_key, task).await?;
             Ok(0)
-        }
+        },
         FUTEX_WAKE => {
             // Resolve physical address for futex key
             let pa = {
@@ -177,7 +179,7 @@ pub async fn sys_futex_async(
             let pa_key = pa + (uaddr & 0xFFF);
             let woken = futex_wake(pa_key, val as usize);
             Ok(woken)
-        }
+        },
         _ => Err(Errno::Enosys),
     }
 }

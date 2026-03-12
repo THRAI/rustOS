@@ -5,12 +5,15 @@
 
 use alloc::sync::Arc;
 
-use crate::hal_common::VirtPageNum;
-use crate::hal_common::{VirtAddr, PAGE_SIZE};
-
-use crate::mm::vm::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
-use crate::mm::{pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page, PteFlags};
-use crate::proc::Task;
+use crate::{
+    hal_common::{VirtAddr, PAGE_SIZE},
+    mm::{
+        pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page,
+        vm::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType},
+        PteFlags,
+    },
+    proc::Task,
+};
 
 /// Unified fault resolution: sync path first, async fallback for file-backed.
 pub async fn resolve_user_fault(
@@ -67,7 +70,7 @@ pub async fn resolve_user_fault(
                 );
             }
             Ok(())
-        }
+        },
         FaultResult::NeedsAsyncIO => {
             crate::klog!(
                 vm,
@@ -94,7 +97,7 @@ pub async fn resolve_user_fault(
                         task.pid,
                         fault_va.as_usize(),
                     );
-                }
+                },
                 Err(e) => {
                     crate::klog!(
                         vm,
@@ -104,10 +107,10 @@ pub async fn resolve_user_fault(
                         fault_va.as_usize(),
                         e
                     );
-                }
+                },
             }
             async_result
-        }
+        },
         FaultResult::Error(e) => {
             crate::klog!(
                 vm,
@@ -118,7 +121,7 @@ pub async fn resolve_user_fault(
                 e
             );
             Err(e)
-        }
+        },
     }
 }
 
@@ -138,15 +141,16 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
         match &vma.store {
             crate::mm::vm::BackingStore::Object { object, offset } => {
-                let obj_offset_bytes = offset + (fault_va_aligned.as_usize() as u64 - vma.start);
-                let obj_offset = VirtPageNum((obj_offset_bytes / PAGE_SIZE as u64) as usize);
-                (object.clone(), obj_offset, vma.start, vma.protection)
-            }
+                let obj_offset_bytes = offset + (fault_va_aligned.as_usize() as u64 - vma.start());
+                let obj_offset =
+                    crate::mm::vm::VObjIndex::from_bytes_floor(obj_offset_bytes as usize);
+                (object.clone(), obj_offset, vma.start(), vma.protection)
+            },
             _ => return Err(FaultError::NotMapped),
         }
     };
 
-    // 2. Check if the page is already in the object
+    // 2. Check if the page is already in the object (walks shadow chain)
     if let Some(existing_pa) = obj.read().lookup_page(obj_offset) {
         let map = task.vm_map.lock();
         let mut pmap = map.pmap_lock();
@@ -159,24 +163,35 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         return Ok(());
     }
 
+    // 2b. Shadow chain collapse: if our backing object has shadow_count == 1,
+    // collapse the chain to shorten future lookups (BSD vm_object_collapse).
+    // This prevents O(n) chain walks on fork-heavy workloads.
+    {
+        let mut obj_write = obj.write();
+        if let Some(backing) = obj_write.backing_object() {
+            if backing.read().shadow_count() == 1 {
+                obj_write.collapse();
+            }
+        }
+    }
+
     // 3. Allocate a frame and zero it.
     // We unconditionally zero it so that if the pager reads fewer than 4096 bytes (e.g. at EOF),
     // the unread portion remains zero, as required for BSS segments.
-    let frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::UserAnon)
-            .ok_or(FaultError::OutOfMemory)?;
+    let frame = crate::mm::alloc_raw_frame_sync(crate::mm::PageRole::UserAnon)
+        .ok_or(FaultError::OutOfMemory)?;
     pmap_zero_page(frame);
 
     // 4. Fetch data via pager
     let pager = { obj.read().pager.clone() };
     if let Some(pager_ref) = pager.as_ref() {
-        let file_offset = obj_offset.0 as u64 * PAGE_SIZE as u64;
+        let file_offset = obj_offset.to_bytes();
         if pager_ref
             .page_in(file_offset as usize, frame)
             .await
             .is_err()
         {
-            crate::mm::allocator::free_raw_frame(frame);
+            crate::mm::free_raw_frame(frame);
             return Err(FaultError::IoError);
         }
     }
@@ -193,7 +208,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
         // Check if another thread raced us
         if let Some(existing_pa) = obj_write.lookup_page(obj_offset) {
-            crate::mm::allocator::free_raw_frame(frame);
+            crate::mm::free_raw_frame(frame);
             if pmap_extract(&pmap, fault_va_aligned).is_none() {
                 if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
                     return Err(FaultError::OutOfMemory);
@@ -202,7 +217,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             return Ok(());
         }
 
-        let vm_page_meta = crate::mm::allocator::get_frame_meta(frame).unwrap();
+        let vm_page_meta = crate::mm::get_frame_meta(frame).unwrap();
         obj_write.insert_page(obj_offset, {
             let mut page = crate::mm::VmPage::new();
             page.phys_addr = vm_page_meta.phys();

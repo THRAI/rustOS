@@ -1,7 +1,8 @@
 //! rv64 trap setup and dispatch.
 
-use crate::hal_common::TrapFrame;
 use core::sync::atomic::Ordering;
+
+use crate::hal_common::TrapFrame;
 
 // Interrupt bit in scause (bit 63 on rv64)
 const SCAUSE_INTERRUPT: usize = 1 << 63;
@@ -67,20 +68,20 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
         match code {
             IRQ_S_TIMER => {
                 super::timer::handle_timer_irq();
-            }
+            },
             IRQ_S_EXTERNAL => {
                 handle_external_irq();
-            }
+            },
             IRQ_S_SOFTWARE => {
                 super::ipi::handle_ipi();
-            }
+            },
             _ => {
                 panic!(
                     "[trap] unhandled interrupt: code={}, sepc={:#x}",
                     code,
                     frame.pc()
                 );
-            }
+            },
         }
     } else {
         match code {
@@ -90,7 +91,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                     frame.pc(),
                     frame.arg(7)
                 );
-            }
+            },
             EXC_ILLEGAL_INST => {
                 panic!(
                     "[trap] illegal instruction: stval={:#x}, sepc={:#x}, ra={:#x}, sp={:#x}",
@@ -99,7 +100,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                     frame.ra(),
                     frame.sp(),
                 );
-            }
+            },
             EXC_LOAD_ACCESS_FAULT
             | EXC_STORE_ACCESS_FAULT
             | EXC_INST_PAGE_FAULT
@@ -124,7 +125,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                     frame.ra(),
                     frame.sp(),
                 );
-            }
+            },
             _ => {
                 panic!(
                     "[trap] unhandled exception: cause={}, stval={:#x}, sepc={:#x}, ra={:#x}, sp={:#x}",
@@ -134,7 +135,7 @@ pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
                     frame.ra(),
                     frame.sp(),
                 );
-            }
+            },
         }
     }
 }

@@ -1,7 +1,6 @@
-use crate::hal_common::VirtAddr;
-use crate::mm::vm::MapPerm;
-use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
+
+use crate::{hal_common::VirtAddr, mm::vm::MapPerm};
 
 /// A single loadable memory region parsed from an ELF PT_LOAD segment.
 #[derive(Debug, Clone)]
@@ -91,7 +90,7 @@ impl ExecContext {
                     if segment_end > max_vaddr {
                         max_vaddr = segment_end;
                     }
-                }
+                },
 
                 // PT_INTERP: extract dynamic linker path
                 goblin::elf::program_header::PT_INTERP => {
@@ -105,13 +104,13 @@ impl ExecContext {
                             ctx.interp_path = Some(String::from(interp_str));
                         }
                     }
-                }
+                },
 
                 // PT_PHDR: record program header table VA for auxv AT_PHDR
                 goblin::elf::program_header::PT_PHDR => {
                     ctx.phdr_vaddr = VirtAddr(phdr.p_vaddr as usize + load_base.0);
-                }
-                _ => {} // Ignore PT_NOTE, PT_GNU_STACK, etc.
+                },
+                _ => {}, // Ignore PT_NOTE, PT_GNU_STACK, etc.
             }
         }
 
@@ -152,8 +151,10 @@ impl From<u32> for MapPerm {
     }
 }
 
-use goblin::elf::{Header, ProgramHeader};
-use goblin::error::Error;
+use goblin::{
+    elf::{Header, ProgramHeader},
+    error::Error,
+};
 
 /// Parse ELF header and program headers from the first page of an ELF file.
 ///

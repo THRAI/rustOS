@@ -2,19 +2,26 @@
 //!
 //! The Vnode trait is the core filesystem abstraction. Ext4Vnode implements
 //! it by sending operations to the delegate task via the bounded channel.
+//!
+//! # Lock ordering
+//!
+//! `VNODE_OBJECTS` must always be acquired **before** `VNODE_LRU`.
+//! This order is consistent across `vnode_object()`, `vnode_destroy_object()`,
+//! and `evict_idle_vnodes()`. Never invert.
 
-use crate::hal_common::VirtPageNum;
-use crate::hal_common::PAGE_SIZE;
-use crate::mm::vm::VmObject;
-use alloc::collections::BTreeMap;
-use alloc::collections::VecDeque;
-use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    string::String,
+    sync::Arc,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::{hal_common::PAGE_SIZE, mm::vm::VmObject};
 /// Unique vnode identifier (inode number within a filesystem).
 pub type VnodeId = u64;
-use crate::hal_common::IrqSafeSpinLock;
 use spin::rwlock::RwLock;
+
+use crate::hal_common::IrqSafeSpinLock;
 
 static VNODE_OBJECTS: IrqSafeSpinLock<Option<BTreeMap<VnodeId, Arc<RwLock<VmObject>>>>> =
     IrqSafeSpinLock::new(None);
@@ -202,8 +209,8 @@ impl Vnode for Ext4Vnode {
         if let Some(obj) = vnode_object_if_exists(self.ino as VnodeId) {
             let mut w = obj.write();
             if size < old_size {
-                let new_pages = (size as usize + PAGE_SIZE - 1) / PAGE_SIZE;
-                w.truncate_pages(VirtPageNum(new_pages));
+                let _new_pages = (size as usize + PAGE_SIZE - 1) / PAGE_SIZE;
+                w.truncate_pages(crate::mm::vm::VObjIndex::from_bytes_ceil(size as usize));
             }
             w.set_size(size as usize);
         }

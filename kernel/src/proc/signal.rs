@@ -7,15 +7,15 @@
 //! sendsig (build sigframe on user stack) → handler runs in user mode →
 //! sigreturn trampoline → sys_sigreturn restores context.
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use bitflags::bitflags;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::hal_common::SpinMutex as Mutex;
-use crate::hal_common::{TrapFrame, VirtAddr, PAGE_SIZE};
+use bitflags::bitflags;
 
-use crate::proc::Task;
+use crate::{
+    hal_common::{SpinMutex as Mutex, TrapFrame, VirtAddr, PAGE_SIZE},
+    proc::Task,
+};
 
 // ---------------------------------------------------------------------------
 // Signal numbers (1-indexed, matching Linux)
@@ -340,8 +340,8 @@ impl SignalState {
                     if default_action(sig) != SigDefault::Ignore {
                         return true; // Would terminate/stop
                     }
-                }
-                SIG_IGN => {}     // Explicitly ignored
+                },
+                SIG_IGN => {},    // Explicitly ignored
                 _ => return true, // User handler installed
             }
             bits &= !(1u64 << bit);
@@ -625,12 +625,12 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
                         Signal(sig)
                     );
                     Err(sig)
-                }
+                },
                 SigDefault::Ignore => Ok(false),
                 SigDefault::Stop => Ok(false), // simplified
                 SigDefault::Continue => Ok(false),
             }
-        }
+        },
         SIG_IGN => Ok(false),
         _handler => {
             klog!(
@@ -653,9 +653,9 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
                     );
                     // sendsig failed (bad user stack) — kill with SIGILL
                     Err(SIGILL)
-                }
+                },
             }
-        }
+        },
     }
 }
 
@@ -666,6 +666,11 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
 use crate::hal_common::SpinMutex;
 
 /// Global task registry for kill() iteration.
+// SAFETY: SpinMutex (no IRQ disable). Currently safe because all callers
+// (register_task, unregister_task, sys_kill, deliver_signal_to_pid) run
+// in syscall/task context only. The timer IRQ handler does not iterate
+// or modify this registry. Must be upgraded to IrqSafeSpinLock if any
+// future IRQ path needs to look up tasks by PID.
 static TASK_REGISTRY: SpinMutex<Vec<Arc<Task>>> = SpinMutex::new(Vec::new());
 
 /// Register a task in the global registry (called on task creation).
@@ -714,9 +719,8 @@ pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
 pub fn map_sigcode_page(pmap: &mut crate::mm::Pmap) {
     use crate::mm::pmap_enter;
 
-    let frame =
-        crate::mm::allocator::alloc_raw_frame_sync(crate::mm::allocator::PageRole::SigTrampoline)
-            .expect("sigcode page alloc failed");
+    let frame = crate::mm::alloc_raw_frame_sync(crate::mm::PageRole::SigTrampoline)
+        .expect("sigcode page alloc failed");
     let page_data = build_sigcode_page();
 
     // Write sigcode to the physical frame

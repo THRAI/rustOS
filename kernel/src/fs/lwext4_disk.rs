@@ -102,7 +102,7 @@ impl KernelDevOp for Disk {
                     let tmp = buf;
                     buf = &mut tmp[n..];
                     read_len += n;
-                }
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -117,7 +117,7 @@ impl KernelDevOp for Disk {
                 Ok(n) => {
                     buf = &buf[n..];
                     write_len += n;
-                }
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -134,7 +134,7 @@ impl KernelDevOp for Disk {
             lwext4_rust::bindings::SEEK_SET => Some(off),
             lwext4_rust::bindings::SEEK_CUR => {
                 dev.position().checked_add_signed(off).map(|v| v as i64)
-            }
+            },
             lwext4_rust::bindings::SEEK_END => size.checked_add_signed(off).map(|v| v as i64),
             _ => Some(off),
         }

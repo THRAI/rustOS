@@ -5,9 +5,9 @@
 //! 2. longest-prefix path translation from namespace path to backend path.
 //! 3. a basic "same mount domain" check for link/rename semantics.
 
+use alloc::{string::String, vec::Vec};
+
 use crate::hal_common::{Errno, SpinMutex};
-use alloc::string::String;
-use alloc::vec::Vec;
 
 const MAX_MOUNTS: usize = 64;
 
@@ -63,10 +63,10 @@ fn normalize_absolute_path(path: &str) -> String {
     let mut comps: Vec<&str> = Vec::new();
     for comp in path.split('/') {
         match comp {
-            "" | "." => {}
+            "" | "." => {},
             ".." => {
                 let _ = comps.pop();
-            }
+            },
             _ => comps.push(comp),
         }
     }

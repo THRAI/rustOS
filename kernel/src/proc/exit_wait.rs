@@ -1,10 +1,12 @@
 //! sys_exit and wait4 with Waker-based lost-wakeup prevention.
 
 use alloc::sync::Arc;
-use core::future::Future;
-use core::pin::Pin;
-use core::sync::atomic::Ordering;
-use core::task::{Context, Poll};
+use core::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::Ordering,
+    task::{Context, Poll},
+};
 
 use crate::proc::{unregister_task, SyscallResult, Task, TaskState, SA_NOCLDWAIT, SIGCHLD};
 

@@ -5,8 +5,7 @@ use core::sync::atomic::Ordering;
 
 // use crate::klog;
 use crate::hal_common::Errno;
-use crate::proc::Task;
-use crate::proc::{SigAction, SigFrame, Signal, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
+use crate::proc::{SigAction, SigFrame, Signal, Task, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
 
 pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     klog!(signal, debug, "sigreturn pid={}", task.pid);
@@ -162,13 +161,13 @@ pub fn sys_sigprocmask(
         match how {
             SIG_BLOCK => {
                 sig_state.blocked.fetch_union(set, Ordering::Release);
-            }
+            },
             SIG_UNBLOCK => {
                 sig_state.blocked.fetch_difference(set, Ordering::Release);
-            }
+            },
             SIG_SETMASK => {
                 sig_state.blocked.store(set, Ordering::Release);
-            }
+            },
             _ => return Err(Errno::Einval),
         }
     }
@@ -200,7 +199,7 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
                     }
                 }
                 Ok(0)
-            }
+            },
             None => Err(Errno::Esrch),
         }
     } else if pid == 0 {

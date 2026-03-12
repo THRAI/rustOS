@@ -11,6 +11,7 @@ mod console;
 mod alloc_early;
 mod drivers;
 mod executor;
+pub mod feature_flags;
 mod fs;
 mod hal;
 mod hal_common;
@@ -88,9 +89,44 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             extern "C" {
                 static ekernel: u8;
             }
-            let mem_start =
-                crate::hal_common::PhysAddr::new(unsafe { &ekernel as *const u8 as usize });
-            let mem_end = crate::hal_common::PhysAddr::new(0x8800_0000); // 128MB QEMU virt
+            let kernel_end = unsafe { &ekernel as *const u8 as usize };
+            let mem_start = crate::hal_common::PhysAddr::new(kernel_end);
+
+            // Discover physical RAM from FDT instead of hardcoding 0x8800_0000.
+            let (num_regions, regions) = hal::parse_memory(dtb_ptr);
+            // Use the first region that contains kernel_end (the kernel is
+            // loaded into one of the FDT-reported memory regions).
+            let mem_end = {
+                let mut end = crate::hal_common::PhysAddr::new(0);
+                for i in 0..num_regions {
+                    let r = &regions[i];
+                    let region_end = r.base + r.size;
+                    if kernel_end >= r.base && kernel_end < region_end {
+                        end = crate::hal_common::PhysAddr::new(region_end);
+                        break;
+                    }
+                }
+                if end.as_usize() == 0 {
+                    // Kernel is not inside any reported region — use the
+                    // largest region's end as a conservative fallback.
+                    let mut best = 0usize;
+                    for i in 0..num_regions {
+                        let region_end = regions[i].base + regions[i].size;
+                        if region_end > best {
+                            best = region_end;
+                        }
+                    }
+                    end = crate::hal_common::PhysAddr::new(best);
+                    klog!(
+                        boot,
+                        warn,
+                        "kernel not in any FDT memory region, using {:#x}",
+                        best
+                    );
+                }
+                end
+            };
+
             klog!(
                 boot,
                 info,
@@ -385,10 +421,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                                 executor::spawn_user_task(init_task2, init_cpu);
                                 launched = true;
                                 break;
-                            }
+                            },
                             Err(e) => {
                                 klog!(boot, warn, "exec {} failed: {:?}", exec_path, e);
-                            }
+                            },
                         }
                     }
                     if !launched {
@@ -473,11 +509,11 @@ fn test_uiomove_short_read() {
     let mut dst = [0u8; 128];
     let r = uiomove(dst.as_mut_ptr(), src.as_mut_ptr(), 128, UioDir::CopyIn);
     match r {
-        Ok(res) if res.done == 128 => {}
+        Ok(res) if res.done == 128 => {},
         other => {
             kprintln!("uiomove short-read FAIL (full copy: {:?})", other);
             return;
-        }
+        },
     }
 
     // Test 2: fault on first chunk returns EFAULT
@@ -488,11 +524,11 @@ fn test_uiomove_short_read() {
         UioDir::CopyIn,
     );
     match r {
-        Err(crate::hal_common::Errno::Efault) => {}
+        Err(crate::hal_common::Errno::Efault) => {},
         other => {
             kprintln!("uiomove short-read FAIL (efault: {:?})", other);
             return;
-        }
+        },
     }
 
     kprintln!("uiomove short-read PASS");
@@ -501,9 +537,8 @@ fn test_uiomove_short_read() {
 #[cfg(feature = "qemu-test")]
 fn test_fork_exit_wait4() {
     use alloc::sync::Arc;
-    use proc::syscall_result::SyscallResult;
-    use proc::Task;
-    use proc::{fork, sys_exit, WaitChildFuture, WaitStatus};
+
+    use proc::{fork, sys_exit, syscall_result::SyscallResult, Task, WaitChildFuture, WaitStatus};
 
     // Create init task (pid 1)
     let init = Task::new_init();
@@ -528,7 +563,7 @@ fn test_fork_exit_wait4() {
     // Child exits with code 42
     let result = sys_exit(&child, WaitStatus::exited(42));
     match result {
-        SyscallResult::Terminated => {}
+        SyscallResult::Terminated => {},
         _ => panic!("sys_exit must return Terminated"),
     }
 
@@ -545,9 +580,11 @@ fn test_fork_exit_wait4() {
 
     // Test WaitChildFuture synchronously via a manual poll
     // Since child is already ZOMBIE, the first poll should return Ready
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use core::{
+        future::Future,
+        pin::Pin,
+        task::{RawWaker, RawWakerVTable, Waker},
+    };
 
     // Create a no-op waker for manual polling
     fn noop_raw_waker() -> RawWaker {
@@ -572,7 +609,7 @@ fn test_fork_exit_wait4() {
                 42 << 8,
                 "wait4 must return exit code 42 (WaitStatus encoded)"
             );
-        }
+        },
         other => panic!("wait4 expected Ready(Some), got {:?}", other),
     }
 
@@ -595,11 +632,11 @@ async fn test_delegate_read() {
                     } else {
                         kprintln!("delegate read FAIL (content={:?})", content);
                     }
-                }
+                },
                 Err(e) => kprintln!("delegate read FAIL (read err={})", e),
             }
             let _ = fs::fs_close(handle).await;
-        }
+        },
         Err(e) => kprintln!("delegate read FAIL (open err={})", e),
     }
 }
@@ -635,20 +672,20 @@ async fn test_vfs_read() {
                                                 content2
                                             );
                                         }
-                                    }
+                                    },
                                     Err(_) => kprintln!("vfs read FAIL (cache read err)"),
                                 }
                                 let _ = syscall::fs::close(&fd_table, fd2);
-                            }
+                            },
                             Err(_) => kprintln!("vfs read FAIL (reopen err)"),
                         }
                     } else {
                         kprintln!("vfs read FAIL (content={:?})", content);
                     }
-                }
+                },
                 Err(_) => kprintln!("vfs read FAIL (read err)"),
             }
-        }
+        },
         Err(_) => kprintln!("vfs read FAIL (open err)"),
     }
 }
@@ -656,7 +693,8 @@ async fn test_vfs_read() {
 #[cfg(feature = "qemu-test")]
 async fn test_fork_exec_wait4() {
     use alloc::sync::Arc;
-    use proc::{exec, fork, sys_exit, Task, WaitChildFuture, WaitStatus};
+
+    use proc::{do_execve, fork, sys_exit, Task, WaitChildFuture, WaitStatus};
 
     // Create init task
     let init = Task::new_init();
@@ -665,20 +703,20 @@ async fn test_fork_exec_wait4() {
     let child = fork(&init);
     let child_pid = child.pid;
 
-    // Try exec on the child — use /hello.txt which is NOT an ELF
+    // Try do_execve on the child — use /hello.txt which is NOT an ELF
     // This should fail with ENOEXEC, proving the ELF validation works
-    match exec(&child, "/hello.txt").await {
+    match do_execve(&child, "/hello.txt", &[], &[]).await {
         Err(crate::hal_common::Errno::Enoexec) => {
             // Expected: hello.txt is not an ELF binary
-        }
+        },
         Ok(_) => {
             kprintln!("fork-exec-wait4 FAIL (hello.txt accepted as ELF)");
             return;
-        }
+        },
         Err(e) => {
             kprintln!("fork-exec-wait4 FAIL (unexpected error: {:?})", e);
             return;
-        }
+        },
     }
 
     // Child exits with code 7
@@ -693,10 +731,10 @@ async fn test_fork_exec_wait4() {
             } else {
                 kprintln!("fork-exec-wait4 FAIL (pid={}, status={})", pid, status);
             }
-        }
+        },
         None => {
             kprintln!("fork-exec-wait4 FAIL (wait4 returned None)");
-        }
+        },
     }
 }
 
@@ -709,11 +747,11 @@ async fn test_pipe_data_transfer() {
 
     // Write to pipe
     match pipe.write(msg) {
-        Ok(n) if n == msg.len() => {}
+        Ok(n) if n == msg.len() => {},
         other => {
             kprintln!("pipe data transfer FAIL (write: {:?})", other);
             return;
-        }
+        },
     }
 
     // Read from pipe
@@ -724,32 +762,32 @@ async fn test_pipe_data_transfer() {
                 // Test EOF: close writer, read should return 0
                 pipe.close_write();
                 match pipe.read(&mut buf) {
-                    Ok(0) => {}
+                    Ok(0) => {},
                     other => {
                         kprintln!("pipe data transfer FAIL (eof: {:?})", other);
                         return;
-                    }
+                    },
                 }
             } else {
                 kprintln!("pipe data transfer FAIL (data mismatch)");
                 return;
             }
-        }
+        },
         other => {
             kprintln!("pipe data transfer FAIL (read: {:?})", other);
             return;
-        }
+        },
     }
 
     // Test EPIPE: close reader, write should return EPIPE
     let pipe2 = Pipe::new();
     pipe2.close_read();
     match pipe2.write(b"test") {
-        Err(crate::hal_common::Errno::Epipe) => {}
+        Err(crate::hal_common::Errno::Epipe) => {},
         other => {
             kprintln!("pipe data transfer FAIL (epipe: {:?})", other);
             return;
-        }
+        },
     }
 
     kprintln!("pipe data transfer PASS");
@@ -757,8 +795,10 @@ async fn test_pipe_data_transfer() {
 
 #[cfg(feature = "qemu-test")]
 fn test_signal_pending_delivery() {
-    use proc::signal::{SA_NOCLDWAIT, SA_RESTART, SIGCHLD, SIGUSR1};
-    use proc::Task;
+    use proc::{
+        signal::{SA_NOCLDWAIT, SA_RESTART, SIGCHLD, SIGUSR1},
+        Task,
+    };
 
     let task = Task::new_init();
 
@@ -771,11 +811,11 @@ fn test_signal_pending_delivery() {
 
     // Dequeue it
     match task.signals.dequeue_signal() {
-        Some(sig) if sig == SIGUSR1 => {}
+        Some(sig) if sig == SIGUSR1 => {},
         other => {
             kprintln!("signal pending delivery FAIL (dequeue: {:?})", other);
             return;
-        }
+        },
     }
 
     // Should be empty now
@@ -835,9 +875,9 @@ fn test_signal_pending_delivery() {
 
 #[cfg(feature = "qemu-test")]
 fn test_mmap_munmap() {
+    use mm::vm::{vm_map::VmMap, VmObject};
+
     use crate::hal_common::{VirtAddr, PAGE_SIZE};
-    use mm::vm::vm_map::VmMap;
-    use mm::vm::VmObject;
 
     let task = proc::Task::new_init();
 
@@ -859,11 +899,11 @@ fn test_mmap_munmap() {
     {
         let mut vm = task.vm_map.lock();
         match vm.insert_entry(vma) {
-            Ok(()) => {}
+            Ok(()) => {},
             Err(_) => {
                 kprintln!("mmap munmap FAIL (insert)");
                 return;
-            }
+            },
         }
         // Verify VMA exists
         if vm.lookup(base.as_usize() as u64).is_none() {
@@ -902,33 +942,33 @@ async fn test_device_nodes() {
                 return;
             }
             let _ = syscall::fs::close(&fd_table, fd);
-        }
+        },
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/null open: {:?})", e);
             return;
-        }
+        },
     }
 
     // Open /dev/zero
     match syscall::fs::open(&fd_table, "/dev/zero", OpenFlags::RDONLY, 0).await {
         Ok(fd) => {
             let _ = syscall::fs::close(&fd_table, fd);
-        }
+        },
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/zero open: {:?})", e);
             return;
-        }
+        },
     }
 
     // Open /dev/console
     match syscall::fs::open(&fd_table, "/dev/console", OpenFlags::RDWR, 0).await {
         Ok(fd) => {
             let _ = syscall::fs::close(&fd_table, fd);
-        }
+        },
         Err(e) => {
             kprintln!("device nodes FAIL (/dev/console open: {:?})", e);
             return;
-        }
+        },
     }
 
     kprintln!("device nodes PASS");
@@ -936,8 +976,9 @@ async fn test_device_nodes() {
 
 #[cfg(feature = "qemu-test")]
 fn test_futex_wake() {
-    use crate::hal_common::PhysAddr;
     use ipc::futex;
+
+    use crate::hal_common::PhysAddr;
 
     // futex_wake on a key with no waiters should return 0
     let key = PhysAddr::new(0xDEAD_0000);

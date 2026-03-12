@@ -2,11 +2,13 @@
 //!
 //! Implements mmap, munmap, brk, mprotect and related memory operations.
 
-use crate::fs::FileObject;
-use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
 use alloc::sync::Arc;
 
-use crate::proc::Task;
+use crate::{
+    fs::FileObject,
+    hal_common::{Errno, VirtAddr, PAGE_SIZE},
+    proc::Task,
+};
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -115,10 +117,10 @@ pub fn sys_mmap(
     fd: u32,
     offset: u64,
 ) -> usize {
-    use crate::fs::VnodeType;
-    use crate::mm::vm::VmError;
-    use crate::mm::vm::VmObject;
-    use crate::mm::vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry};
+    use crate::{
+        fs::VnodeType,
+        mm::vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry, VmObject},
+    };
 
     let aligned_len = match align_up_to_page(len) {
         Some(aligned_len) if aligned_len != 0 => aligned_len,
@@ -197,8 +199,7 @@ pub fn sys_mmap(
 
     match vm.insert_entry(vma) {
         Ok(()) => base,
-        Err(VmError::Overlap) | Err(VmError::InvalidRange) => errno_ret(Errno::Einval),
-        Err(VmError::NotFound) => errno_ret(Errno::Enomem),
+        Err(_) => errno_ret(Errno::Einval),
     }
 }
 
@@ -229,8 +230,6 @@ pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> usize {
 
 /// sys_mprotect: change VMA permissions + update PTEs.
 pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize) -> usize {
-    use crate::mm::vm::VmError;
-
     if len == 0 || !is_page_aligned(addr) {
         return errno_ret(Errno::Einval);
     }
@@ -257,8 +256,7 @@ pub fn sys_mprotect(task: &Arc<Task>, addr: usize, len: usize, prot_bits: usize)
     let mut vm = task.vm_map.lock();
     match vm.protect_range(start, end, perm) {
         Ok(()) => 0,
-        Err(VmError::NotFound) => errno_ret(Errno::Enomem),
-        Err(VmError::Overlap) | Err(VmError::InvalidRange) => errno_ret(Errno::Einval),
+        Err(e) => errno_ret(e),
     }
 }
 

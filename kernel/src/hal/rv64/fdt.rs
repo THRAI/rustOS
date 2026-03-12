@@ -76,7 +76,7 @@ pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
                 } else if in_cpus && depth == 3 && starts_with(name, b"cpu@") {
                     in_cpu_node = true;
                 }
-            }
+            },
             // FDT_END_NODE
             0x00000002 => {
                 if in_cpu_node && depth == 3 {
@@ -86,7 +86,7 @@ pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
                     in_cpus = false;
                 }
                 depth -= 1;
-            }
+            },
             // FDT_PROP
             0x00000003 => {
                 let val_len = read_be32(pos) as usize;
@@ -114,9 +114,9 @@ pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
                         }
                     }
                 }
-            }
+            },
             // FDT_NOP
-            0x00000004 => {}
+            0x00000004 => {},
             // FDT_END
             0x00000009 => break,
             _ => break,
@@ -188,4 +188,146 @@ fn starts_with(s: &[u8], prefix: &[u8]) -> bool {
 /// Check byte-level equality.
 fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
     a == b
+}
+
+// ---------------------------------------------------------------------------
+// Physical memory region discovery from FDT /memory node
+// ---------------------------------------------------------------------------
+
+/// Discovered physical memory region from the FDT `/memory` node.
+#[derive(Debug, Copy, Clone)]
+pub struct MemRegion {
+    pub base: usize,
+    pub size: usize,
+}
+
+/// Parse the `/memory` node from FDT to discover physical RAM regions.
+///
+/// Returns a fixed-size array of up to 4 regions and the count found.
+/// Falls back to a default 128MB region at `0x8000_0000` if the FDT is
+/// missing or unparsable (matching QEMU virt defaults).
+///
+/// # Safety
+/// `dtb_ptr` must point to a valid FDT blob in memory.
+pub fn parse_memory(dtb_ptr: usize) -> (usize, [MemRegion; 4]) {
+    let empty = MemRegion { base: 0, size: 0 };
+    let default_region = MemRegion {
+        base: 0x8000_0000,
+        size: 128 * 1024 * 1024,
+    };
+    let mut regions = [empty; 4];
+
+    if dtb_ptr == 0 {
+        regions[0] = default_region;
+        return (1, regions);
+    }
+
+    let magic = read_be32(dtb_ptr);
+    if magic != 0xd00dfeed {
+        regions[0] = default_region;
+        return (1, regions);
+    }
+
+    let totalsize = read_be32(dtb_ptr + 4) as usize;
+    let off_dt_struct = read_be32(dtb_ptr + 8) as usize;
+    let off_dt_strings = read_be32(dtb_ptr + 12) as usize;
+
+    let struct_base = dtb_ptr + off_dt_struct;
+    let strings_base = dtb_ptr + off_dt_strings;
+    let struct_end = dtb_ptr + totalsize;
+
+    let mut num_regions = 0usize;
+    let mut pos = struct_base;
+    let mut depth: i32 = 0;
+    let mut in_memory_node = false;
+
+    while pos < struct_end {
+        let token = read_be32(pos);
+        pos += 4;
+
+        match token {
+            // FDT_BEGIN_NODE
+            0x00000001 => {
+                let name = read_cstr(pos);
+                let name_len = name.len();
+                pos += align4(name_len + 1);
+                depth += 1;
+
+                // /memory or /memory@XXXXXXXX at depth 1
+                if depth == 1 && starts_with(name, b"memory") {
+                    in_memory_node = true;
+                }
+            },
+            // FDT_END_NODE
+            0x00000002 => {
+                if in_memory_node && depth == 1 {
+                    in_memory_node = false;
+                }
+                depth -= 1;
+            },
+            // FDT_PROP
+            0x00000003 => {
+                let val_len = read_be32(pos) as usize;
+                let name_off = read_be32(pos + 4) as usize;
+                pos += 8;
+                let val_ptr = pos;
+                pos += align4(val_len);
+
+                if in_memory_node {
+                    let prop_name = read_cstr(strings_base + name_off);
+                    if eq_bytes(prop_name, b"reg") {
+                        // Parse reg property: pairs of (base, size).
+                        // Each cell is typically 8 bytes (#address-cells=2, #size-cells=2)
+                        // for 64-bit platforms, but may be 4 bytes on 32-bit.
+                        // QEMU virt uses 2+2 cells (16 bytes per entry).
+                        let entry_size = 16; // 8-byte base + 8-byte size
+                        let mut off = 0;
+                        while off + entry_size <= val_len && num_regions < 4 {
+                            let base = read_be64(val_ptr + off) as usize;
+                            let size = read_be64(val_ptr + off + 8) as usize;
+                            if size > 0 {
+                                regions[num_regions] = MemRegion { base, size };
+                                num_regions += 1;
+                            }
+                            off += entry_size;
+                        }
+                    }
+                }
+            },
+            // FDT_NOP
+            0x00000004 => {},
+            // FDT_END
+            0x00000009 => break,
+            _ => break,
+        }
+    }
+
+    if num_regions == 0 {
+        klog!(
+            boot,
+            warn,
+            "FDT: no /memory node found, assuming 128MB at 0x8000_0000"
+        );
+        regions[0] = default_region;
+        return (1, regions);
+    }
+
+    klog!(
+        boot,
+        info,
+        "FDT: discovered {} memory region(s)",
+        num_regions
+    );
+    for i in 0..num_regions {
+        klog!(
+            boot,
+            info,
+            "  region {}: base={:#x} size={:#x} ({}MB)",
+            i,
+            regions[i].base,
+            regions[i].size,
+            regions[i].size / (1024 * 1024)
+        );
+    }
+    (num_regions, regions)
 }

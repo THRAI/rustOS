@@ -1,2 +1,75 @@
+# Integration test commands for make python-test-rv64
+# Each line is sent to the shell and must return to the prompt within --timeout.
+# Lines starting with # are ignored. Blank lines are ignored.
+
+# --- Basic shell ---
 echo "hi"
-/bin/busybox echo hello | /bin/busybox cat | /bin/busybox wc -l
+pwd
+
+# --- Filesystem: read ---
+ls /
+ls /bin
+cat /hello.txt
+
+# --- Filesystem: write + read back ---
+touch /tmp_testfile
+echo "test_content" > /tmp_testfile
+cat /tmp_testfile
+
+# --- Filesystem: mkdir / rmdir ---
+mkdir /testdir
+ls /testdir
+touch /testdir/file1
+ls /testdir
+rm /testdir/file1
+rmdir /testdir
+
+# --- Filesystem: cp / mv ---
+cp /hello.txt /hello_copy.txt
+cat /hello_copy.txt
+mv /hello_copy.txt /hello_moved.txt
+cat /hello_moved.txt
+rm /hello_moved.txt
+
+# --- Filesystem: hard link ---
+ln /hello.txt /hello_link.txt
+cat /hello_link.txt
+rm /hello_link.txt
+
+# --- Pipes and process lifecycle ---
+echo hello | cat
+echo hello | cat | wc -l
+echo "aaa bbb ccc" | wc -w
+echo -e "z\na\nm" | sort
+
+# --- Text processing ---
+echo "hello world" | grep hello
+echo "line1 line2 line3" | head -c 5
+
+# --- Process management ---
+ps
+uname -a
+
+# --- Multiple sequential commands (stress fork/exec/wait) ---
+echo one; echo two; echo three
+
+# --- Nested directory creation and traversal ---
+mkdir -p /a/b/c
+touch /a/b/c/deep.txt
+find /a -name deep.txt
+rm /a/b/c/deep.txt
+rmdir /a/b/c
+rmdir /a/b
+rmdir /a
+
+# --- Larger pipe chain (exercises multiple concurrent processes) ---
+echo "the quick brown fox" | cat | cat | cat | wc -w
+
+# --- File with multiple lines ---
+echo -e "line1\nline2\nline3" > /multiline.txt
+wc -l /multiline.txt
+cat /multiline.txt
+rm /multiline.txt
+
+# --- Cleanup temp files ---
+rm -f /tmp_testfile

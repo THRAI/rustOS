@@ -68,6 +68,46 @@ jobs:
           echo "=== Files over 500 lines (candidates for refactoring) ==="
           find kernel/src -name '*.rs' -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt 500 ]; then echo "$lines $1"; fi' _ {} \;
 
+  integration-test:
+    name: QEMU Integration Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv64gc-unknown-none-elf
+          components: rust-src, llvm-tools
+      - name: Install Zig (musl cross-compiler for lwext4_rust)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Create riscv64-linux-musl-cc/ar wrappers
+        run: |
+          cat > /usr/local/bin/riscv64-linux-musl-cc <<'WRAPPER'
+          #!/bin/sh
+          exec zig cc -target riscv64-linux-musl "$@"
+          WRAPPER
+          chmod +x /usr/local/bin/riscv64-linux-musl-cc
+
+          cat > /usr/local/bin/riscv64-linux-musl-ar <<'WRAPPER'
+          #!/bin/sh
+          exec zig ar "$@"
+          WRAPPER
+          chmod +x /usr/local/bin/riscv64-linux-musl-ar
+      - name: Install cargo-binutils
+        run: cargo install cargo-binutils
+      - name: Install QEMU and e2fsprogs
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc e2fsprogs
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: Build kernel and disk image
+        run: |
+          make kernel-rv64 LOG=all LEVEL=error
+          make disk-img
+      - name: Run Python integration test
+        run: make python-test-rv64 LOG=all LEVEL=error
+
   pr-review:
     name: Automated PR Review
     if: github.event_name == 'pull_request'

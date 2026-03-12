@@ -17,8 +17,10 @@
 #![allow(clippy::collapsible_if)] // Readability preference in fault/signal paths
 #![allow(clippy::needless_pass_by_value)] // Arc<Task> passed by value is intentional (ownership transfer)
 #![allow(clippy::cast_ptr_alignment)] // MMIO register access requires aligned casts
+#![allow(unknown_lints)] // Suppress errors for lints that differ between nightly versions
 #![allow(clippy::wildcard_imports)] // Used for driver register constants
-#![allow(clippy::manual_is_multiple_of)] // is_multiple_of is nightly-only
+#![allow(clippy::uninlined_format_args)] // Pervasive in klog!/kprintln! macro calls
+#![allow(clippy::manual_is_multiple_of)] // is_multiple_of may not exist on all nightlies
 
 extern crate alloc;
 

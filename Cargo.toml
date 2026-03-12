@@ -9,7 +9,6 @@ undocumented_unsafe_blocks   = "warn"
 cast_ptr_alignment           = "warn"
 ptr_as_ptr                   = "warn"
 transmute_ptr_to_ref         = "warn"
-invalid_null_arguments        = "deny"
 
 # — Performance —
 large_enum_variant            = "warn"
@@ -47,6 +46,7 @@ module_name_repetitions       = "allow"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn        = "warn"
 unused_must_use               = "warn"
+invalid_null_arguments        = "deny"
 
 [workspace.dependencies]
 bitflags = "2"

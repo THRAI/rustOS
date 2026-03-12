@@ -26,10 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: riscv64gc-unknown-none-elf
           components: clippy, rust-src
+      - name: Install RISC-V musl cross-compiler (required by lwext4_rust)
+        run: |
+          wget -q https://musl.cc/riscv64-linux-musl-cross.tgz
+          tar xzf riscv64-linux-musl-cross.tgz
+          echo "$PWD/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Run Clippy with workspace lints
         run: |
           cargo clippy --target riscv64gc-unknown-none-elf -p kernel -- \
@@ -62,10 +69,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: riscv64gc-unknown-none-elf
           components: rust-src
+      - name: Install RISC-V musl cross-compiler (required by lwext4_rust)
+        run: |
+          wget -q https://musl.cc/riscv64-linux-musl-cross.tgz
+          tar xzf riscv64-linux-musl-cross.tgz
+          echo "$PWD/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Install cargo-udeps
         run: cargo install cargo-udeps --locked || true
       - name: Check unused dependencies

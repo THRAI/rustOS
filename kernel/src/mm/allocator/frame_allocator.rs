@@ -345,11 +345,11 @@ pub fn emergency_reclaim_sync() -> Option<PhysAddr> {
 
     // Drain every *other* CPU's magazine back to buddy.
     // We skip our own because alloc_raw_frame_sync already emptied it.
-    for i in 0..PER_CPU_MAGAZINES.len() {
+    for (i, mag_lock) in PER_CPU_MAGAZINES.iter().enumerate() {
         if i == caller_cpu {
             continue;
         }
-        let mut mag = PER_CPU_MAGAZINES[i].lock();
+        let mut mag = mag_lock.lock();
         if !mag.is_empty() {
             let mut buddy = GLOBAL_BUDDY.lock();
             mag.drain(&mut buddy);

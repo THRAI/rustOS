@@ -1152,7 +1152,6 @@ pub async fn sys_read_async(
                         )
                         .await
                         .map_err(|_| Errno::Efault)?;
-                        continue;
                     },
                     Err(e) => return Err(e),
                 }
@@ -1286,11 +1285,7 @@ pub async fn sys_write_async(
                                     obj_r.get_page(crate::mm::vm::VObjIndex::new(pi))
                                 {
                                     let page_base = pi * PAGE_SIZE;
-                                    let copy_start = if offset as usize > page_base {
-                                        offset as usize - page_base
-                                    } else {
-                                        0
-                                    };
+                                    let copy_start = (offset as usize).saturating_sub(page_base);
                                     let copy_end =
                                         core::cmp::min(PAGE_SIZE, offset as usize + n - page_base);
                                     let src_off = page_base + copy_start - offset as usize;

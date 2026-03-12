@@ -186,11 +186,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     let pager = { obj.read().pager.clone() };
     if let Some(pager_ref) = pager.as_ref() {
         let file_offset = obj_offset.to_bytes();
-        if pager_ref
-            .page_in(file_offset as usize, frame)
-            .await
-            .is_err()
-        {
+        if pager_ref.page_in(file_offset, frame).await.is_err() {
             crate::mm::free_raw_frame(frame);
             return Err(FaultError::IoError);
         }

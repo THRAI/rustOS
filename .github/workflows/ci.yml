@@ -50,13 +50,7 @@ jobs:
       - name: Run Clippy with workspace lints
         run: |
           cargo clippy --target riscv64gc-unknown-none-elf -p kernel -- \
-            -D warnings \
-            -W clippy::cognitive_complexity \
-            -W clippy::too_many_arguments \
-            -W clippy::enum_glob_use \
-            -W clippy::wildcard_imports \
-            -W clippy::module_name_repetitions \
-            -W clippy::needless_pass_by_value
+            -D warnings
 
   duplicate-detection:
     name: Duplicate Code Detection

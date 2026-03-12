@@ -332,7 +332,7 @@ impl Iterator for VirtAddrRangePageIter {
             return None;
         }
         let va = self.current;
-        self.current = self.current + PAGE_SIZE;
+        self.current += PAGE_SIZE;
         Some(va)
     }
 }

@@ -642,18 +642,17 @@ pub fn check_pending_signals(task: &Arc<Task>) -> Result<bool, u8> {
                 _handler
             );
             // Deliver to user handler via sendsig
-            match sendsig(task, sig, &action) {
-                Ok(()) => Ok(true),
-                Err(()) => {
-                    klog!(
-                        signal,
-                        debug,
-                        "check_pending pid={} sendsig FAILED -> SIGILL",
-                        task.pid
-                    );
-                    // sendsig failed (bad user stack) — kill with SIGILL
-                    Err(SIGILL)
-                },
+            if let Ok(()) = sendsig(task, sig, &action) {
+                Ok(true)
+            } else {
+                klog!(
+                    signal,
+                    debug,
+                    "check_pending pid={} sendsig FAILED -> SIGILL",
+                    task.pid
+                );
+                // sendsig failed (bad user stack) — kill with SIGILL
+                Err(SIGILL)
             }
         },
     }

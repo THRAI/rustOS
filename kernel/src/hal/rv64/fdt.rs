@@ -318,15 +318,15 @@ pub fn parse_memory(dtb_ptr: usize) -> (usize, [MemRegion; 4]) {
         "FDT: discovered {} memory region(s)",
         num_regions
     );
-    for i in 0..num_regions {
+    for (i, region) in regions.iter().enumerate().take(num_regions) {
         klog!(
             boot,
             info,
             "  region {}: base={:#x} size={:#x} ({}MB)",
             i,
-            regions[i].base,
-            regions[i].size,
-            regions[i].size / (1024 * 1024)
+            region.base,
+            region.size,
+            region.size / (1024 * 1024)
         );
     }
     (num_regions, regions)

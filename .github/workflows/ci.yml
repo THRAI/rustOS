@@ -81,9 +81,15 @@ jobs:
           tar xzf riscv64-linux-musl-cross.tgz
           echo "$PWD/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Install cargo-udeps
-        run: cargo install cargo-udeps --locked || true
+        run: cargo install cargo-udeps --locked
+        continue-on-error: true
       - name: Check unused dependencies
-        run: cargo udeps --target riscv64gc-unknown-none-elf -p kernel 2>&1 || echo "::warning::cargo-udeps check completed with issues"
+        run: |
+          if command -v cargo-udeps &>/dev/null; then
+            cargo udeps --target riscv64gc-unknown-none-elf -p kernel 2>&1 || echo "::warning::cargo-udeps found issues"
+          else
+            echo "::warning::cargo-udeps not available, skipping"
+          fi
         continue-on-error: true
 
   pr-review:

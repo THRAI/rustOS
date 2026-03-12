@@ -30,11 +30,12 @@ jobs:
         with:
           targets: riscv64gc-unknown-none-elf
           components: clippy, rust-src
-      - name: Install RISC-V musl cross-compiler (required by lwext4_rust)
+      - name: Install RISC-V cross-compiler (required by lwext4_rust)
         run: |
-          wget -q https://musl.cc/riscv64-linux-musl-cross.tgz
-          tar xzf riscv64-linux-musl-cross.tgz
-          echo "$PWD/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-riscv64-linux-gnu > /dev/null
+          sudo ln -s /usr/bin/riscv64-linux-gnu-gcc /usr/local/bin/riscv64-linux-musl-cc
+          sudo ln -s /usr/bin/riscv64-linux-gnu-ar /usr/local/bin/riscv64-linux-musl-ar
       - name: Run Clippy with workspace lints
         run: |
           cargo clippy --target riscv64gc-unknown-none-elf -p kernel -- \
@@ -71,11 +72,12 @@ jobs:
         with:
           targets: riscv64gc-unknown-none-elf
           components: rust-src
-      - name: Install RISC-V musl cross-compiler (required by lwext4_rust)
+      - name: Install RISC-V cross-compiler (required by lwext4_rust)
         run: |
-          wget -q https://musl.cc/riscv64-linux-musl-cross.tgz
-          tar xzf riscv64-linux-musl-cross.tgz
-          echo "$PWD/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-riscv64-linux-gnu > /dev/null
+          sudo ln -s /usr/bin/riscv64-linux-gnu-gcc /usr/local/bin/riscv64-linux-musl-cc
+          sudo ln -s /usr/bin/riscv64-linux-gnu-ar /usr/local/bin/riscv64-linux-musl-ar
       - name: Install cargo-udeps
         run: cargo install cargo-udeps --locked
         continue-on-error: true

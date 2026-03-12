@@ -204,7 +204,7 @@ dependencies = [
 [[package]]
 name = "lwext4_rust"
 version = "0.2.0"
-source = "git+https://github.com/THRAI/ext4fs.git?branch=main#609f3388ea28a2e1cd2bac47f8cb803e73703be9"
+source = "git+https://github.com/THRAI/ext4fs.git?branch=main#8a6d52a4a8575db1276db8d1d07c95fb622f2426"
 dependencies = [
  "bindgen",
  "log",

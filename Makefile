@@ -51,7 +51,7 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img clean
+.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
@@ -253,3 +253,20 @@ python-test-rv64: kernel-rv64 $(DISK_IMG)
 clean:
 	cargo clean
 	rm -f $(KERNEL_BIN_RV64)
+
+# Create zig-based riscv64-linux-musl-cc/ar wrappers (matches CI).
+# Replaces any existing wrappers that may use newlib headers (which break lwext4).
+# Requires: zig (brew install zig)
+WRAPPER_DIR ?= $(HOME)/.local/bin
+setup-toolchain:
+	@command -v zig >/dev/null 2>&1 || (echo "ERROR: zig not found. Install with: brew install zig"; exit 1)
+	@mkdir -p $(WRAPPER_DIR)
+	@rm -f $(WRAPPER_DIR)/riscv64-linux-musl-cc
+	@printf '#!/bin/sh\nexec zig cc -target riscv64-linux-musl "$$@"\n' > $(WRAPPER_DIR)/riscv64-linux-musl-cc
+	@chmod +x $(WRAPPER_DIR)/riscv64-linux-musl-cc
+	@rm -f $(WRAPPER_DIR)/riscv64-linux-musl-ar
+	@printf '#!/bin/sh\nexec zig ar "$$@"\n' > $(WRAPPER_DIR)/riscv64-linux-musl-ar
+	@chmod +x $(WRAPPER_DIR)/riscv64-linux-musl-ar
+	@echo "Installed zig-based wrappers in $(WRAPPER_DIR):"
+	@echo "  riscv64-linux-musl-cc -> zig cc -target riscv64-linux-musl"
+	@echo "  riscv64-linux-musl-ar -> zig ar"

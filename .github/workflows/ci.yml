@@ -68,44 +68,6 @@ jobs:
           echo "=== Files over 500 lines (candidates for refactoring) ==="
           find kernel/src -name '*.rs' -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt 500 ]; then echo "$lines $1"; fi' _ {} \;
 
-  unused-deps:
-    name: Unused Dependencies
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: riscv64gc-unknown-none-elf
-          components: rust-src
-      - name: Install Zig (used as musl cross-compiler for lwext4_rust)
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
-      - name: Create riscv64-linux-musl-cc/ar wrappers
-        run: |
-          cat > /usr/local/bin/riscv64-linux-musl-cc <<'WRAPPER'
-          #!/bin/sh
-          exec zig cc -target riscv64-linux-musl "$@"
-          WRAPPER
-          chmod +x /usr/local/bin/riscv64-linux-musl-cc
-
-          cat > /usr/local/bin/riscv64-linux-musl-ar <<'WRAPPER'
-          #!/bin/sh
-          exec zig ar "$@"
-          WRAPPER
-          chmod +x /usr/local/bin/riscv64-linux-musl-ar
-      - name: Install cargo-udeps
-        run: cargo install cargo-udeps --locked
-        continue-on-error: true
-      - name: Check unused dependencies
-        run: |
-          if command -v cargo-udeps &>/dev/null; then
-            cargo udeps --target riscv64gc-unknown-none-elf -p kernel 2>&1 || echo "::warning::cargo-udeps found issues"
-          else
-            echo "::warning::cargo-udeps not available, skipping"
-          fi
-        continue-on-error: true
-
   pr-review:
     name: Automated PR Review
     if: github.event_name == 'pull_request'

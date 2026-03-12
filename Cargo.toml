@@ -53,3 +53,8 @@ bitflags = "2"
 lwext4_rust = { git = "https://github.com/PACTHEMAN123/ext4fs.git", default-features = false, branch = "main" }
 log = { version = "0.4", default-features = false }
 lazy_static = { version = "1.4", default-features = false, features = ["spin_no_std"] }
+
+# Patch lwext4_rust to fix build.rs race: .spawn() → .status() for git-apply.
+# See https://github.com/THRAI/ext4fs/commit/609f338
+[patch."https://github.com/PACTHEMAN123/ext4fs.git"]
+lwext4_rust = { git = "https://github.com/THRAI/ext4fs.git", branch = "main" }

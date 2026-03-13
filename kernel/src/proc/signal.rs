@@ -472,7 +472,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
 
     klog!(
         signal,
-        error,
+        debug,
         "sendsig pid={} saving sepc={:#x} a0={:#x} sp={:#x}",
         task.pid,
         tf.sepc,
@@ -540,7 +540,7 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
 
     klog!(
         signal,
-        error,
+        debug,
         "sendsig pid={} sigframe at {:#x}..{:#x} (size={})",
         task.pid,
         sp,

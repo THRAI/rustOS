@@ -706,6 +706,43 @@ impl VmObject {
         self.backing = grandparent;
     }
 
+    // -----------------------------------------------------------------------
+    // Dirty tracking (UBC — Unified Buffer Cache)
+    // -----------------------------------------------------------------------
+
+    /// Increment modification generation. Called after any page is dirtied.
+    /// Uses AtomicU32 — no write lock required (works under read lock).
+    pub fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Has any page been modified since last writeback?
+    pub fn is_dirty(&self) -> bool {
+        self.generation.load(core::sync::atomic::Ordering::Acquire)
+            != self
+                .clean_generation
+                .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Snapshot current generation as clean. Called after all dirty pages flushed.
+    pub fn mark_clean(&self) {
+        self.clean_generation.store(
+            self.generation.load(core::sync::atomic::Ordering::Acquire),
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Collect dirty pages for writeback. Returns `(page-index, phys-addr)` pairs.
+    /// Caller must hold at least a read lock on this VmObject.
+    pub fn collect_dirty_pages(&self) -> alloc::vec::Vec<(VObjIndex, PhysAddr)> {
+        self.pages
+            .iter()
+            .filter(|(_, page)| page.is_dirty())
+            .map(|(idx, page)| (*idx, page.phys_addr))
+            .collect()
+    }
+
     /// Update the object size in bytes.
     pub fn set_size(&mut self, new_size: usize) {
         self.size = new_size;

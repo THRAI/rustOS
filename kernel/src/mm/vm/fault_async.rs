@@ -175,15 +175,20 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         }
     }
 
-    // 3. Allocate a frame and zero it.
+    // 3. Fetch pager reference and allocate a frame.
     // We unconditionally zero it so that if the pager reads fewer than 4096 bytes (e.g. at EOF),
     // the unread portion remains zero, as required for BSS segments.
-    let frame = crate::mm::alloc_raw_frame_sync(crate::mm::PageRole::UserAnon)
-        .ok_or(FaultError::OutOfMemory)?;
+    let pager = { obj.read().pager.clone() };
+
+    // Use FileCache role for file-backed pages so the page daemon can distinguish them.
+    let role = match pager.as_ref() {
+        Some(p) if !p.is_anon() => crate::mm::PageRole::FileCache,
+        _ => crate::mm::PageRole::UserAnon,
+    };
+    let frame = crate::mm::alloc_raw_frame_sync(role).ok_or(FaultError::OutOfMemory)?;
     pmap_zero_page(frame);
 
     // 4. Fetch data via pager
-    let pager = { obj.read().pager.clone() };
     if let Some(pager_ref) = pager.as_ref() {
         let file_offset = obj_offset.to_bytes();
         if pager_ref.page_in(file_offset, frame).await.is_err() {

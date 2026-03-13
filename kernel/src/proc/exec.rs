@@ -724,8 +724,7 @@ mod legacy {
         let (entry, _) = exec(task, elf_path).await?;
 
         let stack_page_va = USER_STACK_TOP - PAGE_SIZE;
-        let vm_page =
-            crate::mm::allocator::alloc_anon_sync().expect("OOM when allocating user stack");
+        let vm_page = crate::mm::alloc_anon_sync().expect("OOM when allocating user stack");
         let phys = vm_page.phys();
         pmap_zero_page(phys);
 

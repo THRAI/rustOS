@@ -34,6 +34,6 @@ pub use mount::{register_mount, resolve_to_source, same_mount_domain, unregister
 pub use path::resolve;
 pub use pipe::Pipe;
 pub use vnode::{
-    init_vnode_cache, vnode_destroy_object, vnode_object, vnode_object_if_exists, Ext4Vnode, Vnode,
-    VnodeId, VnodeType,
+    init_vnode_cache, vnode_destroy_object, vnode_object, vnode_object_if_exists,
+    vnode_objects_lock, Ext4Vnode, Vnode, VnodeId, VnodeType,
 };

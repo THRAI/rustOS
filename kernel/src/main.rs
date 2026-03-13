@@ -171,7 +171,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 let v: alloc::vec::Vec<u64> = alloc::vec![1, 2, 3, 4, 5];
                 klog!(boot, info, "test vec alloc OK, len={}", v.len());
             }
-            mm::allocator::init_frame_allocator(mem_start, mem_end);
+            mm::init_frame_allocator(mem_start, mem_end);
             klog!(boot, info, "frame allocator done");
         }
 
@@ -188,6 +188,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Initialize filesystem delegate (mounts ext4, spawns delegate task)
         fs::init_delegate();
         klog!(boot, info, "delegate done");
+
+        // Spawn the UBC page daemon (flushes dirty VmObject pages to disk)
+        mm::vm::page_daemon::spawn_page_daemon();
+        klog!(boot, info, "page daemon spawned");
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {

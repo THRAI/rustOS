@@ -81,6 +81,19 @@ pub fn vnode_object_if_exists(vnode_id: VnodeId) -> Option<Arc<LeveledRwLock<VmO
     map.get(&vnode_id).cloned()
 }
 
+/// Acquire the global vnode object cache lock.
+///
+/// Used by the page daemon to snapshot dirty vnodes.  The returned guard
+/// dereferences to `Option<BTreeMap<VnodeId, Arc<LeveledRwLock<VmObject, 3>>>>`.
+/// Callers must drop the guard promptly — it is at lock level 5.
+pub fn vnode_objects_lock() -> crate::hal_common::irq_lock::IrqSafeGuard<
+    'static,
+    Option<BTreeMap<VnodeId, Arc<LeveledRwLock<VmObject, 3>>>>,
+    5,
+> {
+    VNODE_OBJECTS.lock()
+}
+
 pub fn vnode_destroy_object(vnode_id: VnodeId) {
     {
         let mut cache = VNODE_OBJECTS.lock();

@@ -15,6 +15,7 @@ pub enum PageRole {
     KernelStack = 8,
     PipeBuffer = 9,
     SigTrampoline = 10,
+    DriverDma = 11,
 }
 
 impl From<u8> for PageRole {
@@ -31,6 +32,7 @@ impl From<u8> for PageRole {
             8 => PageRole::KernelStack,
             9 => PageRole::PipeBuffer,
             10 => PageRole::SigTrampoline,
+            11 => PageRole::DriverDma,
             _ => PageRole::Free, // fallback
         }
     }

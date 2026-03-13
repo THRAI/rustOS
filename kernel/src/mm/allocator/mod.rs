@@ -24,7 +24,7 @@ pub mod frame_allocator;
 
 pub use buddy::BuddyAllocator;
 #[cfg(not(test))]
-pub use frame_allocator::*;
+pub(in crate::mm) use frame_allocator::*;
 pub use magazine::Magazine;
 pub use types::*; // <-- Export types
 pub(crate) use types::{FRAME_META, FRAME_META_LEN};

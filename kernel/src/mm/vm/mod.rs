@@ -15,6 +15,8 @@ pub mod wait_queue;
 // kernel-mm sets feature "standalone" by default; the kernel crate does not.
 pub mod fault_async;
 
+pub mod page_daemon;
+
 pub mod test_integration;
 
 pub use fault::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};

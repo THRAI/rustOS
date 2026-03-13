@@ -209,7 +209,7 @@ impl VirtioBlk {
         let capacity = cap_lo | (cap_hi << 32);
 
         // Allocate a persistent request header + status byte page
-        let req_frame = alloc_raw_frame_sync(PageRole::FileCache).expect("virtio-blk: req alloc");
+        let req_frame = alloc_raw_frame_sync(PageRole::DriverDma).expect("virtio-blk: req alloc");
         let req_hdr_pa = req_frame.as_usize();
         // Status byte at offset 16 (after the 16-byte header)
         let status_pa = req_hdr_pa + 16;

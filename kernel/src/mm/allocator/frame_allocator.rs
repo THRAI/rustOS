@@ -49,7 +49,7 @@ static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine, 7>; 8] = [
 
 /// Initialize the buddy allocator with the given physical memory range.
 /// Called once during boot after the early bump allocator has reserved its region.
-pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
+pub(in crate::mm) fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     // Initialize the global FRAME_META array
     // We need one VmPage per physical page in the system (up to `end` address)
     // To be safe and cover all possible PFNs up to the max address:
@@ -145,7 +145,7 @@ fn finalize_alloc(addr: PhysAddr, role: PageRole) -> PhysAddr {
 /// Safe for trap context (sync_fault_handler).
 ///
 /// Fallback chain: magazine -> buddy -> emergency_reclaim -> None
-pub fn alloc_raw_frame_sync(role: PageRole) -> Option<PhysAddr> {
+pub(in crate::mm) fn alloc_raw_frame_sync(role: PageRole) -> Option<PhysAddr> {
     let cpu_id = current_cpu_id();
 
     // 1. Try per-CPU magazine (fast path, minimal contention).
@@ -177,14 +177,14 @@ pub fn alloc_raw_frame_sync(role: PageRole) -> Option<PhysAddr> {
 /// synchronously (no async context required).
 ///
 /// Equivalent to `alloc_raw_frame_sync(PageRole::UserAnon)`.
-pub fn frame_alloc_sync() -> Option<PhysAddr> {
+pub(in crate::mm) fn frame_alloc_sync() -> Option<PhysAddr> {
     alloc_raw_frame_sync(PageRole::UserAnon)
 }
 
 /// Async frame allocation. Can yield to cooperate with page daemon.
 ///
 /// Fallback chain: magazine -> buddy -> (wake page daemon + yield) -> emergency_reclaim -> None
-pub async fn alloc_raw_frame(role: PageRole) -> Option<PhysAddr> {
+pub(in crate::mm) async fn alloc_raw_frame(role: PageRole) -> Option<PhysAddr> {
     let cpu_id = current_cpu_id();
 
     // 1. Try per-CPU magazine.
@@ -231,13 +231,13 @@ pub async fn alloc_raw_frame(role: PageRole) -> Option<PhysAddr> {
 
 macro_rules! define_alloc_wrapper {
     ($name:ident, $name_sync:ident, $role_variant:ident) => {
-        pub async fn $name() -> Option<&'static mut VmPage> {
+        pub(in crate::mm) async fn $name() -> Option<&'static mut VmPage> {
             alloc_raw_frame(PageRole::$role_variant)
                 .await
                 .map(|phys| get_frame_meta(phys).unwrap())
         }
 
-        pub fn $name_sync() -> Option<&'static mut VmPage> {
+        pub(in crate::mm) fn $name_sync() -> Option<&'static mut VmPage> {
             alloc_raw_frame_sync(PageRole::$role_variant).map(|phys| get_frame_meta(phys).unwrap())
         }
     };
@@ -261,7 +261,7 @@ define_alloc_wrapper!(
 /// Free a VmPage usage reference previously returned by an allocator wrapper.
 ///
 /// Refcount is decremented. If it hits 0, the frame is returned to the pool.
-pub fn frame_free(frame: &'static mut VmPage) {
+pub(in crate::mm) fn frame_free(frame: &'static mut VmPage) {
     let addr = frame.phys_addr;
 
     // Check and decrement refcount
@@ -285,13 +285,13 @@ pub fn frame_free(frame: &'static mut VmPage) {
 }
 
 /// Alias for `frame_free` to represent dropping a usage reference.
-pub fn frame_free_usage(frame: &'static mut VmPage) {
+pub(in crate::mm) fn frame_free_usage(frame: &'static mut VmPage) {
     frame_free(frame);
 }
 
 /// The actual raw underlying physical free logic. Internal use mostly,
 /// but occasionally used for dropping contiguous allocations or untested stubs.
-pub fn free_raw_frame(addr: PhysAddr) {
+pub(in crate::mm) fn free_raw_frame(addr: PhysAddr) {
     assert!(
         addr.is_page_aligned(),
         "free_raw_frame: addr not page-aligned"
@@ -316,7 +316,7 @@ pub fn free_raw_frame(addr: PhysAddr) {
 
 /// Allocate 2^order contiguous pages directly from the buddy allocator.
 /// For multi-page allocations (e.g., page tables, large buffers).
-pub fn frame_alloc_contiguous(order: usize) -> Option<PhysAddr> {
+pub(in crate::mm) fn frame_alloc_contiguous(order: usize) -> Option<PhysAddr> {
     let mut buddy = GLOBAL_BUDDY.lock();
     let result = buddy.alloc(order);
     #[cfg(debug_assertions)]
@@ -330,7 +330,7 @@ pub fn frame_alloc_contiguous(order: usize) -> Option<PhysAddr> {
 }
 
 /// Free a contiguous block of 2^order pages back to the buddy allocator.
-pub fn frame_free_contiguous(addr: PhysAddr, order: usize) {
+pub(in crate::mm) fn frame_free_contiguous(addr: PhysAddr, order: usize) {
     assert!(addr.is_page_aligned(), "frame_free_contiguous: not aligned");
     #[cfg(debug_assertions)]
     for i in 0..(1usize << order) {
@@ -352,7 +352,7 @@ pub fn frame_free_contiguous(addr: PhysAddr, order: usize) {
 /// (each magazine lock, then the buddy lock inside `drain`), so it has
 /// higher latency than the normal fast path.  It runs synchronously and
 /// never yields, making it safe for trap context.
-pub fn emergency_reclaim_sync() -> Option<PhysAddr> {
+pub(in crate::mm) fn emergency_reclaim_sync() -> Option<PhysAddr> {
     let caller_cpu = current_cpu_id();
 
     // Drain every *other* CPU's magazine back to buddy.
@@ -375,7 +375,7 @@ pub fn emergency_reclaim_sync() -> Option<PhysAddr> {
 
 /// Return the number of free pages available in the buddy allocator.
 /// Does not count pages held in per-CPU magazines.
-pub fn available_pages() -> usize {
+pub(in crate::mm) fn available_pages() -> usize {
     let buddy = GLOBAL_BUDDY.lock();
     buddy.available_pages()
 }

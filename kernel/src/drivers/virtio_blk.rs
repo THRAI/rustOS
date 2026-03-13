@@ -26,10 +26,7 @@ const QUEUE_SIZE_MAX: u16 = 128;
 /// Spin iterations before falling back to WFI in adaptive polling.
 const SPIN_ITERS: usize = 1000;
 
-/// QEMU virt machine VirtIO MMIO base addresses (8 devices, 0x10001000..0x10008000).
-const VIRTIO_MMIO_BASES: [usize; 8] = [
-    0x10008000, 0x10007000, 0x10006000, 0x10005000, 0x10004000, 0x10003000, 0x10002000, 0x10001000,
-];
+// VirtIO MMIO base addresses are now discovered from FDT via platform().virtio_mmio.
 
 /// VirtIO block request types.
 const VIRTIO_BLK_T_IN: u32 = 0; // read
@@ -112,9 +109,14 @@ static VIRTIO_BLK: crate::hal_common::Once<crate::hal_common::SpinMutex<VirtioBl
     crate::hal_common::Once::new();
 
 impl VirtioBlk {
-    /// Probe MMIO addresses and initialize the first block device found.
+    /// Probe FDT-discovered VirtIO MMIO addresses and initialize the first block device found.
     fn probe_and_init() -> Option<Self> {
-        for &base in &VIRTIO_MMIO_BASES {
+        let pi = crate::hal::platform();
+        for dev in pi.virtio_mmio.iter().take(pi.virtio_count) {
+            let base = match dev {
+                Some(d) => d.base,
+                None => continue,
+            };
             let mmio = VirtioMmio::new(base);
             let magic = mmio.read(MAGIC_VALUE);
             if magic != VIRTIO_MAGIC {

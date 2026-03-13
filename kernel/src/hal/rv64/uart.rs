@@ -1,9 +1,17 @@
-//! UART 16550A driver for QEMU virt platform (MMIO at 0x1000_0000)
+//! UART 16550A driver with FDT-discovered base address.
+//!
+//! During early boot, the UART is initialized at the QEMU virt default
+//! address (0x1000_0000). After FDT parsing, `reinit()` updates the base
+//! address to the FDT-discovered value (which is the same on QEMU virt,
+//! but may differ on real hardware).
 
-use core::fmt;
+use core::{
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-/// QEMU virt UART base address
-const UART_BASE: usize = 0x1000_0000;
+/// UART base address. Starts with QEMU virt default; updated by `reinit()`.
+static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
 
 // 16550 register offsets
 const RBR: usize = 0; // Receive Buffer Register (read)
@@ -26,13 +34,19 @@ const LCR_8N1: u8 = 0b11; // 8 data bits, no parity, 1 stop bit
 pub struct Uart;
 
 impl Uart {
+    fn base() -> usize {
+        UART_BASE.load(Ordering::Relaxed)
+    }
+
     fn read_reg(offset: usize) -> u8 {
-        let ptr = (UART_BASE + offset) as *const u8;
+        let ptr = (Self::base() + offset) as *const u8;
+        // SAFETY: MMIO register access at a known-valid hardware address.
         unsafe { core::ptr::read_volatile(ptr) }
     }
 
     fn write_reg(offset: usize, val: u8) {
-        let ptr = (UART_BASE + offset) as *mut u8;
+        let ptr = (Self::base() + offset) as *mut u8;
+        // SAFETY: MMIO register access at a known-valid hardware address.
         unsafe { core::ptr::write_volatile(ptr, val) }
     }
 }
@@ -52,6 +66,19 @@ pub fn init() {
     Uart::write_reg(FCR, 0xC7);
     // Enable receive interrupts (for later use)
     Uart::write_reg(IER, 0x01);
+}
+
+/// Re-initialize UART with an FDT-discovered base address.
+///
+/// Called after `parse_fdt()` to switch from the hardcoded default to the
+/// FDT-discovered address. On QEMU virt this is a no-op (same address),
+/// but on real hardware the address may differ.
+pub fn reinit(base: usize) {
+    let old = UART_BASE.swap(base, Ordering::Relaxed);
+    if old != base {
+        // Re-run init sequence at the new address
+        init();
+    }
 }
 
 /// Write a single byte, spin-waiting on THR empty.

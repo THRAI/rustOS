@@ -8,7 +8,7 @@
 #![allow(dead_code)] // Many HAL/VM primitives are defined for future use
 #![allow(unused_imports)] // Re-exports used by downstream modules
 #![allow(clippy::undocumented_unsafe_blocks)] // ~200 HAL/pmap/driver unsafe blocks predate safety audit
-#![allow(clippy::module_name_repetitions)] // vm_map::VmMap, vm_object::VmObject etc. are intentional
+#![allow(clippy::module_name_repetitions)] // re-exported types may repeat parent module name
 #![allow(clippy::ptr_as_ptr)] // Raw pointer casts pervasive in MMIO/pmap code
 #![allow(clippy::manual_let_else)] // Style preference — not enforced yet
 #![allow(clippy::semicolon_if_nothing_returned)] // Async .await tail expressions
@@ -74,13 +74,21 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Initialize kernel heap first — everything below may allocate
         alloc_early::init_heap();
 
-        // Parse FDT to discover CPUs (before trap/timer — no IRQs yet)
-        let (num_cpus, hartids) = hal::parse_cpus(dtb_ptr);
+        // Parse FDT to discover CPUs, memory, PLIC, UART, VirtIO MMIO.
+        // Single call replaces the old parse_cpus() + parse_memory() pair.
+        hal::parse_fdt(dtb_ptr);
+        let pi = hal::platform();
+        let num_cpus = pi.num_cpus;
+
+        // Re-initialize UART with FDT-discovered address (no-op on QEMU virt
+        // where it's the same 0x1000_0000, but differs on real hardware).
+        hal::uart::reinit(pi.uart_base);
 
         // Pre-initialize PerCpu for ALL discovered harts.
         // Must happen before trap/timer init because the timer IRQ handler
         // accesses per-CPU data via tp register.
-        for (i, &hid) in hartids.iter().enumerate().take(num_cpus) {
+        for i in 0..num_cpus {
+            let hid = pi.hartids[i];
             let cid = hal::hart_to_cpu(hid).unwrap_or(i);
             klog!(boot, info, "init_per_cpu({}, {}) start", cid, hid);
             executor::init_per_cpu(cid, hid);
@@ -112,13 +120,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             let kernel_end = unsafe { &ekernel as *const u8 as usize };
             let mem_start = crate::hal_common::PhysAddr::new(kernel_end);
 
-            // Discover physical RAM from FDT instead of hardcoding 0x8800_0000.
-            let (num_regions, regions) = hal::parse_memory(dtb_ptr);
-            // Use the first region that contains kernel_end (the kernel is
-            // loaded into one of the FDT-reported memory regions).
+            // Use FDT-discovered memory regions from platform().
             let mem_end = {
                 let mut end = crate::hal_common::PhysAddr::new(0);
-                for r in regions.iter().take(num_regions) {
+                for r in pi.memory.iter().take(pi.memory_count) {
                     let region_end = r.base + r.size;
                     if kernel_end >= r.base && kernel_end < region_end {
                         end = crate::hal_common::PhysAddr::new(region_end);
@@ -129,7 +134,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     // Kernel is not inside any reported region — use the
                     // largest region's end as a conservative fallback.
                     let mut best = 0usize;
-                    for r in regions.iter().take(num_regions) {
+                    for r in pi.memory.iter().take(pi.memory_count) {
                         let region_end = r.base + r.size;
                         if region_end > best {
                             best = region_end;
@@ -178,7 +183,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {
-            hal::smp::boot_secondary_harts(num_cpus, &hartids, hartid);
+            hal::smp::boot_secondary_harts(num_cpus, &pi.hartids, hartid);
         }
 
         // --- Integration tests: only compiled when `--features qemu-test` ---
@@ -894,7 +899,7 @@ fn test_signal_pending_delivery() {
 
 #[cfg(feature = "qemu-test")]
 fn test_mmap_munmap() {
-    use mm::vm::{vm_map::VmMap, VmObject};
+    use mm::vm::{VmMap, VmObject};
 
     use crate::hal_common::{VirtAddr, PAGE_SIZE};
 

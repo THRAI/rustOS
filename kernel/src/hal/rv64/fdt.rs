@@ -1,333 +1,418 @@
-//! Minimal FDT (Flattened Device Tree) parsing for CPU discovery.
+//! FDT (Flattened Device Tree) platform discovery.
 //!
-//! Parses the /cpus node to discover hart IDs. Hand-parses the FDT
-//! header and structure block -- no external crate needed.
-use super::super::super::executor::per_cpu::MAX_CPUS;
+//! Parses the DTB once during early boot using the `fdt` crate to discover
+//! CPUs, memory regions, PLIC, UART, and VirtIO MMIO devices. Results are
+//! stored in a global `PlatformInfo` struct accessed via `platform()`.
+//!
+//! Replaces the previous hand-rolled FDT parser. All peripheral modules
+//! (UART, PLIC, VirtIO-blk) read addresses from `platform()` instead of
+//! using hardcoded constants.
+
+use crate::{executor::per_cpu::MAX_CPUS, hal_common::Once};
 
 /// Maximum physical harts we track (for hartid -> cpu_id mapping).
 pub const MAX_HARTS: usize = 64;
 
-/// Global mapping from physical hartid to logical cpu_id.
-/// None means the hart is not mapped (parked or beyond MAX_CPUS).
-static mut HART_TO_CPU: [Option<usize>; MAX_HARTS] = [None; MAX_HARTS];
-
-/// Global mapping from logical cpu_id to physical hartid.
-static mut CPU_TO_HART: [usize; MAX_CPUS] = [0; MAX_CPUS];
-
-/// Parse /cpus node from FDT at dtb_ptr.
-/// Returns (num_cpus, array of hartids for each logical cpu).
-///
-/// Safety: dtb_ptr must point to a valid FDT blob in memory.
-pub fn parse_cpus(dtb_ptr: usize) -> (usize, [usize; MAX_CPUS]) {
-    let mut hartids = [0usize; MAX_CPUS];
-
-    if dtb_ptr == 0 {
-        klog!(smp, error, "dtb_ptr is null, assuming 1 CPU (hart 0)");
-        hartids[0] = 0;
-        unsafe {
-            HART_TO_CPU[0] = Some(0);
-            CPU_TO_HART[0] = 0;
-        }
-        return (1, hartids);
-    }
-
-    // Validate FDT magic
-    let magic = read_be32(dtb_ptr);
-    if magic != 0xd00dfeed {
-        klog!(smp, error, "bad magic {:#x}, assuming 1 CPU", magic);
-        hartids[0] = 0;
-        unsafe {
-            HART_TO_CPU[0] = Some(0);
-            CPU_TO_HART[0] = 0;
-        }
-        return (1, hartids);
-    }
-
-    let totalsize = read_be32(dtb_ptr + 4) as usize;
-    let off_dt_struct = read_be32(dtb_ptr + 8) as usize;
-    let off_dt_strings = read_be32(dtb_ptr + 12) as usize;
-
-    let struct_base = dtb_ptr + off_dt_struct;
-    let strings_base = dtb_ptr + off_dt_strings;
-    let struct_end = dtb_ptr + totalsize;
-
-    // Walk the structure block looking for cpu@ nodes under /cpus
-    let mut num_cpus = 0usize;
-    let mut pos = struct_base;
-    let mut depth: i32 = 0;
-    let mut in_cpus = false;
-    let mut in_cpu_node = false;
-
-    while pos < struct_end {
-        let token = read_be32(pos);
-        pos += 4;
-
-        match token {
-            // FDT_BEGIN_NODE
-            0x00000001 => {
-                let name = read_cstr(pos);
-                let name_len = name.len();
-                // Align to 4 bytes after null terminator
-                pos += align4(name_len + 1);
-                depth += 1;
-
-                if depth == 2 && starts_with(name, b"cpus") {
-                    in_cpus = true;
-                } else if in_cpus && depth == 3 && starts_with(name, b"cpu@") {
-                    in_cpu_node = true;
-                }
-            },
-            // FDT_END_NODE
-            0x00000002 => {
-                if in_cpu_node && depth == 3 {
-                    in_cpu_node = false;
-                }
-                if in_cpus && depth == 2 {
-                    in_cpus = false;
-                }
-                depth -= 1;
-            },
-            // FDT_PROP
-            0x00000003 => {
-                let val_len = read_be32(pos) as usize;
-                let name_off = read_be32(pos + 4) as usize;
-                pos += 8;
-                let val_ptr = pos;
-                pos += align4(val_len);
-
-                if in_cpu_node {
-                    let prop_name = read_cstr(strings_base + name_off);
-                    if eq_bytes(prop_name, b"reg") && val_len >= 4 {
-                        // reg property: hartid (could be 4 or 8 bytes)
-                        let hartid = if val_len >= 8 {
-                            read_be64(val_ptr) as usize
-                        } else {
-                            read_be32(val_ptr) as usize
-                        };
-                        if num_cpus < MAX_CPUS && hartid < MAX_HARTS {
-                            hartids[num_cpus] = hartid;
-                            unsafe {
-                                HART_TO_CPU[hartid] = Some(num_cpus);
-                                CPU_TO_HART[num_cpus] = hartid;
-                            }
-                            num_cpus += 1;
-                        }
-                    }
-                }
-            },
-            // FDT_NOP
-            0x00000004 => {},
-            // FDT_END
-            0x00000009 => break,
-            _ => break,
-        }
-    }
-
-    if num_cpus == 0 {
-        klog!(smp, error, "no CPUs found, assuming 1 CPU (hart 0)");
-        hartids[0] = 0;
-        num_cpus = 1;
-        unsafe {
-            HART_TO_CPU[0] = Some(0);
-            CPU_TO_HART[0] = 0;
-        }
-    }
-
-    klog!(smp, info, "discovered {} CPUs", num_cpus);
-    (num_cpus, hartids)
-}
-
-/// Look up logical cpu_id from physical hartid.
-pub fn hart_to_cpu(hartid: usize) -> Option<usize> {
-    if hartid >= MAX_HARTS {
-        return None;
-    }
-    unsafe { HART_TO_CPU[hartid] }
-}
-
-/// Look up physical hartid from logical cpu_id.
-pub fn cpu_to_hart(cpu_id: usize) -> usize {
-    assert!(cpu_id < MAX_CPUS, "cpu_id out of range");
-    unsafe { CPU_TO_HART[cpu_id] }
-}
-
-// --- FDT byte-level helpers ---
-
-fn read_be32(addr: usize) -> u32 {
-    unsafe { u32::from_be(core::ptr::read_volatile(addr as *const u32)) }
-}
-
-fn read_be64(addr: usize) -> u64 {
-    unsafe { u64::from_be(core::ptr::read_volatile(addr as *const u64)) }
-}
-
-/// Read a null-terminated C string from addr. Returns byte slice (no null).
-fn read_cstr(addr: usize) -> &'static [u8] {
-    let mut len = 0usize;
-    unsafe {
-        while *((addr + len) as *const u8) != 0 {
-            len += 1;
-            if len > 256 {
-                break;
-            } // safety limit
-        }
-        core::slice::from_raw_parts(addr as *const u8, len)
-    }
-}
-
-/// Align up to 4-byte boundary.
-fn align4(n: usize) -> usize {
-    (n + 3) & !3
-}
-
-/// Check if `s` starts with `prefix`.
-fn starts_with(s: &[u8], prefix: &[u8]) -> bool {
-    s.len() >= prefix.len() && &s[..prefix.len()] == prefix
-}
-
-/// Check byte-level equality.
-fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    a == b
-}
-
 // ---------------------------------------------------------------------------
-// Physical memory region discovery from FDT /memory node
+// Platform info types
 // ---------------------------------------------------------------------------
 
-/// Discovered physical memory region from the FDT `/memory` node.
+/// Discovered physical memory region.
 #[derive(Debug, Copy, Clone)]
 pub struct MemRegion {
     pub base: usize,
     pub size: usize,
 }
 
-/// Parse the `/memory` node from FDT to discover physical RAM regions.
+/// A VirtIO MMIO device discovered from the FDT.
+#[derive(Debug, Copy, Clone)]
+pub struct VirtioMmioDevice {
+    pub base: usize,
+    pub size: usize,
+    pub irq: u32,
+}
+
+/// Platform information discovered from the Flattened Device Tree.
 ///
-/// Returns a fixed-size array of up to 4 regions and the count found.
-/// Falls back to a default 128MB region at `0x8000_0000` if the FDT is
-/// missing or unparsable (matching QEMU virt defaults).
+/// Populated once via `parse_fdt()` and available for the kernel's lifetime
+/// through `platform()`.
+pub struct PlatformInfo {
+    // UART
+    pub uart_base: usize,
+    pub uart_irq: u32,
+    // PLIC
+    pub plic_base: usize,
+    pub plic_size: usize,
+    // VirtIO MMIO devices (up to 8)
+    pub virtio_mmio: [Option<VirtioMmioDevice>; 8],
+    pub virtio_count: usize,
+    // Physical memory regions (up to 4)
+    pub memory: [MemRegion; 4],
+    pub memory_count: usize,
+    // CPU topology
+    pub hart_to_cpu: [Option<usize>; MAX_HARTS],
+    pub cpu_to_hart: [usize; MAX_CPUS],
+    pub num_cpus: usize,
+    // Raw hartid array (for boot_secondary_harts compatibility)
+    pub hartids: [usize; MAX_CPUS],
+}
+
+// ---------------------------------------------------------------------------
+// Global platform info singleton
+// ---------------------------------------------------------------------------
+
+static PLATFORM: Once<PlatformInfo> = Once::new();
+
+/// Access the discovered platform information.
+///
+/// # Panics
+/// Panics if called before `parse_fdt()`.
+pub fn platform() -> &'static PlatformInfo {
+    PLATFORM
+        .get()
+        .expect("platform() called before parse_fdt()")
+}
+
+// ---------------------------------------------------------------------------
+// QEMU virt fallback defaults
+// ---------------------------------------------------------------------------
+
+const DEFAULT_UART_BASE: usize = 0x1000_0000;
+const DEFAULT_UART_IRQ: u32 = 10;
+const DEFAULT_PLIC_BASE: usize = 0x0C00_0000;
+const DEFAULT_PLIC_SIZE: usize = 0x0400_0000;
+const DEFAULT_MEM_BASE: usize = 0x8000_0000;
+const DEFAULT_MEM_SIZE: usize = 128 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// FDT parsing
+// ---------------------------------------------------------------------------
+
+/// Parse the Flattened Device Tree and populate global platform info.
+///
+/// Must be called once during early boot, after `init_heap()` (the `fdt`
+/// crate itself does not allocate, but `Once` uses a spin-lock internally).
 ///
 /// # Safety
-/// `dtb_ptr` must point to a valid FDT blob in memory.
-pub fn parse_memory(dtb_ptr: usize) -> (usize, [MemRegion; 4]) {
-    let empty = MemRegion { base: 0, size: 0 };
-    let default_region = MemRegion {
-        base: 0x8000_0000,
-        size: 128 * 1024 * 1024,
+/// `dtb_ptr` must point to a valid FDT blob in memory, or be 0 (in which
+/// case QEMU virt defaults are used).
+pub fn parse_fdt(dtb_ptr: usize) {
+    PLATFORM.call_once(|| build_platform_info(dtb_ptr));
+}
+
+fn build_platform_info(dtb_ptr: usize) -> PlatformInfo {
+    let mut info = PlatformInfo {
+        uart_base: DEFAULT_UART_BASE,
+        uart_irq: DEFAULT_UART_IRQ,
+        plic_base: DEFAULT_PLIC_BASE,
+        plic_size: DEFAULT_PLIC_SIZE,
+        virtio_mmio: [None; 8],
+        virtio_count: 0,
+        memory: [MemRegion { base: 0, size: 0 }; 4],
+        memory_count: 0,
+        hart_to_cpu: [None; MAX_HARTS],
+        cpu_to_hart: [0; MAX_CPUS],
+        num_cpus: 0,
+        hartids: [0; MAX_CPUS],
     };
-    let mut regions = [empty; 4];
 
     if dtb_ptr == 0 {
-        regions[0] = default_region;
-        return (1, regions);
+        klog!(boot, warn, "FDT: dtb_ptr is null, using QEMU virt defaults");
+        apply_defaults(&mut info);
+        return info;
     }
 
-    let magic = read_be32(dtb_ptr);
-    if magic != 0xd00dfeed {
-        regions[0] = default_region;
-        return (1, regions);
-    }
-
-    let totalsize = read_be32(dtb_ptr + 4) as usize;
-    let off_dt_struct = read_be32(dtb_ptr + 8) as usize;
-    let off_dt_strings = read_be32(dtb_ptr + 12) as usize;
-
-    let struct_base = dtb_ptr + off_dt_struct;
-    let strings_base = dtb_ptr + off_dt_strings;
-    let struct_end = dtb_ptr + totalsize;
-
-    let mut num_regions = 0usize;
-    let mut pos = struct_base;
-    let mut depth: i32 = 0;
-    let mut in_memory_node = false;
-
-    while pos < struct_end {
-        let token = read_be32(pos);
-        pos += 4;
-
-        match token {
-            // FDT_BEGIN_NODE
-            0x00000001 => {
-                let name = read_cstr(pos);
-                let name_len = name.len();
-                pos += align4(name_len + 1);
-                depth += 1;
-
-                // /memory or /memory@XXXXXXXX at depth 1
-                if depth == 1 && starts_with(name, b"memory") {
-                    in_memory_node = true;
-                }
-            },
-            // FDT_END_NODE
-            0x00000002 => {
-                if in_memory_node && depth == 1 {
-                    in_memory_node = false;
-                }
-                depth -= 1;
-            },
-            // FDT_PROP
-            0x00000003 => {
-                let val_len = read_be32(pos) as usize;
-                let name_off = read_be32(pos + 4) as usize;
-                pos += 8;
-                let val_ptr = pos;
-                pos += align4(val_len);
-
-                if in_memory_node {
-                    let prop_name = read_cstr(strings_base + name_off);
-                    if eq_bytes(prop_name, b"reg") {
-                        // Parse reg property: pairs of (base, size).
-                        // Each cell is typically 8 bytes (#address-cells=2, #size-cells=2)
-                        // for 64-bit platforms, but may be 4 bytes on 32-bit.
-                        // QEMU virt uses 2+2 cells (16 bytes per entry).
-                        let entry_size = 16; // 8-byte base + 8-byte size
-                        let mut off = 0;
-                        while off + entry_size <= val_len && num_regions < 4 {
-                            let base = read_be64(val_ptr + off) as usize;
-                            let size = read_be64(val_ptr + off + 8) as usize;
-                            if size > 0 {
-                                regions[num_regions] = MemRegion { base, size };
-                                num_regions += 1;
-                            }
-                            off += entry_size;
-                        }
-                    }
-                }
-            },
-            // FDT_NOP
-            0x00000004 => {},
-            // FDT_END
-            0x00000009 => break,
-            _ => break,
-        }
-    }
-
-    if num_regions == 0 {
-        klog!(
-            boot,
-            warn,
-            "FDT: no /memory node found, assuming 128MB at 0x8000_0000"
-        );
-        regions[0] = default_region;
-        return (1, regions);
-    }
+    // SAFETY: dtb_ptr was passed from OpenSBI via a1 and points to a valid
+    // FDT blob in reserved memory.
+    let fdt = match unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) } {
+        Ok(f) => f,
+        Err(_) => {
+            klog!(
+                boot,
+                error,
+                "FDT: invalid DTB at {:#x}, using defaults",
+                dtb_ptr
+            );
+            apply_defaults(&mut info);
+            return info;
+        },
+    };
 
     klog!(
         boot,
         info,
-        "FDT: discovered {} memory region(s)",
-        num_regions
+        "FDT: parsing DTB at {:#x}, size={}",
+        dtb_ptr,
+        fdt.total_size()
     );
-    for (i, region) in regions.iter().enumerate().take(num_regions) {
+
+    // --- CPUs ---
+    parse_cpus_from_fdt(&fdt, &mut info);
+
+    // --- Memory ---
+    parse_memory_from_fdt(&fdt, &mut info);
+
+    // --- PLIC ---
+    parse_plic_from_fdt(&fdt, &mut info);
+
+    // --- UART ---
+    parse_uart_from_fdt(&fdt, &mut info);
+
+    // --- VirtIO MMIO ---
+    parse_virtio_from_fdt(&fdt, &mut info);
+
+    info
+}
+
+fn apply_defaults(info: &mut PlatformInfo) {
+    info.memory[0] = MemRegion {
+        base: DEFAULT_MEM_BASE,
+        size: DEFAULT_MEM_SIZE,
+    };
+    info.memory_count = 1;
+    info.hart_to_cpu[0] = Some(0);
+    info.cpu_to_hart[0] = 0;
+    info.hartids[0] = 0;
+    info.num_cpus = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Per-subsystem FDT parsing
+// ---------------------------------------------------------------------------
+
+fn parse_cpus_from_fdt(fdt: &fdt::Fdt, info: &mut PlatformInfo) {
+    let mut num_cpus = 0usize;
+
+    for cpu in fdt.cpus() {
+        let hartid = cpu.ids().first();
+        if num_cpus < MAX_CPUS && hartid < MAX_HARTS {
+            info.hartids[num_cpus] = hartid;
+            info.hart_to_cpu[hartid] = Some(num_cpus);
+            info.cpu_to_hart[num_cpus] = hartid;
+            num_cpus += 1;
+        }
+    }
+
+    if num_cpus == 0 {
+        klog!(boot, warn, "FDT: no CPUs found, assuming 1 CPU (hart 0)");
+        info.hart_to_cpu[0] = Some(0);
+        info.cpu_to_hart[0] = 0;
+        info.hartids[0] = 0;
+        num_cpus = 1;
+    }
+
+    info.num_cpus = num_cpus;
+    klog!(boot, info, "FDT: discovered {} CPU(s)", num_cpus);
+}
+
+fn parse_memory_from_fdt(fdt: &fdt::Fdt, info: &mut PlatformInfo) {
+    let mut count = 0usize;
+
+    let mem = fdt.memory();
+    for region in mem.regions() {
+        if count >= 4 {
+            break;
+        }
+        let base = region.starting_address as usize;
+        let size = region.size.unwrap_or(0);
+        if size > 0 {
+            info.memory[count] = MemRegion { base, size };
+            count += 1;
+            klog!(
+                boot,
+                info,
+                "FDT: memory region {}: base={:#x} size={:#x} ({}MB)",
+                count - 1,
+                base,
+                size,
+                size / (1024 * 1024)
+            );
+        }
+    }
+
+    if count == 0 {
+        klog!(
+            boot,
+            warn,
+            "FDT: no /memory node, using default 128MB @ 0x8000_0000"
+        );
+        info.memory[0] = MemRegion {
+            base: DEFAULT_MEM_BASE,
+            size: DEFAULT_MEM_SIZE,
+        };
+        count = 1;
+    }
+
+    info.memory_count = count;
+}
+
+fn parse_plic_from_fdt(fdt: &fdt::Fdt, info: &mut PlatformInfo) {
+    let plic_node = fdt.find_compatible(&["sifive,plic-1.0.0", "riscv,plic0"]);
+
+    if let Some(node) = plic_node {
+        if let Some(mut regs) = node.reg() {
+            if let Some(reg) = regs.next() {
+                info.plic_base = reg.starting_address as usize;
+                info.plic_size = reg.size.unwrap_or(DEFAULT_PLIC_SIZE);
+                klog!(
+                    boot,
+                    info,
+                    "FDT: PLIC at {:#x} size={:#x}",
+                    info.plic_base,
+                    info.plic_size
+                );
+                return;
+            }
+        }
+    }
+
+    klog!(
+        boot,
+        warn,
+        "FDT: no PLIC node, using default {:#x}",
+        DEFAULT_PLIC_BASE
+    );
+}
+
+fn parse_uart_from_fdt(fdt: &fdt::Fdt, info: &mut PlatformInfo) {
+    let uart_node = fdt.find_compatible(&["ns16550a"]);
+
+    if let Some(node) = uart_node {
+        if let Some(mut regs) = node.reg() {
+            if let Some(reg) = regs.next() {
+                info.uart_base = reg.starting_address as usize;
+            }
+        }
+        // Read interrupts property (raw big-endian u32)
+        if let Some(irq_prop) = node.property("interrupts") {
+            if irq_prop.value.len() >= 4 {
+                info.uart_irq =
+                    u32::from_be_bytes(irq_prop.value[..4].try_into().unwrap_or([0; 4]));
+            }
+        }
         klog!(
             boot,
             info,
-            "  region {}: base={:#x} size={:#x} ({}MB)",
-            i,
-            region.base,
-            region.size,
-            region.size / (1024 * 1024)
+            "FDT: UART at {:#x} irq={}",
+            info.uart_base,
+            info.uart_irq
         );
+        return;
     }
-    (num_regions, regions)
+
+    klog!(
+        boot,
+        warn,
+        "FDT: no UART node, using default {:#x}",
+        DEFAULT_UART_BASE
+    );
+}
+
+fn parse_virtio_from_fdt(fdt: &fdt::Fdt, info: &mut PlatformInfo) {
+    let mut count = 0usize;
+
+    // Try compatible string first, then path-based search
+    let nodes = fdt.find_all_nodes("/soc/virtio_mmio");
+    for node in nodes {
+        if count >= 8 {
+            break;
+        }
+        let mut base = 0usize;
+        let mut size = 0usize;
+        let mut irq = 0u32;
+
+        if let Some(mut regs) = node.reg() {
+            if let Some(reg) = regs.next() {
+                base = reg.starting_address as usize;
+                size = reg.size.unwrap_or(0x1000);
+            }
+        }
+        if let Some(irq_prop) = node.property("interrupts") {
+            if irq_prop.value.len() >= 4 {
+                irq = u32::from_be_bytes(irq_prop.value[..4].try_into().unwrap_or([0; 4]));
+            }
+        }
+
+        if base != 0 {
+            info.virtio_mmio[count] = Some(VirtioMmioDevice { base, size, irq });
+            count += 1;
+        }
+    }
+
+    // Fallback: try compatible string search if path yielded nothing
+    if count == 0 {
+        let compat_nodes = fdt.find_all_nodes("/soc");
+        for parent in compat_nodes {
+            for child in parent.children() {
+                if count >= 8 {
+                    break;
+                }
+                if let Some(compat) = child.compatible() {
+                    if compat.all().any(|c| c == "virtio,mmio") {
+                        let mut base = 0usize;
+                        let mut size = 0usize;
+                        let mut irq = 0u32;
+
+                        if let Some(mut regs) = child.reg() {
+                            if let Some(reg) = regs.next() {
+                                base = reg.starting_address as usize;
+                                size = reg.size.unwrap_or(0x1000);
+                            }
+                        }
+                        if let Some(irq_prop) = child.property("interrupts") {
+                            if irq_prop.value.len() >= 4 {
+                                irq = u32::from_be_bytes(
+                                    irq_prop.value[..4].try_into().unwrap_or([0; 4]),
+                                );
+                            }
+                        }
+
+                        if base != 0 {
+                            info.virtio_mmio[count] = Some(VirtioMmioDevice { base, size, irq });
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info.virtio_count = count;
+    klog!(
+        boot,
+        info,
+        "FDT: discovered {} VirtIO MMIO device(s)",
+        count
+    );
+    for (i, dev) in info.virtio_mmio.iter().enumerate() {
+        if let Some(d) = dev {
+            klog!(
+                boot,
+                info,
+                "  virtio {}: base={:#x} size={:#x} irq={}",
+                i,
+                d.base,
+                d.size,
+                d.irq
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API (backward-compatible)
+// ---------------------------------------------------------------------------
+
+/// Look up logical cpu_id from physical hartid.
+pub fn hart_to_cpu(hartid: usize) -> Option<usize> {
+    if hartid >= MAX_HARTS {
+        return None;
+    }
+    platform().hart_to_cpu[hartid]
+}
+
+/// Look up physical hartid from logical cpu_id.
+pub fn cpu_to_hart(cpu_id: usize) -> usize {
+    assert!(cpu_id < MAX_CPUS, "cpu_id out of range");
+    platform().cpu_to_hart[cpu_id]
 }

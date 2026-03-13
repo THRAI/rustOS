@@ -149,7 +149,7 @@ fn handle_external_irq() {
         if irq == 0 {
             break;
         }
-        if irq == super::plic::UART_IRQ {
+        if irq == super::plic::get_uart_irq() {
             // Drain entire UART FIFO (handles interrupt coalescing)
             while let Some(ch) = super::uart::getchar() {
                 crate::console::console_irq_push(ch);

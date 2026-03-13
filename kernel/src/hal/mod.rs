@@ -2,7 +2,7 @@ pub mod rv64;
 
 pub use rv64::{
     copy_user::copy_user_chunk,
-    fdt::{hart_to_cpu, parse_cpus, parse_memory},
+    fdt::{hart_to_cpu, parse_fdt, platform},
     ipi::{handle_ipi, send_ipi},
     irq,
     irq::{enable, is_enabled},

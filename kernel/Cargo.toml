@@ -35,6 +35,7 @@ fork-hardcopy = []
 [dependencies]
 async-task = { version = "4.7", default-features = false }
 bitflags = { workspace = true }
+fdt = "0.1.5"
 spin = "0.10.0"
 linked_list_allocator = { version = "0.10", default-features = false }
 lwext4_rust = { workspace = true }

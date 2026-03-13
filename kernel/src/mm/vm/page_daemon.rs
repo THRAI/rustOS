@@ -172,12 +172,13 @@ async fn flush_dirty_vnodes() {
 
 /// Flush a single VmObject's dirty pages.
 async fn flush_object(obj_arc: &Arc<LeveledRwLock<VmObject, 3>>) {
-    // Collect dirty pages + pager under read lock, then drop before I/O.
-    let (dirty_pages, pager) = {
+    // Collect dirty pages + pager + object size under read lock, then drop before I/O.
+    let (dirty_pages, pager, obj_size) = {
         let obj = obj_arc.read();
         let pages = obj.collect_dirty_pages();
         let pager = obj.pager.as_ref().map(Arc::clone);
-        (pages, pager)
+        let size = obj.size();
+        (pages, pager, size)
     };
 
     let Some(pager) = pager else { return };
@@ -186,9 +187,18 @@ async fn flush_object(obj_arc: &Arc<LeveledRwLock<VmObject, 3>>) {
     }
 
     // Write each dirty page through the pager (→ fs_write_at → delegate → lwext4).
+    // Clamp the last page to the actual file size so we don't inflate it with
+    // trailing zeros (a 16-byte file should write 16 bytes, not 4096).
     for (idx, pa) in &dirty_pages {
         let offset = idx.to_bytes();
-        let _ = pager.page_out(offset, *pa).await;
+        let len = if offset + crate::hal_common::PAGE_SIZE > obj_size {
+            obj_size.saturating_sub(offset)
+        } else {
+            crate::hal_common::PAGE_SIZE
+        };
+        if len > 0 {
+            let _ = pager.page_out(offset, *pa, len).await;
+        }
     }
 
     // Clear dirty bits + mark object clean.

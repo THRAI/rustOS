@@ -167,8 +167,17 @@ pub async fn open(
                 )
             };
             if let Some(pager) = pager {
+                let file_size = vnode.size() as usize;
                 for (idx, pa) in &dirty {
-                    let _ = pager.page_out(idx.to_bytes(), *pa).await;
+                    let offset = idx.to_bytes();
+                    let len = if offset + PAGE_SIZE > file_size {
+                        file_size.saturating_sub(offset)
+                    } else {
+                        PAGE_SIZE
+                    };
+                    if len > 0 {
+                        let _ = pager.page_out(offset, *pa, len).await;
+                    }
                 }
             }
         }
@@ -859,8 +868,17 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
         // VmObject lock released before I/O
 
         if let Some(pager) = pager {
+            let file_size = len as usize; // truncation target is the authoritative size
             for (idx, pa) in &dirty_in_range {
-                let _ = pager.page_out(idx.to_bytes(), *pa).await;
+                let offset = idx.to_bytes();
+                let write_len = if offset + PAGE_SIZE > file_size {
+                    file_size.saturating_sub(offset)
+                } else {
+                    PAGE_SIZE
+                };
+                if write_len > 0 {
+                    let _ = pager.page_out(offset, *pa, write_len).await;
+                }
             }
         }
     }

@@ -32,10 +32,14 @@ pub trait Pager: core::fmt::Debug + Send + Sync {
         pa: PhysAddr,
     ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>;
     /// Write pages to backing store.
+    ///
+    /// `len` is the number of valid bytes in the page to write (may be less
+    /// than `PAGE_SIZE` for the last page of a file).
     fn page_out(
         &self,
         offset: usize,
         pa: PhysAddr,
+        len: usize,
     ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>;
 
     /// Returns true if this is an anonymous pager.
@@ -69,6 +73,7 @@ impl Pager for AnonPager {
         &self,
         _offset: usize,
         _pa: PhysAddr,
+        _len: usize,
     ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
     {
         alloc::boxed::Box::pin(async move {
@@ -134,11 +139,14 @@ impl Pager for VnodePager {
         &self,
         offset: usize,
         pa: PhysAddr,
+        len: usize,
     ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), ()>> + Send>>
     {
         let path = self.path.clone();
         alloc::boxed::Box::pin(async move {
-            let data = unsafe { core::slice::from_raw_parts(pa.as_usize() as *const u8, 4096) };
+            let write_len = core::cmp::min(len, PAGE_SIZE);
+            let data =
+                unsafe { core::slice::from_raw_parts(pa.as_usize() as *const u8, write_len) };
             crate::fs::fs_write_at(&path, offset as u64, data)
                 .await
                 .map(|_| ())

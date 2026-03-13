@@ -155,7 +155,24 @@ pub async fn open(
     }
 
     // Handle O_TRUNC for regular files.
+    // Under UBC, flush dirty pages before destroying the VmObject so that
+    // data written but not yet synced is persisted up to the truncation point.
     if trunc && flags.write && vnode.vtype() == crate::fs::VnodeType::Regular {
+        if let Some(obj_arc) = vnode_object_if_exists(vnode.vnode_id()) {
+            let (dirty, pager) = {
+                let obj = obj_arc.read();
+                (
+                    obj.collect_dirty_pages(),
+                    obj.pager.as_ref().map(alloc::sync::Arc::clone),
+                )
+            };
+            if let Some(pager) = pager {
+                for (idx, pa) in &dirty {
+                    let _ = pager.page_out(idx.to_bytes(), *pa).await;
+                }
+            }
+        }
+
         crate::fs::fs_truncate(path_str, 0)
             .await
             .map_err(|_| Errno::Eio)?;
@@ -813,16 +830,41 @@ pub async fn sys_faccessat_async(
 }
 
 /// sys_ftruncate: truncate regular file by fd.
+///
+/// Under UBC, dirty pages in the truncated range are flushed before the
+/// on-disk truncation so data written but not yet synced is not lost.
 pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<(), Errno> {
     use crate::fs::FileObject;
     let desc = {
         let tab = task.fd_table.lock();
         Arc::clone(tab.get(fd).ok_or(Errno::Ebadf)?)
     };
-    let path = match &desc.object {
-        FileObject::Vnode(v) => String::from(v.path()),
+    let (path, vnode_id) = match &desc.object {
+        FileObject::Vnode(v) => (String::from(v.path()), v.vnode_id()),
         _ => return Err(Errno::Einval),
     };
+
+    // Flush dirty pages in the range being truncated before disk truncation.
+    if let Some(obj_arc) = vnode_object_if_exists(vnode_id) {
+        let (dirty_in_range, pager) = {
+            let obj = obj_arc.read();
+            let trunc_idx = crate::mm::vm::VObjIndex::from_bytes_ceil(len as usize);
+            let dirty: alloc::vec::Vec<_> = obj
+                .pages_with_index()
+                .filter(|(idx, page)| *idx >= trunc_idx && page.is_dirty())
+                .map(|(idx, page)| (idx, page.phys_addr))
+                .collect();
+            (dirty, obj.pager.as_ref().map(alloc::sync::Arc::clone))
+        };
+        // VmObject lock released before I/O
+
+        if let Some(pager) = pager {
+            for (idx, pa) in &dirty_in_range {
+                let _ = pager.page_out(idx.to_bytes(), *pa).await;
+            }
+        }
+    }
+
     fs::fs_truncate(&path, len).await?;
     if let FileObject::Vnode(v) = &desc.object {
         v.set_size(len);
@@ -835,16 +877,25 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
 }
 
 /// sys_fsync: flush data and metadata.
+///
+/// Two-phase flush under UBC:
+/// 1. Flush dirty VmObject pages through pager → delegate → lwext4
+/// 2. Flush lwext4's internal block cache to VirtIO disk
 pub async fn sys_fsync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
     use crate::fs::FileObject;
-    let path = {
+    let (path, vnode_id) = {
         let tab = task.fd_table.lock();
         let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
         match &desc.object {
-            FileObject::Vnode(v) => String::from(v.path()),
+            FileObject::Vnode(v) => (String::from(v.path()), v.vnode_id()),
             _ => return Ok(()),
         }
     };
+
+    // Phase 1: Flush dirty VmObject pages for this vnode
+    crate::mm::vm::page_daemon::flush_vnode_dirty(vnode_id).await;
+
+    // Phase 2: Flush lwext4's internal block cache to disk
     crate::fs::fs_cache_flush(&path).await
 }
 
@@ -855,6 +906,9 @@ pub async fn sys_fdatasync_async(task: &Arc<Task>, fd: u32) -> Result<(), Errno>
 
 /// sys_sync: flush all filesystem cache.
 pub async fn sys_sync_async() -> Result<(), Errno> {
+    // Phase 1: Flush all dirty VmObject pages
+    crate::mm::vm::page_daemon::flush_all_dirty().await;
+    // Phase 2: Flush lwext4 block cache
     crate::fs::fs_cache_flush("/").await
 }
 
@@ -1251,66 +1305,94 @@ pub async fn sys_write_async(
             result
         },
         WriteTarget::Vnode {
-            path,
+            path: _,
             mut offset,
             append,
         } => {
-            // Handle O_APPEND: write at end of file
+            // Handle O_APPEND: use vnode's authoritative size (local atomic, no delegate round-trip)
+            let vnode = match &desc.object {
+                FileObject::Vnode(v) => Arc::clone(v),
+                _ => unreachable!(),
+            };
             if append {
-                if let Ok((_, _, file_size)) = crate::fs::fs_lookup(0, &path).await {
-                    offset = file_size;
+                offset = vnode.size();
+            }
+
+            // --- UBC unified write path ---
+            // Data goes into VmObject pages; disk I/O is deferred to the page daemon / fsync.
+            let obj = vnode_object(&*vnode);
+            let to_write = len;
+            let mut total = 0usize;
+
+            // Extend VmObject size if writing past current EOF, so fetch_page_async
+            // can allocate pages in the extended region.
+            {
+                let new_end = (offset as usize) + to_write;
+                let cur_size = obj.read().size();
+                if new_end > cur_size {
+                    obj.write().set_size(new_end);
                 }
             }
 
-            // Copy data from user space to kernel buffer
-            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
-            let mut kbuf = alloc::vec![0u8; len];
-            let rc = unsafe {
-                crate::hal::copy_user_chunk(kbuf.as_mut_ptr(), user_buf as *const u8, len)
-            };
-            if rc != 0 {
-                return Err(Errno::Efault);
+            while total < to_write {
+                let byte_off = (offset as usize) + total;
+                let page_idx = crate::mm::vm::VObjIndex::from_bytes_floor(byte_off);
+                let offset_in_page = byte_off % PAGE_SIZE;
+                let chunk = core::cmp::min(PAGE_SIZE - offset_in_page, to_write - total);
+
+                // 1. Fetch page into VmObject (page_in from disk if not cached)
+                let page = VmObject::fetch_page_async(Arc::clone(&obj), page_idx)
+                    .await
+                    .map_err(|_| Errno::Eio)?;
+
+                // 2. Copy user data INTO the VmObject page
+                let kern = (page.phys_addr.as_usize() + offset_in_page) as *mut u8;
+                let user = (user_buf + total) as *mut u8;
+
+                match uiomove(kern, user, chunk, UioDir::CopyIn) {
+                    Ok(result) => {
+                        total += result.done;
+                    },
+                    Err(Errno::Efault) => {
+                        // Demand-page user buffer, retry this chunk
+                        resolve_user_fault(
+                            task,
+                            VirtAddr::new(user_buf + total),
+                            PageFaultAccessType::READ,
+                        )
+                        .await
+                        .map_err(|_| Errno::Efault)?;
+                        continue;
+                    },
+                    Err(e) => {
+                        if total > 0 {
+                            break;
+                        } // short write
+                        return Err(e);
+                    },
+                }
+
+                // 3. Mark page dirty
+                page.set_dirty();
             }
 
-            // Write to file via delegate
-            match crate::fs::fs_write_at(&path, offset, &kbuf).await {
-                Ok(n) => {
-                    // Update file offset
-                    desc.offset
-                        .store(offset + n as u64, core::sync::atomic::Ordering::Relaxed);
-                    if let FileObject::Vnode(v) = &desc.object {
-                        if let Some(obj) = vnode_object_if_exists(v.vnode_id()) {
-                            let obj_r = obj.read();
-                            let start_page = offset as usize / PAGE_SIZE;
-                            let end_page = (offset as usize + n - 1) / PAGE_SIZE;
-                            for pi in start_page..=end_page {
-                                if let Some(page) =
-                                    obj_r.get_page(crate::mm::vm::VObjIndex::new(pi))
-                                {
-                                    let page_base = pi * PAGE_SIZE;
-                                    let copy_start = (offset as usize).saturating_sub(page_base);
-                                    let copy_end =
-                                        core::cmp::min(PAGE_SIZE, offset as usize + n - page_base);
-                                    let src_off = page_base + copy_start - offset as usize;
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            kbuf[src_off..].as_ptr(),
-                                            (page.phys_addr.as_usize() + copy_start) as *mut u8,
-                                            copy_end - copy_start,
-                                        );
-                                    }
-                                    page.set_dirty();
-                                }
-                            }
-                        }
-                        let old_size = v.size();
-                        let new_size = core::cmp::max(old_size, offset + n as u64);
-                        v.set_size(new_size);
-                    }
-                    Ok(n)
-                },
-                Err(_) => Err(Errno::Eio),
+            // 4. Bump object dirty generation (AtomicU32 — read lock is fine)
+            obj.read().bump_generation();
+
+            // 5. Maybe wake page daemon
+            crate::mm::vm::page_daemon::maybe_wake_page_daemon();
+
+            // 6. Extend file size if needed
+            let new_end = offset + total as u64;
+            if new_end > vnode.size() {
+                vnode.set_size(new_end);
             }
+
+            // 7. Update file offset
+            desc.offset
+                .store(offset + total as u64, core::sync::atomic::Ordering::Relaxed);
+
+            Ok(total)
         },
     }
 }
@@ -1672,8 +1754,30 @@ impl<'a> Future for PipeReadFuture<'a> {
                 }
             },
             Err(Errno::Eagain) => {
+                // Register waker FIRST, then re-check.  This closes the
+                // TOCTOU race where close_write() fires between read()
+                // returning Eagain and the waker being stored: close_write
+                // would take None from reader_waker and never wake us.
                 this.pipe.register_reader_waker(cx.waker());
-                Poll::Pending
+
+                // Double-check: if close_write() raced above, the waker
+                // we just stored will never be taken.  Re-try now.
+                let mut kbuf2 = alloc::vec![0u8; this.len];
+                match this.pipe.read(&mut kbuf2) {
+                    Ok(0) => Poll::Ready(Ok(0)), // EOF — caught the race
+                    Ok(n) => {
+                        let rc = unsafe {
+                            crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf2.as_ptr(), n)
+                        };
+                        if rc != 0 {
+                            Poll::Ready(Err(Errno::Efault))
+                        } else {
+                            Poll::Ready(Ok(n))
+                        }
+                    },
+                    Err(Errno::Eagain) => Poll::Pending, // genuinely blocked, waker stored
+                    Err(e) => Poll::Ready(Err(e)),
+                }
             },
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -1740,12 +1844,47 @@ impl<'a> Future for PipeWriteFuture<'a> {
                 if this.written >= this.data.len() {
                     return Poll::Ready(Ok(this.written));
                 }
+                // Partial write — register waker, then double-check for
+                // close_read() race (same TOCTOU pattern as PipeReadFuture).
                 this.pipe.register_writer_waker(cx.waker());
-                Poll::Pending
+                match this.pipe.write(&this.data[this.written..]) {
+                    Ok(n2) => {
+                        this.written += n2;
+                        if this.written >= this.data.len() {
+                            Poll::Ready(Ok(this.written))
+                        } else {
+                            Poll::Pending
+                        }
+                    },
+                    Err(Errno::Eagain) => Poll::Pending, // genuinely full, waker stored
+                    Err(Errno::Epipe) => {
+                        this.task.signals.post_signal(crate::proc::SIGPIPE);
+                        Poll::Ready(Err(Errno::Epipe))
+                    },
+                    Err(e) => Poll::Ready(Err(e)),
+                }
             },
             Err(Errno::Eagain) => {
+                // Register waker FIRST, then re-check.  Closes the TOCTOU
+                // race where close_read() fires between write() returning
+                // Eagain and the waker being stored.
                 this.pipe.register_writer_waker(cx.waker());
-                Poll::Pending
+                match this.pipe.write(&this.data[this.written..]) {
+                    Ok(n) => {
+                        this.written += n;
+                        if this.written >= this.data.len() {
+                            Poll::Ready(Ok(this.written))
+                        } else {
+                            Poll::Pending
+                        }
+                    },
+                    Err(Errno::Eagain) => Poll::Pending, // genuinely full, waker stored
+                    Err(Errno::Epipe) => {
+                        this.task.signals.post_signal(crate::proc::SIGPIPE);
+                        Poll::Ready(Err(Errno::Epipe))
+                    },
+                    Err(e) => Poll::Ready(Err(e)),
+                }
             },
             Err(Errno::Epipe) => {
                 // Post SIGPIPE when writing to a pipe with no readers

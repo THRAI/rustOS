@@ -3,7 +3,7 @@
 //! Bit layout follows RISC-V Privileged Spec §4.4 (Sv39) and
 //! FreeBSD `sys/riscv/include/pte.h` for RSW software bits.
 
-use super::super::vm::vm_map::MapPerm;
+use super::super::vm::MapPerm;
 
 //TODO: use a macro to generate flags like MapPerm!(R, W, X, U, ...)
 bitflags::bitflags! {

@@ -48,7 +48,7 @@ impl DentryInner {
 }
 
 /// Global dentry cache.
-static DENTRY_CACHE: IrqSafeSpinLock<Option<DentryInner>> = IrqSafeSpinLock::new(None);
+static DENTRY_CACHE: IrqSafeSpinLock<Option<DentryInner>, 5> = IrqSafeSpinLock::new(None);
 
 /// Initialize the dentry cache (call once at boot).
 pub fn init() {

@@ -41,7 +41,7 @@ struct SendSyncBW(Ext4BlockWrapper<Disk>);
 unsafe impl Send for SendSyncBW {}
 unsafe impl Sync for SendSyncBW {}
 
-static EXT4_BW: crate::hal_common::Once<crate::hal_common::SpinMutex<SendSyncBW>> =
+static EXT4_BW: crate::hal_common::Once<crate::hal_common::SpinMutex<SendSyncBW, 0>> =
     crate::hal_common::Once::new();
 
 // ── DelegateToken (Phase 2) ─────────────────────────────────────────

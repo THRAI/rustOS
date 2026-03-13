@@ -195,8 +195,8 @@ pub struct ReplySlot<T: 'static> {
 struct ReplyInner<T> {
     done: AtomicBool,
     in_use: AtomicBool,
-    waker: IrqSafeSpinLock<Option<Waker>>,
-    value: IrqSafeSpinLock<Option<T>>,
+    waker: IrqSafeSpinLock<Option<Waker>, 6>,
+    value: IrqSafeSpinLock<Option<T>, 6>,
 }
 
 impl<T: 'static> ReplySlot<T> {
@@ -345,9 +345,18 @@ define_alloc_reply!( alloc_cacheflush_reply, CACHEFLUSH_REPLIES, CACHEFLUSH_REPL
 define_alloc_reply!(alloc_readdir_reply,    READDIR_REPLIES,    READDIR_REPLY_IDX, Result<([DirEntryRaw; READDIR_BATCH], usize), Errno>);
 
 /// Bounded request channel.
-static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>> = IrqSafeSpinLock::new(VecDeque::new());
+///
+/// Lock ordering: **Level 6** (filesystem I/O).  Accessed only from
+/// async task context (syscall handlers enqueue, delegate task dequeues).
+/// Always acquired before `DELEGATE_WAKER` when both are needed.
+static REQUEST_QUEUE: IrqSafeSpinLock<VecDeque<FsRequest>, 6> =
+    IrqSafeSpinLock::new(VecDeque::new());
 static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DELEGATE_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+/// Waker for the delegate task, signalled when new requests are enqueued.
+///
+/// Lock ordering: **Level 6** (filesystem I/O).  Always acquired *after*
+/// `REQUEST_QUEUE`.
+static DELEGATE_WAKER: IrqSafeSpinLock<Option<Waker>, 6> = IrqSafeSpinLock::new(None);
 
 /// Send a request to the delegate channel.
 /// Returns `Err(Eagain)` if the channel is full.

@@ -13,7 +13,7 @@ use super::IrqSafeSpinLock;
 /// Every access disables IRQs first, preventing the IRQ-reentrance
 /// deadlock that bare spinlocks leave latent.
 pub struct RunQueue<R> {
-    inner: IrqSafeSpinLock<VecDeque<R>>,
+    inner: IrqSafeSpinLock<VecDeque<R>, 8>,
 }
 
 impl<R> RunQueue<R> {

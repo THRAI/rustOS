@@ -1,29 +1,74 @@
 #!/usr/bin/env bash
 # Pre-commit hook for BSD-Async Rust OS Kernel
 # Install: git config core.hooksPath .githooks
+#
+# Mirrors the CI workflow (.github/workflows/ci.yml) as closely as
+# possible so failures are caught locally before push.
+#
+# CI parity:
+#   [fmt]                 cargo fmt --check                    ✓ (same)
+#   [clippy]              cargo clippy ... -D warnings         ✓ (same target + flags)
+#   [duplicate-detection] .rs files over 500 lines             ✓ (same threshold)
+#   [integration-test]    make python-test-rv64                — (too slow; use `make agent-test` manually)
+#   [pr-review]           PR size / unsafe audit               — (PR-only, not applicable)
+#
+# Hook-only checks (not in CI):
+#   - Binary file size > 2MB
+#   - Secrets / .env prevention
+#   - TODO/FIXME without issue reference (warning only)
+#
+# Skip hook: git commit --no-verify
+
 set -euo pipefail
 
 RED='\033[0;31m'
+GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 ERRORS=0
 
-# --- Check formatting ---
-if command -v cargo >/dev/null 2>&1; then
+# Only run Rust checks if kernel sources are staged
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+
+if [ -n "$STAGED_RS" ] && command -v cargo >/dev/null 2>&1; then
+    # --- [CI: fmt] Check formatting ---
+    echo -e "[pre-commit] cargo fmt --check..."
     if ! cargo fmt --check -- --quiet 2>/dev/null; then
-        echo -e "${RED}[pre-commit] cargo fmt check failed. Run 'cargo fmt' to fix.${NC}"
+        echo -e "${RED}[pre-commit] cargo fmt failed. Run 'cargo fmt' to fix.${NC}"
         ERRORS=$((ERRORS + 1))
+    fi
+
+    # --- [CI: clippy] Lint with workspace rules ---
+    # Same target + flags as CI. Takes ~1-2s on incremental builds.
+    echo -e "[pre-commit] cargo clippy (riscv64)..."
+    CLIPPY_OUTPUT=$(cargo clippy --target riscv64gc-unknown-none-elf -p kernel -- -D warnings 2>&1) || {
+        echo "$CLIPPY_OUTPUT"
+        echo -e "${RED}[pre-commit] cargo clippy failed. Fix errors before committing.${NC}"
+        ERRORS=$((ERRORS + 1))
+    }
+
+    # --- [CI: duplicate-detection] Flag .rs files over 500 lines ---
+    LARGE_FILES=0
+    for file in $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true); do
+        if [ -f "$file" ]; then
+            lines=$(wc -l <"$file" | tr -d ' ')
+            if [ "$lines" -gt 500 ]; then
+                echo -e "${YELLOW}[pre-commit] Large source file (${lines} lines): ${file}${NC}"
+                LARGE_FILES=$((LARGE_FILES + 1))
+            fi
+        fi
+    done
+    if [ "$LARGE_FILES" -gt 0 ]; then
+        echo -e "${YELLOW}[pre-commit] ${LARGE_FILES} file(s) over 500 lines — consider splitting.${NC}"
+        # Warning only (matches CI behavior — informational, not blocking)
     fi
 fi
 
-# --- Clippy (workspace lints already configured in Cargo.toml) ---
-# Skipped in pre-commit for speed; runs in CI.
-
-# --- Large file detection (>2MB) ---
+# --- Large binary file detection (>2MB) ---
 MAX_FILE_SIZE=$((2 * 1024 * 1024))
 for file in $(git diff --cached --name-only --diff-filter=ACM); do
     if [ -f "$file" ]; then
-        size=$(wc -c < "$file" | tr -d ' ')
+        size=$(wc -c <"$file" | tr -d ' ')
         if [ "$size" -gt "$MAX_FILE_SIZE" ]; then
             echo -e "${RED}[pre-commit] File too large (${size} bytes): ${file}${NC}"
             echo "  Max allowed: ${MAX_FILE_SIZE} bytes (2MB). Use Git LFS for large files."
@@ -36,7 +81,6 @@ done
 UNLINKED_TODOS=0
 for file in $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(rs|toml|md)$' || true); do
     if [ -f "$file" ]; then
-        # Match TODO/FIXME/HACK/XXX that don't have a parenthesized reference like TODO(#123) or TODO(ISSUE-45)
         while IFS= read -r line; do
             if echo "$line" | grep -qiE '\b(TODO|FIXME|HACK|XXX)\b' && \
                ! echo "$line" | grep -qiE '\b(TODO|FIXME|HACK|XXX)\s*\('; then
@@ -49,7 +93,6 @@ done
 if [ "$UNLINKED_TODOS" -gt 0 ]; then
     echo -e "${YELLOW}[pre-commit] Found ${UNLINKED_TODOS} TODO/FIXME without issue references.${NC}"
     echo "  Recommended format: TODO(#123) or FIXME(ISSUE-45)"
-    # Warning only, don't block commit
 fi
 
 # --- Prevent committing secrets ---
@@ -75,4 +118,5 @@ if [ "$ERRORS" -gt 0 ]; then
     exit 1
 fi
 
+echo -e "${GREEN}[pre-commit] All checks passed.${NC}"
 exit 0

@@ -246,6 +246,34 @@ Flags are stored as bits in an `AtomicU32`. See the `Flag` enum:
 - **Signals**: POSIX-like signal model
 - **No `std`**: Everything is `#![no_std]`, no heap until buddy allocator is initialized
 
+### Error Encoding Policy
+
+The kernel maintains a single Rust-level error type (`Errno`) and converts
+to/from raw integers **only** at three well-defined boundaries.  The full
+policy is documented in `kernel/src/hal_common/errno.rs`.
+
+**Rules:**
+
+1. Inside the Rust kernel, all fallible functions return `KernelResult<T>`
+   (alias for `Result<T, Errno>`).  Never return a raw `usize` encoding
+   an error value.
+2. `Errno::as_i32()` returns **positive** POSIX values (e.g. `EINVAL = 22`).
+3. `Errno::as_linux_ret()` returns **negative** Linux-convention values
+   (e.g. `-22`).  Only the syscall dispatcher should call this.
+4. Domain-specific error enums (e.g. `FaultError` in `mm/vm/`) are fine
+   when they stay within their subsystem and never cross into syscall returns.
+
+**Boundaries (the only places raw integer errnos appear):**
+
+| Boundary | Direction | Function | Location |
+|----------|-----------|----------|----------|
+| Syscall return | `Errno` → `a0` register | `syscall_error_return()` | `syscall/mod.rs` |
+| lwext4 C FFI | C `int` → `Errno` | `lwext4_err()` | `fs/ext4.rs` |
+| copy_user asm | asm `usize` → `Errno` | comparison in `uiomove()` | `mm/uio.rs` |
+
+**Exception:** `sys_brk` returns a plain `usize` (current break address on
+failure, never a negative errno) because the Linux brk ABI requires this.
+
 ## CI/CD
 
 - **CI** (`.github/workflows/ci.yml`): `cargo fmt --check`, `clippy`, unused deps (non-blocking via `cargo-udeps`), large file detection (flags `.rs` files over 500 lines), automated PR review (size/quality metrics, unsafe code detection)

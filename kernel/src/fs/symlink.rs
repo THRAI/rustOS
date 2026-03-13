@@ -17,7 +17,7 @@ impl SymlinkTable {
     }
 }
 
-static SYMLINK_TABLE: SpinMutex<SymlinkTable> = SpinMutex::new(SymlinkTable::new());
+static SYMLINK_TABLE: SpinMutex<SymlinkTable, 5> = SpinMutex::new(SymlinkTable::new());
 
 fn normalize_absolute(path: &str) -> String {
     let mut comps: Vec<&str> = Vec::new();

@@ -10,7 +10,11 @@ use core::task::Waker;
 use crate::hal_common::IrqSafeSpinLock;
 
 /// Global wait queue hash table.
-static WAIT_QUEUES: IrqSafeSpinLock<BTreeMap<usize, Vec<Waker>>> =
+///
+/// Lock ordering: **Level 9** (leaf lock).  Accessed from fault handlers
+/// (VmPage busy-state release) and syscall context.  Never nests inside
+/// any other lock.  IRQ-safe by type for future-proofing.
+static WAIT_QUEUES: IrqSafeSpinLock<BTreeMap<usize, Vec<Waker>>, 9> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Extract and wake all registered `Waker`s associated with the given `token`.

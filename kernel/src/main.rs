@@ -37,6 +37,7 @@ mod hal;
 mod hal_common;
 mod ipc;
 mod libc_stubs;
+mod lockdep;
 mod mm;
 mod proc;
 mod syscall;
@@ -96,6 +97,13 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         }
         let cpu0 = hal::hart_to_cpu(hartid).unwrap_or(0);
         unsafe { executor::set_tp(cpu0) };
+
+        // Activate runtime lock ordering validator (debug builds only).
+        // Must be after set_tp() — lockdep reads cpu_id via tp register.
+        // All lock acquisitions before this point (heap, FDT, per-cpu init)
+        // are single-hart with no concurrency, so ordering is trivially safe.
+        lockdep::enable();
+
         klog!(
             boot,
             info,
@@ -668,7 +676,8 @@ async fn test_delegate_read() {
 #[cfg(feature = "qemu-test")]
 async fn test_vfs_read() {
     use fs::{FdTable, OpenFlags};
-    let fd_table = crate::hal_common::SpinMutex::new(FdTable::new());
+    let fd_table: crate::hal_common::SpinMutex<FdTable, 4> =
+        crate::hal_common::SpinMutex::new(FdTable::new());
 
     // First read: goes through delegate
     match syscall::fs::open(&fd_table, "/hello.txt", OpenFlags::RDONLY, 0).await {
@@ -955,7 +964,8 @@ async fn test_device_nodes() {
 
     // Test /dev/zero behavior: read returns zeros
     // We test via the device open path
-    let fd_table = crate::hal_common::SpinMutex::new(FdTable::new_with_stdio());
+    let fd_table: crate::hal_common::SpinMutex<FdTable, 4> =
+        crate::hal_common::SpinMutex::new(FdTable::new_with_stdio());
 
     // Open /dev/null
     match syscall::fs::open(&fd_table, "/dev/null", OpenFlags::RDWR, 0).await {

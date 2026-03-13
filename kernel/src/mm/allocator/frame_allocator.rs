@@ -22,11 +22,21 @@ const POISON_PATTERN: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 pub const STACK_CANARY: u64 = 0xCAFE_BABE_DEAD_C0DE;
 
 /// Global buddy allocator, protected by IrqSafeSpinLock.
-static GLOBAL_BUDDY: IrqSafeSpinLock<BuddyAllocator> = IrqSafeSpinLock::new(BuddyAllocator::new());
+///
+/// Lock ordering: **Level 7** (physical memory).  Acquired inside pmap
+/// (Level 2) and VmObject (Level 3) paths via `alloc_raw_frame_sync` /
+/// `free_raw_frame`.  Always acquired *after* `PER_CPU_MAGAZINES`.
+/// IRQ-safe: yes -- frame allocation can occur from any context.
+static GLOBAL_BUDDY: IrqSafeSpinLock<BuddyAllocator, 7> =
+    IrqSafeSpinLock::new(BuddyAllocator::new());
 
-/// Per-CPU magazine array. Each CPU gets its own magazine for lock-free
-/// order-0 alloc/free. Indexed by cpu_id.
-static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine>; 8] = [
+/// Per-CPU magazine caches for fast order-0 frame alloc/free.
+///
+/// Lock ordering: **Level 7** (physical memory).  Acquired inside pmap
+/// (Level 2) and VmObject (Level 3) paths.  Always acquired *before*
+/// `GLOBAL_BUDDY` when both are needed (drain/refill paths).
+/// IRQ-safe: yes -- indexed by `current_cpu_id()`.
+static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine, 7>; 8] = [
     IrqSafeSpinLock::new(Magazine::new()),
     IrqSafeSpinLock::new(Magazine::new()),
     IrqSafeSpinLock::new(Magazine::new()),
@@ -107,11 +117,13 @@ pub fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
     }
 }
 /// Get the current CPU's magazine index.
-/// Uses tp-based per_cpu in kernel context.
+///
+/// Reads the `tp`-based per-CPU data structure set up during boot
+/// (see [`crate::executor::per_cpu::set_tp`]).  Must not be called
+/// before `set_tp()` has run on the current hart.
+#[inline]
 fn current_cpu_id() -> usize {
-    // FIXME: dependency on executor
-    // per_cpu::current().cpu_id
-    0
+    crate::executor::per_cpu::current().cpu_id
 }
 
 /// Helper to initialize metadata for a newly allocated frame.

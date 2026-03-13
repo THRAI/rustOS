@@ -31,6 +31,17 @@ bitflags! {
     }
 }
 
+/// Declarative macro to combine [`MapPerm`] flags concisely.
+///
+/// Usage: `map_perm!(R, W, U)` expands to `MapPerm::R | MapPerm::W | MapPerm::U`.
+#[macro_export]
+macro_rules! map_perm {
+    () => { $crate::mm::vm::MapPerm::empty() };
+    ($($flag:ident),+) => {
+        $($crate::mm::vm::MapPerm::$flag)|+
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmInherit {
     Share,
@@ -40,7 +51,7 @@ pub enum VmInherit {
 
 pub enum BackingStore {
     Object {
-        object: Arc<spin::RwLock<VmObject>>,
+        object: Arc<crate::hal_common::LeveledRwLock<VmObject, 3>>,
         offset: u64,
     },
     SubMap(Arc<VmMap>),

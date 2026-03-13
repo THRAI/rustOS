@@ -16,7 +16,11 @@ use crate::{
 };
 
 /// Global futex wait table: maps physical address to list of waiting wakers.
-static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<Waker>>> =
+///
+/// Lock ordering: **Level 9** (leaf lock).  Accessed only from syscall
+/// context (`futex_wait`, `futex_wake`).  Never nests inside or outside
+/// any other lock.  IRQ-safe by type, but not accessed from IRQ handlers.
+static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<Waker>>, 9> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Park the current task on a futex key (physical address).

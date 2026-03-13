@@ -198,7 +198,7 @@ pub fn test_fork_bomb_stress() {
     }
 
     // Phase 1: Fork bomb -- create N children, each shadowing root.
-    let mut children: Vec<Arc<spin::RwLock<VmObject>>> = Vec::new();
+    let mut children: Vec<Arc<crate::hal_common::LeveledRwLock<VmObject, 3>>> = Vec::new();
     for _ in 0..NUM_CHILDREN {
         children.push(VmObject::new_shadow(
             Arc::clone(&root),
@@ -220,7 +220,7 @@ pub fn test_fork_bomb_stress() {
     }
 
     // Phase 2: Each child forks a grandchild (deeper chain).
-    let mut grandchildren: Vec<Arc<spin::RwLock<VmObject>>> = Vec::new();
+    let mut grandchildren: Vec<Arc<crate::hal_common::LeveledRwLock<VmObject, 3>>> = Vec::new();
     for child in children.iter() {
         grandchildren.push(VmObject::new_shadow(
             Arc::clone(child),

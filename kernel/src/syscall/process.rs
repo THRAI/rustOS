@@ -5,7 +5,7 @@ use core::sync::atomic::Ordering;
 
 use crate::{
     executor::{current, spawn_user_task},
-    hal_common::Errno,
+    hal_common::{Errno, KernelResult},
     mm::PageFaultAccessType,
     proc::{
         copyin_argv, copyinstr, do_execve, do_exit, fault_in_user_buffer, find_task_by_pid, fork,
@@ -56,7 +56,7 @@ pub fn sys_clone(
     _parent_tid: usize,
     tls: usize,
     _child_tid: usize,
-) -> usize {
+) -> KernelResult<usize> {
     // Minimal clone support:
     // - process-style clone/fork is supported
     // - thread-group clone is not supported yet
@@ -64,7 +64,7 @@ pub fn sys_clone(
     const CLONE_SETTLS: usize = 0x0008_0000;
 
     if flags & CLONE_THREAD != 0 {
-        return (-(Errno::Enosys.as_i32() as isize)) as usize;
+        return Err(Errno::Enosys);
     }
 
     let child = fork(task);
@@ -82,7 +82,7 @@ pub fn sys_clone(
     let child_pid = child.pid;
     let cpu = current().cpu_id;
     spawn_user_task(child, cpu);
-    child_pid as usize
+    Ok(child_pid as usize)
 }
 
 pub fn sys_exit(task: &Arc<Task>, status: i32) {

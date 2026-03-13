@@ -57,7 +57,7 @@ impl MountTable {
     }
 }
 
-static MOUNT_TABLE: SpinMutex<MountTable> = SpinMutex::new(MountTable::new());
+static MOUNT_TABLE: SpinMutex<MountTable, 5> = SpinMutex::new(MountTable::new());
 
 fn normalize_absolute_path(path: &str) -> String {
     let mut comps: Vec<&str> = Vec::new();

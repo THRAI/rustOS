@@ -22,7 +22,7 @@ pub struct VmMap {
     pub tree: SplayTree,
 
     /// Hardware page map
-    pub pmap: Arc<SpinMutex<Pmap>>,
+    pub pmap: Arc<SpinMutex<Pmap, 2>>,
 
     /// Global total size of memory mapped
     pub size: u64,
@@ -41,7 +41,7 @@ pub struct VmMap {
 }
 
 impl VmMap {
-    pub fn new(pmap: Arc<SpinMutex<Pmap>>) -> Self {
+    pub fn new(pmap: Arc<SpinMutex<Pmap, 2>>) -> Self {
         Self {
             tree: SplayTree::new(),
             pmap,
@@ -54,7 +54,7 @@ impl VmMap {
     }
 
     /// Access the underlying physical map
-    pub fn pmap_lock(&self) -> crate::hal_common::SpinMutexGuard<'_, Pmap> {
+    pub fn pmap_lock(&self) -> crate::hal_common::SpinMutexGuard<'_, Pmap, 2> {
         self.pmap.lock()
     }
 

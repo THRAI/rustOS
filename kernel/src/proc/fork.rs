@@ -33,6 +33,13 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
 
     // Ensure child has sigcode trampoline page (not tracked in vm_map).
     // Prefer sharing parent's mapped page; fallback to creating a new one.
+    //
+    // Lock ordering: parent_vm_map (L1) → parent_pmap (L2) → child_vm_map (L1) → child_pmap (L2).
+    // TODO: This acquires parent_pmap BEFORE child_pmap, but cow_fork_vm
+    // (below, line ~210) acquires child_pmap before parent_pmap.  The
+    // inconsistency is safe TODAY because the child is brand-new and no
+    // other thread can reference it yet, but this should be unified to
+    // always acquire parent before child for robustness.
     {
         let parent_vm = parent.vm_map.lock();
         let parent_pmap = parent_vm.pmap_lock();
@@ -206,6 +213,12 @@ fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
     }
 
     // Phase 2: set up pmap mappings
+    //
+    // Lock ordering: child_pmap (L2) → parent_pmap (L2).
+    // TODO: This acquires child_pmap BEFORE parent_pmap, but the sigcode
+    // block above (line ~36) acquires parent_pmap before child_pmap.
+    // Safe today because the child is brand-new (no concurrent access),
+    // but should be unified to parent-before-child everywhere.
     let child_pmap_arc = child_vm.pmap.clone();
     let mut child_pmap = child_pmap_arc.lock();
     let parent_pmap_arc = parent_vm.pmap.clone();

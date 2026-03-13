@@ -6,9 +6,8 @@
 
 pub mod fault;
 pub mod map;
+pub mod object;
 pub mod page;
-pub mod vm_map;
-pub mod vm_object;
 pub mod wait_queue;
 
 // fault_async and test_integration use kernel-only paths (crate::mm::, crate::fs::,
@@ -24,6 +23,6 @@ pub use map::{
     entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry},
     VmMap,
 };
+pub use object::{VObjIndex, VmObject, VnodePager};
 pub use page::{ExclusiveBusyGuard, SharedBusyGuard, VmPage};
-pub use vm_object::{VObjIndex, VmObject, VnodePager};
 pub use wait_queue::{register_waker, remove_waker, wake_all};

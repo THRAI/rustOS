@@ -60,7 +60,7 @@ pub struct Task {
     /// Parent process (Weak to prevent circular Arc).
     pub parent: Weak<Task>,
     /// Child processes.
-    pub children: Mutex<Vec<Arc<Task>>>,
+    pub children: Mutex<Vec<Arc<Task>>, 4>,
     /// Virtual address space.
     ///
     // SAFETY: SpinMutex (no IRQ disable). Currently safe because the timer
@@ -69,19 +69,19 @@ pub struct Task {
     // faulting hart, not asynchronous IRQs, so they cannot preempt a holder
     // on the same hart. Must be upgraded to IrqSafeSpinLock if any future
     // IRQ/IPI path needs to inspect or modify a VmMap.
-    pub vm_map: Mutex<VmMap>,
+    pub vm_map: Mutex<VmMap, 1>,
     /// File descriptor table placeholder (expanded in VFS plan).
-    pub fd_table: Mutex<FdTable>,
+    pub fd_table: Mutex<FdTable, 4>,
     /// Current working directory (absolute normalized path).
-    pub cwd: Mutex<String>,
+    pub cwd: Mutex<String, 4>,
     /// Current state (Running / Zombie). Stored as AtomicU8 for lock-free access.
     state: AtomicU8,
     /// Exit status, set by sys_exit with Release ordering.
     pub exit_status: AtomicI32,
     /// Waker for parent's WaitChildFuture. Set by wait4 before scanning.
-    pub parent_waker: Mutex<Option<core::task::Waker>>,
+    pub parent_waker: Mutex<Option<core::task::Waker>, 4>,
     /// User-mode register state. Persists across .await points (not on kernel stack).
-    pub trap_frame: Mutex<TrapFrame>,
+    pub trap_frame: Mutex<TrapFrame, 4>,
     /// Kernel stack base (2 pages from frame allocator, page-aligned).
     kstack_base: PhysAddr,
     /// Kernel stack pointer (top of kstack, used by trap_return / __user_trap).
@@ -93,7 +93,7 @@ pub struct Task {
     /// Process group ID.
     pub pgid: AtomicU32,
     /// Top-level waker for async signal injection (wake from kill).
-    pub top_level_waker: Mutex<Option<core::task::Waker>>,
+    pub top_level_waker: Mutex<Option<core::task::Waker>, 4>,
 }
 
 /// Allocate a kernel stack (2 pages) and return (base, sp_top).

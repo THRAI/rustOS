@@ -12,7 +12,13 @@ use crate::hal_common::IrqSafeSpinLock;
 const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16MB
 static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
-static HEAP: IrqSafeSpinLock<Heap> = IrqSafeSpinLock::new(Heap::empty());
+/// Kernel heap backed by a static `.bss` buffer.
+///
+/// Lock ordering: **Level 7** (physical memory).  This is the
+/// `#[global_allocator]` -- any `alloc::` operation (Vec, Arc, Box,
+/// String, BTreeMap) acquires this lock.  IRQ-safe: yes, because
+/// interrupt handlers may allocate transitively.
+static HEAP: IrqSafeSpinLock<Heap, 7> = IrqSafeSpinLock::new(Heap::empty());
 
 struct KernelAllocator;
 

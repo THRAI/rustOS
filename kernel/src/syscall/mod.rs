@@ -7,7 +7,10 @@
 
 use alloc::sync::Arc;
 
-use crate::{hal_common::Errno, proc::Task};
+use crate::{
+    hal_common::{Errno, KernelResult},
+    proc::Task,
+};
 
 pub mod fs;
 pub mod memory;
@@ -177,9 +180,14 @@ impl core::fmt::Display for SyscallId {
     }
 }
 
+/// Convert an [`Errno`] to the Linux-convention negative return value
+/// for placement into the syscall trap frame's `a0` register.
+///
+/// This is the **only** function in the kernel that performs this
+/// conversion.  See the encoding policy in [`crate::hal_common::errno`].
 #[inline]
-fn errno_ret(e: Errno) -> usize {
-    (-(e.as_i32() as isize)) as usize
+fn syscall_error_return(e: Errno) -> usize {
+    e.as_linux_ret() as usize
 }
 
 /// SA_RESTART: check if current pending signal wants syscall restart.
@@ -243,7 +251,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::DUP => {
             let ret = match task.fd_table.lock().dup(a0 as u32) {
                 Ok(fd) => fd as usize,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -251,14 +259,14 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             let cloexec = (a2 & 0o2000000) != 0;
             let ret = match task.fd_table.lock().dup3(a0 as u32, a1 as u32, cloexec) {
                 Ok(fd) => fd as usize,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::PIPE2 => {
             let ret = match fs::sys_pipe2(task, a0, a1) {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -268,10 +276,26 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         },
         SyscallId::BRK => SyscallAction::Return(memory::sys_brk(task, a0)),
         SyscallId::MMAP => {
-            SyscallAction::Return(memory::sys_mmap(task, a0, a1, a2, a3, a4 as u32, a5 as u64))
+            let ret = match memory::sys_mmap(task, a0, a1, a2, a3, a4 as u32, a5 as u64) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
         },
-        SyscallId::MUNMAP => SyscallAction::Return(memory::sys_munmap(task, a0, a1)),
-        SyscallId::MPROTECT => SyscallAction::Return(memory::sys_mprotect(task, a0, a1, a2)),
+        SyscallId::MUNMAP => {
+            let ret = match memory::sys_munmap(task, a0, a1) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::MPROTECT => {
+            let ret = match memory::sys_mprotect(task, a0, a1, a2) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
         SyscallId::SIGACTION => {
             if a1 != 0 {
                 fault_in_user_buffer(task, a1, 32, PageFaultAccessType::READ).await;
@@ -281,7 +305,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             }
             let ret = match signal::sys_sigaction(task, a0, a1, a2) {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -294,7 +318,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             }
             let ret = match signal::sys_sigprocmask(task, a0, a1, a2) {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -305,21 +329,21 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::KILL => {
             let ret = match signal::sys_kill(task, a0 as isize, a1 as u8) {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::SETPGID => {
             let ret = match process::sys_setpgid(task, a0 as u32, a1 as u32) {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::GETPGID => {
             let ret = match process::sys_getpgid(task, a0 as u32) {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -330,7 +354,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             }
             let ret = match sync::sys_clock_gettime(task, a0 as u32, a1) {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -340,14 +364,14 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             }
             let ret = match sync::sys_gettimeofday(task, a0, a1) {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::NANOSLEEP => {
             let ret = match sync::sys_nanosleep_async(task, a0, a1).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -355,14 +379,14 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::UNAME => {
             let ret = match misc::sys_uname(task, a0) {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::IOCTL => {
             let ret = match fs::sys_ioctl_async(task, a0 as u32, a1, a2).await {
                 Ok(v) => v as usize,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -371,7 +395,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                 .await
             {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -379,21 +403,21 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             let ret = match fs::sys_renameat2_async(task, a0 as isize, a1, a2 as isize, a3, 0).await
             {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::GETCWD => {
             let ret = match fs::sys_getcwd(task, a0, a1) {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::FTRUNCATE => {
             let ret = match fs::sys_ftruncate_async(task, a0 as u32, a1 as u64).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -401,110 +425,110 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             let ret =
                 match fs::sys_faccessat_async(task, a0 as isize, a1, a2 as i32, a3 as i32).await {
                     Ok(()) => 0,
-                    Err(e) => errno_ret(e),
+                    Err(e) => syscall_error_return(e),
                 };
             SyscallAction::Return(ret)
         },
         SyscallId::FCNTL => {
             let ret = match fs::sys_fcntl(task, a0 as u32, a1 as u32, a2) {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::WRITEV => match fs::sys_writev_async(task, a0 as u32, a1, a2).await {
             Ok(n) => SyscallAction::Return(n),
             Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
-            Err(e) => SyscallAction::Return(errno_ret(e)),
+            Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
         SyscallId::PPOLL => match fs::sys_ppoll_async(task, a0, a1, a2).await {
             Ok(n) => SyscallAction::Return(n),
             Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
-            Err(e) => SyscallAction::Return(errno_ret(e)),
+            Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
         SyscallId::WRITE => match fs::sys_write_async(task, a0 as u32, a1, a2).await {
             Ok(n) => SyscallAction::Return(n),
             Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
-            Err(e) => SyscallAction::Return(errno_ret(e)),
+            Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
         SyscallId::READ => match fs::sys_read_async(task, a0 as u32, a1, a2).await {
             Ok(n) => SyscallAction::Return(n),
             Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
-            Err(e) => SyscallAction::Return(errno_ret(e)),
+            Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
         SyscallId::READV => match fs::sys_readv_async(task, a0 as u32, a1, a2).await {
             Ok(n) => SyscallAction::Return(n),
             Err(Errno::Eintr) if should_restart_syscall(task) => SyscallAction::Continue,
-            Err(e) => SyscallAction::Return(errno_ret(e)),
+            Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
-        SyscallId::SENDFILE => SyscallAction::Return(errno_ret(Errno::Einval)),
+        SyscallId::SENDFILE => SyscallAction::Return(syscall_error_return(Errno::Einval)),
         SyscallId::READLINKAT => {
             let ret = match fs::sys_readlinkat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(n) => n,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::SYNC => {
             let ret = match fs::sys_sync_async().await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::FSYNC => {
             let ret = match fs::sys_fsync_async(task, a0 as u32).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::FDATASYNC => {
             let ret = match fs::sys_fdatasync_async(task, a0 as u32).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::OPENAT => {
             let ret = match fs::sys_openat_async(task, a0 as isize, a1, a2).await {
                 Ok(fd) => fd as usize,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::CHDIR => {
             let ret = match fs::sys_chdir_async(task, a0).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::CLOSE => {
             let ret = match fs::sys_close(task, a0 as u32) {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::FSTAT => {
             let ret = match fs::sys_fstat(task, a0 as u32, a1) {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::UTIMENSAT => {
             let ret = match fs::sys_utimensat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::LSEEK => {
             let ret = match fs::sys_lseek(task, a0 as u32, a1 as i64, a2 as u32) {
                 Ok(off) => off as usize,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -521,7 +545,13 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             );
             crate::hal::shutdown();
         },
-        SyscallId::CLONE => SyscallAction::Return(process::sys_clone(task, a0, a1, a2, a3, a4)),
+        SyscallId::CLONE => {
+            let ret = match process::sys_clone(task, a0, a1, a2, a3, a4) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
         SyscallId::EXECVE => {
             match process::sys_execve_async(task, AT_FDCWD, a0, a1, a2).await {
                 Ok((entry, sp, argc, envc)) => {
@@ -545,62 +575,62 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                     tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
                     SyscallAction::Continue
                 },
-                Err(e) => SyscallAction::Return(errno_ret(e)),
+                Err(e) => SyscallAction::Return(syscall_error_return(e)),
             }
         },
         SyscallId::WAIT4 => {
             let ret = match process::sys_wait4_async(task, a0 as isize, a1, a2).await {
                 Ok(pid) => pid as usize,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::FUTEX => {
             let ret = match sync::sys_futex_async(task, a0, a1 as u32, a2 as u32).await {
                 Ok(v) => v,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::MOUNT => {
             let ret = match fs::sys_mount_async(task, a0, a1, a2, a3, a4).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::UMOUNT2 => {
             let ret = match fs::sys_umount2_async(task, a0, a1).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::MKDIRAT => {
             let ret = match fs::sys_mkdirat_async(task, a0 as isize, a1, a2).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::UNLINKAT => {
             let ret = match fs::sys_unlinkat_async(task, a0 as isize, a1, a2 as i32).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::GETDENTS64 => {
             let ret = match fs::sys_getdents64_async(task, a0 as u32, a1, a2).await {
                 Ok(n) => n,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::SYMLINKAT => {
             let ret = match fs::sys_symlinkat_async(task, a0, a1 as isize, a2).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -608,7 +638,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             let ret =
                 match fs::sys_renameat2_async(task, a0 as isize, a1, a2 as isize, a3, a4).await {
                     Ok(()) => 0,
-                    Err(e) => errno_ret(e),
+                    Err(e) => syscall_error_return(e),
                 };
             SyscallAction::Return(ret)
         },
@@ -619,7 +649,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::FSTATAT => {
             let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(()) => 0,
-                Err(e) => errno_ret(e),
+                Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
@@ -633,7 +663,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                 a1,
                 a2
             );
-            SyscallAction::Return((-38isize) as usize)
+            SyscallAction::Return(syscall_error_return(Errno::Enosys))
         },
     };
 

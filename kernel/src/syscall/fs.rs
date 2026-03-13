@@ -56,7 +56,7 @@ fn stat_mode_from_type(file_type: u8) -> u32 {
 
 /// Resolve path, create `FileDescription`, and insert into fd table.
 pub async fn open(
-    fd_table: &crate::hal_common::SpinMutex<FdTable>,
+    fd_table: &crate::hal_common::SpinMutex<FdTable, 4>,
     path_str: &str,
     flags: OpenFlags,
     raw_flags: u32,
@@ -169,13 +169,16 @@ pub async fn open(
 }
 
 /// Remove fd from table.
-pub fn close(fd_table: &crate::hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(), Errno> {
+pub fn close(fd_table: &crate::hal_common::SpinMutex<FdTable, 4>, fd: u32) -> Result<(), Errno> {
     let _desc = fd_table.lock().remove(fd).ok_or(Errno::Ebadf)?;
     Ok(())
 }
 
 /// Get file metadata by fd.
-pub fn stat(fd_table: &crate::hal_common::SpinMutex<FdTable>, fd: u32) -> Result<(u64, u8), Errno> {
+pub fn stat(
+    fd_table: &crate::hal_common::SpinMutex<FdTable, 4>,
+    fd: u32,
+) -> Result<(u64, u8), Errno> {
     let table = fd_table.lock();
     let desc = table.get(fd).ok_or(Errno::Ebadf)?;
     match &desc.object {
@@ -196,7 +199,7 @@ pub fn stat(fd_table: &crate::hal_common::SpinMutex<FdTable>, fd: u32) -> Result
 /// This is a simplified path for vnode reads only.
 #[allow(dead_code)]
 pub async fn read(
-    fd_table: &crate::hal_common::SpinMutex<FdTable>,
+    fd_table: &crate::hal_common::SpinMutex<FdTable, 4>,
     fd: u32,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {

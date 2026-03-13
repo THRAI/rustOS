@@ -19,12 +19,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::{hal_common::PAGE_SIZE, mm::vm::VmObject};
 /// Unique vnode identifier (inode number within a filesystem).
 pub type VnodeId = u64;
-use spin::rwlock::RwLock;
+use crate::hal_common::{IrqSafeSpinLock, LeveledRwLock};
 
-use crate::hal_common::IrqSafeSpinLock;
-
-static VNODE_OBJECTS: IrqSafeSpinLock<Option<BTreeMap<VnodeId, Arc<RwLock<VmObject>>>>> =
-    IrqSafeSpinLock::new(None);
+static VNODE_OBJECTS: IrqSafeSpinLock<
+    Option<BTreeMap<VnodeId, Arc<LeveledRwLock<VmObject, 3>>>>,
+    5,
+> = IrqSafeSpinLock::new(None);
 
 const MAX_CACHED_VNODES: usize = 64;
 
@@ -32,7 +32,7 @@ struct VnodeLru {
     entries: VecDeque<VnodeId>,
 }
 
-static VNODE_LRU: IrqSafeSpinLock<Option<VnodeLru>> = IrqSafeSpinLock::new(None);
+static VNODE_LRU: IrqSafeSpinLock<Option<VnodeLru>, 5> = IrqSafeSpinLock::new(None);
 
 pub fn init_vnode_cache() {
     *VNODE_OBJECTS.lock() = Some(BTreeMap::new());
@@ -41,7 +41,7 @@ pub fn init_vnode_cache() {
     });
 }
 
-pub fn vnode_object(vnode: &dyn Vnode) -> Arc<RwLock<VmObject>> {
+pub fn vnode_object(vnode: &dyn Vnode) -> Arc<LeveledRwLock<VmObject, 3>> {
     let id = vnode.vnode_id();
     {
         let cache = VNODE_OBJECTS.lock();
@@ -75,7 +75,7 @@ pub fn vnode_object(vnode: &dyn Vnode) -> Arc<RwLock<VmObject>> {
     obj
 }
 
-pub fn vnode_object_if_exists(vnode_id: VnodeId) -> Option<Arc<RwLock<VmObject>>> {
+pub fn vnode_object_if_exists(vnode_id: VnodeId) -> Option<Arc<LeveledRwLock<VmObject, 3>>> {
     let cache = VNODE_OBJECTS.lock();
     let map = cache.as_ref()?;
     map.get(&vnode_id).cloned()

@@ -670,7 +670,7 @@ use crate::hal_common::SpinMutex;
 // in syscall/task context only. The timer IRQ handler does not iterate
 // or modify this registry. Must be upgraded to IrqSafeSpinLock if any
 // future IRQ path needs to look up tasks by PID.
-static TASK_REGISTRY: SpinMutex<Vec<Arc<Task>>> = SpinMutex::new(Vec::new());
+static TASK_REGISTRY: SpinMutex<Vec<Arc<Task>>, 0> = SpinMutex::new(Vec::new());
 
 /// Register a task in the global registry (called on task creation).
 pub fn register_task(task: &Arc<Task>) {

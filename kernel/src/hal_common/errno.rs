@@ -1,4 +1,36 @@
-/// Kernel error codes (BSD-style)
+//! Kernel error types and the canonical `KernelResult` alias.
+//!
+//! # Error Encoding Policy
+//!
+//! The kernel maintains a single Rust-level error type ([`Errno`]) and
+//! converts to/from raw integers **only** at well-defined boundaries:
+//!
+//! | Boundary | Direction | Conversion |
+//! |----------|-----------|------------|
+//! | **Syscall return** | `Errno` → `a0` register | [`Errno::as_linux_ret`] (negative POSIX value) called **only** by `syscall_error_return()` in `syscall/mod.rs` |
+//! | **lwext4 C FFI** | C `int` → `Errno` | `lwext4_err()` in `fs/ext4.rs` (accepts positive or negative C codes) |
+//! | **copy_user asm** | asm `usize` → `Errno` | `uio.rs` compares against `Errno::Efault.as_i32()` (positive 14) |
+//!
+//! ## Rules
+//!
+//! 1. **Inside the Rust kernel, all fallible functions return
+//!    [`KernelResult<T>`].** Never return a raw `usize` encoding an error.
+//! 2. **[`Errno::as_i32`] returns positive POSIX values.** This is the
+//!    canonical representation inside the kernel.
+//! 3. **[`Errno::as_linux_ret`] returns negative values** following the
+//!    Linux syscall convention (`-errno`). Only the syscall dispatcher
+//!    should call this.
+//! 4. **Domain-specific error enums** (e.g. `FaultError` in `mm/vm/`)
+//!    are fine when they stay within their subsystem and never cross into
+//!    syscall returns.
+
+/// The canonical kernel error-return type.
+///
+/// Every fallible kernel function should return this instead of
+/// `Result<T, Errno>` longhand.
+pub type KernelResult<T> = core::result::Result<T, Errno>;
+
+/// Kernel error codes (BSD-style, POSIX-numbered).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Errno {
     Enomem,
@@ -29,10 +61,11 @@ pub enum Errno {
 }
 
 impl Errno {
-    /// Convert to positive errno value (POSIX numbering).
+    /// Convert to **positive** errno value (POSIX numbering).
     ///
-    /// Callers that need the Linux negative-return convention should
-    /// negate the result themselves (e.g. `-(errno.as_i32() as isize)`).
+    /// This is the canonical representation used inside the kernel.
+    /// For the Linux syscall-return convention (negative), use
+    /// [`as_linux_ret`](Self::as_linux_ret) instead.
     pub fn as_i32(self) -> i32 {
         match self {
             Errno::Eperm => 1,
@@ -61,5 +94,16 @@ impl Errno {
             Errno::Enotempty => 39,
             Errno::Enametoolong => 36,
         }
+    }
+
+    /// Return the **negative** errno value following the Linux syscall
+    /// return convention: `-(positive_posix_code)`.
+    ///
+    /// This is the encoding placed into the user trap frame's `a0`
+    /// register.  Only the syscall dispatcher (`syscall_error_return`)
+    /// should call this method.
+    #[inline]
+    pub fn as_linux_ret(self) -> isize {
+        -(self.as_i32() as isize)
     }
 }

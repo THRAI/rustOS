@@ -16,7 +16,7 @@ const PIPE_BUF: usize = 4096;
 
 /// A unidirectional pipe with a fixed ring buffer.
 pub struct Pipe {
-    buf: SpinMutex<PipeBuffer>,
+    buf: SpinMutex<PipeBuffer, 4>,
     /// True when the read end has been closed.
     reader_closed: AtomicBool,
     /// True when the write end has been closed.

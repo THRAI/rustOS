@@ -13,11 +13,9 @@ use core::{
     sync::atomic::AtomicU32,
 };
 
-use spin::RwLock;
-
 use crate::{
     fs::Vnode,
-    hal_common::{Errno, PageNum, PhysAddr, PAGE_SIZE},
+    hal_common::{Errno, LeveledRwLock, PageNum, PhysAddr, PAGE_SIZE},
     mm::{
         get_frame_meta, pmap_copy_page, pmap_zero_page,
         vm::{ExclusiveBusyGuard, SharedBusyGuard},
@@ -167,7 +165,7 @@ pub struct VmObject {
     pub pager: Option<Arc<dyn Pager>>,
 
     /// Parent in the shadow chain (for COW).
-    backing: Option<Arc<RwLock<VmObject>>>,
+    backing: Option<Arc<LeveledRwLock<VmObject, 3>>>,
     /// How many shadow objects use this as their backing.
     shadow_count: usize,
 
@@ -275,8 +273,8 @@ impl VmObject {
     }
 
     /// Create a new anonymous VmObject (no backing).
-    pub fn new_anon(size: usize) -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(Self {
+    pub fn new_anon(size: usize) -> Arc<LeveledRwLock<Self, 3>> {
+        Arc::new(LeveledRwLock::new(Self {
             pages: BTreeMap::new(),
             backing: None,
             shadow_count: 0,
@@ -290,8 +288,8 @@ impl VmObject {
     }
 
     /// Create a new file-backed VmObject.
-    pub fn new_file(vnode: &(impl Vnode + ?Sized)) -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(Self {
+    pub fn new_file(vnode: &(impl Vnode + ?Sized)) -> Arc<LeveledRwLock<Self, 3>> {
+        Arc::new(LeveledRwLock::new(Self {
             pages: BTreeMap::new(),
             backing: None,
             shadow_count: 0,
@@ -320,8 +318,8 @@ impl VmObject {
         size_pages: usize,
         base_offset: usize,
         valid_bytes: usize,
-    ) -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(Self {
+    ) -> Arc<LeveledRwLock<Self, 3>> {
+        Arc::new(LeveledRwLock::new(Self {
             pages: BTreeMap::new(),
             backing: None,
             shadow_count: 0,
@@ -343,12 +341,15 @@ impl VmObject {
     ///
     /// The new shadow starts empty; page lookups walk through to the parent.
     /// Increments parent's `shadow_count`.
-    pub fn new_shadow(parent: Arc<RwLock<VmObject>>, size: usize) -> Arc<RwLock<Self>> {
+    pub fn new_shadow(
+        parent: Arc<LeveledRwLock<VmObject, 3>>,
+        size: usize,
+    ) -> Arc<LeveledRwLock<Self, 3>> {
         {
             let mut p = parent.write();
             p.shadow_count += 1;
         }
-        Arc::new(RwLock::new(Self {
+        Arc::new(LeveledRwLock::new(Self {
             pages: BTreeMap::new(),
             backing: Some(parent),
             shadow_count: 0,
@@ -387,10 +388,10 @@ impl VmObject {
     }
 
     /// Traverses the shadow chain to find a page or allocate one if missing.
-    /// This method is static, taking an `Arc<RwLock<VmObject>>` and dropping the read
+    /// This method is static, taking an `Arc<LeveledRwLock<VmObject, 3>>` and dropping the read
     /// lock during sleeps to avoid deadlocking the object tree.
     pub async fn grab_for_fault(
-        top_object: Arc<RwLock<Self>>,
+        top_object: Arc<LeveledRwLock<Self, 3>>,
         pindex: VObjIndex,
     ) -> Result<Arc<VmPage>, Errno> {
         loop {
@@ -466,7 +467,7 @@ impl VmObject {
 
     /// fetch a filled page. When kernel needs a page from uvm, it calls this function.
     pub async fn fetch_page_async(
-        obj_arc: Arc<RwLock<Self>>,
+        obj_arc: Arc<LeveledRwLock<Self, 3>>,
         pindex: VObjIndex,
     ) -> Result<Arc<VmPage>, Errno> {
         let page = Self::grab_for_fault(Arc::clone(&obj_arc), pindex).await?;
@@ -618,12 +619,12 @@ impl VmObject {
     }
 
     /// Get a reference to the backing object (if any).
-    pub fn backing(&self) -> Option<&Arc<RwLock<VmObject>>> {
+    pub fn backing(&self) -> Option<&Arc<LeveledRwLock<VmObject, 3>>> {
         self.backing.as_ref()
     }
 
     /// Return a clone of the backing object Arc (for shadow chain traversal).
-    pub fn backing_object(&self) -> Option<Arc<RwLock<VmObject>>> {
+    pub fn backing_object(&self) -> Option<Arc<LeveledRwLock<VmObject, 3>>> {
         self.backing.as_ref().map(Arc::clone)
     }
 
@@ -1281,7 +1282,7 @@ mod tests {
         }
 
         // Wave 1: create 100 shadows (simulates fork bomb).
-        let mut shadows: Vec<Arc<RwLock<VmObject>>> = Vec::new();
+        let mut shadows: Vec<Arc<LeveledRwLock<VmObject, 3>>> = Vec::new();
         for _ in 0..100 {
             shadows.push(VmObject::new_shadow(Arc::clone(&backing), 4096));
         }
@@ -1323,7 +1324,7 @@ mod tests {
 
         // Build a 200-deep chain: each "child" forks from previous "parent".
         // Keep all intermediate refs alive (simulates all processes running).
-        let mut all: Vec<Arc<RwLock<VmObject>>> = vec![Arc::clone(&root)];
+        let mut all: Vec<Arc<LeveledRwLock<VmObject, 3>>> = vec![Arc::clone(&root)];
         for _ in 0..200 {
             let parent = all.last().unwrap();
             let child = VmObject::new_shadow(Arc::clone(parent), 4096);
@@ -1374,7 +1375,7 @@ mod tests {
         }
 
         // 100 shadows, each does a COW write to a different page.
-        let mut shadows: Vec<Arc<RwLock<VmObject>>> = Vec::new();
+        let mut shadows: Vec<Arc<LeveledRwLock<VmObject, 3>>> = Vec::new();
         for i in 0..100 {
             let s = VmObject::new_shadow(Arc::clone(&backing), 4096 * 4);
             {

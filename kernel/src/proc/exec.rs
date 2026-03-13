@@ -218,7 +218,7 @@ pub async fn do_execve(
     // 2d. Create user stack VMA (anonymous, RW)
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
     let stack_obj = VmObject::new_anon(USER_STACK_SIZE);
-    let stack_obj_ref = Arc::clone(&stack_obj);
+    let stack_obj_ref: Arc<crate::hal_common::LeveledRwLock<VmObject, 3>> = Arc::clone(&stack_obj);
     let stack_vma = VmMapEntry::new(
         stack_bottom as u64,
         USER_STACK_TOP as u64,

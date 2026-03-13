@@ -122,7 +122,7 @@ impl ConsoleInputBuffer {
     }
 }
 
-static CONSOLE_INPUT: IrqSafeSpinLock<ConsoleInputBuffer> =
+static CONSOLE_INPUT: IrqSafeSpinLock<ConsoleInputBuffer, 9> =
     IrqSafeSpinLock::new(ConsoleInputBuffer::new());
 
 /// Called from UART IRQ handler — push one byte, wake reader if parked.

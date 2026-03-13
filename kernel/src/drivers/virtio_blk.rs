@@ -105,7 +105,7 @@ pub struct VirtioBlk {
 // driver uses polled I/O only — there is no completion IRQ handler that
 // could re-enter this lock. Must be upgraded to IrqSafeSpinLock if
 // interrupt-driven I/O is added.
-static VIRTIO_BLK: crate::hal_common::Once<crate::hal_common::SpinMutex<VirtioBlk>> =
+static VIRTIO_BLK: crate::hal_common::Once<crate::hal_common::SpinMutex<VirtioBlk, 0>> =
     crate::hal_common::Once::new();
 
 impl VirtioBlk {
@@ -411,6 +411,6 @@ pub fn init() {
 }
 
 /// Get a reference to the global VirtIO-blk driver.
-pub fn get() -> &'static crate::hal_common::SpinMutex<VirtioBlk> {
+pub fn get() -> &'static crate::hal_common::SpinMutex<VirtioBlk, 0> {
     VIRTIO_BLK.get().expect("virtio-blk not initialized")
 }

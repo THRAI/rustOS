@@ -21,7 +21,11 @@ struct AsidState {
     generation: u64,
 }
 
-static ASID_ALLOC: IrqSafeSpinLock<AsidState> = IrqSafeSpinLock::new(AsidState {
+/// Lock ordering: **Level 9** (leaf lock).  Called only from
+/// `pmap_activate` in task context.  Never nests inside or outside
+/// any other lock in the hierarchy.  IRQ-safe by type, but not
+/// accessed from IRQ handlers.
+static ASID_ALLOC: IrqSafeSpinLock<AsidState, 9> = IrqSafeSpinLock::new(AsidState {
     next: 1,
     generation: 1,
 });

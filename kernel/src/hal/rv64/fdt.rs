@@ -124,18 +124,15 @@ fn build_platform_info(dtb_ptr: usize) -> PlatformInfo {
 
     // SAFETY: dtb_ptr was passed from OpenSBI via a1 and points to a valid
     // FDT blob in reserved memory.
-    let fdt = match unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) } {
-        Ok(f) => f,
-        Err(_) => {
-            klog!(
-                boot,
-                error,
-                "FDT: invalid DTB at {:#x}, using defaults",
-                dtb_ptr
-            );
-            apply_defaults(&mut info);
-            return info;
-        },
+    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) }) else {
+        klog!(
+            boot,
+            error,
+            "FDT: invalid DTB at {:#x}, using defaults",
+            dtb_ptr
+        );
+        apply_defaults(&mut info);
+        return info;
     };
 
     klog!(

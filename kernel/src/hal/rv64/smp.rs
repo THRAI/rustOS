@@ -64,8 +64,12 @@ extern "C" fn secondary_rust_main(cpu_id: usize) -> ! {
     let hartid = fdt::cpu_to_hart(cpu_id);
     klog!(smp, info, "hart {} (cpu {}) starting", hartid, cpu_id);
 
-    // Initialize PerCpu for this CPU
-    crate::executor::init_per_cpu(cpu_id, hartid);
+    // PerCpu was already allocated by the boot hart in rust_main().
+    // Set tp first so lockdep (which reads cpu_id via tp) works for
+    // all subsequent lock acquisitions on this hart.
+    // NOTE: the boot hart's init_per_cpu() loop already allocated
+    // PerCpu for all discovered harts.  Calling init_per_cpu() again
+    // here would leak the first allocation.
     unsafe { crate::executor::set_tp(cpu_id) };
 
     // Set up trap vectors

@@ -16,7 +16,7 @@ pub const MAX_CPUS: usize = 8;
 /// Per-CPU data: run queue, timer wheel, hart/cpu identity, preemption flag, fixup pointer.
 pub struct PerCpu {
     pub run_queue: RunQueue<async_task::Runnable>,
-    pub timer_wheel: IrqSafeSpinLock<TimerWheel>,
+    pub timer_wheel: IrqSafeSpinLock<TimerWheel, 8>,
     pub hartid: usize,
     pub cpu_id: usize,
     pub needs_reschedule: AtomicBool,

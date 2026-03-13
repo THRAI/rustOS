@@ -183,7 +183,7 @@ pub fn sync_fault_handler(
 /// Classify the fault and handle it.
 fn classify_and_handle(
     vma: &VmMapEntry,
-    obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
+    obj: Arc<crate::hal_common::LeveledRwLock<crate::mm::vm::VmObject, 3>>,
     obj_page_offset: VObjIndex,
     fault_va_aligned: VirtAddr,
     access_type: PageFaultAccessType,
@@ -245,7 +245,7 @@ fn classify_and_handle(
 /// the topmost VmObject, and map it.
 fn handle_anonymous_fault(
     vma: &VmMapEntry,
-    obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
+    obj: Arc<crate::hal_common::LeveledRwLock<crate::mm::vm::VmObject, 3>>,
     obj_page_offset: VObjIndex,
     fault_va_aligned: VirtAddr,
     pmap: &mut Pmap,
@@ -295,7 +295,7 @@ fn handle_anonymous_fault(
 /// VmObject and remap with write permission.
 fn handle_cow_fault(
     vma: &VmMapEntry,
-    obj: Arc<spin::RwLock<crate::mm::vm::VmObject>>,
+    obj: Arc<crate::hal_common::LeveledRwLock<crate::mm::vm::VmObject, 3>>,
     obj_page_offset: VObjIndex,
     fault_va_aligned: VirtAddr,
     old_phys: PhysAddr,

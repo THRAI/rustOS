@@ -176,7 +176,17 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let current_perm = if map.timestamp.load(core::sync::atomic::Ordering::Relaxed) != saved_ts
         {
             match map.lookup_readonly(fault_va.as_usize() as u64) {
-                Some(vma) => vma.protection,
+                Some(vma) => {
+                    // Verify backing object identity — after execve, the same VA
+                    // may exist with a different object. Inserting into the old
+                    // object would create a dangling PTE when the old object drops.
+                    if let crate::mm::vm::BackingStore::Object { object, .. } = &vma.store {
+                        if !Arc::ptr_eq(object, &obj) {
+                            return Ok(());
+                        }
+                    }
+                    vma.protection
+                },
                 None => return Ok(()), // VMA gone — silently succeed (no mapping needed)
             }
         } else {
@@ -268,6 +278,15 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let current_perm = if map.timestamp.load(core::sync::atomic::Ordering::Relaxed) != saved_ts
         {
             if let Some(vma) = map.lookup_readonly(fault_va.as_usize() as u64) {
+                // Verify backing object identity — after execve, the same VA
+                // may exist with a different object. Inserting into the old
+                // object would create a dangling PTE when the old object drops.
+                if let crate::mm::vm::BackingStore::Object { object, .. } = &vma.store {
+                    if !Arc::ptr_eq(object, &obj) {
+                        drop(PageRef::new(frame));
+                        return Ok(());
+                    }
+                }
                 vma.protection
             } else {
                 // VMA removed during async I/O (munmap raced). Discard the page.

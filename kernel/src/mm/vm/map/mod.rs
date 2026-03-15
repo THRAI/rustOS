@@ -30,14 +30,33 @@ pub struct VmMap {
     /// Entry count
     pub nentries: usize,
 
-    /// ABA defense timestamp, incremented heavily
+    /// ABA defense timestamp, incremented at every map mutation.
+    ///
+    /// ## Async Fault Revalidation Protocol
+    ///
+    /// The async fault handler drops the VmMap lock during I/O. On re-acquire,
+    /// it compares the saved timestamp against the current value. If changed,
+    /// it re-lookups the VMA and verifies backing object identity via
+    /// `Arc::ptr_eq`. This single mechanism replaces three separate designs:
+    ///
+    /// - **VMA removal detection** (replaces `IN_TRANSITION`): timestamp
+    ///   increments on every remove_range/remove_entry_containing. Fault
+    ///   handler re-lookups VMA — if gone, discards the frame and bails.
+    ///
+    /// - **Permission change detection**: timestamp increments on
+    ///   protect_range. Fault handler uses fresh `vma.protection`.
+    ///
+    /// - **Address space replacement detection** (replaces `busy_count`):
+    ///   after execve, the entire VmMap is replaced. Fault handler
+    ///   re-acquires the (new) map, sees timestamp mismatch,
+    ///   re-lookups VMA. Object identity check (`Arc::ptr_eq`) catches the
+    ///   case where the same VA exists in the new map with a different
+    ///   backing object.
+    ///
+    /// If thread profiling later shows that wasted I/O from concurrent
+    /// munmap-during-fault is a bottleneck, a `busy_count` prevention
+    /// layer can be added on top without changing the detection logic.
     pub timestamp: AtomicU32,
-
-    /// Global map busy count to synchronize teardown vs faults/syscalls
-    pub busy_count: AtomicU32,
-
-    /// Should we wake any waiter when busy_count reaches 0
-    pub needs_busy_wakeup: core::sync::atomic::AtomicBool,
 }
 
 impl VmMap {
@@ -48,8 +67,6 @@ impl VmMap {
             size: 0,
             nentries: 0,
             timestamp: AtomicU32::new(0),
-            busy_count: AtomicU32::new(0),
-            needs_busy_wakeup: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -83,14 +100,6 @@ impl VmMap {
         self.nentries = 0;
         self.timestamp
             .fetch_add(1, core::sync::atomic::Ordering::Release);
-    }
-    /// Wait for map busy_count to drop to 0, blocking concurrent tasks
-    pub async fn wait_for_unbusy(&self) {
-        // We will implement an async wait using WaitQueue later.
-        // For now, busy polling or yield
-        while self.busy_count.load(Ordering::Acquire) > 0 {
-            // spin or yield
-        }
     }
 
     pub fn insert_entry(&mut self, entry: VmMapEntry) -> Result<(), Errno> {

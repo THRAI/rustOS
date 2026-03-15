@@ -13,8 +13,6 @@ bitflags! {
         const COW            = 1 << 0;
         const NEEDS_COPY     = 1 << 1;
         const GROWS_DOWN     = 1 << 2;
-        const IN_TRANSITION  = 1 << 3;
-        const NEEDS_WAKEUP   = 1 << 4;
         /// User heap area managed by brk(2).
         const HEAP           = 1 << 5;
     }
@@ -152,11 +150,6 @@ impl VmMapEntry {
     }
 
     pub fn is_mergeable_with(&self, next: &VmMapEntry) -> bool {
-        if self.flags.contains(EntryFlags::IN_TRANSITION)
-            || next.flags.contains(EntryFlags::IN_TRANSITION)
-        {
-            return false;
-        }
         if self.flags != next.flags
             || self.protection != next.protection
             || self.inheritance != next.inheritance
@@ -199,16 +192,5 @@ impl VmMapEntry {
 
     pub(crate) fn set_bounds(&mut self, new_start: u64, new_end: u64) {
         self.range = VirtAddrRange::from_raw(new_start as usize, new_end as usize);
-    }
-}
-
-impl Drop for VmMapEntry {
-    fn drop(&mut self) {
-        if self.flags.contains(EntryFlags::IN_TRANSITION) {
-            crate::kprintln!(
-                "WARNING: Dropping VmMapEntry that is IN_TRANSITION! start={:#x}",
-                self.start()
-            );
-        }
     }
 }

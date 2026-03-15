@@ -37,6 +37,9 @@ runtest.sh
 *.swo
 *~
 
+# Worktrees
+.worktrees/
+
 # OS files
 .DS_Store
 Thumbs.db

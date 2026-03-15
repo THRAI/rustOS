@@ -5,6 +5,8 @@
 //! - `free_raw_frame()`: returns frame via per-CPU magazine, drains to buddy when full
 //! - `frame_alloc_contiguous()`: multi-page allocation directly from buddy
 
+use core::sync::atomic::Ordering;
+
 use crate::{
     hal_common::{IrqSafeSpinLock, PhysAddr, PAGE_SIZE},
     mm::{
@@ -85,8 +87,10 @@ pub(in crate::mm) fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
             meta.phys_addr = PhysAddr::new(pfn * PAGE_SIZE);
         }
 
-        FRAME_META = meta_array.as_mut_ptr();
-        FRAME_META_LEN = max_pfn;
+        // Publish with Release ordering so secondary harts see the
+        // fully-initialised array once they observe the non-null pointer.
+        FRAME_META.store(meta_array.as_mut_ptr(), Ordering::Release);
+        FRAME_META_LEN.store(max_pfn, Ordering::Release);
     }
 
     crate::klog!(
@@ -231,13 +235,13 @@ pub(in crate::mm) async fn alloc_raw_frame(role: PageRole) -> Option<PhysAddr> {
 
 macro_rules! define_alloc_wrapper {
     ($name:ident, $name_sync:ident, $role_variant:ident) => {
-        pub(in crate::mm) async fn $name() -> Option<&'static mut VmPage> {
+        pub(in crate::mm) async fn $name() -> Option<&'static VmPage> {
             alloc_raw_frame(PageRole::$role_variant)
                 .await
                 .map(|phys| get_frame_meta(phys).unwrap())
         }
 
-        pub(in crate::mm) fn $name_sync() -> Option<&'static mut VmPage> {
+        pub(in crate::mm) fn $name_sync() -> Option<&'static VmPage> {
             alloc_raw_frame_sync(PageRole::$role_variant).map(|phys| get_frame_meta(phys).unwrap())
         }
     };
@@ -261,7 +265,7 @@ define_alloc_wrapper!(
 /// Free a VmPage usage reference previously returned by an allocator wrapper.
 ///
 /// Refcount is decremented. If it hits 0, the frame is returned to the pool.
-pub(in crate::mm) fn frame_free(frame: &'static mut VmPage) {
+pub(in crate::mm) fn frame_free(frame: &'static VmPage) {
     let addr = frame.phys_addr;
 
     // Check and decrement refcount
@@ -291,7 +295,7 @@ pub(in crate::mm) fn frame_free(frame: &'static mut VmPage) {
 }
 
 /// Alias for `frame_free` to represent dropping a usage reference.
-pub(in crate::mm) fn frame_free_usage(frame: &'static mut VmPage) {
+pub(in crate::mm) fn frame_free_usage(frame: &'static VmPage) {
     frame_free(frame);
 }
 

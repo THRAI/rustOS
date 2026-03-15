@@ -44,11 +44,11 @@ pub struct PmapStats {
 /// Per-address-space page table state.
 pub struct Pmap {
     /// Level-0 page tables (leaf PTEs)
-    l0_tables: Vec<&'static mut VmPage>,
+    l0_tables: Vec<&'static VmPage>,
     /// Level-1 page tables (megapage directories)
-    l1_directories: Vec<&'static mut VmPage>,
+    l1_directories: Vec<&'static VmPage>,
     /// Root page table physical address (page-aligned).
-    root: &'static mut VmPage,
+    root: &'static VmPage,
     /// Current ASID.
     asid: u16,
     /// ASID generation (for lazy revalidation).

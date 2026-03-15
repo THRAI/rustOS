@@ -31,7 +31,7 @@ pub(crate) fn alloc_raw_frame_sync(
 }
 
 /// Allocate an anonymous (zero-filled) frame.
-pub(crate) fn alloc_anon_sync() -> Option<&'static mut vm::VmPage> {
+pub(crate) fn alloc_anon_sync() -> Option<&'static vm::VmPage> {
     allocator::alloc_anon_sync()
 }
 
@@ -41,7 +41,7 @@ pub(crate) fn frame_alloc_contiguous(order: usize) -> Option<crate::hal_common::
 }
 
 /// Free a single frame (refcount-aware).
-pub(crate) fn frame_free(frame: &'static mut vm::VmPage) {
+pub(crate) fn frame_free(frame: &'static vm::VmPage) {
     allocator::frame_free(frame);
 }
 
@@ -56,7 +56,7 @@ pub(crate) fn frame_free_contiguous(addr: crate::hal_common::PhysAddr, order: us
 }
 
 /// Get frame metadata by physical address.
-pub(crate) fn get_frame_meta(addr: crate::hal_common::PhysAddr) -> Option<&'static mut vm::VmPage> {
+pub(crate) fn get_frame_meta(addr: crate::hal_common::PhysAddr) -> Option<&'static vm::VmPage> {
     allocator::get_frame_meta(addr)
 }
 

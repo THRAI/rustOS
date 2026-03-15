@@ -38,21 +38,28 @@ impl From<u8> for PageRole {
     }
 }
 
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
 use crate::mm::VmPage;
 
-// Global metadata array pointer and length
-// Initialized during boot
-pub(crate) static mut FRAME_META: *mut VmPage = core::ptr::null_mut();
-pub(crate) static mut FRAME_META_LEN: usize = 0;
+// Global metadata array pointer and length.
+// Initialized during boot with Release stores; read with Acquire loads
+// for SMP visibility.
+pub(crate) static FRAME_META: AtomicPtr<VmPage> = AtomicPtr::new(core::ptr::null_mut());
+pub(crate) static FRAME_META_LEN: AtomicUsize = AtomicUsize::new(0);
 
-pub fn get_frame_meta(phys: PhysAddr) -> Option<&'static mut VmPage> {
+pub fn get_frame_meta(phys: PhysAddr) -> Option<&'static VmPage> {
     let pfn = phys.page_align_down().as_usize() / PAGE_SIZE;
-    unsafe {
-        if pfn < FRAME_META_LEN {
-            Some(&mut *FRAME_META.add(pfn))
-        } else {
-            None
-        }
+    let len = FRAME_META_LEN.load(Ordering::Acquire);
+    let ptr = FRAME_META.load(Ordering::Acquire);
+    if pfn < len && !ptr.is_null() {
+        // SAFETY: `ptr` was set during boot to a valid array of `len` VmPage
+        // entries that lives for the lifetime of the kernel.  All VmPage
+        // fields are Atomic*, so a shared reference is sound even under
+        // concurrent access from multiple CPUs.
+        Some(unsafe { &*ptr.add(pfn) })
+    } else {
+        None
     }
 }
 

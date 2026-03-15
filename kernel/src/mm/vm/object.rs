@@ -8,10 +8,7 @@
 //! to handle arbitrarily deep shadow chains (500+) without stack overflow.
 
 use alloc::{collections::BTreeMap, sync::Arc};
-use core::{
-    marker::{Send, Sync},
-    sync::atomic::AtomicU32,
-};
+use core::sync::atomic::AtomicU32;
 
 use crate::{
     fs::Vnode,

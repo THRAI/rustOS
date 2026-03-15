@@ -2,6 +2,47 @@
 //!
 //! Output uses a global spinlock so SMP output is not interleaved.
 //! Input is a transparent byte pipe: UART IRQ pushes bytes, ConsoleReadFuture drains them.
+//!
+//! # Macro hierarchy
+//!
+//! | Macro | Purpose | Gated? |
+//! |-------|---------|--------|
+//! | [`kprint!`] | Raw UART write (no newline) | Never |
+//! | [`kprintln!`] | Raw UART write (with newline) | Never |
+//! | [`klog!`] | Structured kernel log | Module + level (compile-time) |
+//! | [`kerr!`] | Log + produce [`Errno`] value | Same as `klog!` |
+//! | [`kreturn!`] | Log + `return Err(errno)` | Same as `klog!` (reserved) |
+//!
+//! # Two-layer compile-time gating
+//!
+//! Applied to `klog!`, `kerr!`, and `kreturn!`:
+//!
+//! 1. **Level gate** — `log-level-{error,warn,info,debug,trace}` features.
+//!    Implication chain: trace ⊃ debug ⊃ info ⊃ warn ⊃ error.
+//!    If **no** `log-level-*` feature is set, all levels pass (default-allow).
+//! 2. **Module gate** — `log-{module}` features (e.g. `log-vm`, `log-fs`).
+//!    Only messages whose module feature is enabled pass through.
+//!
+//! **Special case:** `error` level bypasses module gating — errors are always
+//! visible regardless of which `log-*` module features are enabled.
+//!
+//! # `kerr!` discipline
+//!
+//! Every `Errno` return should be paired with a log via `kerr!`:
+//!
+//! ```ignore
+//! // GOOD — errno and log are inseparable
+//! alloc().ok_or_else(|| kerr!(vm, error, Errno::Enomem, "OOM va={:#x}", va))?;
+//!
+//! // BAD — returns errno with no log
+//! alloc().ok_or(Errno::Enomem)?;
+//! ```
+//!
+//! # Boot milestone prints
+//!
+//! Boot milestones that are `agent-test` expectations (e.g. `"delegate running"`,
+//! `"exec OK"`) must use unconditional `kprintln!`, not `klog!`.  The default
+//! build uses `LEVEL=error`, which compiles away `info`/`debug`/`trace` messages.
 
 use core::{
     fmt::{self, Write},
@@ -193,6 +234,46 @@ macro_rules! klog {
         if cfg!(any(not(any(feature="log-level-error", feature="log-level-warn", feature="log-level-info", feature="log-level-debug", feature="log-level-trace")), feature="log-level-trace")) {
             $crate::_klog_if!($mod, "TRACE: ", $($arg)*)
         }
+    };
+}
+
+/// Produce an [`Errno`] while logging at the failure site.
+///
+/// Evaluates to the `$errno` expression after emitting a [`klog!`] message.
+/// Use in any error-producing position: `?`, `return Err()`, `FaultResult::Error()`, etc.
+///
+/// ```ignore
+/// // With ?
+/// frame.ok_or_else(|| kerr!(vm, error, Errno::Enomem, "OOM va={:#x}", va))?;
+///
+/// // With return
+/// return Err(kerr!(fs, warn, Errno::Enoent, "file not found"));
+///
+/// // With FaultResult
+/// return FaultResult::Error(kerr!(vm, error, Errno::Enomem, "pmap_enter failed"));
+/// ```
+#[macro_export]
+macro_rules! kerr {
+    ($mod:ident, $level:ident, $errno:expr, $($arg:tt)*) => {{
+        $crate::klog!($mod, $level, $($arg)*);
+        $errno
+    }};
+}
+
+/// Sugar for `return Err(kerr!(...))` — log and early-return from a
+/// [`KernelResult`] function in one statement.
+///
+/// Reserved for future function-level tracing. Not yet used in production paths.
+///
+/// ```ignore
+/// kreturn!(vm, error, Errno::Enomem, "alloc failed va={:#x}", va);
+/// // expands to: return Err(kerr!(vm, error, Errno::Enomem, "alloc failed va={:#x}", va));
+/// ```
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! kreturn {
+    ($mod:ident, $level:ident, $errno:expr, $($arg:tt)*) => {
+        return Err($crate::kerr!($mod, $level, $errno, $($arg)*))
     };
 }
 

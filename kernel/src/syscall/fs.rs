@@ -1225,8 +1225,7 @@ pub async fn sys_read_async(
                             VirtAddr::new(user_buf + total),
                             PageFaultAccessType::WRITE,
                         )
-                        .await
-                        .map_err(|_| Errno::Efault)?;
+                        .await?;
                     },
                     Err(e) => return Err(e),
                 }
@@ -1378,8 +1377,7 @@ pub async fn sys_write_async(
                             VirtAddr::new(user_buf + total),
                             PageFaultAccessType::READ,
                         )
-                        .await
-                        .map_err(|_| Errno::Efault)?;
+                        .await?;
                         continue;
                     },
                     Err(e) => {

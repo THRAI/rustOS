@@ -20,9 +20,9 @@
 //! 3. **[`Errno::as_linux_ret`] returns negative values** following the
 //!    Linux syscall convention (`-errno`). Only the syscall dispatcher
 //!    should call this.
-//! 4. **Domain-specific error enums** (e.g. `FaultError` in `mm/vm/`)
-//!    are fine when they stay within their subsystem and never cross into
-//!    syscall returns.
+//! 4. **Domain-specific error enums** are acceptable when they stay
+//!    within their subsystem and never cross into syscall returns.
+//!    Prefer [`kerr!`] to pair every `Errno` with a log at the failure site.
 
 /// The canonical kernel error-return type.
 ///

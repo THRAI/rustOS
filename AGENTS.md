@@ -260,8 +260,9 @@ policy is documented in `kernel/src/hal_common/errno.rs`.
 2. `Errno::as_i32()` returns **positive** POSIX values (e.g. `EINVAL = 22`).
 3. `Errno::as_linux_ret()` returns **negative** Linux-convention values
    (e.g. `-22`).  Only the syscall dispatcher should call this.
-4. Domain-specific error enums (e.g. `FaultError` in `mm/vm/`) are fine
-   when they stay within their subsystem and never cross into syscall returns.
+4. Domain-specific error enums are acceptable when they stay within their
+   subsystem and never cross into syscall returns.  Prefer `kerr!` to pair
+   every `Errno` with a log at the failure site (see Logging Discipline).
 
 **Boundaries (the only places raw integer errnos appear):**
 
@@ -273,6 +274,67 @@ policy is documented in `kernel/src/hal_common/errno.rs`.
 
 **Exception:** `sys_brk` returns a plain `usize` (current break address on
 failure, never a negative errno) because the Linux brk ABI requires this.
+
+### Logging Discipline
+
+All kernel logging goes through macros defined in `kernel/src/console.rs`.
+There are no log sinks, ring buffers, structured logging, or runtime filters
+beyond `feature_flags::SyscallTrace`. Output is UART only.
+
+**Macro hierarchy:**
+
+| Macro | Purpose | Gated? |
+|-------|---------|--------|
+| `kprint!(fmt, args...)` | Raw UART write (no newline) | Never |
+| `kprintln!(fmt, args...)` | Raw UART write (with newline) | Never |
+| `klog!(mod, level, fmt, args...)` | Structured kernel log | Module + level (compile-time) |
+| `kerr!(mod, level, errno, fmt, args...)` | Log + produce `Errno` value | Same as `klog!` |
+| `kreturn!(mod, level, errno, fmt, args...)` | Log + `return Err(errno)` | Same as `klog!` (unused, reserved) |
+
+**Two-layer compile-time gating (applied to `klog!`, `kerr!`, `kreturn!`):**
+
+1. **Level gate** — controlled by `log-level-{error,warn,info,debug,trace}` features.
+   Levels form an implication chain: `trace` implies `debug` implies `info` implies
+   `warn` implies `error`.  If **no** `log-level-*` feature is set, all levels pass
+   (default-allow).  Once any level feature is set, only enabled levels pass.
+2. **Module gate** — controlled by `log-{module}` features (e.g. `log-vm`, `log-fs`).
+   Only messages whose module feature is enabled pass through.
+
+**Special case — `error` level bypasses module gating.** `klog!(vm, error, ...)`
+prints even when `log-vm` is disabled.  This is intentional: errors must always
+be visible.
+
+**`kerr!` discipline — every `Errno` must be paired with a log:**
+
+When returning an `Errno` from a failure site, use `kerr!` instead of
+constructing the errno directly.  This enforces that every error production
+is logged at the point where diagnostic context (addresses, pids, etc.) is
+available.
+
+```rust
+// GOOD — errno and log are inseparable
+let frame = alloc_frame().ok_or_else(|| {
+    kerr!(vm, error, Errno::Enomem, "OOM: frame alloc pid={} va={:#x}", pid, va)
+})?;
+
+// BAD — returns errno with no log, diagnostic info is lost
+let frame = alloc_frame().ok_or(Errno::Enomem)?;
+```
+
+**Level assignment conventions:**
+
+| Severity | Level | Module-gated? | When to use |
+|----------|-------|---------------|-------------|
+| Operational failure | `error` | No (always visible) | OOM, I/O failure, invariant violation |
+| Suspicious but recoverable | `warn` | Yes | Unexpected state, races, fallback paths |
+| Normal flow (verbose) | `debug` | Yes | Permission checks, VMA lookups, expected faults |
+| Hot-path tracing | `trace` | Yes | Per-fault flow, per-syscall entry/exit |
+
+**Boot milestone prints use `kprintln!`, not `klog!`:**
+
+Boot milestones that are `agent-test` expectations (e.g. `"delegate running"`,
+`"exec OK"`) must use unconditional `kprintln!`.  Using `klog!` would make them
+invisible when `LEVEL=error` (the default build), causing test failures.
 
 ## CI/CD
 

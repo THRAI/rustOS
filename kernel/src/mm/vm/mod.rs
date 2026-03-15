@@ -19,7 +19,7 @@ pub mod page_daemon;
 
 pub mod test_integration;
 
-pub use fault::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType};
+pub use fault::{sync_fault_handler, FaultResult, PageFaultAccessType};
 pub use fault_async::resolve_user_fault;
 pub use map::{
     entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry},

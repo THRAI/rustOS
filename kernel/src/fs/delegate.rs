@@ -385,7 +385,8 @@ async fn delegate_task() {
         klog!(fs, error, "ext4 mount failed: {:?}", e);
         return;
     }
-    klog!(fs, info, "ext4 mounted, delegate running");
+    kprintln!("delegate running");
+    klog!(fs, debug, "ext4 mounted, delegate loop entered");
 
     // SAFETY: We are the single delegate task — the only holder of this token.
     let mut tok = unsafe { DelegateToken::new() };

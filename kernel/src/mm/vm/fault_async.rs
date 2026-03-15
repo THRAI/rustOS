@@ -6,10 +6,10 @@
 use alloc::sync::Arc;
 
 use crate::{
-    hal_common::{VirtAddr, PAGE_SIZE},
+    hal_common::{Errno, VirtAddr, PAGE_SIZE},
     mm::{
         pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page,
-        vm::{sync_fault_handler, FaultError, FaultResult, PageFaultAccessType},
+        vm::{sync_fault_handler, FaultResult, PageFaultAccessType},
         PteFlags,
     },
     proc::Task,
@@ -20,7 +20,7 @@ pub async fn resolve_user_fault(
     task: &Arc<Task>,
     fault_va: VirtAddr,
     access_type: PageFaultAccessType,
-) -> Result<(), FaultError> {
+) -> Result<(), Errno> {
     // Fast path: if the page is already mapped with sufficient permissions, skip.
     // Must check PTE flags — not just presence — to avoid bypassing COW faults.
     {
@@ -129,13 +129,20 @@ pub async fn resolve_user_fault(
 ///
 /// Also handles anonymous VMAs (stack, heap, BSS) that reach this path:
 /// allocate a zeroed frame and map it directly.
-async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(), FaultError> {
+async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(), Errno> {
     // 1. Look up VMA and compute object offsets
     let (obj, obj_offset, _vma_start, vma_perm) = {
         let mut map = task.vm_map.lock();
-        let vma = map
-            .lookup(fault_va.as_usize() as u64)
-            .ok_or(FaultError::NotMapped)?;
+        let vma = map.lookup(fault_va.as_usize() as u64).ok_or_else(|| {
+            kerr!(
+                vm,
+                warn,
+                Errno::Efault,
+                "async fault NOT_MAPPED pid={} va={:#x}",
+                task.pid,
+                fault_va.as_usize()
+            )
+        })?;
 
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
@@ -146,7 +153,16 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
                     crate::mm::vm::VObjIndex::from_bytes_floor(obj_offset_bytes as usize);
                 (object.clone(), obj_offset, vma.start(), vma.protection)
             },
-            _ => return Err(FaultError::NotMapped),
+            _ => {
+                return Err(kerr!(
+                    vm,
+                    warn,
+                    Errno::Efault,
+                    "async fault INVALID_BACKING pid={} va={:#x}",
+                    task.pid,
+                    fault_va.as_usize()
+                ))
+            },
         }
     };
 
@@ -157,7 +173,14 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
         if pmap_extract(&pmap, fault_va_aligned).is_none() {
             if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
-                return Err(FaultError::OutOfMemory);
+                return Err(kerr!(
+                    vm,
+                    error,
+                    Errno::Enomem,
+                    "async fault OOM: pmap_enter cached pid={} va={:#x}",
+                    task.pid,
+                    fault_va.as_usize()
+                ));
             }
         }
         return Ok(());
@@ -185,7 +208,16 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         Some(p) if !p.is_anon() => crate::mm::PageRole::FileCache,
         _ => crate::mm::PageRole::UserAnon,
     };
-    let frame = crate::mm::alloc_raw_frame_sync(role).ok_or(FaultError::OutOfMemory)?;
+    let frame = crate::mm::alloc_raw_frame_sync(role).ok_or_else(|| {
+        kerr!(
+            vm,
+            error,
+            Errno::Enomem,
+            "async fault OOM: frame alloc pid={} va={:#x}",
+            task.pid,
+            fault_va.as_usize()
+        )
+    })?;
     pmap_zero_page(frame);
 
     // 4. Fetch data via pager
@@ -193,7 +225,15 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let file_offset = obj_offset.to_bytes();
         if pager_ref.page_in(file_offset, frame).await.is_err() {
             crate::mm::free_raw_frame(frame);
-            return Err(FaultError::IoError);
+            return Err(kerr!(
+                vm,
+                error,
+                Errno::Eio,
+                "async fault IO_ERROR: page_in pid={} va={:#x} offset={:#x}",
+                task.pid,
+                fault_va.as_usize(),
+                file_offset
+            ));
         }
     }
 
@@ -212,7 +252,14 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             crate::mm::free_raw_frame(frame);
             if pmap_extract(&pmap, fault_va_aligned).is_none() {
                 if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
-                    return Err(FaultError::OutOfMemory);
+                    return Err(kerr!(
+                        vm,
+                        error,
+                        Errno::Enomem,
+                        "async fault OOM: pmap_enter race pid={} va={:#x}",
+                        task.pid,
+                        fault_va.as_usize()
+                    ));
                 }
             }
             return Ok(());
@@ -227,7 +274,14 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
         if pmap_extract(&pmap, fault_va_aligned).is_none() {
             if pmap_enter(&mut pmap, fault_va_aligned, frame, vma_perm, false).is_err() {
-                return Err(FaultError::OutOfMemory);
+                return Err(kerr!(
+                    vm,
+                    error,
+                    Errno::Enomem,
+                    "async fault OOM: pmap_enter final pid={} va={:#x}",
+                    task.pid,
+                    fault_va.as_usize()
+                ));
             }
         }
     }

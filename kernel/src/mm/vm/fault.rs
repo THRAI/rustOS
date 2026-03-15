@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 
 use super::super::pmap::{self, Pmap};
 use crate::{
-    hal_common::{PhysAddr, VirtAddr, PAGE_SIZE},
+    hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE},
     mm::vm::{BackingStore, MapPerm, VObjIndex, VmMap, VmMapEntry},
 };
 
@@ -27,20 +27,7 @@ pub enum FaultResult {
     /// File-backed page needs async I/O (Phase 3).
     NeedsAsyncIO,
     /// Fault could not be resolved.
-    Error(FaultError),
-}
-
-/// Reasons a page fault cannot be resolved synchronously.
-#[derive(Debug)]
-pub enum FaultError {
-    /// No physical memory available.
-    OutOfMemory,
-    /// Access type not permitted by VMA protection.
-    InvalidAccess,
-    /// No VMA covers the faulting address.
-    NotMapped,
-    /// I/O error during async page fetch.
-    IoError,
+    Error(Errno),
 }
 
 /// Access type that caused the page fault.
@@ -115,8 +102,13 @@ pub fn sync_fault_handler(
     // 1. Find the VMA containing the faulting address.
     let vma = match vm_map.lookup_readonly(fault_va.0 as u64) {
         None => {
-            crate::klog!(vm, debug, "fault NOT_MAPPED va={:#x}", fault_va.0);
-            return FaultResult::Error(FaultError::NotMapped);
+            return FaultResult::Error(kerr!(
+                vm,
+                debug,
+                Errno::Efault,
+                "fault NOT_MAPPED va={:#x}",
+                fault_va.0
+            ));
         },
         Some(vma) => vma,
     };
@@ -134,17 +126,17 @@ pub fn sync_fault_handler(
 
     // 2. Check permissions.
     if !access_type.permitted_by(vma.protection) {
-        crate::klog!(
+        return FaultResult::Error(kerr!(
             vm,
             debug,
+            Errno::Efault,
             "fault PERM_DENIED va={:#x} prot={:?} w={} r={} x={}",
             fault_va.0,
             vma.protection,
             access_type.write,
             access_type.read,
             access_type.execute
-        );
-        return FaultResult::Error(FaultError::InvalidAccess);
+        ));
     }
 
     // 3. Compute object offset.
@@ -157,7 +149,13 @@ pub fn sync_fault_handler(
             )
         },
         BackingStore::SubMap { .. } | BackingStore::Guard => {
-            return FaultResult::Error(FaultError::InvalidAccess);
+            return FaultResult::Error(kerr!(
+                vm,
+                debug,
+                Errno::Efault,
+                "fault INVALID_BACKING va={:#x} store=SubMap|Guard",
+                fault_va_aligned.0
+            ));
         },
     };
 
@@ -217,24 +215,24 @@ fn classify_and_handle(
         },
         Some(phys) => {
             if pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.protection, false).is_err() {
-                crate::klog!(
+                return FaultResult::Error(kerr!(
                     vm,
                     error,
+                    Errno::Enomem,
                     "fault map FAILED va={:#x} pa={:#x} perm={:?}",
                     fault_va_aligned.0,
                     phys.as_usize(),
                     vma.protection
-                );
-                return FaultResult::Error(FaultError::OutOfMemory);
+                ));
             }
             if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
-                crate::klog!(
+                return FaultResult::Error(kerr!(
                     vm,
                     error,
+                    Errno::Efault,
                     "fault map VERIFY_FAILED va={:#x} (pte missing right after enter)",
                     fault_va_aligned.0
-                );
-                return FaultResult::Error(FaultError::NotMapped);
+                ));
             }
             FaultResult::Resolved
         },
@@ -255,7 +253,15 @@ fn handle_anonymous_fault(
         let mut obj_write = obj.write();
         match obj_write.fault_allocate_anon(obj_page_offset) {
             Ok(phys) => phys,
-            Err(_) => return FaultResult::Error(FaultError::OutOfMemory),
+            Err(_) => {
+                return FaultResult::Error(kerr!(
+                    vm,
+                    error,
+                    Errno::Enomem,
+                    "anon fault OOM: alloc failed va={:#x}",
+                    fault_va_aligned.0
+                ))
+            },
         }
     };
 
@@ -269,23 +275,23 @@ fn handle_anonymous_fault(
     )
     .is_err()
     {
-        crate::klog!(
+        return FaultResult::Error(kerr!(
             vm,
             error,
+            Errno::Enomem,
             "anon fault map FAILED va={:#x} pa={:#x}",
             fault_va_aligned.0,
             new_frame_phys.as_usize()
-        );
-        return FaultResult::Error(FaultError::OutOfMemory);
+        ));
     }
     if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
-        crate::klog!(
+        return FaultResult::Error(kerr!(
             vm,
             error,
+            Errno::Efault,
             "anon fault VERIFY_FAILED va={:#x}",
             fault_va_aligned.0
-        );
-        return FaultResult::Error(FaultError::NotMapped);
+        ));
     }
 
     FaultResult::Resolved
@@ -344,7 +350,15 @@ fn handle_cow_fault(
         let mut obj_write = obj.write();
         match obj_write.fault_cow(obj_page_offset, old_phys) {
             Ok(phys) => phys,
-            Err(_) => return FaultResult::Error(FaultError::OutOfMemory),
+            Err(_) => {
+                return FaultResult::Error(kerr!(
+                    vm,
+                    error,
+                    Errno::Enomem,
+                    "cow fault OOM: copy alloc failed va={:#x}",
+                    fault_va_aligned.0
+                ))
+            },
         }
     };
 
@@ -357,23 +371,23 @@ fn handle_cow_fault(
     )
     .is_err()
     {
-        crate::klog!(
+        return FaultResult::Error(kerr!(
             vm,
             error,
+            Errno::Enomem,
             "cow fault map FAILED va={:#x} pa={:#x}",
             fault_va_aligned.0,
             new_frame_phys.as_usize()
-        );
-        return FaultResult::Error(FaultError::OutOfMemory);
+        ));
     }
     if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
-        crate::klog!(
+        return FaultResult::Error(kerr!(
             vm,
             error,
+            Errno::Efault,
             "cow fault VERIFY_FAILED va={:#x}",
             fault_va_aligned.0
-        );
-        return FaultResult::Error(FaultError::NotMapped);
+        ));
     }
 
     FaultResult::Resolved
@@ -427,7 +441,7 @@ mod tests {
             VirtAddr::new(0x5000),
             PageFaultAccessType::READ,
         );
-        assert!(matches!(result, FaultResult::Error(FaultError::NotMapped)));
+        assert!(matches!(result, FaultResult::Error(Errno::Efault)));
     }
 
     #[test]
@@ -442,7 +456,7 @@ mod tests {
         );
         assert!(
             matches!(result, FaultResult::Resolved)
-                || matches!(result, FaultResult::Error(FaultError::InvalidAccess))
+                || matches!(result, FaultResult::Error(Errno::Efault))
         );
     }
 
@@ -456,10 +470,7 @@ mod tests {
             VirtAddr::new(0x1000),
             PageFaultAccessType::EXECUTE,
         );
-        assert!(matches!(
-            result,
-            FaultResult::Error(FaultError::InvalidAccess)
-        ));
+        assert!(matches!(result, FaultResult::Error(Errno::Efault)));
     }
 
     #[test]

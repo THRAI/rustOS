@@ -841,6 +841,10 @@ pub async fn sys_faccessat_async(
 ///
 /// Under UBC, dirty pages in the truncated range are flushed before the
 /// on-disk truncation so data written but not yet synced is not lost.
+///
+/// NOTE: Concurrent write + truncate on the same fd from different threads
+/// is undefined behavior per POSIX (requires flock for synchronization).
+/// This implementation does not serialize them.
 pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<(), Errno> {
     use crate::fs::FileObject;
     let desc = {
@@ -882,10 +886,16 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
         }
     }
 
-    fs::fs_truncate(&path, len).await?;
+    // Update VmObject size + truncate cached pages BEFORE on-disk truncation.
+    // This prevents the page daemon from racing: if it flushes between
+    // fs_truncate and set_size, it would use the old (larger) size to compute
+    // write lengths, potentially re-extending the file on disk.
     if let FileObject::Vnode(v) = &desc.object {
         v.set_size(len);
     }
+
+    fs::fs_truncate(&path, len).await?;
+
     let cur = desc.offset.load(Ordering::Relaxed);
     if cur > len {
         desc.offset.store(len, Ordering::Relaxed);
@@ -1387,17 +1397,15 @@ pub async fn sys_write_async(
                     },
                 }
 
-                // 3. Mark page dirty
+                // 3. Mark page dirty and update dirty page counter
                 if let Some(meta) = crate::mm::get_frame_meta(page) {
                     meta.set_dirty();
+                    crate::mm::vm::page_daemon::maybe_wake_page_daemon();
                 }
             }
 
             // 4. Bump object dirty generation (AtomicU32 — read lock is fine)
             obj.read().bump_generation();
-
-            // 5. Maybe wake page daemon
-            crate::mm::vm::page_daemon::maybe_wake_page_daemon();
 
             // 6. Extend file size if needed
             let new_end = offset + total as u64;

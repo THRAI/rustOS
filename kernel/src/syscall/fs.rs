@@ -1113,6 +1113,8 @@ pub fn absolutize_path(task: &Arc<Task>, dirfd: isize, raw_path: &str) -> Result
     Err(Errno::Einval)
 }
 
+const CONSOLE_AGGREGATE_LIMIT: usize = 128;
+
 /// sys_read_async: read from file descriptor.
 pub async fn sys_read_async(
     task: &Arc<Task>,
@@ -1174,6 +1176,7 @@ pub async fn sys_read_async(
             }
         },
         ReadSource::DevConsole => {
+            task.flush_all_console_write_buffers();
             ConsoleReadFuture {
                 task,
                 user_buf,
@@ -1296,8 +1299,12 @@ pub async fn sys_write_async(
             if rc != 0 {
                 return Err(Errno::Efault);
             }
-            // Use atomic batch write to prevent output interleaving
-            crate::console::putchars(&kbuf);
+            if len > CONSOLE_AGGREGATE_LIMIT {
+                task.flush_console_write_buffer(fd);
+                crate::console::putchars(&kbuf);
+            } else {
+                task.append_console_write_bytes(fd, &kbuf);
+            }
             Ok(len)
         },
         WriteTarget::PipeWrite(pipe) => {
@@ -1472,6 +1479,8 @@ pub async fn sys_writev_async(
     iov_ptr: usize,
     iovcnt: usize,
 ) -> Result<usize, Errno> {
+    use crate::fs::{DeviceKind, FileObject};
+
     if iovcnt == 0 {
         return Ok(0);
     }
@@ -1487,6 +1496,44 @@ pub async fn sys_writev_async(
     };
     if rc != 0 {
         return Err(Errno::Efault);
+    }
+
+    let is_console = {
+        let tab = task.fd_table.lock();
+        let Some(desc) = tab.get(fd) else {
+            return Err(Errno::Ebadf);
+        };
+        matches!(&desc.object, FileObject::Device(DeviceKind::ConsoleWrite))
+    };
+
+    if is_console {
+        let mut combined = alloc::vec::Vec::new();
+        for i in 0..iovcnt {
+            let off = i * 16;
+            let base = usize::from_le_bytes(iov_buf[off..off + 8].try_into().unwrap());
+            let len = usize::from_le_bytes(iov_buf[off + 8..off + 16].try_into().unwrap());
+            if len == 0 {
+                continue;
+            }
+            fault_in_user_buffer(task, base, len, PageFaultAccessType::READ).await;
+            let start = combined.len();
+            combined.resize(start + len, 0);
+            let rc = unsafe {
+                crate::hal::copy_user_chunk(combined[start..].as_mut_ptr(), base as *const u8, len)
+            };
+            if rc != 0 {
+                if start > 0 {
+                    combined.truncate(start);
+                    break;
+                }
+                return Err(Errno::Efault);
+            }
+        }
+        if combined.is_empty() {
+            return Ok(0);
+        }
+        task.append_console_write_bytes(fd, &combined);
+        return Ok(combined.len());
     }
 
     let mut total = 0usize;

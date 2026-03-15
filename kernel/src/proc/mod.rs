@@ -12,10 +12,6 @@ pub mod user_copy;
 
 pub use elf::{parse_elf_first_page, ExecContext};
 pub use exec::do_execve;
-#[cfg(feature = "exec-legacy")]
-pub use exec::exec;
-#[cfg(feature = "exec-legacy")]
-pub use exec::exec_with_args;
 pub use exit_wait::{WaitChildFuture, WaitStatus};
 pub use fork::fork;
 pub use pid::alloc_pid;

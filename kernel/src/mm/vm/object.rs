@@ -292,23 +292,20 @@ impl VmObject {
         }))
     }
 
-    /// Create a new file-backed VmObject.
+    /// Create a new file-backed VmObject for the entire file.
+    ///
+    /// Convenience wrapper around `new_vnode_region` with `base_offset=0`
+    /// and `valid_bytes=usize::MAX` (all bytes file-backed).
     pub fn new_file(vnode: &(impl Vnode + ?Sized)) -> Arc<LeveledRwLock<Self, 3>> {
-        Arc::new(LeveledRwLock::new(Self {
-            pages: BTreeMap::new(),
-            backing: None,
-            shadow_count: 0,
-            pager: Some(Arc::new(VnodePager {
-                vnode_id: vnode.vnode_id() as usize,
-                path: vnode.path().into(),
-                base_offset: 0,
-                valid_bytes: usize::MAX,
-            })),
-            size: vnode.size() as usize,
-            resident_count: 0,
-            generation: AtomicU32::new(0),
-            clean_generation: AtomicU32::new(0),
-        }))
+        let size_bytes = vnode.size() as usize;
+        let size_pages = (size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        Self::new_vnode_region(
+            vnode.vnode_id() as usize,
+            vnode.path(),
+            size_pages,
+            0,
+            usize::MAX,
+        )
     }
 
     /// Create a file-backed VmObject for a specific region of a vnode.

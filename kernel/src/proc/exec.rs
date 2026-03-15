@@ -161,7 +161,7 @@ pub async fn do_execve(
             merged_backed_bytes,
         );
 
-        let vma = VmMapEntry::new_file_backed(
+        let vma = VmMapEntry::new(
             va_start as u64,
             va_end as u64,
             BackingStore::Object {

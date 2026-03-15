@@ -165,6 +165,23 @@ impl Pager for VnodePager {
 /// `shadow_count` tracks how many shadow objects point to this object as
 /// their backing. Used by `collapse()` to determine when page migration
 /// is safe (BSD vm_object_collapse semantics).
+///
+/// ## Lock Ordering Invariant (D-4)
+///
+/// VmObject locks (level 3) must only be acquired in **child → parent**
+/// (upward) direction along the shadow chain.  `collapse()` holds `self`
+/// (child) and acquires `self.backing` (parent) — always upward.
+///
+/// The reverse direction (parent → child) is **structurally impossible**:
+/// VmObject has a `backing` pointer to its parent but no `children` field.
+/// There is no API that traverses parent → child.  This makes the
+/// invariant self-enforcing — you cannot violate it without first adding
+/// a downward pointer, which would require updating this documentation
+/// and the lock ordering analysis.
+///
+/// If a downward pointer is ever needed (e.g. for page daemon scanning),
+/// it must use a separate lock level or `try_write()` to avoid AB/BA
+/// deadlock between concurrent collapse operations on the same chain.
 pub struct VmObject {
     /// Pages owned directly by this object, keyed by page offset (in pages).
     /// Each `PageRef` is a move-only handle: dropping it decrements the
@@ -632,6 +649,12 @@ impl VmObject {
     ///
     /// Precondition: caller holds `&mut self` (write lock on this object),
     /// and `backing.shadow_count == 1` (we are the sole shadow).
+    ///
+    /// **Lock ordering (D-4):** This method acquires `backing.write()` while
+    /// holding `self.write()` — two level-3 locks. This is safe because the
+    /// direction is always child → parent (upward). The reverse is
+    /// structurally impossible (no `children` field exists). See the
+    /// VmObject struct doc comment for the full invariant.
     ///
     /// Pages in backing that conflict with pages already in self (COW copies)
     /// are freed. Non-conflicting pages are renamed (moved) into self.

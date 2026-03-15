@@ -307,13 +307,18 @@ fn handle_cow_fault(
     old_phys: PhysAddr,
     pmap: &mut Pmap,
 ) -> FaultResult {
-    // Fast path: page is in THIS object (not a backing ancestor) AND we are
-    // the sole reference. Safe to just flip the PTE to writable.
-    // Without the has_page check, a page found via shadow chain walk (in a
-    // parent object) would be incorrectly promoted to writable, corrupting
-    // the parent's view.
-    let is_local_page = obj.read().has_page(obj_page_offset);
-    if is_local_page && Arc::strong_count(&obj) == 1 {
+    // Fast path: page is in THIS object (not a backing ancestor) AND no
+    // child shadow exists. Safe to just flip the PTE to writable — no other
+    // process can reach this page through the shadow chain.
+    //
+    // VmMap read lock is held by our caller (resolve_user_fault), which
+    // excludes fork (fork takes VmMap write lock). This guarantees
+    // shadow_count cannot increase between our check and pmap_protect.
+    let can_promote = {
+        let obj_read = obj.read();
+        obj_read.has_page(obj_page_offset) && obj_read.shadow_count() == 0
+    };
+    if can_promote {
         pmap::pmap_protect(
             pmap,
             fault_va_aligned,

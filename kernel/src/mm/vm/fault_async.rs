@@ -9,7 +9,7 @@ use crate::{
     hal_common::{Errno, VirtAddr, PAGE_SIZE},
     mm::{
         pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page,
-        vm::{sync_fault_handler, FaultResult, PageFaultAccessType},
+        vm::{page_ref::PageRef, sync_fault_handler, FaultResult, PageFaultAccessType},
         PteFlags,
     },
     proc::Task,
@@ -224,7 +224,8 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     if let Some(pager_ref) = pager.as_ref() {
         let file_offset = obj_offset.to_bytes();
         if pager_ref.page_in(file_offset, frame).await.is_err() {
-            crate::mm::free_raw_frame(frame);
+            // Decrement FRAME_META refs and free via PageRef drop.
+            drop(PageRef::new(frame));
             return Err(kerr!(
                 vm,
                 error,
@@ -249,7 +250,8 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
         // Check if another thread raced us
         if let Some(existing_pa) = obj_write.lookup_page(obj_offset) {
-            crate::mm::free_raw_frame(frame);
+            // Another thread already inserted a page. Free ours via PageRef drop.
+            drop(PageRef::new(frame));
             if pmap_extract(&pmap, fault_va_aligned).is_none() {
                 if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
                     return Err(kerr!(
@@ -265,12 +267,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
             return Ok(());
         }
 
-        let vm_page_meta = crate::mm::get_frame_meta(frame).unwrap();
-        obj_write.insert_page(obj_offset, {
-            let mut page = crate::mm::VmPage::new();
-            page.phys_addr = vm_page_meta.phys();
-            Arc::new(page)
-        });
+        obj_write.insert_page(obj_offset, PageRef::new(frame));
 
         if pmap_extract(&pmap, fault_va_aligned).is_none() {
             if pmap_enter(&mut pmap, fault_va_aligned, frame, vma_perm, false).is_err() {

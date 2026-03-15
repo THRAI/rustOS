@@ -436,9 +436,7 @@ impl VmMap {
                                 (new_heap_end - heap_start) / crate::hal_common::PAGE_SIZE;
                             let mut obj = object.write();
                             obj.set_size(new_heap_end - heap_start);
-                            let dropped =
-                                obj.truncate_pages(crate::mm::vm::VObjIndex::new(new_pages));
-                            drop(dropped);
+                            obj.truncate_pages(crate::mm::vm::VObjIndex::new(new_pages));
                         }
                         unmap_range = Some((new_heap_end, old_brk_aligned));
                     }

@@ -740,9 +740,7 @@ mod legacy {
                 );
                 if let BackingStore::Object { object, .. } = &vma.store {
                     let mut obj = object.write();
-                    let mut page = crate::mm::vm::VmPage::new();
-                    page.phys_addr = phys;
-                    obj.insert_page(page_idx, Arc::new(page));
+                    obj.insert_page(page_idx, crate::mm::vm::PageRef::new(phys));
                 }
             } else {
                 return Err(Errno::Enomem);

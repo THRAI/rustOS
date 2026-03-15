@@ -205,8 +205,8 @@ async fn flush_object(obj_arc: &Arc<LeveledRwLock<VmObject, 3>>) {
     {
         let obj = obj_arc.read();
         for (idx, _) in &dirty_pages {
-            if let Some(page) = obj.get_page(*idx) {
-                page.clear_dirty_all();
+            if let Some(pr) = obj.get_page(*idx) {
+                pr.meta().clear_dirty_all();
             }
         }
         DIRTY_PAGE_COUNT.fetch_sub(dirty_pages.len() as u32, Ordering::Relaxed);

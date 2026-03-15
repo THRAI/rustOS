@@ -346,11 +346,9 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                                 let obj_idx =
                                     (*offset + (va as u64 - child_vma.start)) / PAGE_SIZE as u64;
                                 let mut child_obj = object.write();
-                                let mut page = crate::mm::vm::VmPage::new();
-                                page.phys_addr = new_phys;
                                 child_obj.insert_page(
                                     crate::hal_common::PageNum::new(obj_idx as usize),
-                                    Arc::new(page),
+                                    crate::mm::vm::PageRef::new(new_phys),
                                 );
                                 let _ = pmap::pmap_enter(
                                     &mut child_pmap,

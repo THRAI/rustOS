@@ -259,9 +259,8 @@ pub async fn read(
         let page = VmObject::fetch_page_async(Arc::clone(&obj), page_idx)
             .await
             .map_err(|_| Errno::Eio)?;
-        let src_slice = unsafe {
-            core::slice::from_raw_parts(page.phys_addr.as_usize() as *const u8, PAGE_SIZE)
-        };
+        let src_slice =
+            unsafe { core::slice::from_raw_parts(page.as_usize() as *const u8, PAGE_SIZE) };
         buf[total..total + chunk].copy_from_slice(&src_slice[in_page..in_page + chunk]);
         total += chunk;
     }
@@ -860,8 +859,8 @@ pub async fn sys_ftruncate_async(task: &Arc<Task>, fd: u32, len: u64) -> Result<
             let trunc_idx = crate::mm::vm::VObjIndex::from_bytes_ceil(len as usize);
             let dirty: alloc::vec::Vec<_> = obj
                 .pages_with_index()
-                .filter(|(idx, page)| *idx >= trunc_idx && page.is_dirty())
-                .map(|(idx, page)| (idx, page.phys_addr))
+                .filter(|(idx, pr)| *idx >= trunc_idx && pr.meta().is_dirty())
+                .map(|(idx, pr)| (idx, pr.phys()))
                 .collect();
             (dirty, obj.pager.as_ref().map(alloc::sync::Arc::clone))
         };
@@ -1211,7 +1210,7 @@ pub async fn sys_read_async(
                     .await
                     .map_err(|_| Errno::Eio)?;
 
-                let kern = (page.phys_addr.as_usize() + offset_in_page) as *mut u8;
+                let kern = (page.as_usize() + offset_in_page) as *mut u8;
                 let user = (user_buf + total) as *mut u8;
 
                 match uiomove(kern, user, chunk, UioDir::CopyOut) {
@@ -1363,7 +1362,7 @@ pub async fn sys_write_async(
                     .map_err(|_| Errno::Eio)?;
 
                 // 2. Copy user data INTO the VmObject page
-                let kern = (page.phys_addr.as_usize() + offset_in_page) as *mut u8;
+                let kern = (page.as_usize() + offset_in_page) as *mut u8;
                 let user = (user_buf + total) as *mut u8;
 
                 match uiomove(kern, user, chunk, UioDir::CopyIn) {
@@ -1389,7 +1388,9 @@ pub async fn sys_write_async(
                 }
 
                 // 3. Mark page dirty
-                page.set_dirty();
+                if let Some(meta) = crate::mm::get_frame_meta(page) {
+                    meta.set_dirty();
+                }
             }
 
             // 4. Bump object dirty generation (AtomicU32 — read lock is fine)

@@ -12,8 +12,8 @@ use super::super::{
 use crate::{
     hal_common::{VirtAddr, PAGE_SIZE},
     mm::vm::{
-        sync_fault_handler, BackingStore, FaultResult, PageFaultAccessType, VmMap, VmMapEntry,
-        VmObject, VmPage,
+        page_ref::PageRef, sync_fault_handler, BackingStore, FaultResult, PageFaultAccessType,
+        VmMap, VmMapEntry, VmObject,
     },
 };
 
@@ -74,9 +74,10 @@ pub fn test_cow_fault() {
     let parent_obj = VmObject::new_anon(PAGE_SIZE);
     {
         let mut w = parent_obj.write();
-        let mut p = VmPage::new();
-        p.phys_addr = parent_page.phys();
-        w.insert_page(crate::mm::vm::VObjIndex::new(0), Arc::new(p));
+        w.insert_page(
+            crate::mm::vm::VObjIndex::new(0),
+            PageRef::new(parent_page.phys()),
+        );
     }
 
     // Create shadow (simulates fork)
@@ -192,9 +193,7 @@ pub fn test_fork_bomb_stress() {
             core::ptr::write_bytes(ptr, (i + 1) as u8, PAGE_SIZE);
         }
         let mut w = root.write();
-        let mut p = VmPage::new();
-        p.phys_addr = page.phys();
-        w.insert_page(crate::mm::vm::VObjIndex::new(i), Arc::new(p));
+        w.insert_page(crate::mm::vm::VObjIndex::new(i), PageRef::new(page.phys()));
     }
 
     // Phase 1: Fork bomb -- create N children, each shadowing root.

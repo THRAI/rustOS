@@ -4,7 +4,10 @@ use core::ptr::NonNull;
 use bitflags::bitflags;
 
 use super::VmMap;
-use crate::{hal_common::VirtAddrRange, mm::vm::VmObject};
+use crate::{
+    hal_common::{LeveledRwLock, VirtAddr, VirtAddrRange},
+    mm::vm::{VObjIndex, VmObject},
+};
 
 bitflags! {
     /// VmMapEntry state flags for COW and concurrency control.
@@ -182,5 +185,24 @@ impl VmMapEntry {
 
     pub(crate) fn set_bounds(&mut self, new_start: u64, new_end: u64) {
         self.range = VirtAddrRange::from_raw(new_start as usize, new_end as usize);
+    }
+
+    /// Extract the backing VmObject and compute the page offset for a fault VA.
+    ///
+    /// Returns `None` for non-Object backing stores (SubMap, Guard).
+    pub fn extract_object_offset(
+        &self,
+        fault_va_aligned: VirtAddr,
+    ) -> Option<(Arc<LeveledRwLock<VmObject, 3>>, VObjIndex)> {
+        match &self.store {
+            BackingStore::Object { object, offset } => {
+                let offset_bytes = offset + (fault_va_aligned.as_usize() as u64 - self.start());
+                Some((
+                    object.clone(),
+                    VObjIndex::from_bytes_floor(offset_bytes as usize),
+                ))
+            },
+            _ => None,
+        }
     }
 }

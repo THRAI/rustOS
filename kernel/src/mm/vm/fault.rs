@@ -140,15 +140,9 @@ pub fn sync_fault_handler(
     }
 
     // 3. Compute object offset.
-    let (obj, obj_page_offset) = match &vma.store {
-        BackingStore::Object { object, offset } => {
-            let offset_bytes = offset + ((fault_va_aligned.0 as u64) - vma.start());
-            (
-                object.clone(),
-                VObjIndex::from_bytes_floor(offset_bytes as usize),
-            )
-        },
-        BackingStore::SubMap { .. } | BackingStore::Guard => {
+    let (obj, obj_page_offset) = match vma.extract_object_offset(fault_va_aligned) {
+        Some(pair) => pair,
+        None => {
             return FaultResult::Error(kerr!(
                 vm,
                 debug,

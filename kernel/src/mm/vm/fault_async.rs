@@ -6,14 +6,50 @@
 use alloc::sync::Arc;
 
 use crate::{
-    hal_common::{Errno, VirtAddr, PAGE_SIZE},
+    hal_common::{Errno, LeveledRwLock, VirtAddr, PAGE_SIZE},
     mm::{
         pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page,
-        vm::{page_ref::PageRef, sync_fault_handler, FaultResult, PageFaultAccessType},
+        vm::{
+            page_ref::PageRef, sync_fault_handler, BackingStore, FaultResult, MapPerm,
+            PageFaultAccessType, VmMap, VmObject,
+        },
         PteFlags,
     },
     proc::Task,
 };
+
+/// Re-check VMA after timestamp mismatch. Returns fresh permissions if
+/// the VMA still exists and backs the same object (`Arc::ptr_eq`), or
+/// `None` to bail (VMA gone or object identity changed).
+///
+/// This is the unified TOCTOU revalidation — it replaces the old
+/// `IN_TRANSITION` and `busy_count` mechanisms with a single detection
+/// protocol. See `VmMap.timestamp` doc comment for the full design.
+///
+/// If thread profiling later shows wasted I/O from concurrent
+/// munmap-during-fault, a `busy_count` prevention layer can be added
+/// on top without changing this function.
+fn revalidate_vma(
+    map: &VmMap,
+    fault_va: usize,
+    obj: &Arc<LeveledRwLock<VmObject, 3>>,
+    saved_ts: u32,
+    vma_perm: MapPerm,
+) -> Option<MapPerm> {
+    if map.timestamp.load(core::sync::atomic::Ordering::Relaxed) == saved_ts {
+        return Some(vma_perm);
+    }
+    let vma = map.lookup_readonly(fault_va as u64)?;
+    // Verify backing object identity — after execve, the same VA may
+    // exist with a different object. Inserting into the old object would
+    // create a dangling PTE when the old object drops.
+    if let BackingStore::Object { object, .. } = &vma.store {
+        if !Arc::ptr_eq(object, obj) {
+            return None;
+        }
+    }
+    Some(vma.protection)
+}
 
 /// Unified fault resolution: sync path first, async fallback for file-backed.
 pub async fn resolve_user_fault(
@@ -149,48 +185,27 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
-        match &vma.store {
-            crate::mm::vm::BackingStore::Object { object, offset } => {
-                let obj_offset_bytes = offset + (fault_va_aligned.as_usize() as u64 - vma.start());
-                let obj_offset =
-                    crate::mm::vm::VObjIndex::from_bytes_floor(obj_offset_bytes as usize);
-                (object.clone(), obj_offset, vma.start(), vma.protection, ts)
-            },
-            _ => {
-                return Err(kerr!(
+        let (object, obj_offset) =
+            vma.extract_object_offset(fault_va_aligned).ok_or_else(|| {
+                kerr!(
                     vm,
                     warn,
                     Errno::Efault,
                     "async fault INVALID_BACKING pid={} va={:#x}",
                     task.pid,
                     fault_va.as_usize()
-                ))
-            },
-        }
+                )
+            })?;
+        (object, obj_offset, vma.start(), vma.protection, ts)
     };
 
     // 2. Check if the page is already in the object (walks shadow chain)
     if let Some(existing_pa) = obj.read().lookup_page(obj_offset) {
         let map = task.vm_map.read();
-        // Revalidate if map mutated since our lookup
-        let current_perm = if map.timestamp.load(core::sync::atomic::Ordering::Relaxed) != saved_ts
+        let current_perm = match revalidate_vma(&map, fault_va.as_usize(), &obj, saved_ts, vma_perm)
         {
-            match map.lookup_readonly(fault_va.as_usize() as u64) {
-                Some(vma) => {
-                    // Verify backing object identity — after execve, the same VA
-                    // may exist with a different object. Inserting into the old
-                    // object would create a dangling PTE when the old object drops.
-                    if let crate::mm::vm::BackingStore::Object { object, .. } = &vma.store {
-                        if !Arc::ptr_eq(object, &obj) {
-                            return Ok(());
-                        }
-                    }
-                    vma.protection
-                },
-                None => return Ok(()), // VMA gone — silently succeed (no mapping needed)
-            }
-        } else {
-            vma_perm
+            Some(perm) => perm,
+            None => return Ok(()), // VMA gone or object identity changed
         };
         let mut pmap = map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
@@ -274,27 +289,14 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let map = task.vm_map.read();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
-        // Revalidate: did the map change during async I/O?
-        let current_perm = if map.timestamp.load(core::sync::atomic::Ordering::Relaxed) != saved_ts
+        let current_perm = if let Some(perm) =
+            revalidate_vma(&map, fault_va.as_usize(), &obj, saved_ts, vma_perm)
         {
-            if let Some(vma) = map.lookup_readonly(fault_va.as_usize() as u64) {
-                // Verify backing object identity — after execve, the same VA
-                // may exist with a different object. Inserting into the old
-                // object would create a dangling PTE when the old object drops.
-                if let crate::mm::vm::BackingStore::Object { object, .. } = &vma.store {
-                    if !Arc::ptr_eq(object, &obj) {
-                        drop(PageRef::new(frame));
-                        return Ok(());
-                    }
-                }
-                vma.protection
-            } else {
-                // VMA removed during async I/O (munmap raced). Discard the page.
-                drop(PageRef::new(frame));
-                return Ok(());
-            }
+            perm
         } else {
-            vma_perm
+            // VMA gone or object identity changed — discard frame.
+            drop(PageRef::new(frame));
+            return Ok(());
         };
 
         let mut pmap = map.pmap_lock();

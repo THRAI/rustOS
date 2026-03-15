@@ -259,11 +259,13 @@ pub fn sys_mprotect(
 pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
     use core::sync::atomic::Ordering;
 
-    let current_brk = task.brk.load(Ordering::Relaxed);
     if addr == 0 {
-        return current_brk;
+        return task.brk.load(Ordering::Relaxed);
     }
 
+    let mut vm = task.vm_map.lock();
+    // Read brk under lock to prevent race with concurrent sys_brk
+    let current_brk = task.brk.load(Ordering::Relaxed);
     let requested_brk = addr;
     let new_brk_aligned = (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let old_brk_aligned = (current_brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -272,8 +274,6 @@ pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
         task.brk.store(requested_brk, Ordering::Relaxed);
         return requested_brk;
     }
-
-    let mut vm = task.vm_map.lock();
 
     if new_brk_aligned > old_brk_aligned {
         if vm.grow_heap(old_brk_aligned, new_brk_aligned).is_err() {

@@ -136,6 +136,13 @@ impl VmPage {
                 // Mark WANTED so the holder knows to call wake_all
                 self.busy_state
                     .fetch_or(BusyState::WANTED.bits(), Ordering::Relaxed);
+                // Recheck after registering waker to prevent lost wakeup:
+                // if the holder released between our caller's check and here,
+                // the wake_all() already fired before our waker was registered.
+                if !self.is_exclusive_busied() {
+                    remove_waker(token, cx.waker());
+                    return Poll::Ready(());
+                }
                 yielded = true;
                 Poll::Pending
             } else {

@@ -455,6 +455,14 @@ pub fn pmap_activate(pmap: &mut Pmap) {
 pub fn pmap_deactivate(pmap: &mut Pmap) {
     let cpu_id = crate::executor::current().cpu_id;
     pmap.active[cpu_id].store(false, Ordering::Release);
+    // SAFETY: Flush TLB entries for this ASID to prevent stale translations
+    // when another hart reuses this pmap or its pages are freed.
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma zero, {asid}",
+            asid = in(reg) pmap.asid as usize,
+        );
+    }
 }
 
 /// Handle A/D bit fault: set A and/or D bits on the PTE.
@@ -465,27 +473,46 @@ pub fn pmap_fault(pmap: &Pmap, va: VirtAddr, write: bool) -> bool {
             Some(p) => p,
             None => return false,
         };
-        let raw = pte_ptr.read_volatile();
-        if !pte_is_valid(raw) || !pte_is_leaf(raw) {
-            return false;
-        }
 
-        let mut flags = pte_flags(raw);
-        let mut changed = false;
+        loop {
+            let raw = pte_ptr.read_volatile();
+            if !pte_is_valid(raw) || !pte_is_leaf(raw) {
+                return false;
+            }
 
-        if !flags.contains(PteFlags::A) {
-            flags |= PteFlags::A;
-            changed = true;
-        }
-        if write && !flags.contains(PteFlags::D) {
-            flags |= PteFlags::D;
-            changed = true;
-        }
+            let mut flags = pte_flags(raw);
+            let mut changed = false;
 
-        if changed {
-            pte_ptr.write_volatile(encode_pte(pte_pa(raw), flags));
+            if !flags.contains(PteFlags::A) {
+                flags |= PteFlags::A;
+                changed = true;
+            }
+            if write && !flags.contains(PteFlags::D) {
+                flags |= PteFlags::D;
+                changed = true;
+            }
+
+            if !changed {
+                return false; // already set
+            }
+
+            let new_raw = encode_pte(pte_pa(raw), flags);
+            // SAFETY: pte_ptr is u64-aligned (page table entry). Reinterpret as AtomicU64
+            // for lock-free CAS. Two harts setting same bits is benign.
+            let pte_atomic = &*(pte_ptr as *const u64 as *const core::sync::atomic::AtomicU64);
+            if pte_atomic
+                .compare_exchange_weak(
+                    raw,
+                    new_raw,
+                    core::sync::atomic::Ordering::Release,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+            // PTE changed under us — re-read
         }
-        changed
     }
 }
 

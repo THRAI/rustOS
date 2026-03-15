@@ -277,6 +277,12 @@ pub(in crate::mm) fn frame_free(frame: &'static mut VmPage) {
             return;
         }
 
+        // Ensure all prior writes from other CPUs (that decremented refs) are
+        // visible before we return this frame to the buddy pool.  This is the
+        // standard Arc::drop pattern — matches page.rs teardown_from_object
+        // (line 320) and unwire_mapped (line 351).
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
         // Refcount reached 0, transition to Free and proceed with true physical free
         meta.set_role(PageRole::Free);
     }

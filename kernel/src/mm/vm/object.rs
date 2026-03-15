@@ -812,6 +812,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use super::*;
+    use crate::mm::vm::page_ref::PageRef;
 
     #[test]
     fn new_object_is_empty() {
@@ -827,12 +828,8 @@ mod tests {
         let obj = VmObject::new(8192);
         {
             let mut w = obj.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0x1000);
-            w.insert_page(0, Arc::new(p1));
-            let mut p2 = VmPage::new();
-            p2.phys_addr = PhysAddr::new(0x2000);
-            w.insert_page(1, Arc::new(p2));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0x1000)));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0x2000)));
         }
         let r = obj.read();
         assert_eq!(r.resident_count(), 2);
@@ -846,9 +843,7 @@ mod tests {
         let parent = VmObject::new(4096);
         {
             let mut w = parent.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0x1000);
-            w.insert_page(0, Arc::new(p1));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0x1000)));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
         // Shadow walks backing chain, so parent's page is visible
@@ -869,23 +864,17 @@ mod tests {
         let grandparent = VmObject::new(4096);
         {
             let mut w = grandparent.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xA000);
-            w.insert_page(0, Arc::new(p1));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xA000)));
         }
         let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
         {
             let mut w = parent.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xB000);
-            w.insert_page(1, Arc::new(p1));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0xB000)));
         }
         let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
         {
             let mut w = child.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xC000);
-            w.insert_page(2, Arc::new(p1));
+            w.insert_page(2, PageRef::new(PhysAddr::new(0xC000)));
         }
         // Child has page 2, parent has page 1, grandparent has page 0
         let r = child.read();
@@ -903,10 +892,7 @@ mod tests {
             let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
             {
                 let mut w = shadow.write();
-                w.insert_page(
-                    i as u64,
-                    Arc::new(VmPage::new_test(PhysAddr::new((i + 1) * 0x1000))),
-                );
+                w.insert_page(i as u64, PageRef::new(PhysAddr::new((i + 1) * 0x1000)));
             }
             current = shadow;
         }
@@ -932,12 +918,8 @@ mod tests {
         let obj = VmObject::new(4096);
         {
             let mut w = obj.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0x1000);
-            w.insert_page(0, Arc::new(p1));
-            let mut p2 = VmPage::new();
-            p2.phys_addr = PhysAddr::new(0x2000);
-            w.insert_page(0, Arc::new(p2));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0x1000)));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0x2000)));
         }
         let r = obj.read();
         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0x2000));
@@ -955,21 +937,15 @@ mod tests {
 
     #[test]
     fn shadow_override_hides_parent_page() {
-        // Insert page at offset 0 in parent, then insert different page
-        // at same offset in shadow — shadow's page should win.
         let parent = VmObject::new(4096);
         {
             let mut w = parent.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xAAAA_0000);
-            w.insert_page(0, Arc::new(p1));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xAAAA_0000)));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&parent), 4096);
         {
             let mut w = shadow.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xBBBB_0000);
-            w.insert_page(0, Arc::new(p1));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xBBBB_0000)));
         }
         let r = shadow.read();
         assert_eq!(r.lookup_page(0).unwrap(), PhysAddr::new(0xBBBB_0000));
@@ -998,11 +974,7 @@ mod tests {
             let shadow = VmObject::new_shadow(Arc::clone(&current), 4096);
             {
                 let mut w = shadow.write();
-                w.insert_page(i as u64, {
-                    let mut p = VmPage::new();
-                    p.phys_addr = PhysAddr::new((i + 1) * 0x1000);
-                    Arc::new(p)
-                });
+                w.insert_page(i as u64, PageRef::new(PhysAddr::new((i + 1) * 0x1000)));
             }
             current = shadow;
         }
@@ -1014,12 +986,8 @@ mod tests {
         let obj = VmObject::new(4096);
         {
             let mut w = obj.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0x1000);
-            w.insert_page(0, Arc::new(p1));
-            let mut p2 = VmPage::new();
-            p2.phys_addr = PhysAddr::new(0x2000);
-            w.insert_page(1, Arc::new(p2));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0x1000)));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0x2000)));
             assert_eq!(w.resident_count(), 2);
             let removed = w.remove_page(0);
             assert!(removed.is_some());
@@ -1070,16 +1038,11 @@ mod tests {
 
     #[test]
     fn collapse_migrates_pages_from_backing() {
-        // Backing has pages at offsets 0 and 1.
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xA000);
-            w.insert_page(0, Arc::new(p1));
-            let mut p2 = VmPage::new();
-            p2.phys_addr = PhysAddr::new(0xB000);
-            w.insert_page(1, Arc::new(p2));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xA000)));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0xB000)));
         }
         // Single shadow — shadow_count == 1, collapse is safe.
         let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
@@ -1102,20 +1065,14 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xDEAD);
-            w.insert_page(0, Arc::new(p1));
-            let mut p2 = VmPage::new();
-            p2.phys_addr = PhysAddr::new(0xBEEF);
-            w.insert_page(1, Arc::new(p2));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xDEAD)));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0xBEEF)));
         }
         let shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
         // Shadow has its own page at offset 0 (COW copy).
         {
             let mut w = shadow.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xC000);
-            w.insert_page(0, Arc::new(p1));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xC000)));
         }
 
         // Collapse: offset 0 conflicts (shadow wins), offset 1 migrates.
@@ -1138,9 +1095,7 @@ mod tests {
         let backing = VmObject::new(4096);
         {
             let mut w = backing.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0x1000);
-            w.insert_page(0, Arc::new(p1));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0x1000)));
         }
         let s1 = VmObject::new_shadow(Arc::clone(&backing), 4096);
         let _s2 = VmObject::new_shadow(Arc::clone(&backing), 4096);
@@ -1162,16 +1117,12 @@ mod tests {
         let grandparent = VmObject::new(4096);
         {
             let mut w = grandparent.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xAAAA);
-            w.insert_page(0, Arc::new(p1));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xAAAA)));
         }
         let parent = VmObject::new_shadow(Arc::clone(&grandparent), 4096);
         {
             let mut w = parent.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xBBBB);
-            w.insert_page(1, Arc::new(p1));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0xBBBB)));
         }
         let child = VmObject::new_shadow(Arc::clone(&parent), 4096);
         assert_eq!(parent.read().shadow_count(), 1);
@@ -1211,12 +1162,8 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xF0F0);
-            w.insert_page(0, Arc::new(p1));
-            let mut p2 = VmPage::new();
-            p2.phys_addr = PhysAddr::new(0xF1F1);
-            w.insert_page(1, Arc::new(p2));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xF0F0)));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0xF1F1)));
         }
 
         // Step 2: fork — parent shadow and child shadow.
@@ -1257,12 +1204,8 @@ mod tests {
         let backing = VmObject::new(8192);
         {
             let mut w = backing.write();
-            let mut p1 = VmPage::new();
-            p1.phys_addr = PhysAddr::new(0xF0F0);
-            w.insert_page(0, Arc::new(p1));
-            let mut p2 = VmPage::new();
-            p2.phys_addr = PhysAddr::new(0xF1F1);
-            w.insert_page(1, Arc::new(p2));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xF0F0)));
+            w.insert_page(1, PageRef::new(PhysAddr::new(0xF1F1)));
         }
 
         let parent_shadow = VmObject::new_shadow(Arc::clone(&backing), 8192);
@@ -1271,9 +1214,7 @@ mod tests {
         // Child already did a COW copy of offset 0.
         {
             let mut w = child_shadow.write();
-            let mut p = VmPage::new();
-            p.phys_addr = PhysAddr::new(0xC09F);
-            w.insert_page(0, Arc::new(p));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xC09F)));
         }
 
         // Parent exits.
@@ -1304,9 +1245,7 @@ mod tests {
         let backing = VmObject::new(4096);
         {
             let mut w = backing.write();
-            let mut p = VmPage::new();
-            p.phys_addr = PhysAddr::new(0xBA5E);
-            w.insert_page(0, Arc::new(p));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0xBA5E)));
         }
 
         // Wave 1: create 100 shadows (simulates fork bomb).
@@ -1345,9 +1284,7 @@ mod tests {
         let root = VmObject::new(4096);
         {
             let mut w = root.write();
-            let mut p = VmPage::new();
-            p.phys_addr = PhysAddr::new(0x2007);
-            w.insert_page(0, Arc::new(p));
+            w.insert_page(0, PageRef::new(PhysAddr::new(0x2007)));
         }
 
         // Build a 200-deep chain: each "child" forks from previous "parent".
@@ -1394,11 +1331,10 @@ mod tests {
         {
             let mut w = backing.write();
             for i in 0..4u64 {
-                w.insert_page(i, {
-                    let mut p = crate::mm::VmPage::new();
-                    p.phys_addr = hal_common::PhysAddr::new((0xA000 + i as usize) * 0x1000);
-                    Arc::new(p)
-                });
+                w.insert_page(
+                    i,
+                    PageRef::new(PhysAddr::new((0xA000 + i as usize) * 0x1000)),
+                );
             }
         }
 
@@ -1410,11 +1346,10 @@ mod tests {
                 let mut w = s.write();
                 // Each shadow writes to offset (i % 4).
                 let offset = (i % 4) as u64;
-                w.insert_page(offset, {
-                    let mut p = crate::mm::VmPage::new();
-                    p.phys_addr = hal_common::PhysAddr::new(0xC000_0000 + i * 0x1000);
-                    Arc::new(p)
-                });
+                w.insert_page(
+                    offset,
+                    PageRef::new(PhysAddr::new(0xC000_0000 + i * 0x1000)),
+                );
             }
             shadows.push(s);
         }

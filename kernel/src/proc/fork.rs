@@ -41,9 +41,9 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     // other thread can reference it yet, but this should be unified to
     // always acquire parent before child for robustness.
     {
-        let parent_vm = parent.vm_map.lock();
+        let parent_vm = parent.vm_map.read();
         let parent_pmap = parent_vm.pmap_lock();
-        let child_vm = child.vm_map.lock();
+        let child_vm = child.vm_map.read();
         let mut child_pmap = child_vm.pmap_lock();
         if let Some(sigcode_pa) = pmap_extract(&parent_pmap, VirtAddr::new(SIGCODE_VA)) {
             let prot = crate::map_perm!(R, X, U);
@@ -122,8 +122,8 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
 /// the first write triggers a COW fault.
 #[cfg(not(feature = "fork-hardcopy"))]
 fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
-    let mut parent_vm = parent.vm_map.lock();
-    let mut child_vm = child.vm_map.lock();
+    let mut parent_vm = parent.vm_map.write();
+    let mut child_vm = child.vm_map.write();
 
     // Build fork plans first, then apply parent mutations and child inserts.
     let mut parent_rebinds: Vec<(u64, BackingStore)> = Vec::new();
@@ -275,8 +275,8 @@ fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
 /// Should be used as a fallback when COW errors.
 #[cfg(feature = "fork-hardcopy")]
 fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
-    let parent_vm = parent.vm_map.lock();
-    let mut child_vm = child.vm_map.lock();
+    let parent_vm = parent.vm_map.read();
+    let mut child_vm = child.vm_map.write();
 
     // Copy VmMapEntries
     for vma in parent_vm.iter() {

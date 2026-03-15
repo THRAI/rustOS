@@ -934,7 +934,7 @@ fn test_mmap_munmap() {
         crate::map_perm!(R, W, U),
     );
     {
-        let mut vm = task.vm_map.lock();
+        let mut vm = task.vm_map.write();
         match vm.insert_entry(vma) {
             Ok(()) => {},
             Err(_) => {

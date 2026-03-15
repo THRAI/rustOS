@@ -180,7 +180,7 @@ pub fn sys_mmap(
         build_file_backed_object(&vnode, map_private)
     };
 
-    let mut vm = task.vm_map.lock();
+    let mut vm = task.vm_map.write();
     let base = resolve_mmap_base(&mut vm, addr, aligned_len, map_fixed)?;
 
     let vma = VmMapEntry::new(
@@ -213,7 +213,7 @@ pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> KernelResult<usi
     if aligned_start >= aligned_end {
         return Err(Errno::Einval);
     }
-    let mut vm = task.vm_map.lock();
+    let mut vm = task.vm_map.write();
     let removed = vm.remove_range(aligned_start, aligned_end);
     free_removed_frames(removed);
     Ok(0)
@@ -243,7 +243,7 @@ pub fn sys_mprotect(
 
     let perm = prot_bits_to_perm(prot_bits)?;
 
-    let mut vm = task.vm_map.lock();
+    let mut vm = task.vm_map.write();
     match vm.protect_range(start, end, perm) {
         Ok(()) => Ok(0),
         Err(e) => Err(e),
@@ -263,7 +263,7 @@ pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
         return task.brk.load(Ordering::Relaxed);
     }
 
-    let mut vm = task.vm_map.lock();
+    let mut vm = task.vm_map.write();
     // Read brk under lock to prevent race with concurrent sys_brk
     let current_brk = task.brk.load(Ordering::Relaxed);
     let requested_brk = addr;

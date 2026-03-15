@@ -354,7 +354,7 @@ pub async fn do_execve(
 
     // 3a. Swap old VmMap with new VmMap
     {
-        let mut vm = task.vm_map.lock();
+        let mut vm = task.vm_map.write();
         // Replace the old VmMap; old one drops automatically
         let old_vm = core::mem::replace(&mut *vm, new_vm);
         // Destroy old pmap: switch satp first, then free old page tables
@@ -570,7 +570,7 @@ mod legacy {
         }
 
         {
-            let mut vm = task.vm_map.lock();
+            let mut vm = task.vm_map.write();
             vm.clear();
             let mut pmap = vm.pmap_lock();
             let mut old_pmap = core::mem::replace(&mut *pmap, pmap_create());
@@ -609,7 +609,7 @@ mod legacy {
                 prot,
             );
 
-            let mut vm = task.vm_map.lock();
+            let mut vm = task.vm_map.write();
             if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
                 return Err(map_insert_err(e));
             }
@@ -670,7 +670,7 @@ mod legacy {
             crate::map_perm!(R, W, U),
         );
         {
-            let mut vm = task.vm_map.lock();
+            let mut vm = task.vm_map.write();
             if vm.insert_entry(stack_vma).is_err() {
                 return Err(Errno::Enomem);
             }
@@ -679,7 +679,7 @@ mod legacy {
         task.fd_table.lock().strip_cloexec();
 
         {
-            let vm_map = task.vm_map.lock();
+            let vm_map = task.vm_map.read();
             let mut pmap = vm_map.pmap_lock();
             crate::proc::map_sigcode_page(&mut pmap);
         }
@@ -729,7 +729,7 @@ mod legacy {
         pmap_zero_page(phys);
 
         {
-            let mut vm = task.vm_map.lock();
+            let mut vm = task.vm_map.write();
             if let Some(vma) = vm.lookup_mut(stack_page_va as u64) {
                 let page_idx = crate::hal_common::VirtPageNum(
                     (stack_page_va - vma.start as usize) / PAGE_SIZE
@@ -1025,7 +1025,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 
     // 3. Reset vm_map and pmap: tear down old address space
     {
-        let mut vm = task.vm_map.lock();
+        let mut vm = task.vm_map.write();
         vm.clear();
         let mut pmap = vm.pmap_lock();
         // Create the new pmap BEFORE destroying the old one.  We must switch
@@ -1099,7 +1099,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
             prot,
         );
 
-        let mut vm = task.vm_map.lock();
+        let mut vm = task.vm_map.write();
         if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
             return Err(map_insert_err(e));
         }
@@ -1163,7 +1163,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         crate::map_perm!(R, W, U),
     );
     {
-        let mut vm = task.vm_map.lock();
+        let mut vm = task.vm_map.write();
         if vm.insert_entry(stack_vma).is_err() {
             return Err(Errno::Enomem);
         }
@@ -1174,7 +1174,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
 
     // 7. Map sigcode trampoline page for signal delivery
     {
-        let vm_map = task.vm_map.lock();
+        let vm_map = task.vm_map.read();
         let mut pmap = vm_map.pmap_lock();
         map_sigcode_page(&mut pmap);
     }
@@ -1285,7 +1285,7 @@ async fn load_interp(task: &Arc<Task>, interp_path: &str, offset: usize) -> Resu
             prot,
         );
 
-        let mut vm = task.vm_map.lock();
+        let mut vm = task.vm_map.write();
         if let Err(e) = insert_or_merge_file_vma(&mut vm, vma) {
             return Err(map_insert_err(e));
         }

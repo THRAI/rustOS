@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use crate::proc::{alloc_pid, SignalState};
 use crate::{
     fs::FdTable,
-    hal_common::{PhysAddr, SpinMutex as Mutex, TrapFrame, PAGE_SIZE},
+    hal_common::{LeveledRwLock, PhysAddr, SpinMutex as Mutex, TrapFrame, PAGE_SIZE},
     mm::{frame_alloc_contiguous, frame_free_contiguous, pmap, vm::VmMap},
 };
 
@@ -63,13 +63,11 @@ pub struct Task {
     pub children: Mutex<Vec<Arc<Task>>, 4>,
     /// Virtual address space.
     ///
-    // SAFETY: SpinMutex (no IRQ disable). Currently safe because the timer
-    // IRQ handler only sets `needs_reschedule` and advances TimerWheel —
-    // it never accesses any VmMap. Page faults are synchronous traps on the
-    // faulting hart, not asynchronous IRQs, so they cannot preempt a holder
-    // on the same hart. Must be upgraded to IrqSafeSpinLock if any future
-    // IRQ/IPI path needs to inspect or modify a VmMap.
-    pub vm_map: Mutex<VmMap, 1>,
+    /// Uses `LeveledRwLock` so page faults (read lock) can proceed
+    /// concurrently with each other, while mutations like mmap/munmap
+    /// take the write lock for exclusive access. The pmap inside VmMap
+    /// is independently locked (SpinMutex level 2).
+    pub vm_map: LeveledRwLock<VmMap, 1>,
     /// File descriptor table placeholder (expanded in VFS plan).
     pub fd_table: Mutex<FdTable, 4>,
     /// Current working directory (absolute normalized path).
@@ -124,7 +122,7 @@ impl Task {
             pid,
             parent,
             children: Mutex::new(Vec::new()),
-            vm_map: Mutex::new(VmMap::new(pmap)),
+            vm_map: LeveledRwLock::new(VmMap::new(pmap)),
             fd_table: Mutex::new(FdTable::new()),
             cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
@@ -155,7 +153,7 @@ impl Task {
             pid,
             parent: Weak::new(),
             children: Mutex::new(Vec::new()),
-            vm_map: Mutex::new(VmMap::new(pmap)),
+            vm_map: LeveledRwLock::new(VmMap::new(pmap)),
             fd_table: Mutex::new(FdTable::new_with_stdio()),
             cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
@@ -194,7 +192,7 @@ impl Task {
     /// This keeps zombie tasks lightweight so parent-side `wait4()` reaping
     /// does not end up dropping a full address space on the current kernel stack.
     pub fn release_zombie_resources(&self) {
-        self.vm_map.lock().clear();
+        self.vm_map.write().clear();
         *self.fd_table.lock() = FdTable::new();
     }
 }

@@ -6,9 +6,13 @@ pub struct SplayTree {
     root: Option<NonNull<VmMapEntry>>,
 }
 
-// Safety: VmMap wraps SplayTree and is Send + Sync, and it protects access to the tree with its RwLock.
+// SAFETY: VmMap wraps SplayTree and protects access with LeveledRwLock<VmMap, 1>.
+// The RwLock guarantees that &SplayTree (shared reads) and &mut SplayTree
+// (exclusive writes) are never handed out concurrently, so it is safe to
+// implement Sync here.  The NonNull<VmMapEntry> inside is never aliased
+// across threads without the lock held.
 unsafe impl Send for SplayTree {}
-// unsafe impl Sync for SplayTree {}
+unsafe impl Sync for SplayTree {}
 
 impl SplayTree {
     pub const fn new() -> Self {

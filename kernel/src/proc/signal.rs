@@ -299,20 +299,6 @@ impl SignalState {
             .fetch_add(Signal::new_unchecked(sig), Ordering::Release);
     }
 
-    /// Check if there are unmasked pending signals.
-    #[allow(unused)]
-    pub fn has_unmasked_pending(&self) -> bool {
-        let pending = self.pending.load(Ordering::Acquire);
-        let blocked = self.blocked.load(Ordering::Relaxed);
-        let mut unblockable = SigSet::empty();
-        unblockable
-            .add(Signal::new_unchecked(SIGKILL))
-            .add(Signal::new_unchecked(SIGSTOP));
-
-        let deliverable = pending.difference(blocked.difference(unblockable));
-        !deliverable.is_empty()
-    }
-
     /// Check if there are unmasked pending signals that would actually
     /// interrupt (not default-ignored like SIGCHLD with SIG_DFL).
     pub fn has_actionable_pending(&self) -> bool {
@@ -396,10 +382,9 @@ impl SignalState {
 /// Placed just above USER_STACK_TOP to avoid collisions.
 pub const SIGCODE_VA: usize = 0x0000_003F_FFFF_F000;
 
-/// SYS_rt_sigreturn on rv64 Linux = 139
-const _SYS_RT_SIGRETURN: usize = 139;
-
 /// Build the sigcode page contents: `li a7, 139; ecall; unimp`
+///
+/// SYS_rt_sigreturn on rv64 Linux = 139.
 /// Returns a page-sized buffer.
 pub fn build_sigcode_page() -> [u8; PAGE_SIZE] {
     let mut page = [0u8; PAGE_SIZE];

@@ -198,8 +198,6 @@ pub struct VmObject {
     size: usize,
     /// Number of pages resident in *this* object (not backing).
     resident_count: usize,
-    /// I/O barrier: number of pages currently being paged in.
-    paging_in_progress: AtomicU32,
     /// Dirty tracking generation counters.
     generation: AtomicU32,
     clean_generation: AtomicU32,
@@ -289,7 +287,6 @@ impl VmObject {
             pager: Some(Arc::new(AnonPager)),
             size,
             resident_count: 0,
-            paging_in_progress: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             clean_generation: AtomicU32::new(0),
         }))
@@ -309,7 +306,6 @@ impl VmObject {
             })),
             size: vnode.size() as usize,
             resident_count: 0,
-            paging_in_progress: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             clean_generation: AtomicU32::new(0),
         }))
@@ -339,7 +335,6 @@ impl VmObject {
             })),
             size: size_pages * PAGE_SIZE,
             resident_count: 0,
-            paging_in_progress: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             clean_generation: AtomicU32::new(0),
         }))
@@ -364,7 +359,6 @@ impl VmObject {
             pager: Some(Arc::new(AnonPager)),
             size,
             resident_count: 0,
-            paging_in_progress: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             clean_generation: AtomicU32::new(0),
         }))
@@ -388,11 +382,6 @@ impl VmObject {
             current = obj.backing.as_ref().map(Arc::clone);
         }
         None
-    }
-
-    /// Traverse shadow chain to find a page (BSD-style backing traversal).
-    pub fn lookup_page_in_chain(&self, pindex: VObjIndex) -> Option<PhysAddr> {
-        self.lookup_page(pindex)
     }
 
     /// Traverses the shadow chain to find a page or allocate one if missing.

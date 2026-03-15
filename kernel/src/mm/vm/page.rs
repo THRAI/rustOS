@@ -3,14 +3,14 @@
 //! Handles cross-thread sync (`exBusy`/`sBusy`), object linkage, and hardware
 //! referencing. Aligned to FreeBSD's definition.
 
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use bitflags::bitflags;
 
 use crate::{
     hal_common::PhysAddr,
     mm::{
-        vm::{register_waker, remove_waker, wake_all, VmObject},
+        vm::{register_waker, remove_waker, wake_all},
         PageRole,
     },
 };
@@ -32,10 +32,6 @@ bitflags! {
 #[repr(C)]
 #[derive(Debug)]
 pub struct VmPage {
-    /// Which object owns this page (if any).
-    pub object: AtomicPtr<VmObject>,
-    /// Logical offset within the object.
-    pub pindex: u64,
     /// The physical address this struct represents.
     pub phys_addr: PhysAddr,
 
@@ -48,8 +44,6 @@ pub struct VmPage {
 
     /// Role of the page (from `PageRole` enum).
     pub role_flags: AtomicU8,
-    /// 1 if the page contains valid data, 0 if data is pending/I/O.
-    pub valid: AtomicU8,
     /// Has the page been modified since the last page-out?
     pub dirty: AtomicU8,
 }
@@ -57,13 +51,10 @@ pub struct VmPage {
 impl VmPage {
     pub const fn new() -> Self {
         Self {
-            object: AtomicPtr::new(core::ptr::null_mut()),
-            pindex: 0,
             phys_addr: PhysAddr::new(0),
             busy_state: AtomicU32::new(0),
             refs: AtomicU32::new(0),
             role_flags: AtomicU8::new(PageRole::Free as u8),
-            valid: AtomicU8::new(0),
             dirty: AtomicU8::new(0),
         }
     }
@@ -72,14 +63,6 @@ impl VmPage {
     pub fn new_test(pa: PhysAddr) -> Self {
         let mut p = Self::new();
         p.phys_addr = pa;
-        p.valid.store(1, Ordering::Relaxed);
-        p
-    }
-
-    /// Create a dummy cached page for tests.
-    pub fn new_cached_test(pa: PhysAddr) -> Self {
-        let p = Self::new_test(pa);
-        p.dirty.store(0, Ordering::Relaxed);
         p
     }
 
@@ -239,18 +222,6 @@ impl VmPage {
     // ------------------------------------------------------------------------
     // Pager Aux Methods
     // ------------------------------------------------------------------------
-
-    pub fn is_valid(&self) -> bool {
-        self.valid.load(Ordering::Relaxed) != 0
-    }
-
-    pub fn set_valid(&self) {
-        self.valid.store(1, Ordering::Relaxed);
-    }
-
-    pub fn clear_valid(&self) {
-        self.valid.store(0, Ordering::Relaxed);
-    }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed) != 0

@@ -321,9 +321,14 @@ pub fn pmap_enter(
 
 /// Remove mappings in the range [va_start, va_end).
 ///
-/// Walks each page in the range with alloc=false. Clears valid PTEs
-/// and issues a shootdown for the entire range.
+/// Quiesces remote harts before modifying PTEs to prevent stale TLB
+/// entries from being used during the modification window (C-4 fix).
 pub fn pmap_remove(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr) {
+    // Quiesce remote harts BEFORE modifying any PTE.
+    // If no remote harts are active, this is a no-op.
+    #[cfg(target_arch = "riscv64")]
+    let _quiesce = shootdown::QuiesceGuard::new(&pmap.active);
+
     let mut invalidated = false;
 
     let mut va = va_start.as_usize();
@@ -346,20 +351,30 @@ pub fn pmap_remove(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr) {
         va += PAGE_SIZE;
     }
 
+    // Flush local TLB for the modified range.
     if invalidated {
         #[cfg(target_arch = "riscv64")]
-        shootdown::pmap_shootdown(
-            &pmap.active,
-            va_start.as_usize(),
-            va_end.as_usize(),
-            pmap.asid,
-        );
+        shootdown::adaptive_flush(va_start.as_usize(), va_end.as_usize(), pmap.asid as usize);
     }
+
+    // _quiesce drops here → releases remote harts.
+    // Remote harts flush_all and resume; next user-mode access walks fresh PTEs.
 }
 
 /// Change protection on mappings in the range [va_start, va_end).
+///
+/// Quiesces remote harts before modifying PTEs to prevent stale writable
+/// TLB entries from being used during the modification window (C-4 fix).
+/// This is critical for COW fork (downgrade RW→RO) and mprotect —
+/// without quiesce, a remote hart could write through a stale writable
+/// TLB entry while we're making the page read-only, corrupting shared data.
 pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot: MapPerm) {
     let new_flags = map_perm_to_pte_flags(prot);
+
+    // Quiesce remote harts BEFORE modifying any PTE.
+    #[cfg(target_arch = "riscv64")]
+    let _quiesce = shootdown::QuiesceGuard::new(&pmap.active);
+
     let mut invalidated = false;
 
     let mut va = va_start.as_usize();
@@ -381,15 +396,14 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
         va += PAGE_SIZE;
     }
 
+    // Flush local TLB for the modified range.
     if invalidated {
         #[cfg(target_arch = "riscv64")]
-        shootdown::pmap_shootdown(
-            &pmap.active,
-            va_start.as_usize(),
-            va_end.as_usize(),
-            pmap.asid,
-        );
+        shootdown::adaptive_flush(va_start.as_usize(), va_end.as_usize(), pmap.asid as usize);
     }
+
+    // _quiesce drops here → releases remote harts.
+    // Remote harts flush_all and resume; next user-mode access walks fresh PTEs.
 }
 
 /// Translate a virtual address to a physical address.

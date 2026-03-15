@@ -4,6 +4,21 @@
 //! the VA range + ASID, sets `pending`, sends an IPI, then spins on `ack`.
 //! The remote CPU's IPI handler calls `handle_shootdown_ipi()` which
 //! performs the sfence.vma and sets `ack`.
+//!
+//! ## Quiesce Protocol (C-4 fix)
+//!
+//! For batched PTE modifications (`pmap_protect`, `pmap_remove`), a simple
+//! post-hoc shootdown leaves a window where remote harts execute user code
+//! with stale TLB entries.  The quiesce protocol parks remote harts in
+//! kernel mode with interrupts disabled **before** any PTE is modified:
+//!
+//! 1. Initiator sets `quiesce=true, pending=true` on each active remote CPU.
+//! 2. Initiator sends IPIs to all active remote CPUs (parallel dispatch).
+//! 3. Initiator waits for all `ack=true` (remote harts are parked).
+//! 4. Initiator modifies PTEs + flushes local TLB.
+//! 5. Initiator drops `QuiesceGuard` → clears `pending` on each slot.
+//! 6. Remote harts see `pending=false`, flush local TLB, restore interrupts,
+//!    resume.  Next user-mode access takes a TLB miss and walks fresh PTEs.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -25,6 +40,9 @@ pub struct ShootdownRequest {
     pub asid: AtomicUsize,
     /// If true, flush entire TLB (used for ASID generation rollover).
     pub flush_all: AtomicBool,
+    /// If true, this is a quiesce request: ack immediately, then spin
+    /// with interrupts disabled until `pending` is cleared by the initiator.
+    pub quiesce: AtomicBool,
 }
 
 impl ShootdownRequest {
@@ -36,6 +54,7 @@ impl ShootdownRequest {
             va_end: AtomicUsize::new(0),
             asid: AtomicUsize::new(0),
             flush_all: AtomicBool::new(false),
+            quiesce: AtomicBool::new(false),
         }
     }
 }
@@ -56,13 +75,53 @@ pub fn has_pending(cpu_id: usize) -> bool {
 /// Handle a shootdown IPI on the current CPU.
 ///
 /// Called from the IPI handler. Performs the appropriate sfence.vma
-/// and acknowledges the request.
+/// and acknowledges the request. For quiesce requests, parks the hart
+/// with interrupts disabled until the initiator releases it.
 pub fn handle_shootdown_ipi(cpu_id: usize) {
     let req = &SHOOTDOWN[cpu_id];
     if !req.pending.load(Ordering::Acquire) {
         return;
     }
 
+    // Quiesce path: park this hart with interrupts disabled until the
+    // initiator finishes modifying PTEs and drops the QuiesceGuard.
+    if req.quiesce.load(Ordering::Acquire) {
+        // Tell the initiator we're parked.
+        req.ack.store(true, Ordering::Release);
+
+        // SAFETY: Disable S-mode interrupts to prevent timer IRQs from
+        // triggering context switches while we're quiesced. Save old
+        // sstatus so we restore the original SIE state on exit.
+        #[cfg(target_arch = "riscv64")]
+        let old_sstatus: usize;
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            // csrrc: read sstatus, then clear SIE (bit 1). Returns old value.
+            core::arch::asm!("csrrc {}, sstatus, {}", out(reg) old_sstatus, in(reg) 1usize << 1);
+        }
+
+        // Spin until the initiator releases us by clearing `pending`.
+        while req.pending.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+
+        // Flush entire local TLB — the initiator modified PTEs while we
+        // were parked, so any cached translations may be stale.
+        #[cfg(target_arch = "riscv64")]
+        crate::hal::flush_all();
+
+        // Restore original interrupt state.
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            // Only re-enable SIE if it was enabled before we disabled it.
+            core::arch::asm!("csrs sstatus, {}", in(reg) old_sstatus & (1usize << 1));
+        }
+
+        req.quiesce.store(false, Ordering::Release);
+        return;
+    }
+
+    // Normal shootdown path: flush TLB, then ack.
     #[cfg(target_arch = "riscv64")]
     {
         if req.flush_all.load(Ordering::Relaxed) {
@@ -82,8 +141,9 @@ pub fn handle_shootdown_ipi(cpu_id: usize) {
 
 /// Invalidate TLB entries on remote CPUs where `active[cpu]` is true.
 ///
-/// The caller must also flush the local TLB. This function only handles
-/// remote CPUs via IPI.
+/// Used for single-page operations (`pmap_enter`, `pte_bit_clear`) where
+/// the quiesce overhead is not justified.  For batched operations
+/// (`pmap_protect`, `pmap_remove`), use `quiesce_remote_harts` instead.
 #[cfg(target_arch = "riscv64")]
 pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: usize, asid: u16) {
     let local_cpu = crate::executor::current().cpu_id;
@@ -108,6 +168,7 @@ pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: 
         req.va_end.store(va_end, Ordering::Relaxed);
         req.asid.store(asid as usize, Ordering::Relaxed);
         req.flush_all.store(false, Ordering::Relaxed);
+        req.quiesce.store(false, Ordering::Relaxed);
         req.ack.store(false, Ordering::Release);
         req.pending.store(true, Ordering::Release);
 
@@ -134,6 +195,7 @@ pub fn ipi_broadcast_flush_all() {
         }
 
         req.flush_all.store(true, Ordering::Relaxed);
+        req.quiesce.store(false, Ordering::Relaxed);
         req.ack.store(false, Ordering::Release);
         req.pending.store(true, Ordering::Release);
 
@@ -145,9 +207,91 @@ pub fn ipi_broadcast_flush_all() {
     }
 }
 
-/// Adaptive TLB flush: per-page if small range, full ASID flush otherwise.
+// ---------------------------------------------------------------------------
+// Quiesce protocol for batched PTE modifications (C-4 fix)
+// ---------------------------------------------------------------------------
+
+/// RAII guard that releases quiesced remote harts on drop.
+///
+/// While this guard is alive, all remote harts that had the relevant pmap
+/// active are parked in kernel mode with interrupts disabled. The
+/// initiator can safely modify PTEs without TLB consistency concerns.
 #[cfg(target_arch = "riscv64")]
-fn adaptive_flush(va_start: usize, va_end: usize, asid: usize) {
+pub struct QuiesceGuard {
+    /// Bitmask of CPU IDs that were quiesced (and need releasing).
+    quiesced_mask: u64,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl QuiesceGuard {
+    /// Quiesce all remote harts that have this pmap active.
+    ///
+    /// Sends quiesce IPIs to all active remote harts in parallel,
+    /// then waits for all acks. Each remote hart will:
+    /// 1. Trap into kernel (if in user mode) or handle IPI (if in kernel).
+    /// 2. Disable interrupts (`csrrc sstatus, SIE`).
+    /// 3. Ack (so we know it's parked).
+    /// 4. Spin on `pending` until we release it.
+    pub fn new(active: &[AtomicBool; MAX_CPUS]) -> Self {
+        let local_cpu = crate::executor::current().cpu_id;
+        let mut quiesced_mask: u64 = 0;
+
+        // Phase 1: Fire IPIs to all active remote harts (parallel dispatch).
+        for (cpu, req) in SHOOTDOWN.iter().enumerate() {
+            if cpu == local_cpu {
+                continue;
+            }
+            if !active[cpu].load(Ordering::Acquire) {
+                continue;
+            }
+            // Wait for any prior shootdown to complete.
+            while req.pending.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+
+            req.quiesce.store(true, Ordering::Relaxed);
+            req.flush_all.store(false, Ordering::Relaxed);
+            req.ack.store(false, Ordering::Release);
+            req.pending.store(true, Ordering::Release);
+
+            crate::hal::send_ipi(cpu);
+            quiesced_mask |= 1u64 << cpu;
+        }
+
+        // Phase 2: Wait for all acks (all remote harts are parked).
+        for (cpu, req) in SHOOTDOWN.iter().enumerate() {
+            if quiesced_mask & (1u64 << cpu) == 0 {
+                continue;
+            }
+            while !req.ack.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+        }
+
+        Self { quiesced_mask }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Drop for QuiesceGuard {
+    fn drop(&mut self) {
+        // Release all quiesced harts by clearing `pending`.
+        // Each hart will: flush_all, restore SIE, return from IPI handler.
+        for (cpu, req) in SHOOTDOWN.iter().enumerate() {
+            if self.quiesced_mask & (1u64 << cpu) == 0 {
+                continue;
+            }
+            req.pending.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Adaptive TLB flush: per-page if small range, full ASID flush otherwise.
+///
+/// Used for local TLB flush after PTE modifications. Also called by the
+/// IPI handler on remote harts for normal (non-quiesce) shootdowns.
+#[cfg(target_arch = "riscv64")]
+pub(super) fn adaptive_flush(va_start: usize, va_end: usize, asid: usize) {
     let npages = (va_end.saturating_sub(va_start)) / crate::hal_common::PAGE_SIZE;
     if npages <= SHOOTDOWN_PAGE_THRESHOLD {
         let mut va = va_start;

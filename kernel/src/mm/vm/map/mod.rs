@@ -100,6 +100,23 @@ impl VmMap {
             .fetch_add(1, core::sync::atomic::Ordering::Release);
     }
 
+    /// Remove an entry from the tree by key, updating size/nentries bookkeeping.
+    fn remove_tree_entry(&mut self, key: u64) -> Option<VmMapEntry> {
+        let entry = *self.tree.remove(key)?;
+        self.size = self.size.saturating_sub(entry.size());
+        self.nentries = self.nentries.saturating_sub(1);
+        Some(entry)
+    }
+
+    /// Reinsert entries into the tree, updating size/nentries bookkeeping.
+    fn reinsert_entries(&mut self, entries: impl Iterator<Item = VmMapEntry>) {
+        for entry in entries {
+            self.size += entry.size();
+            self.nentries += 1;
+            self.tree.insert(alloc::boxed::Box::new(entry));
+        }
+    }
+
     pub fn insert_entry(&mut self, entry: VmMapEntry) -> Result<(), Errno> {
         if entry.start() >= entry.end() {
             return Err(Errno::Einval);
@@ -126,8 +143,7 @@ impl VmMap {
 
     /// Remove the entry containing `va`.
     pub fn remove_entry_containing(&mut self, va: u64) -> Option<VmMapEntry> {
-        let removed = self.tree.remove(va)?;
-        let entry = *removed;
+        let entry = self.remove_tree_entry(va)?;
 
         // Remove hardware page table mappings for this entry's VA range
         {
@@ -139,8 +155,6 @@ impl VmMap {
             );
         }
 
-        self.size = self.size.saturating_sub(entry.size());
-        self.nentries = self.nentries.saturating_sub(1);
         self.timestamp.fetch_add(1, Ordering::SeqCst);
         Some(entry)
     }
@@ -149,69 +163,27 @@ impl VmMap {
         if start >= end {
             return alloc::vec::Vec::new();
         }
+        let (s, e) = (start.as_usize() as u64, end.as_usize() as u64);
 
-        self.timestamp.fetch_add(1, Ordering::SeqCst);
-        let start_addr = start.as_usize() as u64;
-        let end_addr = end.as_usize() as u64;
-
-        // Tear down hardware mappings first.
+        // Pmap: tear down entire range upfront (preserves dirty bit attribution)
         {
             let mut pmap = self.pmap.lock();
             pmap_remove(&mut pmap, start, end);
         }
 
+        let keys = overlapping_keys(self, s, e);
         let mut removed = alloc::vec::Vec::new();
-
-        // Collect all entries that overlap [start_addr, end_addr).
-        let mut to_remove = alloc::vec::Vec::new();
-        for entry in self.iter() {
-            if entry.start() < end_addr && entry.end() > start_addr {
-                to_remove.push(entry.start());
-            }
-        }
-
-        // Remove/split all overlapping entries.
-        for key in to_remove {
-            let entry_box = match self.tree.remove(key) {
+        for key in keys {
+            let entry = match self.remove_tree_entry(key) {
                 Some(e) => e,
                 None => continue,
             };
-            let entry = *entry_box;
-            let entry_start = entry.start();
-            let entry_end = entry.end();
-
-            // Account for removing the original entry from the tree.
-            self.size = self.size.saturating_sub(entry.size());
-            self.nentries = self.nentries.saturating_sub(1);
-
-            let mut split_entries = alloc::vec::Vec::new();
-
-            // Keep left surviving piece: [entry_start, start_addr)
-            if entry_start < start_addr {
-                let mut left = entry.clone_for_split(entry_start);
-                left.set_bounds(entry_start, start_addr);
-                split_entries.push(left);
-            }
-
-            // Keep right surviving piece: [end_addr, entry_end)
-            if entry_end > end_addr {
-                let mut right = entry.clone_for_split(end_addr);
-                right.set_bounds(end_addr, entry_end);
-                split_entries.push(right);
-            }
-
-            if split_entries.is_empty() {
-                // Fully removed entry.
-                removed.push(entry);
-            } else {
-                for kept in split_entries {
-                    self.size = self.size.saturating_add(kept.size());
-                    self.nentries += 1;
-                    self.tree.insert(alloc::boxed::Box::new(kept));
-                }
-            }
+            let split = split_entry_at(entry, s, e);
+            self.reinsert_entries([split.left, split.right].into_iter().flatten());
+            removed.push(split.middle);
         }
 
+        self.timestamp.fetch_add(1, Ordering::SeqCst);
         removed
     }
 
@@ -269,89 +241,28 @@ impl VmMap {
         if start >= end {
             return Err(Errno::Einval);
         }
+        let (s, e) = (start.as_usize() as u64, end.as_usize() as u64);
 
-        let start_addr = start.as_usize() as u64;
-        let end_addr = end.as_usize() as u64;
+        // Validate: full coverage + max_protection (pure, no mutation)
+        validate_protect_coverage(self, s, e, perm)?;
 
-        let mut overlapping = alloc::vec::Vec::new();
-        for entry in self.iter() {
-            if entry.start() < end_addr && entry.end() > start_addr {
-                overlapping.push((entry.start(), entry.end(), entry.max_protection));
-            }
-        }
-
-        if overlapping.is_empty() {
-            return Err(Errno::Enomem);
-        }
-
-        overlapping.sort_unstable_by_key(|&(entry_start, _, _)| entry_start);
-
-        let mut covered_until = start_addr;
-        for &(entry_start, entry_end, max_protection) in &overlapping {
-            if entry_start > covered_until {
-                return Err(Errno::Enomem);
-            }
-            if !max_protection.contains(perm) {
-                return Err(Errno::Einval);
-            }
-            if entry_end > covered_until {
-                covered_until = entry_end;
-            }
-            if covered_until >= end_addr {
-                break;
-            }
-        }
-
-        if covered_until < end_addr {
-            return Err(Errno::Enomem);
-        }
-
-        let keys: alloc::vec::Vec<u64> = overlapping
-            .into_iter()
-            .map(|(entry_start, _, _)| entry_start)
-            .collect();
-
+        // Split + re-protect affected middles
+        let keys = overlapping_keys(self, s, e);
         for key in keys {
-            let entry_box = match self.tree.remove(key) {
-                Some(entry) => entry,
+            let entry = match self.remove_tree_entry(key) {
+                Some(e) => e,
                 None => continue,
             };
-            let entry = *entry_box;
-
-            self.size = self.size.saturating_sub(entry.size());
-            self.nentries = self.nentries.saturating_sub(1);
-
-            let entry_start = entry.start();
-            let entry_end = entry.end();
-
-            if entry_start < start_addr {
-                let mut left = entry.clone_for_split(entry_start);
-                left.set_bounds(entry_start, start_addr);
-                self.size = self.size.saturating_add(left.size());
-                self.nentries += 1;
-                self.tree.insert(alloc::boxed::Box::new(left));
-            }
-
-            let protected_start = core::cmp::max(entry_start, start_addr);
-            let protected_end = core::cmp::min(entry_end, end_addr);
-            if protected_start < protected_end {
-                let mut middle = entry.clone_for_split(protected_start);
-                middle.set_bounds(protected_start, protected_end);
-                middle.protection = perm;
-                self.size = self.size.saturating_add(middle.size());
-                self.nentries += 1;
-                self.tree.insert(alloc::boxed::Box::new(middle));
-            }
-
-            if entry_end > end_addr {
-                let mut right = entry.clone_for_split(end_addr);
-                right.set_bounds(end_addr, entry_end);
-                self.size = self.size.saturating_add(right.size());
-                self.nentries += 1;
-                self.tree.insert(alloc::boxed::Box::new(right));
-            }
+            let mut split = split_entry_at(entry, s, e);
+            split.middle.protection = perm;
+            self.reinsert_entries(
+                [split.left, Some(split.middle), split.right]
+                    .into_iter()
+                    .flatten(),
+            );
         }
 
+        // Pmap: update hardware PTEs (after VMA update per FreeBSD ordering)
         self.timestamp.fetch_add(1, Ordering::SeqCst);
         {
             let mut pmap = self.pmap.lock();
@@ -613,13 +524,13 @@ impl VmMap {
         let descriptors: alloc::vec::Vec<ForkDescriptor> =
             self.iter().filter_map(ForkDescriptor::from_vma).collect();
 
-        // Phase 2: apply VMA + pmap mutations under one ShootdownBatch
         let child_pmap_arc = child.pmap.clone();
         let mut child_pmap = child_pmap_arc.lock();
         let parent_pmap_arc = self.pmap.clone();
         let mut parent_pmap = parent_pmap_arc.lock();
-        let mut batch = parent_pmap.shootdown_batch();
 
+        // Phase 2: apply VMA + pmap mutations under one ShootdownBatch
+        let mut batch = parent_pmap.shootdown_batch();
         descriptors.into_iter().try_for_each(|desc| {
             desc.apply(self, child, &mut parent_pmap, &mut child_pmap, &mut batch)
         })
@@ -763,4 +674,82 @@ fn build_cow_shadows(
         mapping.with_object(parent_shadow),
         mapping.with_object(child_shadow),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Range operation helpers — shared by remove_range and protect_range
+// ---------------------------------------------------------------------------
+
+/// Result of splitting a VmMapEntry at range boundaries [clip_start, clip_end).
+struct SplitResult {
+    /// [entry_start, clip_start) — unchanged survivor (None if fully inside)
+    left: Option<VmMapEntry>,
+    /// [max(entry_start, clip_start), min(entry_end, clip_end)) — affected piece
+    middle: VmMapEntry,
+    /// [clip_end, entry_end) — unchanged survivor (None if fully inside)
+    right: Option<VmMapEntry>,
+}
+
+/// Pure geometry: split an entry at [clip_start, clip_end) boundaries.
+fn split_entry_at(entry: VmMapEntry, clip_start: u64, clip_end: u64) -> SplitResult {
+    let left = (entry.start() < clip_start).then(|| {
+        let mut l = entry.clone_for_split(entry.start());
+        l.set_bounds(entry.start(), clip_start);
+        l
+    });
+    let right = (entry.end() > clip_end).then(|| {
+        let mut r = entry.clone_for_split(clip_end);
+        r.set_bounds(clip_end, entry.end());
+        r
+    });
+    let mid_start = core::cmp::max(entry.start(), clip_start);
+    let mid_end = core::cmp::min(entry.end(), clip_end);
+    let mut middle = entry.clone_for_split(mid_start);
+    middle.set_bounds(mid_start, mid_end);
+    SplitResult {
+        left,
+        middle,
+        right,
+    }
+}
+
+/// Collect keys of all entries overlapping [start, end).
+fn overlapping_keys(vm: &VmMap, start: u64, end: u64) -> alloc::vec::Vec<u64> {
+    vm.iter()
+        .filter(|e| e.start() < end && e.end() > start)
+        .map(|e| e.start())
+        .collect()
+}
+
+/// Validate that [start, end) is fully covered by VMAs and perm ≤ max_protection.
+fn validate_protect_coverage(vm: &VmMap, start: u64, end: u64, perm: MapPerm) -> Result<(), Errno> {
+    let mut entries: alloc::vec::Vec<_> = vm
+        .iter()
+        .filter(|e| e.start() < end && e.end() > start)
+        .map(|e| (e.start(), e.end(), e.max_protection))
+        .collect();
+
+    if entries.is_empty() {
+        return Err(Errno::Enomem);
+    }
+    entries.sort_unstable_by_key(|&(s, _, _)| s);
+
+    let mut covered = start;
+    for (s, e, max_prot) in entries {
+        if s > covered {
+            return Err(Errno::Enomem);
+        }
+        if !max_prot.contains(perm) {
+            return Err(Errno::Einval);
+        }
+        covered = core::cmp::max(covered, e);
+        if covered >= end {
+            return Ok(());
+        }
+    }
+    if covered < end {
+        Err(Errno::Enomem)
+    } else {
+        Ok(())
+    }
 }

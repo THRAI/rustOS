@@ -17,10 +17,9 @@ use crate::{
     fs::{resolve, VnodeType},
     hal_common::{Errno, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap_activate, pmap_create, pmap_destroy, pmap_enter, MapPerm, VmMap, VmMapEntry,
-        VmMapping, VmObject,
+        pmap_activate, pmap_create, pmap_destroy, pmap_enter, MapPerm, VmMap, VmMapping, VmObject,
     },
-    proc::{map_sigcode_page, parse_elf_first_page, ExecContext, SigSet, Task, SIG_DFL, SIG_IGN},
+    proc::{parse_elf_first_page, ExecContext, SigSet, Task, SIG_DFL, SIG_IGN},
 };
 
 // ---------------------------------------------------------------------------
@@ -196,17 +195,16 @@ pub async fn do_execve(
             merged_backed_bytes,
         );
 
-        let vma = VmMapEntry::new(
-            va_start as u64,
-            va_end as u64,
-            VmMapping::FilePrivate {
-                object: obj,
-                offset: file_offset_page_aligned as u64,
-            },
+        let mapping = VmMapping::FilePrivate {
+            object: obj,
+            offset: file_offset_page_aligned as u64,
+        };
+        if let Err(e) = new_vm.map_or_merge(
+            VirtAddr::new(va_start),
+            VirtAddr::new(va_end),
             region.prot,
-        );
-
-        if let Err(e) = insert_or_merge_file_vma(&mut new_vm, vma) {
+            mapping,
+        ) {
             // new_vm drops automatically, cleaning up
             return Err(map_insert_err(e));
         }
@@ -252,16 +250,18 @@ pub async fn do_execve(
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
     let stack_obj = VmObject::new_anon(USER_STACK_SIZE);
     let stack_obj_ref: Arc<crate::hal_common::LeveledRwLock<VmObject, 3>> = Arc::clone(&stack_obj);
-    let stack_vma = VmMapEntry::new(
-        stack_bottom as u64,
-        USER_STACK_TOP as u64,
-        VmMapping::AnonPrivate {
-            object: stack_obj,
-            offset: 0,
-        },
-        crate::map_perm!(R, W, U),
-    );
-    if new_vm.insert_entry(stack_vma).is_err() {
+    if new_vm
+        .map(
+            VirtAddr::new(stack_bottom),
+            VirtAddr::new(USER_STACK_TOP),
+            crate::map_perm!(R, W, U),
+            VmMapping::AnonPrivate {
+                object: stack_obj,
+                offset: 0,
+            },
+        )
+        .is_err()
+    {
         return Err(kerr!(
             exec,
             error,
@@ -394,11 +394,8 @@ pub async fn do_execve(
         (sp, final_entry)
     };
 
-    // 2f. Map sigcode trampoline page in the new pmap
-    {
-        let mut pmap = new_pmap_arc.lock();
-        map_sigcode_page(&mut pmap);
-    }
+    // 2f. Map sigcode trampoline page as a proper VMA + eager pmap enter
+    new_vm.map_sigcode();
 
     // =====================================================================
     // STAGE 3: Point of no return -- atomic swap
@@ -556,17 +553,17 @@ async fn load_interp_into(
             file_offset_page_aligned,
             merged_backed_bytes,
         );
-        let vma = VmMapEntry::new(
-            va_start as u64,
-            va_end as u64,
-            VmMapping::FilePrivate {
-                object: obj,
-                offset: file_offset_page_aligned as u64,
-            },
-            prot,
-        );
+        let mapping = VmMapping::FilePrivate {
+            object: obj,
+            offset: file_offset_page_aligned as u64,
+        };
 
-        if let Err(e) = insert_or_merge_file_vma(vm, vma) {
+        if let Err(e) = vm.map_or_merge(
+            VirtAddr::new(va_start),
+            VirtAddr::new(va_end),
+            prot,
+            mapping,
+        ) {
             return Err(map_insert_err(e));
         }
     }
@@ -695,28 +692,4 @@ fn elf_flags_to_prot(flags: u32) -> MapPerm {
         prot |= MapPerm::X;
     }
     prot
-}
-
-/// Insert a file-backed VMA, merging exact same-page overlaps produced by
-/// ELF PT_LOAD headers that split permissions inside one page.
-///
-/// During exec each PT_LOAD creates a fresh VmObject, so we cannot rely on
-/// Arc identity (Arc::ptr_eq) to detect same-file overlaps.  Instead we
-/// match on identical file offset — sufficient because this function is
-/// only called during exec where all segments originate from the same
-/// vnode.
-fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), Errno> {
-    if !matches!(new_vma.mapping, VmMapping::Guard) {
-        if let Some(existing) = vm.lookup_mut(new_vma.start()) {
-            if existing.start() == new_vma.start() && existing.end() == new_vma.end() {
-                let same_backing = existing.mapping.offset() == new_vma.mapping.offset();
-                if same_backing {
-                    // Merge segment perms (e.g. text R|X|U + rodata R|U = R|X|U)
-                    existing.protection |= new_vma.protection;
-                    return Ok(());
-                }
-            }
-        }
-    }
-    vm.insert_entry(new_vma)
 }

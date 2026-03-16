@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 use crate::mm::vm::{MapPerm, VmMapping};
 use crate::{
     hal_common::{VirtAddr, PAGE_SIZE},
-    mm::{pmap, pmap_enter, pmap_extract},
-    proc::{map_sigcode_page, Task, SIGCODE_VA},
+    mm::pmap,
+    proc::Task,
 };
 
 /// Fork the parent task, creating a child with COW (or deep-copy) VM.
@@ -26,38 +26,13 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
         child.pid
     );
     // VM copy strategy: COW shadow chains (default) or deep copy (feature flag).
+    // Sigcode is now a VmMapping::Shared VMA, so it is inherited automatically
+    // by fork (cow_fork_vm copies the VMA with Arc-shared object; deep_copy
+    // clones it).  No special-case pmap_extract/pmap_enter needed.
     #[cfg(not(feature = "fork-hardcopy"))]
     cow_fork_vm(parent, &child);
     #[cfg(feature = "fork-hardcopy")]
     deep_copy_pages(parent, &child);
-
-    // Ensure child has sigcode trampoline page (not tracked in vm_map).
-    // Prefer sharing parent's mapped page; fallback to creating a new one.
-    //
-    // Lock ordering: parent_vm_map (L1) → parent_pmap (L2) → child_vm_map (L1) → child_pmap (L2).
-    // TODO: This acquires parent_pmap BEFORE child_pmap, but cow_fork_vm
-    // (below, line ~210) acquires child_pmap before parent_pmap.  The
-    // inconsistency is safe TODAY because the child is brand-new and no
-    // other thread can reference it yet, but this should be unified to
-    // always acquire parent before child for robustness.
-    {
-        let parent_vm = parent.vm_map.read();
-        let parent_pmap = parent_vm.pmap_lock();
-        let child_vm = child.vm_map.read();
-        let mut child_pmap = child_vm.pmap_lock();
-        if let Some(sigcode_pa) = pmap_extract(&parent_pmap, VirtAddr::new(SIGCODE_VA)) {
-            let prot = crate::map_perm!(R, X, U);
-            let _ = pmap_enter(
-                &mut child_pmap,
-                VirtAddr::new(SIGCODE_VA),
-                sigcode_pa,
-                prot,
-                false,
-            );
-        } else {
-            map_sigcode_page(&mut child_pmap);
-        }
-    }
 
     // Fork fd table (Arc-shared OpenFile entries per POSIX)
     {

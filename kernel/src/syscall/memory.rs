@@ -157,7 +157,7 @@ pub fn sys_mmap(
 ) -> KernelResult<usize> {
     use crate::{
         fs::VnodeType,
-        mm::vm::{MapPerm, VmMapEntry, VmMapping, VmObject},
+        mm::vm::{MapPerm, VmMapping, VmObject},
     };
 
     let aligned_len = match align_up_to_page(len) {
@@ -294,15 +294,18 @@ pub fn sys_mmap(
         VmMapping::FilePrivate { object, offset }
     };
 
-    let vma = VmMapEntry::new(base as u64, (base + aligned_len) as u64, mapping, perm);
-
-    match vm.insert_entry(vma) {
+    match vm.map(
+        VirtAddr::new(base),
+        VirtAddr::new(base + aligned_len),
+        perm,
+        mapping,
+    ) {
         Ok(()) => Ok(base),
         Err(_) => Err(kerr!(
             syscall,
             debug,
             Errno::Einval,
-            "sys_mmap: insert_entry failed base={:#x} len={:#x}",
+            "sys_mmap: map failed base={:#x} len={:#x}",
             base,
             aligned_len
         )),

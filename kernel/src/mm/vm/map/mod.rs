@@ -1,18 +1,16 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::hal_common::{Errno, VirtAddr, PAGE_SIZE};
-
 pub mod entry;
 pub mod splay;
 
 pub(crate) use splay::{SplayTree, SplayTreeIter};
 
 use crate::{
-    hal_common::SpinMutex,
+    hal_common::{Errno, LeveledRwLock, SpinMutex, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap_protect, pmap_remove,
-        vm::{MapPerm, VmMapEntry, VmMapping},
+        pmap_enter, pmap_protect, pmap_remove,
+        vm::{CowState, MapPerm, VmMapEntry, VmMapping, VmObject},
         Pmap,
     },
 };
@@ -362,6 +360,121 @@ impl VmMap {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Builder entry points
+    // -----------------------------------------------------------------------
+
+    /// Map a region into the address space.
+    /// Validates alignment, overlap. Bumps timestamp.
+    /// Does NOT touch pmap (lazy fault model).
+    pub fn map(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        perm: MapPerm,
+        mapping: VmMapping,
+    ) -> Result<(), Errno> {
+        let entry = VmMapEntry::new(
+            start.as_usize() as u64,
+            end.as_usize() as u64,
+            mapping,
+            perm,
+        );
+        self.insert_entry(entry)
+    }
+
+    /// map() variant for exec: if an entry at exact [start, end) with
+    /// the same file offset exists, merge permissions (|=).
+    /// Absorbs the old insert_or_merge_file_vma function.
+    pub fn map_or_merge(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        perm: MapPerm,
+        mapping: VmMapping,
+    ) -> Result<(), Errno> {
+        let s = start.as_usize() as u64;
+        let e = end.as_usize() as u64;
+        if let Some(existing) = self.lookup_mut(s) {
+            if existing.start() == s
+                && existing.end() == e
+                && existing.mapping.offset() == mapping.offset()
+            {
+                existing.protection |= perm;
+                return Ok(());
+            }
+        }
+        self.map(start, end, perm, mapping)
+    }
+
+    // -----------------------------------------------------------------------
+    // Accountant methods
+    // -----------------------------------------------------------------------
+
+    /// Replace the VmObject inside a VmMapping variant.
+    /// Preserves the variant discriminant. Bumps timestamp.
+    pub fn rebind_store(
+        &mut self,
+        va: u64,
+        new_object: Arc<LeveledRwLock<VmObject, 3>>,
+    ) -> Result<(), Errno> {
+        let vma = self.lookup_mut(va).ok_or(Errno::Esrch)?;
+        vma.mapping = vma.mapping.with_object(new_object);
+        self.timestamp.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Set the COW lifecycle state on an entry. Bumps timestamp.
+    pub fn set_cow_state(&mut self, va: u64, state: CowState) -> Result<(), Errno> {
+        let vma = self.lookup_mut(va).ok_or(Errno::Esrch)?;
+        vma.cow_state = state;
+        self.timestamp.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Sigcode VMA
+    // -----------------------------------------------------------------------
+
+    /// Map the sigcode trampoline page as a Shared VMA and eagerly enter it
+    /// into the pmap.  Called during exec and (implicitly via fork VMA copy)
+    /// during fork.
+    pub fn map_sigcode(&mut self) {
+        use crate::proc::signal::{sigcode_object, SIGCODE_VA};
+
+        let obj = sigcode_object().clone();
+        self.map(
+            VirtAddr::new(SIGCODE_VA),
+            VirtAddr::new(SIGCODE_VA + PAGE_SIZE),
+            crate::map_perm!(R, X, U),
+            VmMapping::Shared {
+                object: obj,
+                offset: 0,
+            },
+        )
+        .expect("map_sigcode: insert failed");
+
+        // Eagerly enter the page into pmap so signal delivery works
+        // without a fault.
+        if let Some(pa) = sigcode_object()
+            .read()
+            .lookup_page(crate::mm::vm::VObjIndex::new(0))
+        {
+            let mut pmap = self.pmap.lock();
+            let _ = pmap_enter(
+                &mut pmap,
+                VirtAddr::new(SIGCODE_VA),
+                pa,
+                crate::map_perm!(R, X, U),
+                false,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Heap management
+    // -----------------------------------------------------------------------
+
     pub fn grow_heap(
         &mut self,
         old_brk_aligned: usize,
@@ -402,17 +515,16 @@ impl VmMap {
         }
 
         let grow_len = new_brk_aligned - old_brk_aligned;
-        let obj = crate::mm::vm::VmObject::new_anon(grow_len);
-        let vma = VmMapEntry::new(
-            old_brk_aligned as u64,
-            new_brk_aligned as u64,
-            VmMapping::Heap {
-                object: obj,
-                offset: 0,
-            },
+        let mapping = VmMapping::Heap {
+            object: VmObject::new_anon(grow_len),
+            offset: 0,
+        };
+        self.map(
+            VirtAddr::new(old_brk_aligned),
+            VirtAddr::new(new_brk_aligned),
             MapPerm::R | MapPerm::W | MapPerm::U,
-        );
-        self.insert_entry(vma)
+            mapping,
+        )
     }
 
     pub fn shrink_heap(

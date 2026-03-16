@@ -695,25 +695,39 @@ pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
 }
 
 // ---------------------------------------------------------------------------
-// Map sigcode page into a process's address space
+// Global sigcode VmObject (shared across all processes)
 // ---------------------------------------------------------------------------
 
-/// Map the sigcode trampoline page into the given pmap.
-/// Called during exec (and for init).
-pub fn map_sigcode_page(pmap: &mut crate::mm::Pmap) {
-    use crate::mm::pmap_enter;
+use crate::hal_common::{LeveledRwLock, Once};
 
-    let frame = crate::mm::alloc_raw_frame_sync(crate::mm::PageRole::SigTrampoline)
-        .expect("sigcode page alloc failed");
-    let page_data = build_sigcode_page();
+static SIGCODE_OBJ: Once<Arc<LeveledRwLock<crate::mm::vm::VmObject, 3>>> = Once::new();
 
-    // Write sigcode to the physical frame
-    unsafe {
-        let va = frame.into_kernel_vaddr();
-        core::ptr::copy_nonoverlapping(page_data.as_ptr(), va.as_mut_ptr(), PAGE_SIZE);
-    }
+/// Initialize the global sigcode VmObject. Safe to call multiple times
+/// (only the first call allocates). Called lazily on first exec.
+pub fn init_sigcode_object() {
+    SIGCODE_OBJ.call_once(|| {
+        use crate::mm::vm::{PageRef, VObjIndex, VmObject};
 
-    // Map as read-only + user-accessible
-    let prot = crate::map_perm!(R, X, U);
-    let _ = pmap_enter(pmap, VirtAddr::new(SIGCODE_VA), frame, prot, false);
+        let obj = VmObject::new_anon(PAGE_SIZE);
+        let frame = crate::mm::alloc_raw_frame_sync(crate::mm::PageRole::SigTrampoline)
+            .expect("sigcode frame alloc failed");
+
+        // Write sigcode instructions into the physical frame
+        let page_data = build_sigcode_page();
+        unsafe {
+            let va = frame.into_kernel_vaddr();
+            core::ptr::copy_nonoverlapping(page_data.as_ptr(), va.as_mut_ptr(), PAGE_SIZE);
+        }
+
+        obj.write()
+            .insert_page(VObjIndex::new(0), PageRef::new(frame));
+        obj
+    });
+}
+
+/// Get a reference to the global sigcode VmObject.
+/// Lazily initializes on first call.
+pub fn sigcode_object() -> &'static Arc<LeveledRwLock<crate::mm::vm::VmObject, 3>> {
+    init_sigcode_object();
+    SIGCODE_OBJ.get().expect("sigcode object not initialized")
 }

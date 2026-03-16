@@ -4,6 +4,7 @@
 //! the hardware Sv39 page tables. API matches BLACKBOX §4.3.
 
 pub mod asid;
+pub mod container;
 pub mod pte;
 pub mod shootdown;
 pub mod test_integration;
@@ -110,6 +111,63 @@ impl Pmap {
         #[cfg(not(target_arch = "riscv64"))]
         {
             None
+        }
+    }
+
+    /// Read-only lookup. Returns `None` if no valid leaf PTE at `va`.
+    pub fn get(&self, va: VirtAddr) -> Option<container::PmapRef> {
+        // SAFETY: `self.root.phys()` is a valid page table root PA.
+        // We pass `alloc = false` so no pages are allocated.
+        // The kernel is identity-mapped so PA == VA for page table pages.
+        unsafe {
+            let pte_ptr = walk::walk::<SV39_LEVELS>(self.root.phys(), va, false, &mut |_| None)?;
+            let raw = pte_ptr.read_volatile();
+            if pte_is_valid(raw) && pte_is_leaf(raw) {
+                Some(container::PmapRef {
+                    pa: PhysAddr::new(pte_pa(raw)),
+                    flags: pte_flags(raw),
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Mutable entry lookup, analogous to `HashMap::entry()`.
+    ///
+    /// Returns `Occupied` if a valid leaf PTE exists, `Vacant` otherwise.
+    pub fn entry(&mut self, va: VirtAddr) -> container::PmapEntry<'_> {
+        // SAFETY: same as `get` — valid root PA, no allocation, identity map.
+        unsafe {
+            let pte_ptr = walk::walk::<SV39_LEVELS>(self.root.phys(), va, false, &mut |_| None);
+            match pte_ptr {
+                Some(ptr) => {
+                    let raw = ptr.read_volatile();
+                    if pte_is_valid(raw) && pte_is_leaf(raw) {
+                        container::PmapEntry::Occupied(container::OccupiedEntry {
+                            pte_ptr: ptr,
+                            pmap: self,
+                            va,
+                            pa: PhysAddr::new(pte_pa(raw)),
+                            flags: pte_flags(raw),
+                        })
+                    } else {
+                        container::PmapEntry::Vacant(container::VacantEntry { pmap: self, va })
+                    }
+                },
+                None => container::PmapEntry::Vacant(container::VacantEntry { pmap: self, va }),
+            }
+        }
+    }
+
+    /// Insert only if vacant — the "cache fill" pattern.
+    ///
+    /// Returns `Ok(())` if the VA was already mapped (no-op) or if the
+    /// new mapping was inserted successfully.
+    pub fn entry_or_insert(&mut self, va: VirtAddr, pa: PhysAddr, perm: MapPerm) -> Result<(), ()> {
+        match self.entry(va) {
+            container::PmapEntry::Occupied(_) => Ok(()),
+            container::PmapEntry::Vacant(v) => v.insert(pa, perm),
         }
     }
 }

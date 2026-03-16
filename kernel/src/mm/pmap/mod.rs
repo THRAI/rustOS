@@ -171,6 +171,24 @@ impl Pmap {
         }
     }
 
+    /// Read-only range iterator over valid leaf PTEs in `[start, end)`.
+    ///
+    /// Yields `(VirtAddr, PhysAddr, PteFlags)` for each valid leaf PTE,
+    /// skipping empty subtrees efficiently (1 GiB for invalid L0, 2 MiB
+    /// for invalid L1).
+    pub fn range(&self, start: VirtAddr, end: VirtAddr) -> container::PmapRange<'_> {
+        let root_pa = self.root.phys().as_usize();
+        let start_va = start.as_usize();
+        let end_va = end.as_usize();
+        let start_idx = (start_va >> 30) & 0x1FF;
+        let end_idx = if end_va == 0 {
+            511
+        } else {
+            ((end_va - 1) >> 30) & 0x1FF
+        };
+        container::PmapRange::new(self, start_va, end_va, (root_pa, start_idx, end_idx))
+    }
+
     /// Visit valid leaf PTEs in `[start, end)`, skipping empty subtrees.
     ///
     /// The closure receives an `OccupiedEntryMut` that can remove or modify

@@ -6,7 +6,9 @@
 use core::marker::PhantomData;
 
 use super::{
-    pte::{encode_pte, map_perm_to_pte_flags, PteFlags},
+    pte::{
+        encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa, PteFlags,
+    },
     Pmap,
 };
 use crate::{
@@ -231,5 +233,154 @@ impl OccupiedEntryMut<'_> {
         }
         self.flags = new_flags;
         ShootdownToken(self.va)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PmapRange — read-only range iterator over valid leaf PTEs
+// ---------------------------------------------------------------------------
+
+/// Read-only range iterator over valid leaf PTEs in `[start, end)`.
+///
+/// Skips empty subtrees in the Sv39 3-level page table:
+/// - Invalid L0 PTE → skip 1 GiB
+/// - Invalid L1 PTE → skip 2 MiB
+///
+/// Yields `(VirtAddr, PhysAddr, PteFlags)` for each valid leaf PTE.
+pub struct PmapRange<'a> {
+    _pmap: &'a super::Pmap,
+    start_va: usize,
+    end_va: usize,
+    /// Per-level state: (table_pa, current_idx, end_idx_inclusive)
+    stack: [(usize, usize, usize); 3],
+    depth: usize,
+}
+
+impl<'a> PmapRange<'a> {
+    /// Create a new range iterator. Called by `Pmap::range()`.
+    pub(crate) fn new(
+        pmap: &'a super::Pmap,
+        start_va: usize,
+        end_va: usize,
+        root_stack_entry: (usize, usize, usize),
+    ) -> Self {
+        Self {
+            _pmap: pmap,
+            start_va,
+            end_va,
+            stack: [root_stack_entry, (0, 0, 0), (0, 0, 0)],
+            depth: 0,
+        }
+    }
+
+    /// Sv39 bit-shift for a given depth.
+    /// depth 0 (L0/root) → 30, depth 1 (L1) → 21, depth 2 (L2) → 12.
+    #[inline]
+    fn shift_for(depth: usize) -> usize {
+        12 + 9 * (2 - depth)
+    }
+
+    /// Reconstruct the virtual address from indices stored in the stack
+    /// at levels `0..=depth`.
+    #[inline]
+    fn reconstruct_va(&self, depth: usize) -> usize {
+        let mut va = 0usize;
+        for d in 0..=depth {
+            va |= self.stack[d].1 << Self::shift_for(d);
+        }
+        va
+    }
+
+    /// Compute child-level start/end indices when descending from `parent_depth`.
+    ///
+    /// Mirrors the clipping logic in `walk_range_mut`: compute the VA span
+    /// of the parent entry's subtree, clip against `[start_va, end_va)`,
+    /// then extract child-level VPN indices from the clipped range.
+    #[inline]
+    fn child_index_range(&self, parent_depth: usize) -> (usize, usize) {
+        let child_shift = Self::shift_for(parent_depth + 1);
+        let parent_span: usize = 1 << Self::shift_for(parent_depth);
+
+        // VA base of the parent entry's subtree (from stack indices 0..=parent).
+        let subtree_va = self.reconstruct_va(parent_depth);
+
+        // Clip the iteration range to this subtree.
+        let clipped_start = if self.start_va > subtree_va {
+            self.start_va
+        } else {
+            subtree_va
+        };
+        let subtree_end = subtree_va + parent_span;
+        let clipped_end = if self.end_va < subtree_end {
+            self.end_va
+        } else {
+            subtree_end
+        };
+
+        let child_start = (clipped_start >> child_shift) & 0x1FF;
+        let child_end = ((clipped_end - 1) >> child_shift) & 0x1FF;
+        (child_start, child_end)
+    }
+}
+
+impl Iterator for PmapRange<'_> {
+    type Item = (VirtAddr, PhysAddr, PteFlags);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start_va >= self.end_va {
+            return None;
+        }
+
+        loop {
+            let (table_pa, current_idx, end_idx) = self.stack[self.depth];
+
+            // Past end at this level → pop up.
+            if current_idx > end_idx {
+                if self.depth == 0 {
+                    return None; // All L0 entries exhausted.
+                }
+                self.depth -= 1;
+                self.stack[self.depth].1 += 1; // Advance parent index.
+                continue;
+            }
+
+            // SAFETY: `table_pa` is a valid, identity-mapped page table page PA.
+            // `current_idx` is in [0, 512) so the offset is within the 4 KiB page.
+            // We only read (no mutation), and hold `&Pmap` for lifetime safety.
+            let raw = unsafe {
+                let pte_ptr = (table_pa as *const u64).add(current_idx);
+                pte_ptr.read_volatile()
+            };
+
+            if !pte_is_valid(raw) {
+                // Invalid PTE → skip this subtree, advance index.
+                self.stack[self.depth].1 += 1;
+                continue;
+            }
+
+            if pte_is_leaf(raw) {
+                // Valid leaf → yield (va, pa, flags), then advance.
+                let va = self.reconstruct_va(self.depth);
+                self.stack[self.depth].1 += 1;
+                return Some((
+                    VirtAddr::new(va),
+                    PhysAddr::new(pte_pa(raw)),
+                    pte_flags(raw),
+                ));
+            }
+
+            // Valid non-leaf → descend if not at max depth.
+            if self.depth < 2 {
+                let child_table_pa = pte_pa(raw);
+                let (child_start, child_end) = self.child_index_range(self.depth);
+                self.depth += 1;
+                self.stack[self.depth] = (child_table_pa, child_start, child_end);
+                continue;
+            }
+
+            // Depth 2 but non-leaf — shouldn't happen in valid Sv39.
+            // Skip defensively.
+            self.stack[self.depth].1 += 1;
+        }
     }
 }

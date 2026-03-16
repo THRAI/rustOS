@@ -7,9 +7,9 @@ pub mod splay;
 pub(crate) use splay::{SplayTree, SplayTreeIter};
 
 use crate::{
-    hal_common::{Errno, LeveledRwLock, SpinMutex, VirtAddr, PAGE_SIZE},
+    hal_common::{Errno, LeveledRwLock, PhysAddr, SpinMutex, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap_enter, pmap_protect, pmap_remove,
+        pmap_enter, pmap_extract, pmap_protect, pmap_remove,
         vm::{CowState, MapPerm, VmMapEntry, VmMapping, VmObject},
         Pmap,
     },
@@ -596,6 +596,131 @@ impl VmMap {
 
     pub fn iter(&self) -> SplayTreeIter<'_> {
         self.tree.iter()
+    }
+
+    // -----------------------------------------------------------------------
+    // COW fork
+    // -----------------------------------------------------------------------
+
+    /// COW fork: create shadow chains for writable VMAs, share read-only VMAs.
+    /// Copies parent page mappings into child pmap.
+    ///
+    /// `self` is the parent VmMap, `child` is the freshly-created child VmMap.
+    /// After this call, writable pages are downgraded to RO in both parent and
+    /// child pmaps so the first write triggers a COW fault.
+    pub fn cow_fork_into(&mut self, child: &mut VmMap) -> Result<(), Errno> {
+        let mut parent_rebinds: alloc::vec::Vec<(u64, VmMapping)> = alloc::vec::Vec::new();
+        let mut child_entries: alloc::vec::Vec<VmMapEntry> = alloc::vec::Vec::new();
+        let mut pmap_ranges: alloc::vec::Vec<(u64, u64, MapPerm, bool)> = alloc::vec::Vec::new();
+
+        for vma in self.iter() {
+            let is_writable = vma.protection.contains(MapPerm::W);
+
+            let (parent_new_mapping, child_new_mapping) = match &vma.mapping {
+                VmMapping::Guard => (None, VmMapping::Guard),
+                mapping => {
+                    let parent_obj = match mapping.object() {
+                        Some(obj) => obj,
+                        None => {
+                            // Should not happen for non-Guard variants
+                            continue;
+                        },
+                    };
+
+                    if is_writable {
+                        // Writable mapping: both parent and child must get their own
+                        // shadows backed by the original object, otherwise whichever
+                        // side writes first will leak modifications to the other side.
+                        let size_bytes = (vma.end() - vma.start()) as usize;
+                        let parent_obj_shadow =
+                            VmObject::new_shadow(Arc::clone(parent_obj), size_bytes);
+                        let child_obj_shadow =
+                            VmObject::new_shadow(Arc::clone(parent_obj), size_bytes);
+
+                        // Keep file-backed demand-fault behavior on shadow heads.
+                        {
+                            let parent_read = parent_obj.read();
+                            if let Some(ref pager) = parent_read.pager {
+                                if !pager.is_anon() {
+                                    parent_obj_shadow.write().pager = Some(Arc::clone(pager));
+                                    child_obj_shadow.write().pager = Some(Arc::clone(pager));
+                                }
+                            }
+                        }
+                        (
+                            Some(mapping.with_object(parent_obj_shadow)),
+                            mapping.with_object(child_obj_shadow),
+                        )
+                    } else {
+                        // Read-only: share the same VmObject (no shadow needed)
+                        (None, mapping.with_object(Arc::clone(parent_obj)))
+                    }
+                },
+            };
+
+            if let Some(new_mapping) = parent_new_mapping {
+                parent_rebinds.push((vma.start(), new_mapping));
+            };
+
+            let child_vma =
+                VmMapEntry::new(vma.start(), vma.end(), child_new_mapping, vma.protection);
+            child_entries.push(child_vma);
+            pmap_ranges.push((vma.start(), vma.end(), vma.protection, is_writable));
+        }
+
+        // Rebind parent VMAs to their new COW shadow heads.
+        for (start, new_mapping) in parent_rebinds {
+            if let Some(vma) = self.lookup_mut(start) {
+                vma.mapping = new_mapping;
+            }
+        }
+
+        // Install child VMAs.
+        for entry in child_entries {
+            child.insert_entry(entry)?;
+        }
+
+        // Phase 2: set up pmap mappings
+        //
+        // Lock ordering: child_pmap (L2) → parent_pmap (L2).
+        // Safe today because the child is brand-new (no concurrent access).
+        let child_pmap_arc = child.pmap.clone();
+        let mut child_pmap = child_pmap_arc.lock();
+        let parent_pmap_arc = self.pmap.clone();
+        let mut parent_pmap = parent_pmap_arc.lock();
+
+        for (start, end, prot, is_writable) in pmap_ranges {
+            if is_writable && !prot.contains(MapPerm::W) {
+                continue;
+            }
+            if prot.is_empty() {
+                continue;
+            }
+
+            let mut va = start as usize;
+            while va < end as usize {
+                if let Some(pa) = pmap_extract(&parent_pmap, VirtAddr::new(va)) {
+                    if is_writable {
+                        // Strip W from parent PTE to force COW fault on parent writes too
+                        let ro_prot = prot & !MapPerm::W;
+                        pmap_protect(
+                            &mut parent_pmap,
+                            VirtAddr::new(va),
+                            VirtAddr(va + PAGE_SIZE),
+                            ro_prot,
+                        );
+                        // Map same physical page read-only in child
+                        let _ = pmap_enter(&mut child_pmap, VirtAddr::new(va), pa, ro_prot, false);
+                    } else {
+                        // Read-only: share with same permissions
+                        let _ = pmap_enter(&mut child_pmap, VirtAddr::new(va), pa, prot, false);
+                    }
+                }
+                va += PAGE_SIZE;
+            }
+        }
+
+        Ok(())
     }
 }
 

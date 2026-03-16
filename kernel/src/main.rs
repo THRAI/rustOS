@@ -574,14 +574,17 @@ fn test_uiomove_short_read() {
 fn test_fork_exit_wait4() {
     use alloc::sync::Arc;
 
-    use proc::{fork, sys_exit, syscall_result::SyscallResult, Task, WaitChildFuture, WaitStatus};
+    use proc::{
+        do_clone, sys_exit, syscall_result::SyscallResult, CloneFlags, Task, WaitChildFuture,
+        WaitStatus,
+    };
 
     // Create init task (pid 1)
     let init = Task::new_init();
     let init_pid = init.pid;
 
-    // Fork to create child
-    let child = fork(&init);
+    // Fork to create child (via do_clone with no special flags)
+    let child = do_clone(&init, CloneFlags::empty(), 0, 0).expect("do_clone failed");
     let child_pid = child.pid;
 
     // Verify child has different pid
@@ -731,13 +734,13 @@ async fn test_vfs_read() {
 async fn test_fork_exec_wait4() {
     use alloc::sync::Arc;
 
-    use proc::{do_execve, fork, sys_exit, Task, WaitChildFuture, WaitStatus};
+    use proc::{do_clone, do_execve, sys_exit, CloneFlags, Task, WaitChildFuture, WaitStatus};
 
     // Create init task
     let init = Task::new_init();
 
-    // Fork child
-    let child = fork(&init);
+    // Fork child (via do_clone with no special flags)
+    let child = do_clone(&init, CloneFlags::empty(), 0, 0).expect("do_clone failed");
     let child_pid = child.pid;
 
     // Try do_execve on the child — use /hello.txt which is NOT an ELF

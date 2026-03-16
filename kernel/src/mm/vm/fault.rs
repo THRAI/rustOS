@@ -13,7 +13,7 @@
 
 use alloc::sync::Arc;
 
-use super::super::pmap::{self, Pmap};
+use super::super::pmap::Pmap;
 use crate::{
     hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE},
     mm::vm::{BackingStore, MapPerm, VObjIndex, VmMap, VmMapEntry},
@@ -208,7 +208,10 @@ fn classify_and_handle(
             handle_cow_fault(vma, obj, obj_page_offset, fault_va_aligned, _old_phys, pmap)
         },
         Some(phys) => {
-            if pmap::pmap_enter(pmap, fault_va_aligned, phys, vma.protection, false).is_err() {
+            if pmap
+                .entry_or_insert(fault_va_aligned, phys, vma.protection)
+                .is_err()
+            {
                 return FaultResult::Error(kerr!(
                     vm,
                     error,
@@ -217,15 +220,6 @@ fn classify_and_handle(
                     fault_va_aligned.0,
                     phys.as_usize(),
                     vma.protection
-                ));
-            }
-            if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
-                return FaultResult::Error(kerr!(
-                    vm,
-                    error,
-                    Errno::Efault,
-                    "fault map VERIFY_FAILED va={:#x} (pte missing right after enter)",
-                    fault_va_aligned.0
                 ));
             }
             FaultResult::Resolved
@@ -260,14 +254,9 @@ fn handle_anonymous_fault(
     };
 
     // Map the page in the hardware page table.
-    if pmap::pmap_enter(
-        pmap,
-        fault_va_aligned,
-        new_frame_phys,
-        vma.protection,
-        false,
-    )
-    .is_err()
+    if pmap
+        .entry_or_insert(fault_va_aligned, new_frame_phys, vma.protection)
+        .is_err()
     {
         return FaultResult::Error(kerr!(
             vm,
@@ -276,15 +265,6 @@ fn handle_anonymous_fault(
             "anon fault map FAILED va={:#x} pa={:#x}",
             fault_va_aligned.0,
             new_frame_phys.as_usize()
-        ));
-    }
-    if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
-        return FaultResult::Error(kerr!(
-            vm,
-            error,
-            Errno::Efault,
-            "anon fault VERIFY_FAILED va={:#x}",
-            fault_va_aligned.0
         ));
     }
 
@@ -313,12 +293,10 @@ fn handle_cow_fault(
         obj_read.has_page(obj_page_offset) && obj_read.shadow_count() == 0
     };
     if can_promote {
-        pmap::pmap_protect(
-            pmap,
-            fault_va_aligned,
-            VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
-            vma.protection,
-        );
+        if let crate::mm::pmap::container::PmapEntry::Occupied(mut e) = pmap.entry(fault_va_aligned)
+        {
+            e.promote(vma.protection);
+        }
         return FaultResult::Resolved;
     }
 
@@ -332,12 +310,11 @@ fn handle_cow_fault(
                 obj_write.collapse();
                 if obj_write.has_page(obj_page_offset) {
                     drop(obj_write);
-                    pmap::pmap_protect(
-                        pmap,
-                        fault_va_aligned,
-                        VirtAddr(fault_va_aligned.0 + PAGE_SIZE),
-                        vma.protection,
-                    );
+                    if let crate::mm::pmap::container::PmapEntry::Occupied(mut e) =
+                        pmap.entry(fault_va_aligned)
+                    {
+                        e.promote(vma.protection);
+                    }
                     return FaultResult::Resolved;
                 }
             }
@@ -361,32 +338,23 @@ fn handle_cow_fault(
         }
     };
 
-    if pmap::pmap_enter(
-        pmap,
-        fault_va_aligned,
-        new_frame_phys,
-        vma.protection,
-        false,
-    )
-    .is_err()
-    {
-        return FaultResult::Error(kerr!(
-            vm,
-            error,
-            Errno::Enomem,
-            "cow fault map FAILED va={:#x} pa={:#x}",
-            fault_va_aligned.0,
-            new_frame_phys.as_usize()
-        ));
-    }
-    if pmap::pmap_extract(pmap, fault_va_aligned).is_none() {
-        return FaultResult::Error(kerr!(
-            vm,
-            error,
-            Errno::Efault,
-            "cow fault VERIFY_FAILED va={:#x}",
-            fault_va_aligned.0
-        ));
+    // Map the new COW copy into the page table, replacing the old mapping.
+    match pmap.entry(fault_va_aligned) {
+        crate::mm::pmap::container::PmapEntry::Occupied(mut e) => {
+            e.insert(new_frame_phys, vma.protection);
+        },
+        crate::mm::pmap::container::PmapEntry::Vacant(v) => {
+            if v.insert(new_frame_phys, vma.protection).is_err() {
+                return FaultResult::Error(kerr!(
+                    vm,
+                    error,
+                    Errno::Enomem,
+                    "cow fault map FAILED va={:#x} pa={:#x}",
+                    fault_va_aligned.0,
+                    new_frame_phys.as_usize()
+                ));
+            }
+        },
     }
 
     FaultResult::Resolved

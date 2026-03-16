@@ -8,12 +8,11 @@ use alloc::sync::Arc;
 use crate::{
     hal_common::{Errno, LeveledRwLock, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page,
+        pmap_zero_page,
         vm::{
             page_ref::PageRef, sync_fault_handler, BackingStore, FaultResult, MapPerm,
             PageFaultAccessType, VmMap, VmObject,
         },
-        PteFlags,
     },
     proc::Task,
 };
@@ -63,12 +62,12 @@ pub async fn resolve_user_fault(
         let vm_map = task.vm_map.read();
         let pmap = vm_map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-        if let Some((_pa, flags)) = pmap_extract_with_flags(&pmap, fault_va_aligned) {
+        if let Some(entry) = pmap.get(fault_va_aligned) {
             let mut ok = true;
-            if access_type.write && !flags.contains(PteFlags::W) {
+            if access_type.write && !entry.permits_write() {
                 ok = false; // COW page — must go through fault handler
             }
-            if access_type.execute && !flags.contains(PteFlags::X) {
+            if access_type.execute && !entry.permits_exec() {
                 ok = false;
             }
             if ok {
@@ -80,7 +79,7 @@ pub async fn resolve_user_fault(
                 "resolve_user_fault fastpath miss: pid={} va={:#x} flags={:?} access(w={},x={})",
                 task.pid,
                 fault_va_aligned.as_usize(),
-                flags,
+                entry.flags(),
                 access_type.write,
                 access_type.execute
             );
@@ -209,25 +208,18 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         };
         let mut pmap = map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-        if pmap_extract(&pmap, fault_va_aligned).is_none() {
-            if pmap_enter(
-                &mut pmap,
-                fault_va_aligned,
-                existing_pa,
-                current_perm,
-                false,
-            )
+        if pmap
+            .entry_or_insert(fault_va_aligned, existing_pa, current_perm)
             .is_err()
-            {
-                return Err(kerr!(
-                    vm,
-                    error,
-                    Errno::Enomem,
-                    "async fault OOM: pmap_enter cached pid={} va={:#x}",
-                    task.pid,
-                    fault_va.as_usize()
-                ));
-            }
+        {
+            return Err(kerr!(
+                vm,
+                error,
+                Errno::Enomem,
+                "async fault OOM: pmap_enter cached pid={} va={:#x}",
+                task.pid,
+                fault_va.as_usize()
+            ));
         }
         return Ok(());
     }
@@ -306,42 +298,36 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         if let Some(existing_pa) = obj_write.lookup_page(obj_offset) {
             // Another thread already inserted a page. Free ours via PageRef drop.
             drop(PageRef::new(frame));
-            if pmap_extract(&pmap, fault_va_aligned).is_none() {
-                if pmap_enter(
-                    &mut pmap,
-                    fault_va_aligned,
-                    existing_pa,
-                    current_perm,
-                    false,
-                )
+            if pmap
+                .entry_or_insert(fault_va_aligned, existing_pa, current_perm)
                 .is_err()
-                {
-                    return Err(kerr!(
-                        vm,
-                        error,
-                        Errno::Enomem,
-                        "async fault OOM: pmap_enter race pid={} va={:#x}",
-                        task.pid,
-                        fault_va.as_usize()
-                    ));
-                }
+            {
+                return Err(kerr!(
+                    vm,
+                    error,
+                    Errno::Enomem,
+                    "async fault OOM: pmap_enter race pid={} va={:#x}",
+                    task.pid,
+                    fault_va.as_usize()
+                ));
             }
             return Ok(());
         }
 
         obj_write.insert_page(obj_offset, PageRef::new(frame));
 
-        if pmap_extract(&pmap, fault_va_aligned).is_none() {
-            if pmap_enter(&mut pmap, fault_va_aligned, frame, current_perm, false).is_err() {
-                return Err(kerr!(
-                    vm,
-                    error,
-                    Errno::Enomem,
-                    "async fault OOM: pmap_enter final pid={} va={:#x}",
-                    task.pid,
-                    fault_va.as_usize()
-                ));
-            }
+        if pmap
+            .entry_or_insert(fault_va_aligned, frame, current_perm)
+            .is_err()
+        {
+            return Err(kerr!(
+                vm,
+                error,
+                Errno::Enomem,
+                "async fault OOM: pmap_enter final pid={} va={:#x}",
+                task.pid,
+                fault_va.as_usize()
+            ));
         }
     }
 

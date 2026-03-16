@@ -131,6 +131,7 @@ ifneq ($(UNAME_S),Linux)
 endif
 	@test -d $(OSCOMP_TC) || (echo "missing $(OSCOMP_TC)"; exit 1)
 	@test -f $(OSCOMP_RUN) || (echo "missing $(OSCOMP_RUN)"; exit 1)
+	@test -f $(OSCOMP_TC)/riscv/musl/busybox || (echo "missing $(OSCOMP_TC)/riscv/musl/busybox"; exit 1)
 	rm -f scripts/sdcard-rv.img
 	dd if=/dev/zero of=scripts/sdcard-rv.img bs=1M count=512
 	mkfs.ext4 -F -O ^metadata_csum_seed scripts/sdcard-rv.img
@@ -141,6 +142,33 @@ endif
 	sudo find scripts/mnt -type f -name "*.sh" -exec chmod +x {} \;
 	sudo chmod +x scripts/mnt/riscv/run-oj.sh
 	sudo mkdir -p scripts/mnt/bin scripts/mnt/lib scripts/mnt/lib64 scripts/mnt/etc
+	sudo cp $(OSCOMP_TC)/riscv/musl/busybox scripts/mnt/bin/busybox
+	sudo chmod +x scripts/mnt/bin/busybox
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/sh
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/ls
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/cat
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/mkdir
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/rm
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/rmdir
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/mv
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/cp
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/touch
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/pwd
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/echo
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/ln
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/chmod
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/chown
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/uname
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/ps
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/kill
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/grep
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/find
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/head
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/tail
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/wc
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/sort
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/sed
+	sudo ln -f scripts/mnt/bin/busybox scripts/mnt/bin/awk
 	sudo cp scripts/initproc scripts/mnt/bin/initproc
 	sudo chmod +x scripts/mnt/bin/initproc
 	sudo umount scripts/mnt

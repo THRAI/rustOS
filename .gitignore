@@ -24,6 +24,7 @@ scripts/sdcard-la.img
 *.expect
 *.img
 kernel-rv
+/ai_answer/
 # allow testcase text fixtures
 !testcase/**/*.txt
 */__pycache__/

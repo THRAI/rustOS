@@ -603,124 +603,27 @@ impl VmMap {
     // -----------------------------------------------------------------------
 
     /// COW fork: create shadow chains for writable VMAs, share read-only VMAs.
-    /// Copies parent page mappings into child pmap.
     ///
-    /// `self` is the parent VmMap, `child` is the freshly-created child VmMap.
-    /// After this call, writable pages are downgraded to RO in both parent and
-    /// child pmaps so the first write triggers a COW fault.
+    /// Pipeline:
+    /// 1. **Classify** — each parent VMA → `ForkDescriptor` (pure, no mutation)
+    /// 2. **Apply** — fold descriptors into (parent rebind + child insert + pmap)
+    ///    under a single `ShootdownBatch` across all writable pages.
     pub fn cow_fork_into(&mut self, child: &mut VmMap) -> Result<(), Errno> {
-        let mut parent_rebinds: alloc::vec::Vec<(u64, VmMapping)> = alloc::vec::Vec::new();
-        let mut child_entries: alloc::vec::Vec<VmMapEntry> = alloc::vec::Vec::new();
-        let mut pmap_ranges: alloc::vec::Vec<(u64, u64, MapPerm, bool)> = alloc::vec::Vec::new();
+        // Phase 1: classify (pure — snapshot decisions before mutating anything)
+        let descriptors: alloc::vec::Vec<ForkDescriptor> =
+            self.iter().filter_map(ForkDescriptor::from_vma).collect();
 
-        for vma in self.iter() {
-            let is_writable = vma.protection.contains(MapPerm::W);
-
-            let (parent_new_mapping, child_new_mapping) = match &vma.mapping {
-                VmMapping::Guard => (None, VmMapping::Guard),
-                mapping => {
-                    let parent_obj = match mapping.object() {
-                        Some(obj) => obj,
-                        None => {
-                            // Should not happen for non-Guard variants
-                            continue;
-                        },
-                    };
-
-                    if is_writable {
-                        // Writable mapping: both parent and child must get their own
-                        // shadows backed by the original object, otherwise whichever
-                        // side writes first will leak modifications to the other side.
-                        let size_bytes = (vma.end() - vma.start()) as usize;
-                        let parent_obj_shadow =
-                            VmObject::new_shadow(Arc::clone(parent_obj), size_bytes);
-                        let child_obj_shadow =
-                            VmObject::new_shadow(Arc::clone(parent_obj), size_bytes);
-
-                        // Keep file-backed demand-fault behavior on shadow heads.
-                        {
-                            let parent_read = parent_obj.read();
-                            if let Some(ref pager) = parent_read.pager {
-                                if !pager.is_anon() {
-                                    parent_obj_shadow.write().pager = Some(Arc::clone(pager));
-                                    child_obj_shadow.write().pager = Some(Arc::clone(pager));
-                                }
-                            }
-                        }
-                        (
-                            Some(mapping.with_object(parent_obj_shadow)),
-                            mapping.with_object(child_obj_shadow),
-                        )
-                    } else {
-                        // Read-only: share the same VmObject (no shadow needed)
-                        (None, mapping.with_object(Arc::clone(parent_obj)))
-                    }
-                },
-            };
-
-            if let Some(new_mapping) = parent_new_mapping {
-                parent_rebinds.push((vma.start(), new_mapping));
-            };
-
-            let child_vma =
-                VmMapEntry::new(vma.start(), vma.end(), child_new_mapping, vma.protection);
-            child_entries.push(child_vma);
-            pmap_ranges.push((vma.start(), vma.end(), vma.protection, is_writable));
-        }
-
-        // Rebind parent VMAs to their new COW shadow heads.
-        for (start, new_mapping) in parent_rebinds {
-            if let Some(vma) = self.lookup_mut(start) {
-                vma.mapping = new_mapping;
-            }
-        }
-
-        // Install child VMAs.
-        for entry in child_entries {
-            child.insert_entry(entry)?;
-        }
-
-        // Phase 2: set up pmap mappings
-        //
-        // Lock ordering: child_pmap (L2) → parent_pmap (L2).
-        // Safe today because the child is brand-new (no concurrent access).
+        // Phase 2: apply VMA + pmap mutations under one ShootdownBatch
         let child_pmap_arc = child.pmap.clone();
         let mut child_pmap = child_pmap_arc.lock();
         let parent_pmap_arc = self.pmap.clone();
         let mut parent_pmap = parent_pmap_arc.lock();
+        let mut batch = parent_pmap.shootdown_batch();
 
-        for (start, end, prot, is_writable) in pmap_ranges {
-            if is_writable && !prot.contains(MapPerm::W) {
-                continue;
-            }
-            if prot.is_empty() {
-                continue;
-            }
-
-            let mut va = start as usize;
-            while va < end as usize {
-                if let Some(pa) = pmap_extract(&parent_pmap, VirtAddr::new(va)) {
-                    if is_writable {
-                        // Strip W from parent PTE to force COW fault on parent writes too
-                        let ro_prot = prot & !MapPerm::W;
-                        pmap_protect(
-                            &mut parent_pmap,
-                            VirtAddr::new(va),
-                            VirtAddr(va + PAGE_SIZE),
-                            ro_prot,
-                        );
-                        // Map same physical page read-only in child
-                        let _ = pmap_enter(&mut child_pmap, VirtAddr::new(va), pa, ro_prot, false);
-                    } else {
-                        // Read-only: share with same permissions
-                        let _ = pmap_enter(&mut child_pmap, VirtAddr::new(va), pa, prot, false);
-                    }
-                }
-                va += PAGE_SIZE;
-            }
-        }
-
-        Ok(())
+        descriptors.into_iter().try_for_each(|desc| {
+            desc.apply(self, child, &mut parent_pmap, &mut child_pmap, &mut batch)
+        })
+        // batch drops here → single quiesce release + single adaptive flush
     }
 }
 
@@ -732,4 +635,132 @@ impl Drop for VmMap {
         // 2. Clear tree
         // SplayTree's drop iteratively drops all entries
     }
+}
+
+// ---------------------------------------------------------------------------
+// COW fork descriptor — pure classification of per-VMA fork action
+// ---------------------------------------------------------------------------
+
+/// What fork does with one VMA. Produced by pure classification, consumed
+/// by `apply()` which binds VMA + pmap mutations together.
+enum ForkDescriptor {
+    /// Read-only region: share the VmObject, copy pmap entries as-is.
+    Share {
+        start: u64,
+        end: u64,
+        prot: MapPerm,
+        child_mapping: VmMapping,
+    },
+    /// Writable region: shadow both sides, downgrade parent pmap to RO.
+    Cow {
+        start: u64,
+        end: u64,
+        prot: MapPerm,
+        parent_shadow: VmMapping,
+        child_shadow: VmMapping,
+    },
+}
+
+impl ForkDescriptor {
+    /// Pure classification: inspect a parent VMA and decide the fork action.
+    /// Returns `None` for Guard entries (nothing to inherit).
+    fn from_vma(vma: &VmMapEntry) -> Option<Self> {
+        let obj = vma.mapping.object()?;
+        if vma.protection.contains(MapPerm::W) {
+            let (parent_shadow, child_shadow) = build_cow_shadows(obj, &vma.mapping);
+            Some(Self::Cow {
+                start: vma.start(),
+                end: vma.end(),
+                prot: vma.protection,
+                parent_shadow,
+                child_shadow,
+            })
+        } else {
+            Some(Self::Share {
+                start: vma.start(),
+                end: vma.end(),
+                prot: vma.protection,
+                child_mapping: vma.mapping.with_object(Arc::clone(obj)),
+            })
+        }
+    }
+
+    /// Apply this descriptor: rebind parent VMA + insert child VMA + sync pmap.
+    /// All three mutations are bound in one call. The `batch` is shared across
+    /// all descriptors so writable page downgrades use a single ShootdownBatch.
+    fn apply(
+        self,
+        parent: &mut VmMap,
+        child: &mut VmMap,
+        parent_pmap: &mut crate::mm::Pmap,
+        child_pmap: &mut crate::mm::Pmap,
+        batch: &mut crate::mm::pmap::shootdown::ShootdownBatch,
+    ) -> Result<(), Errno> {
+        match self {
+            Self::Share {
+                start,
+                end,
+                prot,
+                child_mapping,
+            } => {
+                // VMA: insert child entry (parent unchanged)
+                child.insert_entry(VmMapEntry::new(start, end, child_mapping, prot))?;
+                // Pmap: copy parent pages into child as-is
+                let va_start = VirtAddr::new(start as usize);
+                let va_end = VirtAddr::new(end as usize);
+                for (va, pa, _) in parent_pmap.range(va_start, va_end) {
+                    child_pmap.entry_or_insert(va, pa, prot).ok();
+                }
+            },
+            Self::Cow {
+                start,
+                end,
+                prot,
+                parent_shadow,
+                child_shadow,
+            } => {
+                // VMA: rebind parent store to shadow, insert child with its shadow
+                if let Some(vma) = parent.lookup_mut(start) {
+                    vma.mapping = parent_shadow;
+                }
+                child.insert_entry(VmMapEntry::new(start, end, child_shadow, prot))?;
+                // Pmap: downgrade parent W→RO, copy to child as RO
+                let ro = prot & !MapPerm::W;
+                let va_start = VirtAddr::new(start as usize);
+                let va_end = VirtAddr::new(end as usize);
+                parent_pmap.for_each_in_range_mut(va_start, va_end, |mut entry| {
+                    child_pmap.entry_or_insert(entry.va(), entry.pa(), ro).ok();
+                    batch.add(entry.set_perm(ro));
+                });
+            },
+        }
+        Ok(())
+    }
+}
+
+/// Build COW shadow VmObjects for both parent and child, preserving
+/// file-backed pager on both shadow heads for demand-fault continuity.
+fn build_cow_shadows(
+    parent_obj: &Arc<LeveledRwLock<VmObject, 3>>,
+    mapping: &VmMapping,
+) -> (VmMapping, VmMapping) {
+    let size_bytes = parent_obj.read().size();
+    let parent_shadow = VmObject::new_shadow(Arc::clone(parent_obj), size_bytes);
+    let child_shadow = VmObject::new_shadow(Arc::clone(parent_obj), size_bytes);
+
+    // Propagate non-anonymous pager so demand faults still reach the vnode.
+    {
+        let parent_read = parent_obj.read();
+        if let Some(ref pager) = parent_read.pager {
+            if !pager.is_anon() {
+                parent_shadow.write().pager = Some(Arc::clone(pager));
+                child_shadow.write().pager = Some(Arc::clone(pager));
+            }
+        }
+    }
+
+    (
+        mapping.with_object(parent_shadow),
+        mapping.with_object(child_shadow),
+    )
 }

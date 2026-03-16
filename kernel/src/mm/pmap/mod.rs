@@ -171,6 +171,11 @@ impl Pmap {
         }
     }
 
+    /// Create a `ShootdownBatch` for this pmap without exposing internals.
+    pub fn shootdown_batch(&self) -> shootdown::ShootdownBatch {
+        shootdown::ShootdownBatch::new(&self.active, self.asid)
+    }
+
     /// Read-only range iterator over valid leaf PTEs in `[start, end)`.
     ///
     /// Yields `(VirtAddr, PhysAddr, PteFlags)` for each valid leaf PTE,

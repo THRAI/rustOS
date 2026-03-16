@@ -286,6 +286,68 @@ impl Drop for QuiesceGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ShootdownBatch — batched TLB invalidation with quiesce protocol
+// ---------------------------------------------------------------------------
+
+/// Batched TLB invalidation with quiesce protocol.
+/// 1. `new()` → `QuiesceGuard` parks remote harts
+/// 2. `add()` → collect `ShootdownToken`s from entry mutations
+/// 3. `drop()` → adaptive local flush + release remote harts (they `flush_all`)
+#[cfg(target_arch = "riscv64")]
+pub struct ShootdownBatch {
+    dirty_vas: alloc::vec::Vec<usize>,
+    asid: u16,
+    _quiesce: QuiesceGuard,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl ShootdownBatch {
+    pub fn new(active: &[AtomicBool; MAX_CPUS], asid: u16) -> Self {
+        Self {
+            dirty_vas: alloc::vec::Vec::new(),
+            asid,
+            _quiesce: QuiesceGuard::new(active),
+        }
+    }
+
+    pub fn add(&mut self, token: super::container::ShootdownToken) {
+        self.dirty_vas.push(token.va().as_usize());
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Drop for ShootdownBatch {
+    fn drop(&mut self) {
+        if !self.dirty_vas.is_empty() {
+            if self.dirty_vas.len() <= SHOOTDOWN_PAGE_THRESHOLD {
+                for &va in &self.dirty_vas {
+                    // SAFETY: sfence.vma with specific VA and ASID is always safe
+                    // when executed on the local hart. We hold the quiesce guard
+                    // so remote harts are parked.
+                    unsafe {
+                        core::arch::asm!("sfence.vma {}, {}", in(reg) va, in(reg) self.asid as usize);
+                    }
+                }
+            } else {
+                crate::hal::flush_asid(self.asid as usize);
+            }
+        }
+        // _quiesce drops here → releases remote harts → they flush_all
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub struct ShootdownBatch;
+
+#[cfg(not(target_arch = "riscv64"))]
+impl ShootdownBatch {
+    pub fn new(_active: &[AtomicBool; MAX_CPUS], _asid: u16) -> Self {
+        Self
+    }
+    pub fn add(&mut self, _token: super::container::ShootdownToken) {}
+}
+
 /// Adaptive TLB flush: per-page if small range, full ASID flush otherwise.
 ///
 /// Used for local TLB flush after PTE modifications. Also called by the

@@ -170,6 +170,96 @@ impl Pmap {
             container::PmapEntry::Vacant(v) => v.insert(pa, perm),
         }
     }
+
+    /// Visit valid leaf PTEs in `[start, end)`, skipping empty subtrees.
+    ///
+    /// The closure receives an `OccupiedEntryMut` that can remove or modify
+    /// the PTE.  The entry does NOT borrow `&mut Pmap`, so there is no
+    /// borrow conflict with the walker.
+    pub fn for_each_in_range_mut<F>(&mut self, start: VirtAddr, end: VirtAddr, mut f: F)
+    where
+        F: FnMut(container::OccupiedEntryMut<'_>),
+    {
+        let root_pa = self.root.phys().as_usize();
+        // SAFETY: `root_pa` is a valid page table root PA (identity-mapped).
+        // We hold `&mut self` which guarantees exclusive access to this
+        // address space's page tables.
+        unsafe {
+            Self::walk_range_mut(root_pa, start.as_usize(), end.as_usize(), 0, &mut f);
+        }
+    }
+
+    /// Internal recursive walker. Parameterized by Sv39 level:
+    /// - Level 0: root (VPN\[2\], bits \[38:30\], each entry spans 1 GiB)
+    /// - Level 1: directory (VPN\[1\], bits \[29:21\], each entry spans 2 MiB)
+    /// - Level 2: leaf table (VPN\[0\], bits \[20:12\], each entry spans 4 KiB)
+    ///
+    /// Skips invalid non-leaf entries (entire subtrees).
+    ///
+    /// # Safety
+    ///
+    /// `table_pa` must be a valid, identity-mapped page table page PA.
+    /// The caller must hold exclusive access to the page table hierarchy.
+    unsafe fn walk_range_mut<F>(table_pa: usize, start: usize, end: usize, level: usize, f: &mut F)
+    where
+        F: FnMut(container::OccupiedEntryMut<'_>),
+    {
+        if start >= end {
+            return;
+        }
+
+        let shift = 12 + 9 * (SV39_LEVELS - 1 - level);
+        let span: usize = 1usize << shift;
+        let idx_mask = 0x1FFusize;
+
+        let start_idx = (start >> shift) & idx_mask;
+        let end_idx = ((end - 1) >> shift) & idx_mask;
+
+        for idx in start_idx..=end_idx {
+            // SAFETY: `table_pa` is a valid, identity-mapped page table page.
+            // `idx` is in [0, 512) so the offset is within the 4 KiB page.
+            let pte_ptr = unsafe { (table_pa as *mut u64).add(idx) };
+            let raw = unsafe { pte_ptr.read_volatile() };
+
+            if !pte_is_valid(raw) {
+                continue;
+            }
+
+            if pte_is_leaf(raw) {
+                // Reconstruct the VA for this leaf PTE.
+                // `start` carries the correct high bits for levels above us
+                // (because we clip child_start when recursing). Clear bits
+                // at this level and below, then set this index's contribution.
+                let mask = (span - 1) | (idx_mask << shift);
+                let va_base = (start & !mask) | (idx << shift);
+
+                f(container::OccupiedEntryMut {
+                    pte_ptr,
+                    va: VirtAddr::new(va_base),
+                    pa: PhysAddr::new(pte_pa(raw)),
+                    flags: pte_flags(raw),
+                    _lifetime: core::marker::PhantomData,
+                });
+                continue;
+            }
+
+            // Non-leaf: descend with clipped range.
+            if level < SV39_LEVELS - 1 {
+                let subtree_start = (start & !((span << 9) - 1)) | (idx << shift);
+                let subtree_end = subtree_start + span;
+                let child_start = core::cmp::max(start, subtree_start);
+                let child_end = core::cmp::min(end, subtree_end);
+                if child_start < child_end {
+                    // SAFETY: `pte_pa(raw)` is the PA of the next-level page
+                    // table, which is valid and identity-mapped. `level + 1`
+                    // is at most `SV39_LEVELS - 1` due to the guard above.
+                    unsafe {
+                        Self::walk_range_mut(pte_pa(raw), child_start, child_end, level + 1, f);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,120 +469,62 @@ pub fn pmap_enter(
 
 /// Remove mappings in the range [va_start, va_end).
 ///
-/// Quiesces remote harts before modifying PTEs to prevent stale TLB
-/// entries from being used during the modification window (C-4 fix).
+/// Uses `ShootdownBatch` (quiesce + batched flush) to park remote harts
+/// before modifying PTEs, then flushes locally on drop (C-4 fix).
 pub fn pmap_remove(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr) {
-    // Quiesce remote harts BEFORE modifying any PTE.
-    // If no remote harts are active, this is a no-op.
-    #[cfg(target_arch = "riscv64")]
-    let _quiesce = shootdown::QuiesceGuard::new(&pmap.active);
+    // ShootdownBatch::new reads pmap.active to build a quiesce mask, then
+    // stores only a u64 bitmask — no outstanding borrow on pmap fields after
+    // new() returns. asid is Copy.
+    let mut batch = shootdown::ShootdownBatch::new(&pmap.active, pmap.asid);
+    let mut removed = 0usize;
+    let mut unwired = 0usize;
 
-    let mut invalidated = false;
-
-    let mut va = va_start.as_usize();
-    while va < va_end.as_usize() {
-        unsafe {
-            if let Some(pte_ptr) =
-                walk::walk::<SV39_LEVELS>(pmap.root.phys(), VirtAddr::new(va), false, &mut |_| None)
-            {
-                let old = pte_ptr.read_volatile();
-                if pte_is_valid(old) {
-                    pte_ptr.write_volatile(0);
-                    pmap.stats.resident_count = pmap.stats.resident_count.saturating_sub(1);
-                    if pte_flags(old).contains(PteFlags::SW_WIRED) {
-                        pmap.stats.wired_count = pmap.stats.wired_count.saturating_sub(1);
-                    }
-                    invalidated = true;
-                }
-            }
+    pmap.for_each_in_range_mut(va_start, va_end, |entry| {
+        if entry.flags().contains(PteFlags::SW_WIRED) {
+            unwired += 1;
         }
-        va += PAGE_SIZE;
-    }
+        batch.add(entry.remove());
+        removed += 1;
+    });
 
-    // Flush local TLB for the modified range.
-    if invalidated {
-        #[cfg(target_arch = "riscv64")]
-        shootdown::adaptive_flush(va_start.as_usize(), va_end.as_usize(), pmap.asid as usize);
-    }
-
-    // _quiesce drops here → releases remote harts.
-    // Remote harts flush_all and resume; next user-mode access walks fresh PTEs.
+    pmap.stats.resident_count = pmap.stats.resident_count.saturating_sub(removed);
+    pmap.stats.wired_count = pmap.stats.wired_count.saturating_sub(unwired);
+    // batch drops here → adaptive local flush + release remote harts
 }
 
 /// Change protection on mappings in the range [va_start, va_end).
 ///
-/// Quiesces remote harts before modifying PTEs to prevent stale writable
-/// TLB entries from being used during the modification window (C-4 fix).
+/// Uses `ShootdownBatch` (quiesce + batched flush) to park remote harts
+/// before modifying PTEs, then flushes locally on drop (C-4 fix).
 /// This is critical for COW fork (downgrade RW→RO) and mprotect —
 /// without quiesce, a remote hart could write through a stale writable
 /// TLB entry while we're making the page read-only, corrupting shared data.
 pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot: MapPerm) {
-    let new_flags = map_perm_to_pte_flags(prot);
+    // ShootdownBatch::new reads pmap.active to build a quiesce mask, then
+    // stores only a u64 bitmask — no outstanding borrow on pmap fields.
+    let mut batch = shootdown::ShootdownBatch::new(&pmap.active, pmap.asid);
 
-    // Quiesce remote harts BEFORE modifying any PTE.
-    #[cfg(target_arch = "riscv64")]
-    let _quiesce = shootdown::QuiesceGuard::new(&pmap.active);
-
-    let mut invalidated = false;
-
-    let mut va = va_start.as_usize();
-    while va < va_end.as_usize() {
-        unsafe {
-            if let Some(pte_ptr) =
-                walk::walk::<SV39_LEVELS>(pmap.root.phys(), VirtAddr::new(va), false, &mut |_| None)
-            {
-                let old = pte_ptr.read_volatile();
-                if pte_is_valid(old) && pte_is_leaf(old) {
-                    let pa = pte_pa(old);
-                    // Preserve software bits from old PTE.
-                    let sw_bits = pte_flags(old) & (PteFlags::SW_WIRED | PteFlags::SW_MANAGED);
-                    pte_ptr.write_volatile(encode_pte(pa, new_flags | sw_bits));
-                    invalidated = true;
-                }
-            }
-        }
-        va += PAGE_SIZE;
-    }
-
-    // Flush local TLB for the modified range.
-    if invalidated {
-        #[cfg(target_arch = "riscv64")]
-        shootdown::adaptive_flush(va_start.as_usize(), va_end.as_usize(), pmap.asid as usize);
-    }
-
-    // _quiesce drops here → releases remote harts.
-    // Remote harts flush_all and resume; next user-mode access walks fresh PTEs.
+    pmap.for_each_in_range_mut(va_start, va_end, |mut entry| {
+        batch.add(entry.set_perm(prot));
+    });
+    // batch drops here → adaptive local flush + release remote harts
 }
 
 /// Translate a virtual address to a physical address.
 pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
-    unsafe {
-        let mut no_alloc = |_| None;
-        let pte_ptr = walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, false, &mut no_alloc)?;
-        let raw = pte_ptr.read_volatile();
-        if pte_is_valid(raw) && pte_is_leaf(raw) {
-            Some(PhysAddr::new(pte_pa(raw) | va.page_offset()))
-        } else {
-            None
-        }
-    }
+    pmap.get(va)
+        .map(|r| PhysAddr::new(r.pa().as_usize() | va.page_offset()))
 }
 
 /// Extract physical address AND PTE flags for a mapped virtual address.
 /// Returns None if the page is not mapped (no valid leaf PTE).
 pub fn pmap_extract_with_flags(pmap: &Pmap, va: VirtAddr) -> Option<(PhysAddr, PteFlags)> {
-    unsafe {
-        let pte_ptr = walk::walk::<SV39_LEVELS>(pmap.root.phys(), va, false, &mut |_| None)?;
-        let raw = pte_ptr.read_volatile();
-        if pte_is_valid(raw) && pte_is_leaf(raw) {
-            Some((
-                PhysAddr::new(pte_pa(raw) | va.page_offset()),
-                pte_flags(raw),
-            ))
-        } else {
-            None
-        }
-    }
+    pmap.get(va).map(|r| {
+        (
+            PhysAddr::new(r.pa().as_usize() | va.page_offset()),
+            r.flags(),
+        )
+    })
 }
 
 /// Activate this pmap on the current CPU: write satp, set pm_active.

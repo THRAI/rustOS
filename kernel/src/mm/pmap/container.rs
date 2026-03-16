@@ -3,6 +3,8 @@
 //! Models pmap as a Rust map container `VA → (PA, PteFlags)`.
 //! `PmapRef` for read-only lookups, `PmapEntry` (Occupied/Vacant) for mutations.
 
+use core::marker::PhantomData;
+
 use super::{
     pte::{encode_pte, map_perm_to_pte_flags, PteFlags},
     Pmap,
@@ -173,4 +175,61 @@ impl<'a> VacantEntry<'a> {
 pub enum PmapEntry<'a> {
     Occupied(OccupiedEntry<'a>),
     Vacant(VacantEntry<'a>),
+}
+
+// ---------------------------------------------------------------------------
+// OccupiedEntryMut — lightweight mutable view for range traversal
+// ---------------------------------------------------------------------------
+
+/// Mutable entry yielded during range traversal.
+///
+/// Borrows the PTE slot directly via raw pointer, NOT `&mut Pmap` — this
+/// avoids borrow conflicts with the walker that owns the iteration state.
+pub struct OccupiedEntryMut<'a> {
+    pub(crate) pte_ptr: *mut u64,
+    pub(crate) va: VirtAddr,
+    pub(crate) pa: PhysAddr,
+    pub(crate) flags: PteFlags,
+    pub(crate) _lifetime: PhantomData<&'a mut u64>,
+}
+
+impl OccupiedEntryMut<'_> {
+    pub fn va(&self) -> VirtAddr {
+        self.va
+    }
+    pub fn pa(&self) -> PhysAddr {
+        self.pa
+    }
+    pub fn flags(&self) -> PteFlags {
+        self.flags
+    }
+
+    /// Remove the PTE. Returns a token for batched flush.
+    ///
+    /// Does NOT update pmap stats or perform shootdown — the caller is
+    /// responsible for collecting the token into a `ShootdownBatch`.
+    pub fn remove(self) -> ShootdownToken {
+        // SAFETY: `pte_ptr` is a valid, aligned pointer to a leaf PTE slot
+        // obtained from the page table walker. The caller holds `&mut Pmap`
+        // (via `for_each_in_range_mut`) which guarantees exclusive access.
+        unsafe {
+            self.pte_ptr.write_volatile(0);
+        }
+        ShootdownToken(self.va)
+    }
+
+    /// Change permissions on this PTE. Returns a token for batched flush.
+    ///
+    /// Preserves software bits (SW_WIRED, SW_MANAGED) from the original PTE.
+    pub fn set_perm(&mut self, perm: MapPerm) -> ShootdownToken {
+        let sw_bits = self.flags & (PteFlags::SW_WIRED | PteFlags::SW_MANAGED);
+        let new_flags = map_perm_to_pte_flags(perm) | sw_bits;
+        // SAFETY: same as `remove` — valid PTE pointer, exclusive pmap access.
+        unsafe {
+            self.pte_ptr
+                .write_volatile(encode_pte(self.pa.as_usize(), new_flags));
+        }
+        self.flags = new_flags;
+        ShootdownToken(self.va)
+    }
 }

@@ -59,6 +59,12 @@ impl TrapFrame {
         self.sepc = self.sepc.wrapping_add(4);
     }
 
+    /// Advance past the current syscall/trap instruction.
+    #[inline]
+    pub fn advance_syscall_pc(&mut self) {
+        self.advance_pc();
+    }
+
     /// Get syscall/function argument by index (a0=x10 .. a7=x17).
     /// Panics if n > 7.
     #[inline]
@@ -78,6 +84,38 @@ impl TrapFrame {
     #[inline]
     pub fn set_ret_val(&mut self, val: usize) {
         self.x[10] = val;
+    }
+
+    /// Set stack pointer (x2).
+    #[inline]
+    pub fn set_sp(&mut self, val: usize) {
+        self.x[2] = val;
+    }
+
+    /// Set return address (x1).
+    #[inline]
+    pub fn set_ra(&mut self, val: usize) {
+        self.x[1] = val;
+    }
+
+    /// Syscall number register (a7 = x17 on rv64 Linux ABI).
+    #[inline]
+    pub fn syscall_nr(&self) -> usize {
+        self.x[17]
+    }
+
+    /// Set user TLS/thread pointer (x4).
+    #[inline]
+    pub fn set_tls(&mut self, val: usize) {
+        self.x[4] = val;
+    }
+
+    /// Prepare a standard user entry state.
+    #[inline]
+    pub fn prepare_user_entry(&mut self, entry: usize, sp: usize) {
+        self.sepc = entry;
+        self.set_sp(sp);
+        self.sstatus = (1 << 5) | (1 << 13);
     }
 
     /// Stack pointer (x2).

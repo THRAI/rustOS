@@ -11,18 +11,6 @@ use crate::{
     proc::Task,
 };
 
-/// Timer frequency: QEMU virt = 10 MHz.
-const TIMER_FREQ: u64 = 10_000_000;
-
-/// Read rdtime CSR (RISC-V cycle counter used as time source).
-fn read_rdtime() -> u64 {
-    let val: u64;
-    unsafe {
-        core::arch::asm!("rdtime {}", out(reg) val);
-    }
-    val
-}
-
 /// sys_clock_gettime: read hardware time.
 pub fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(), Errno> {
     let _ = task; // used for user memory access context
@@ -30,9 +18,9 @@ pub fn sys_clock_gettime(task: &Arc<Task>, _clockid: u32, tp: usize) -> Result<(
         return Err(Errno::Efault);
     }
 
-    let ticks = read_rdtime();
-    let secs = ticks / TIMER_FREQ;
-    let nsecs = (ticks % TIMER_FREQ) * 1_000_000_000 / TIMER_FREQ;
+    let nanos = crate::hal::monotonic_ns();
+    let secs = nanos / 1_000_000_000;
+    let nsecs = nanos % 1_000_000_000;
 
     // struct timespec { time_t tv_sec; long tv_nsec; } — 16 bytes on rv64
     let ts: [u64; 2] = [secs, nsecs];
@@ -52,9 +40,9 @@ pub fn sys_gettimeofday(task: &Arc<Task>, tv: usize, _tz: usize) -> Result<(), E
         return Err(Errno::Efault);
     }
 
-    let ticks = read_rdtime();
-    let secs = ticks / TIMER_FREQ;
-    let usecs = (ticks % TIMER_FREQ) * 1_000_000 / TIMER_FREQ;
+    let nanos = crate::hal::monotonic_ns();
+    let secs = nanos / 1_000_000_000;
+    let usecs = (nanos % 1_000_000_000) / 1_000;
 
     // struct timeval { long tv_sec; long tv_usec; } on rv64 => 16 bytes
     let tv_out: [u64; 2] = [secs, usecs];
@@ -94,14 +82,14 @@ pub async fn sys_nanosleep_async(
     }
 
     // Interruptible sleep: poll in 10ms increments to check signals
-    let start = crate::hal::read_time_ms();
+    let start = crate::hal::monotonic_ms();
     let deadline = start + total_ms;
 
     loop {
         if task.signals.has_actionable_pending() {
             // Write remaining time to rem pointer
             if rem_ptr != 0 {
-                let now = crate::hal::read_time_ms();
+                let now = crate::hal::monotonic_ms();
                 let remaining_ms = deadline.saturating_sub(now);
                 let rem_secs = remaining_ms / 1000;
                 let rem_nsecs = (remaining_ms % 1000) * 1_000_000;
@@ -117,7 +105,7 @@ pub async fn sys_nanosleep_async(
             return Err(Errno::Eintr);
         }
 
-        let now = crate::hal::read_time_ms();
+        let now = crate::hal::monotonic_ms();
         if now >= deadline {
             break;
         }

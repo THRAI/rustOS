@@ -13,14 +13,14 @@ use alloc::boxed::Box;
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 8;
 
-/// Per-CPU data: run queue, timer wheel, hart/cpu identity, preemption flag, fixup pointer.
+/// Per-CPU data: run queue, timer wheel, hart/cpu identity, preemption flag, arch fixup pointer.
 pub struct PerCpu {
     pub run_queue: RunQueue<async_task::Runnable>,
     pub timer_wheel: IrqSafeSpinLock<TimerWheel, 8>,
     pub hartid: usize,
     pub cpu_id: usize,
     pub needs_reschedule: AtomicBool,
-    pub pcb_onfault: AtomicUsize,
+    pub(crate) pcb_onfault: AtomicUsize,
 }
 
 /// Global per-CPU pointers. Null = not initialized.
@@ -70,10 +70,7 @@ pub fn get(cpu_id: usize) -> &'static PerCpu {
 /// Get PerCpu for the current CPU via tp register.
 #[inline]
 pub fn current() -> &'static PerCpu {
-    let tp: usize;
-    unsafe {
-        core::arch::asm!("mv {}, tp", out(reg) tp);
-    }
+    let tp = crate::hal::read_cpu_local_ptr();
     assert!(tp != 0, "tp register not initialized (PerCpu not set up)");
     unsafe { &*(tp as *const PerCpu) }
 }
@@ -83,7 +80,5 @@ pub unsafe fn set_tp(cpu_id: usize) {
     let per_cpu = get(cpu_id) as *const PerCpu as usize;
     // SAFETY: Caller guarantees cpu_id is valid and this runs during
     // single-threaded boot or with interrupts disabled.
-    unsafe {
-        core::arch::asm!("mv tp, {}", in(reg) per_cpu);
-    }
+    unsafe { crate::hal::write_cpu_local_ptr(per_cpu) };
 }

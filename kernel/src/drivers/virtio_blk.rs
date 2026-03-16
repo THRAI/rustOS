@@ -372,9 +372,9 @@ impl VirtioBlk {
             spins += 1;
             // Brief SIE window: lets pending IRQs fire, which causes a vCPU exit
             // and gives QEMU's device model a chance to process the virtqueue.
-            unsafe {
-                core::arch::asm!("csrsi sstatus, 0x2", "nop", "csrci sstatus, 0x2",);
-            }
+            crate::hal::local_irq_enable();
+            core::hint::spin_loop();
+            crate::hal::local_irq_disable();
             core::hint::spin_loop();
         }
 

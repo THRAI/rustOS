@@ -4,6 +4,7 @@ pub mod copy_user;
 pub mod fdt;
 pub mod ipi;
 pub mod irq;
+pub mod paging;
 pub mod plic;
 pub mod sbi;
 pub mod smp;

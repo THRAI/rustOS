@@ -552,31 +552,22 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             };
             SyscallAction::Return(ret)
         },
-        SyscallId::EXECVE => {
-            match process::sys_execve_async(task, AT_FDCWD, a0, a1, a2).await {
-                Ok((entry, sp, argc, envc)) => {
-                    let ptr_sz = core::mem::size_of::<usize>();
-                    let argv_ptr = sp + ptr_sz;
-                    let envp_ptr = argv_ptr + (argc + 1) * ptr_sz;
-                    let _ = envc;
-                    let mut tf = task.trap_frame.lock();
-                    tf.sepc = entry;
-                    tf.x[2] = sp;
-                    for i in 1..32 {
-                        if i != 2 {
-                            tf.x[i] = 0;
-                        }
+        SyscallId::EXECVE => match process::sys_execve_async(task, AT_FDCWD, a0, a1, a2).await {
+            Ok((entry, sp, argc, envc)) => {
+                let ptr_sz = core::mem::size_of::<usize>();
+                let argv_ptr = sp + ptr_sz;
+                let envp_ptr = argv_ptr + (argc + 1) * ptr_sz;
+                let _ = envc;
+                let mut tf = task.trap_frame.lock();
+                for i in 1..32 {
+                    if i != 2 {
+                        tf.x[i] = 0;
                     }
-                    // Linux rv64 process entry ABI:
-                    // a0=argc, a1=argv, a2=envp.
-                    tf.x[10] = argc;
-                    tf.x[11] = argv_ptr;
-                    tf.x[12] = envp_ptr;
-                    tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
-                    SyscallAction::Continue
-                },
-                Err(e) => SyscallAction::Return(syscall_error_return(e)),
-            }
+                }
+                crate::hal::syscall_abi::setup_exec(&mut tf, entry, sp, argc, argv_ptr, envp_ptr);
+                SyscallAction::Continue
+            },
+            Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
         SyscallId::WAIT4 => {
             let ret = match process::sys_wait4_async(task, a0 as isize, a1, a2).await {

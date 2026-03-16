@@ -71,12 +71,13 @@ pub fn sys_clone(
 
     // If caller supplied a child stack, override sp in the child's trap frame.
     // musl __clone stores fn/arg on this stack before ecall; child reads them via sp.
-    if child_stack != 0 {
-        child.trap_frame.lock().x[2] = child_stack;
-    }
-    // For clone with CLONE_SETTLS, initialize user tp (x4) for the child.
-    if (flags & CLONE_SETTLS) != 0 && tls != 0 {
-        child.trap_frame.lock().x[4] = tls;
+    if child_stack != 0 || ((flags & CLONE_SETTLS) != 0 && tls != 0) {
+        let mut child_tf = child.trap_frame.lock();
+        crate::hal::syscall_abi::setup_clone_child(
+            &mut child_tf,
+            (child_stack != 0).then_some(child_stack),
+            ((flags & CLONE_SETTLS) != 0 && tls != 0).then_some(tls),
+        );
     }
 
     let child_pid = child.pid;

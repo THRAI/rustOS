@@ -9,7 +9,7 @@ use crate::proc::{SigAction, SigFrame, Signal, Task, MAX_SIG, SIGFRAME_SIZE, SIG
 
 pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     klog!(signal, debug, "sigreturn pid={}", task.pid);
-    let sp = task.trap_frame.lock().x[2]; // current SP points to sigframe
+    let sp = task.trap_frame.lock().sp(); // current SP points to sigframe
 
     // Copyin the sigframe from user memory
     let mut frame = core::mem::MaybeUninit::<SigFrame>::uninit();
@@ -25,22 +25,11 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     }
     let frame = unsafe { frame.assume_init() };
 
-    // Validate sepc: must be in user space (< 0x0000_0040_0000_0000)
-    const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
-    if frame.saved_tf.sepc >= USER_MAX_VA {
-        return Err(Errno::Einval);
-    }
+    crate::hal::signal_abi::validate_sigreturn_frame(&frame.saved_tf)?;
 
-    // Restore trap frame with sanitization
     {
         let mut tf = task.trap_frame.lock();
-        tf.x = frame.saved_tf.x;
-        tf.sepc = frame.saved_tf.sepc;
-        // Sanitize sstatus: SPP cleared (user mode), SPIE set, FS>=Initial
-        tf.sstatus = (frame.saved_tf.sstatus & !(1 << 8)) | (1 << 5);
-        if tf.sstatus & (3 << 13) == 0 {
-            tf.sstatus |= 1 << 13; // FS=Initial if Off
-        }
+        crate::hal::restore_after_sigreturn(&mut tf, &frame.saved_tf)?;
     }
 
     // Restore signal mask

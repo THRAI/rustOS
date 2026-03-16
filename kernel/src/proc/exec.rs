@@ -359,7 +359,7 @@ pub async fn do_execve(
         let old_vm = core::mem::replace(&mut *vm, new_vm);
         // Destroy old pmap: switch satp first, then free old page tables
         let mut new_pmap_guard = vm.pmap_lock();
-        pmap_activate(&mut new_pmap_guard);
+        crate::hal::activate_pmap(&mut new_pmap_guard);
         drop(new_pmap_guard);
         // Now satp points to new root -- safe to destroy old
         let mut old_pmap_guard = old_vm.pmap_lock();
@@ -574,7 +574,7 @@ mod legacy {
             vm.clear();
             let mut pmap = vm.pmap_lock();
             let mut old_pmap = core::mem::replace(&mut *pmap, pmap_create());
-            pmap_activate(&mut pmap);
+            crate::hal::activate_pmap(&mut pmap);
             pmap_destroy(&mut old_pmap);
         }
 
@@ -1035,7 +1035,7 @@ pub async fn exec(task: &Arc<Task>, elf_path: &str) -> Result<(usize, usize), Er
         // otherwise any TLB miss would walk freed memory (use-after-free on
         // the page table), causing a cascading fault.
         let mut old_pmap = core::mem::replace(&mut *pmap, pmap_create());
-        pmap_activate(&mut pmap);
+        crate::hal::activate_pmap(&mut pmap);
         // Now satp points to the new root — safe to free the old page tables.
         pmap_destroy(&mut old_pmap);
     }

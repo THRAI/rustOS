@@ -50,7 +50,7 @@ use core::{
     task::Waker,
 };
 
-use crate::{hal::uart, hal_common::IrqSafeSpinLock};
+use crate::{hal, hal_common::IrqSafeSpinLock};
 
 /// Global print lock — ensures only one hart writes at a time.
 /// We use a raw AtomicBool instead of IrqSafeSpinLock to avoid
@@ -64,22 +64,13 @@ static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
 /// IrqSafeSpinLock here would create a recursive deadlock.
 #[inline(always)]
 fn with_print_lock<F: FnOnce()>(f: F) {
-    // SAFETY: disable SIE bit in sstatus, saving previous value.
-    let saved: usize;
-    unsafe {
-        core::arch::asm!("csrrci {}, sstatus, 0x2", out(reg) saved);
-    }
+    let saved = hal::disable_local_irq_save();
     while PRINT_LOCK.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
     f();
     PRINT_LOCK.store(false, Ordering::Release);
-    // SAFETY: restore SIE bit if it was set before.
-    if saved & 0x2 != 0 {
-        unsafe {
-            core::arch::asm!("csrsi sstatus, 0x2");
-        }
-    }
+    hal::restore_local_irq(saved);
 }
 
 struct LockedUartWriter;
@@ -88,9 +79,9 @@ impl Write for LockedUartWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for b in s.bytes() {
             if b == b'\n' {
-                uart::putchar(b'\r');
+                hal::putchar(b'\r');
             }
-            uart::putchar(b);
+            hal::putchar(b);
         }
         Ok(())
     }
@@ -105,7 +96,7 @@ pub fn _print(args: fmt::Arguments) {
 /// Write a single byte to the UART (with locking for atomic output).
 pub fn putchar(c: u8) {
     with_print_lock(|| {
-        uart::putchar(c);
+        hal::putchar(c);
     });
 }
 
@@ -113,7 +104,7 @@ pub fn putchar(c: u8) {
 pub fn putchars(bytes: &[u8]) {
     with_print_lock(|| {
         for &b in bytes {
-            uart::putchar(b);
+            hal::putchar(b);
         }
     });
 }

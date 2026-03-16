@@ -12,7 +12,7 @@
 
 use alloc::sync::Arc;
 
-use crate::{hal_common::TrapFrame, proc::Task};
+use crate::{hal::TrapFrame, proc::Task};
 
 /// Placed at the top of the per-task kernel stack.
 /// sscratch points here when CPU is in user mode.

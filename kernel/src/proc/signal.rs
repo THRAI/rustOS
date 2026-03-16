@@ -13,7 +13,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use bitflags::bitflags;
 
 use crate::{
-    hal_common::{SpinMutex as Mutex, TrapFrame, VirtAddr, PAGE_SIZE},
+    hal::{sigcode_va, TrapFrame},
+    hal_common::{SpinMutex as Mutex, VirtAddr, PAGE_SIZE},
     proc::Task,
 };
 
@@ -394,7 +395,7 @@ impl SignalState {
 
 /// Fixed VA for the sigcode (sigreturn trampoline) page.
 /// Placed just above USER_STACK_TOP to avoid collisions.
-pub const SIGCODE_VA: usize = 0x0000_003F_FFFF_F000;
+pub const SIGCODE_VA: usize = crate::hal::signal_abi::SIGCODE_VA;
 
 /// SYS_rt_sigreturn on rv64 Linux = 139
 const _SYS_RT_SIGRETURN: usize = 139;
@@ -402,17 +403,7 @@ const _SYS_RT_SIGRETURN: usize = 139;
 /// Build the sigcode page contents: `li a7, 139; ecall; unimp`
 /// Returns a page-sized buffer.
 pub fn build_sigcode_page() -> [u8; PAGE_SIZE] {
-    let mut page = [0u8; PAGE_SIZE];
-    // RISC-V instructions (little-endian):
-    // li a7, 139  =>  addi a7, zero, 139  =>  08b00893
-    // ecall       =>  00000073
-    // unimp       =>  00000000 (c.unimp = 0x0000)
-    let li_a7: u32 = 0x08b0_0893; // addi a7, x0, 139
-    let ecall: u32 = 0x0000_0073;
-    page[0..4].copy_from_slice(&li_a7.to_le_bytes());
-    page[4..8].copy_from_slice(&ecall.to_le_bytes());
-    // Rest is zeros (unimp / padding)
-    page
+    crate::hal::build_sigcode_page()
 }
 
 // ---------------------------------------------------------------------------
@@ -475,13 +466,13 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
         debug,
         "sendsig pid={} saving sepc={:#x} a0={:#x} sp={:#x}",
         task.pid,
-        tf.sepc,
-        tf.x[10],
-        tf.x[2]
+        tf.pc(),
+        tf.arg(0),
+        tf.sp()
     );
 
     // Determine stack pointer for signal frame
-    let mut sp = tf.x[2]; // current user SP
+    let mut sp = tf.sp(); // current user SP
 
     // Check SA_ONSTACK
     if action.flags & SA_ONSTACK != 0 {
@@ -556,18 +547,15 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
 
     // Redirect trap frame to handler
     //TODO: manually controlling trap frame is acceptable. make it a method.
-    tf.sepc = action.handler;
-    tf.x[10] = sig as usize; // a0 = signo
-    tf.x[11] = siginfo_va; // a1 = siginfo (valid ptr if SA_SIGINFO, else NULL)
-    tf.x[12] = sp; // a2 = ucontext (pointer to sigframe)
-    tf.x[2] = sp; // sp = sigframe
-    tf.x[1] = SIGCODE_VA; // ra = sigreturn trampoline
-
-    // Sanitize sstatus: SPP=0 (user mode), SPIE=1, FS>=Initial
-    tf.sstatus = (tf.sstatus & !(1 << 8)) | (1 << 5); // clear SPP, set SPIE
-    if tf.sstatus & (3 << 13) == 0 {
-        tf.sstatus |= 1 << 13; // FS=Initial if Off
-    }
+    crate::hal::setup_signal_entry(
+        &mut tf,
+        action.handler,
+        sig as usize,
+        siginfo_va,
+        sp,
+        sp,
+        Some(sigcode_va()),
+    );
 
     Ok(())
 }

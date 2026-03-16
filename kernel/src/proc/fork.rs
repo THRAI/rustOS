@@ -74,8 +74,8 @@ pub fn fork(parent: &Arc<Task>) -> Arc<Task> {
     {
         let mut child_tf = child.trap_frame.lock();
         *child_tf = *parent.trap_frame.lock();
-        child_tf.set_ret_val(0);
-        child_tf.advance_pc(); // skip ecall — parent's sepc is advanced by dispatcher, child's must be done here
+        crate::hal::syscall_abi::set_return(&mut child_tf, 0);
+        crate::hal::syscall_abi::advance(&mut child_tf); // skip ecall — parent's sepc is advanced by dispatcher, child's must be done here
     }
 
     // Copy brk

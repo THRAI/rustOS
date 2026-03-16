@@ -31,9 +31,9 @@ pub fn executor_loop() -> ! {
             // Ensure IRQs are enabled so timer ticks advance the timer wheel
             // while tasks run. Without this, the wfi path leaves SIE=0 and
             // IrqSafeSpinLock save/restore preserves that disabled state.
-            crate::hal::enable();
+            crate::hal::local_irq_enable();
             if irq_log_count < 5 {
-                let sie = crate::hal::is_enabled();
+                let sie = crate::hal::local_irq_is_enabled();
                 crate::klog!(sched, debug, "cpu={} run task, SIE={}", pc.cpu_id, sie);
                 irq_log_count += 1;
             }
@@ -42,13 +42,9 @@ pub fn executor_loop() -> ! {
             // Queue is empty -- idle with wfi.
             // Enable SIE so IRQs (timer, IPI) can wake us, then disable
             // after wakeup to safely loop back and re-check the queue.
-            unsafe {
-                core::arch::asm!(
-                    "csrsi sstatus, 0x2", // enable SIE
-                    "wfi",                // wait for interrupt
-                    "csrci sstatus, 0x2", // disable SIE
-                );
-            }
+            crate::hal::local_irq_enable();
+            crate::hal::idle_once();
+            crate::hal::local_irq_disable();
         }
     }
 }

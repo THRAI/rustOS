@@ -60,16 +60,14 @@ static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool =
 #[no_mangle]
 pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     if !BOOT_HART_CLAIMED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        hal::init_uart();
+        hal::init_console();
         kprintln!("hello world");
         klog!(boot, info, "hart {} booting, dtb @ {:#x}", hartid, dtb_ptr);
 
         // Ensure SIE=0 and set stvec before anything that uses IrqSafeSpinLock.
         // OpenSBI may leave SIE=1; IrqSafeSpinLock restore would re-enable it,
         // causing stray interrupts before per-CPU data is ready.
-        unsafe {
-            core::arch::asm!("csrci sstatus, 0x2");
-        }
+        hal::local_irq_disable();
         hal::set_kernel_trap_entry();
 
         // Initialize kernel heap first — everything below may allocate
@@ -77,25 +75,25 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Parse FDT to discover CPUs, memory, PLIC, UART, VirtIO MMIO.
         // Single call replaces the old parse_cpus() + parse_memory() pair.
-        hal::parse_fdt(dtb_ptr);
+        hal::parse_boot_platform(dtb_ptr);
         let pi = hal::platform();
         let num_cpus = pi.num_cpus;
 
         // Re-initialize UART with FDT-discovered address (no-op on QEMU virt
         // where it's the same 0x1000_0000, but differs on real hardware).
-        hal::uart::reinit(pi.uart_base);
+        hal::reinit_console(pi.uart_base);
 
         // Pre-initialize PerCpu for ALL discovered harts.
         // Must happen before trap/timer init because the timer IRQ handler
         // accesses per-CPU data via tp register.
         for i in 0..num_cpus {
             let hid = pi.hartids[i];
-            let cid = hal::hart_to_cpu(hid).unwrap_or(i);
+            let cid = hal::boot_id_to_cpu(hid).unwrap_or(i);
             klog!(boot, info, "init_per_cpu({}, {}) start", cid, hid);
             executor::init_per_cpu(cid, hid);
             klog!(boot, info, "init_per_cpu({}, {}) done", cid, hid);
         }
-        let cpu0 = hal::hart_to_cpu(hartid).unwrap_or(0);
+        let cpu0 = hal::boot_id_to_cpu(hartid).unwrap_or(0);
         unsafe { executor::set_tp(cpu0) };
 
         // Activate runtime lock ordering validator (debug builds only).
@@ -115,10 +113,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         trap::init();
 
         // Initialize PLIC for UART IRQ on boot hart
-        hal::init_plic_hart(hartid);
+        hal::init_external_irq_this_cpu(hartid);
 
         // Arm the first timer interrupt (10ms interval)
-        hal::init_timer();
+        hal::init_this_cpu_timer();
 
         // Initialize frame allocator with physical memory after kernel image
         {
@@ -195,7 +193,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {
-            hal::smp::boot_secondary_harts(num_cpus, &pi.hartids, hartid);
+            hal::boot_secondary_cpus(num_cpus, &pi.hartids, hartid);
         }
 
         // --- Integration tests: only compiled when `--features qemu-test` ---
@@ -378,7 +376,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             executor::spawn_kernel_task(
                 async {
                     executor::sleep(12_000).await;
-                    hal::sbi::shutdown();
+                    hal::shutdown();
                 },
                 cpu0,
             )
@@ -449,9 +447,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                             Ok((entry, sp)) => {
                                 {
                                     let mut tf = init_task2.trap_frame.lock();
-                                    tf.sepc = entry;
-                                    tf.x[2] = sp;
-                                    tf.sstatus = (1 << 5) | (1 << 13); // SPP=0, SPIE=1, FS=Initial
+                                    crate::hal::syscall_abi::setup_exec(
+                                        &mut tf, entry, sp, 0, 0, 0,
+                                    );
                                 }
                                 kprintln!("exec OK: {} entry={:#x} sp={:#x}", exec_path, entry, sp);
                                 executor::spawn_user_task(init_task2, init_cpu);
@@ -473,7 +471,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         }
 
         // Enable global interrupts
-        hal::irq::enable();
+        hal::local_irq_enable();
         klog!(boot, info, "interrupts enabled, entering executor loop");
 
         // Enter the executor loop (never returns)
@@ -483,13 +481,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     // Non-boot harts: return to SBI stopped state so hart_start can restart them
     // at secondary_entry. A wfi loop won't work because hart_start requires
     // the hart to be in SBI "stopped" state.
-    hal::sbi::hart_stop();
-    // hart_stop should not return, but just in case:
-    loop {
-        unsafe {
-            core::arch::asm!("wfi");
-        }
-    }
+    hal::stop_this_cpu();
 }
 
 #[cfg(feature = "qemu-test")]
@@ -1057,53 +1049,7 @@ fn test_fixup() {
 /// verify the registers are intact. Tests trap entry/exit correctness.
 #[cfg(feature = "qemu-test")]
 fn register_clobber_test() {
-    let ok: usize;
-    unsafe {
-        core::arch::asm!(
-            // Write known values to t0-t6 (caller-saved temporaries)
-            "li t0, 0xDEAD0000",
-            "li t1, 0xDEAD0001",
-            "li t2, 0xDEAD0002",
-            "li t3, 0xDEAD0003",
-            "li t4, 0xDEAD0004",
-            "li t5, 0xDEAD0005",
-            "li t6, 0xDEAD0006",
-            // Enable interrupts and wait for a timer IRQ
-            "csrsi sstatus, 0x2",  // SIE = 1
-            "wfi",                  // wait for timer IRQ
-            "csrci sstatus, 0x2",  // SIE = 0
-            // Now check all values survived the trap
-            "li {tmp}, 0",         // assume pass (0 = ok)
-            "li {exp}, 0xDEAD0000",
-            "bne t0, {exp}, 1f",
-            "li {exp}, 0xDEAD0001",
-            "bne t1, {exp}, 1f",
-            "li {exp}, 0xDEAD0002",
-            "bne t2, {exp}, 1f",
-            "li {exp}, 0xDEAD0003",
-            "bne t3, {exp}, 1f",
-            "li {exp}, 0xDEAD0004",
-            "bne t4, {exp}, 1f",
-            "li {exp}, 0xDEAD0005",
-            "bne t5, {exp}, 1f",
-            "li {exp}, 0xDEAD0006",
-            "bne t6, {exp}, 1f",
-            "j 2f",                // all passed
-            "1:",                  // fail
-            "li {tmp}, 1",
-            "2:",
-            tmp = out(reg) ok,
-            exp = out(reg) _,
-            out("t0") _,
-            out("t1") _,
-            out("t2") _,
-            out("t3") _,
-            out("t4") _,
-            out("t5") _,
-            out("t6") _,
-        );
-    }
-    if ok == 0 {
+    if hal::cpu::register_clobber_self_test() {
         kprintln!("register clobber PASS");
     } else {
         kprintln!("register clobber FAIL");
@@ -1114,8 +1060,6 @@ fn register_clobber_test() {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     kprintln!("[PANIC] {}", info);
     loop {
-        unsafe {
-            core::arch::asm!("wfi");
-        }
+        hal::idle_once();
     }
 }

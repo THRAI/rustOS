@@ -5,7 +5,7 @@
 
 use super::{
     super::allocator::{alloc_raw_frame_sync, PageRole},
-    pmap_activate, pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove,
+    pmap_create, pmap_destroy, pmap_enter, pmap_extract, pmap_remove,
 };
 use crate::hal_common::{VirtAddr, PAGE_SIZE};
 
@@ -77,7 +77,7 @@ pub fn test_pmap_satp_switch() {
     let saved = crate::hal_common::irq_lock::arch_irq::disable_and_save();
 
     // 3. Activate pmap (writes satp, sfence.vma)
-    pmap_activate(&mut pmap);
+    crate::hal::activate_pmap(&mut pmap);
 
     // 4. Write through the new virtual mapping
     unsafe {
@@ -94,9 +94,7 @@ pub fn test_pmap_satp_switch() {
     }
 
     // 6. Deactivate: return to bare mode (satp=0)
-    unsafe {
-        core::arch::asm!("csrw satp, zero", "sfence.vma zero, zero",);
-    }
+    crate::hal::paging::deactivate_current();
 
     // === END IRQ-LOCKED WINDOW ===
     crate::hal_common::irq_lock::arch_irq::restore(saved);

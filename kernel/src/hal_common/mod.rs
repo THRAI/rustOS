@@ -16,4 +16,3 @@ pub use once::Once;
 pub use run_queue::RunQueue;
 pub use spin_mutex::{SpinMutex, SpinMutexGuard};
 pub use timer_wheel::TimerWheel;
-pub use trap_frame::TrapFrame;

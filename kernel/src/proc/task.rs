@@ -19,7 +19,8 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use crate::proc::{alloc_pid, SignalState};
 use crate::{
     fs::FdTable,
-    hal_common::{PhysAddr, SpinMutex as Mutex, TrapFrame, PAGE_SIZE},
+    hal::{TrapFrame, TrapFrame as _},
+    hal_common::{PhysAddr, SpinMutex as Mutex, PAGE_SIZE},
     mm::{frame_alloc_contiguous, frame_free_contiguous, pmap, vm::VmMap},
 };
 

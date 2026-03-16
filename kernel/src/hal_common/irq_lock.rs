@@ -53,38 +53,15 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-/// Arch-specific IRQ control.
-/// On host targets (x86_64, aarch64), these are no-ops for testability.
-#[cfg(not(target_arch = "riscv64"))]
 pub mod arch_irq {
+    #[inline(always)]
     pub fn disable_and_save() -> usize {
-        0
-    }
-    pub fn restore(_saved: usize) {}
-}
-
-#[cfg(target_arch = "riscv64")]
-pub mod arch_irq {
-    /// Read sstatus, clear SIE bit, return old sstatus value.
-    pub fn disable_and_save() -> usize {
-        let saved: usize;
-        unsafe {
-            core::arch::asm!(
-                "csrrci {}, sstatus, 0x2",
-                out(reg) saved,
-            );
-        }
-        saved
+        crate::hal::disable_local_irq_save()
     }
 
-    /// Restore SIE bit from saved sstatus value.
+    #[inline(always)]
     pub fn restore(saved: usize) {
-        // Only restore the SIE bit (bit 1)
-        if saved & 0x2 != 0 {
-            unsafe {
-                core::arch::asm!("csrsi sstatus, 0x2");
-            }
-        }
+        crate::hal::restore_local_irq(saved);
     }
 }
 
@@ -120,7 +97,7 @@ impl<T, const LEVEL: u8> IrqSafeSpinLock<T, LEVEL> {
     }
 
     pub fn lock(&self) -> IrqSafeGuard<'_, T, LEVEL> {
-        let saved = arch_irq::disable_and_save();
+        let saved = crate::hal::disable_local_irq_save();
         crate::lockdep::on_acquire(LEVEL);
         while self
             .locked
@@ -157,7 +134,7 @@ impl<T, const LEVEL: u8> Drop for IrqSafeGuard<'_, T, LEVEL> {
     fn drop(&mut self) {
         self.lock.locked.store(0, Ordering::Release);
         crate::lockdep::on_release(LEVEL);
-        arch_irq::restore(self.saved);
+        crate::hal::restore_local_irq(self.saved);
     }
 }
 

@@ -70,10 +70,18 @@ pub fn sys_clone(
         ));
     }
 
-    let child = do_clone(task, clone_flags, child_stack, tls)?;
+    let (child, vfork_done) = do_clone(task, clone_flags, child_stack, tls)?;
     let child_pid = child.pid;
     let cpu = current().cpu_id;
     spawn_user_task(child, cpu);
+
+    // CLONE_VFORK: parent blocks until child exits or execs
+    if let Some(vfork) = vfork_done {
+        while !vfork.is_done() {
+            core::hint::spin_loop();
+        }
+    }
+
     Ok(child_pid as usize)
 }
 

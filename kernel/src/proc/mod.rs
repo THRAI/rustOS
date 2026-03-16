@@ -11,7 +11,7 @@ pub mod syscall_result;
 pub mod task;
 pub mod user_copy;
 
-pub use clone::{do_clone, CloneFlags};
+pub use clone::{do_clone, CloneFlags, VforkDone};
 pub use elf::{parse_elf_first_page, ExecContext};
 pub use exec::do_execve;
 pub use exit_wait::{WaitChildFuture, WaitStatus};

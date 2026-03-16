@@ -16,7 +16,7 @@ use alloc::{
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 // use crate::hal_common::IrqSafeSpinLock;
-use crate::proc::{alloc_pid, SignalState};
+use crate::proc::{alloc_pid, clone::VforkDone, SignalState};
 use crate::{
     fs::FdTable,
     hal_common::{LeveledRwLock, PhysAddr, SpinMutex as Mutex, TrapFrame, PAGE_SIZE},
@@ -61,15 +61,15 @@ pub struct Task {
     pub parent: Weak<Task>,
     /// Child processes.
     pub children: Mutex<Vec<Arc<Task>>, 4>,
-    /// Virtual address space.
+    /// Virtual address space (Arc-wrapped for CLONE_VM sharing).
     ///
     /// Uses `LeveledRwLock` so page faults (read lock) can proceed
     /// concurrently with each other, while mutations like mmap/munmap
     /// take the write lock for exclusive access. The pmap inside VmMap
     /// is independently locked (SpinMutex level 2).
-    pub vm_map: LeveledRwLock<VmMap, 1>,
-    /// File descriptor table placeholder (expanded in VFS plan).
-    pub fd_table: Mutex<FdTable, 4>,
+    pub vm_map: Arc<LeveledRwLock<VmMap, 1>>,
+    /// File descriptor table (Arc-wrapped for CLONE_FILES sharing).
+    pub fd_table: Arc<Mutex<FdTable, 4>>,
     /// Current working directory (absolute normalized path).
     pub cwd: Mutex<String, 4>,
     /// Current state (Running / Zombie). Stored as AtomicU8 for lock-free access.
@@ -92,6 +92,8 @@ pub struct Task {
     pub pgid: AtomicU32,
     /// Top-level waker for async signal injection (wake from kill).
     pub top_level_waker: Mutex<Option<core::task::Waker>, 4>,
+    /// vfork completion handle: child signals this on exit or exec.
+    pub vfork_done: Option<Arc<VforkDone>>,
 }
 
 /// Allocate a kernel stack (2 pages) and return (base, sp_top).
@@ -122,8 +124,8 @@ impl Task {
             pid,
             parent,
             children: Mutex::new(Vec::new()),
-            vm_map: LeveledRwLock::new(VmMap::new(pmap)),
-            fd_table: Mutex::new(FdTable::new()),
+            vm_map: Arc::new(LeveledRwLock::new(VmMap::new(pmap))),
+            fd_table: Arc::new(Mutex::new(FdTable::new())),
             cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
@@ -135,6 +137,7 @@ impl Task {
             signals: SignalState::new(),
             pgid: AtomicU32::new(pgid),
             top_level_waker: Mutex::new(None),
+            vfork_done: None,
         })
     }
 
@@ -153,8 +156,8 @@ impl Task {
             pid,
             parent: Weak::new(),
             children: Mutex::new(Vec::new()),
-            vm_map: LeveledRwLock::new(VmMap::new(pmap)),
-            fd_table: Mutex::new(FdTable::new_with_stdio()),
+            vm_map: Arc::new(LeveledRwLock::new(VmMap::new(pmap))),
+            fd_table: Arc::new(Mutex::new(FdTable::new_with_stdio())),
             cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
@@ -166,6 +169,7 @@ impl Task {
             signals: SignalState::new(),
             pgid: AtomicU32::new(pid),
             top_level_waker: Mutex::new(None),
+            vfork_done: None,
         })
     }
 

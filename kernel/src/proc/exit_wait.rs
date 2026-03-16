@@ -42,6 +42,11 @@ pub fn sys_exit(task: &Arc<Task>, status: WaitStatus) -> SyscallResult {
     // Unregister from global task registry
     unregister_task(task.pid);
 
+    // Signal vfork parent (if any) that child has exited
+    if let Some(ref vfork) = task.vfork_done {
+        vfork.signal();
+    }
+
     // Wake parent's WaitChildFuture if registered, and post SIGCHLD
     if let Some(parent) = task.parent.upgrade() {
         // Check SA_NOCLDWAIT flag on parent's SIGCHLD action

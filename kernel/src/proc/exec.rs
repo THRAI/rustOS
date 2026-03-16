@@ -443,6 +443,11 @@ pub async fn do_execve(
     // 3d. Close O_CLOEXEC file descriptors
     task.fd_table.lock().strip_cloexec();
 
+    // 3e. Signal vfork parent (if any) that child has exec'd
+    if let Some(ref vfork) = task.vfork_done {
+        vfork.signal();
+    }
+
     klog!(
         exec,
         debug,

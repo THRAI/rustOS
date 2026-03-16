@@ -4,10 +4,10 @@
 //! COW VM logic lives in `VmMap::cow_fork_into()`.
 
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
-    hal_common::{Errno, KernelResult},
+    hal_common::{Errno, KernelResult, SpinMutex},
     proc::{SigSet, Task},
 };
 
@@ -27,20 +27,62 @@ bitflags::bitflags! {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VforkDone: parent-blocks-until-child-exits/execs
+// ---------------------------------------------------------------------------
+
+/// Completion handle for vfork semantics.
+///
+/// The parent spins (or yields) on `is_done()` after spawning a CLONE_VFORK
+/// child. The child calls `signal()` on exit or exec to unblock the parent.
+pub struct VforkDone {
+    done: AtomicBool,
+    waker: SpinMutex<Option<core::task::Waker>, 4>,
+}
+
+impl VforkDone {
+    pub fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            waker: SpinMutex::new(None),
+        }
+    }
+
+    /// Signal completion — child has exited or exec'd.
+    pub fn signal(&self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(w) = self.waker.lock().take() {
+            w.wake();
+        }
+    }
+
+    /// Check if child has signalled completion.
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// do_clone
+// ---------------------------------------------------------------------------
+
 /// Unified process/thread creation primitive.
 /// Replaces fork() with flag-driven dispatch.
+///
+/// Returns the child `Task` and an optional `VforkDone` handle (set when
+/// `CLONE_VFORK` is requested — the caller must block on it).
 pub fn do_clone(
     parent: &Arc<Task>,
     flags: CloneFlags,
     child_stack: usize,
     tls: usize,
-) -> KernelResult<Arc<Task>> {
+) -> KernelResult<(Arc<Task>, Option<Arc<VforkDone>>)> {
     // Validate: CLONE_THREAD requires CLONE_VM | CLONE_SIGHAND
     if flags.contains(CloneFlags::THREAD) && !flags.contains(CloneFlags::VM | CloneFlags::SIGHAND) {
         return Err(Errno::Einval);
     }
 
-    let child = Task::new(Arc::downgrade(parent));
+    let mut child = Task::new(Arc::downgrade(parent));
     klog!(
         proc,
         debug,
@@ -51,22 +93,32 @@ pub fn do_clone(
     );
 
     // --- Address space ---
-    // For now, CLONE_VM is not wired (needs Task Arc-wrapping, done in C2)
-    // Always do COW fork for now
-    #[cfg(not(feature = "fork-hardcopy"))]
-    {
-        let mut parent_vm = parent.vm_map.write();
-        let mut child_vm = child.vm_map.write();
-        parent_vm.cow_fork_into(&mut child_vm)?;
-    }
-    #[cfg(feature = "fork-hardcopy")]
-    {
-        super::fork::deep_copy_pages(parent, &child);
+    if flags.contains(CloneFlags::VM) {
+        // Share address space: point child's vm_map Arc to parent's.
+        // child refcount == 1 (just created), so Arc::get_mut is safe.
+        let task_mut = Arc::get_mut(&mut child).expect("child is not shared yet");
+        task_mut.vm_map = Arc::clone(&parent.vm_map);
+    } else {
+        // COW fork (default path)
+        #[cfg(not(feature = "fork-hardcopy"))]
+        {
+            let mut parent_vm = parent.vm_map.write();
+            let mut child_vm = child.vm_map.write();
+            parent_vm.cow_fork_into(&mut child_vm)?;
+        }
+        #[cfg(feature = "fork-hardcopy")]
+        {
+            super::fork::deep_copy_pages(parent, &child);
+        }
     }
 
     // --- File descriptors ---
-    // CLONE_FILES not wired yet (needs Arc-wrapping, done in C2)
-    {
+    if flags.contains(CloneFlags::FILES) {
+        // Share fd_table: point child's Arc to parent's
+        let task_mut = Arc::get_mut(&mut child).expect("child is not shared yet");
+        task_mut.fd_table = Arc::clone(&parent.fd_table);
+    } else {
+        // Copy (default fork path)
         let parent_fds = parent.fd_table.lock();
         *child.fd_table.lock() = parent_fds.fork();
     }
@@ -103,6 +155,7 @@ pub fn do_clone(
         .store(SigSet::empty(), Ordering::Relaxed);
 
     // Copy signal actions from parent.
+    // TODO(C2): CLONE_SIGHAND — Arc-wrap signal actions for sharing
     {
         let parent_actions = parent.signals.actions.lock();
         *child.signals.actions.lock() = *parent_actions;
@@ -114,8 +167,18 @@ pub fn do_clone(
         Ordering::Relaxed,
     );
 
+    // --- CLONE_VFORK ---
+    let vfork_done = if flags.contains(CloneFlags::VFORK) {
+        let vfork = Arc::new(VforkDone::new());
+        let task_mut = Arc::get_mut(&mut child).expect("child is not shared yet");
+        task_mut.vfork_done = Some(Arc::clone(&vfork));
+        Some(vfork)
+    } else {
+        None
+    };
+
     // --- Parent-child linkage ---
     parent.children.lock().push(Arc::clone(&child));
 
-    Ok(child)
+    Ok((child, vfork_done))
 }

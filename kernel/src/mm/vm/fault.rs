@@ -16,7 +16,7 @@ use alloc::sync::Arc;
 use super::super::pmap::Pmap;
 use crate::{
     hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE},
-    mm::vm::{BackingStore, MapPerm, VObjIndex, VmMap, VmMapEntry},
+    mm::vm::{MapPerm, VObjIndex, VmMap, VmMapEntry},
 };
 
 /// Result of a synchronous page fault resolution attempt.

@@ -69,8 +69,7 @@ impl SplayTree {
             let mut dummy = VmMapEntry::new(
                 0,
                 0,
-                crate::mm::vm::BackingStore::Guard,
-                crate::mm::vm::EntryFlags::empty(),
+                crate::mm::vm::VmMapping::Guard,
                 crate::mm::vm::MapPerm::empty(),
             );
             let mut left_tail = NonNull::from(&mut dummy);

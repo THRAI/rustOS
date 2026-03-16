@@ -921,16 +921,15 @@ fn test_mmap_munmap() {
     // Insert an anonymous VMA
     let base = VirtAddr::new(0x1000_0000);
     let len = PAGE_SIZE;
-    use crate::mm::vm::{BackingStore, EntryFlags, VmMapEntry};
+    use crate::mm::vm::{VmMapEntry, VmMapping};
     let obj = VmObject::new_anon(1);
     let vma = VmMapEntry::new(
         base.as_usize() as u64,
         (base.as_usize() + len) as u64,
-        BackingStore::Object {
+        VmMapping::AnonPrivate {
             object: obj,
             offset: 0,
         },
-        EntryFlags::empty(),
         crate::map_perm!(R, W, U),
     );
     {

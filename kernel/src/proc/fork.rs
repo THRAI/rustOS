@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(not(feature = "fork-hardcopy"))]
-use crate::mm::vm::{BackingStore, MapPerm};
+use crate::mm::vm::{MapPerm, VmMapping};
 use crate::{
     hal_common::{VirtAddr, PAGE_SIZE},
     mm::{pmap, pmap_enter, pmap_extract},
@@ -126,18 +126,24 @@ fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
     let mut child_vm = child.vm_map.write();
 
     // Build fork plans first, then apply parent mutations and child inserts.
-    let mut parent_rebinds: Vec<(u64, BackingStore)> = Vec::new();
+    let mut parent_rebinds: Vec<(u64, VmMapping)> = Vec::new();
     let mut child_entries: Vec<crate::mm::vm::VmMapEntry> = Vec::new();
     let mut pmap_ranges: Vec<(u64, u64, MapPerm, bool)> = Vec::new();
 
     for vma in parent_vm.iter() {
         let is_writable = vma.protection.contains(MapPerm::W);
 
-        let (parent_new_store, child_new_store) = match &vma.store {
-            BackingStore::Object {
-                offset,
-                object: parent_obj,
-            } => {
+        let (parent_new_mapping, child_new_mapping) = match &vma.mapping {
+            VmMapping::Guard => (None, VmMapping::Guard),
+            mapping => {
+                let parent_obj = match mapping.object() {
+                    Some(obj) => obj,
+                    None => {
+                        // Should not happen for non-Guard variants
+                        continue;
+                    },
+                };
+
                 if is_writable {
                     // Writable mapping: both parent and child must get their own
                     // shadows backed by the original object, otherwise whichever
@@ -159,41 +165,24 @@ fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
                         }
                     }
                     (
-                        Some(BackingStore::Object {
-                            object: parent_obj_shadow,
-                            offset: *offset,
-                        }),
-                        BackingStore::Object {
-                            object: child_obj_shadow,
-                            offset: *offset,
-                        },
+                        Some(mapping.with_object(parent_obj_shadow)),
+                        mapping.with_object(child_obj_shadow),
                     )
                 } else {
                     // Read-only: share the same VmObject (no shadow needed)
-                    (
-                        None,
-                        BackingStore::Object {
-                            object: Arc::clone(parent_obj),
-                            offset: *offset,
-                        },
-                    )
+                    (None, mapping.with_object(Arc::clone(parent_obj)))
                 }
             },
-            BackingStore::SubMap(_) => {
-                panic!("SubMap not supported in fork");
-            },
-            BackingStore::Guard => (None, BackingStore::Guard),
         };
 
-        if let Some(new_store) = parent_new_store {
-            parent_rebinds.push((vma.start(), new_store));
+        if let Some(new_mapping) = parent_new_mapping {
+            parent_rebinds.push((vma.start(), new_mapping));
         };
 
         let child_vma = crate::mm::vm::VmMapEntry::new(
             vma.start(),
             vma.end(),
-            child_new_store,
-            vma.flags,
+            child_new_mapping,
             vma.protection,
         );
         child_entries.push(child_vma);
@@ -201,9 +190,9 @@ fn cow_fork_vm(parent: &Arc<Task>, child: &Arc<Task>) {
     }
 
     // Rebind parent VMAs to their new COW shadow heads.
-    for (start, new_store) in parent_rebinds {
+    for (start, new_mapping) in parent_rebinds {
         if let Some(vma) = parent_vm.lookup_mut(start) {
-            vma.store = new_store;
+            vma.mapping = new_mapping;
         }
     }
 
@@ -280,14 +269,13 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
 
     // Copy VmMapEntries
     for vma in parent_vm.iter() {
-        let new_store = match &vma.store {
-            crate::mm::vm::BackingStore::Object {
-                offset,
-                object: parent_obj,
-            } => {
-                let size = vma.end - vma.start;
+        let new_mapping = match &vma.mapping {
+            crate::mm::vm::VmMapping::Guard => crate::mm::vm::VmMapping::Guard,
+            mapping => {
+                let parent_obj = mapping.object().expect("non-Guard must have object");
+                let size = (vma.end() - vma.start()) as usize;
                 // Create a clone of the object for the child (not a shadow)
-                let new_obj = crate::mm::vm::VmObject::new_anon(size as usize);
+                let new_obj = crate::mm::vm::VmObject::new_anon(size);
                 // Copy pager from parent so child can demand-fault file-backed pages
                 // that the parent hasn't touched yet. Without this, unfaulted pages
                 // get zero-filled (AnonPager) instead of loaded from the ELF vnode.
@@ -299,23 +287,11 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                         }
                     }
                 }
-                crate::mm::vm::BackingStore::Object {
-                    object: new_obj,
-                    offset: *offset,
-                }
+                mapping.with_object(new_obj)
             },
-            crate::mm::vm::BackingStore::SubMap(_) => {
-                panic!("SubMap not supported in fork");
-            },
-            crate::mm::vm::BackingStore::Guard => crate::mm::vm::BackingStore::Guard,
         };
-        let child_vma = crate::mm::vm::VmMapEntry::new(
-            vma.start,
-            vma.end,
-            new_store,
-            vma.flags,
-            vma.protection,
-        );
+        let child_vma =
+            crate::mm::vm::VmMapEntry::new(vma.start(), vma.end(), new_mapping, vma.protection);
         child_vm.insert_entry(child_vma).unwrap();
     }
 
@@ -330,8 +306,8 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
         if is_writable {
             // Walk every page in the VMA range via parent's pmap to find
             // all mapped pages (both VmObject-backed and pmap-only).
-            let mut va = vma.start as usize;
-            while va < vma.end as usize {
+            let mut va = vma.start() as usize;
+            while va < vma.end() as usize {
                 if let Some(src_pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
                     if let Some(new_frame) = crate::mm::alloc_anon_sync() {
                         new_frame.as_page_slice_mut().copy_from_slice(
@@ -339,12 +315,11 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
                         );
 
                         if let Some(child_vma) = child_vm.lookup_mut(va as u64) {
-                            if let crate::mm::vm::BackingStore::Object { object, offset } =
-                                &child_vma.store
-                            {
+                            if let Some(object) = child_vma.mapping.object() {
                                 let new_phys = new_frame.phys();
+                                let offset = child_vma.mapping.offset();
                                 let obj_idx =
-                                    (*offset + (va as u64 - child_vma.start)) / PAGE_SIZE as u64;
+                                    (offset + (va as u64 - child_vma.start())) / PAGE_SIZE as u64;
                                 let mut child_obj = object.write();
                                 child_obj.insert_page(
                                     crate::hal_common::PageNum::new(obj_idx as usize),
@@ -367,8 +342,8 @@ fn deep_copy_pages(parent: &Arc<Task>, child: &Arc<Task>) {
             // Read-only: share pages currently in pmap.
             // The VmObject is already Arc::clone'd by fork_deep_copy, so
             // demand faults will find pages in the shared object.
-            let mut va = vma.start as usize;
-            while va < vma.end as usize {
+            let mut va = vma.start() as usize;
+            while va < vma.end() as usize {
                 if let Some(pa) = pmap::pmap_extract(&parent_pmap, VirtAddr::new(va)) {
                     let _ = pmap::pmap_enter(
                         &mut child_pmap,

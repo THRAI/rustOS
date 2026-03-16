@@ -12,7 +12,7 @@ use crate::{
     hal_common::SpinMutex,
     mm::{
         pmap_protect, pmap_remove,
-        vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry},
+        vm::{MapPerm, VmMapEntry, VmMapping},
         Pmap,
     },
 };
@@ -375,10 +375,12 @@ impl VmMap {
             let mut extended = false;
             {
                 if let Some(vma) = self.lookup_mut((old_brk_aligned - 1) as u64) {
-                    if vma.end() == old_brk_aligned as u64 && vma.flags.contains(EntryFlags::HEAP) {
+                    if vma.end() == old_brk_aligned as u64
+                        && matches!(vma.mapping, VmMapping::Heap { .. })
+                    {
                         let heap_start = vma.start() as usize;
                         vma.set_bounds(heap_start as u64, new_brk_aligned as u64);
-                        if let BackingStore::Object { object, .. } = &vma.store {
+                        if let Some(object) = vma.mapping.object() {
                             object.write().set_size(new_brk_aligned - heap_start);
                         }
                         extended = true;
@@ -404,11 +406,10 @@ impl VmMap {
         let vma = VmMapEntry::new(
             old_brk_aligned as u64,
             new_brk_aligned as u64,
-            BackingStore::Object {
+            VmMapping::Heap {
                 object: obj,
                 offset: 0,
             },
-            EntryFlags::HEAP,
             MapPerm::R | MapPerm::W | MapPerm::U,
         );
         self.insert_entry(vma)
@@ -432,7 +433,9 @@ impl VmMap {
 
         {
             if let Some(vma) = self.lookup_mut((old_brk_aligned - 1) as u64) {
-                if vma.end() == old_brk_aligned as u64 && vma.flags.contains(EntryFlags::HEAP) {
+                if vma.end() == old_brk_aligned as u64
+                    && matches!(vma.mapping, VmMapping::Heap { .. })
+                {
                     let heap_start = vma.start() as usize;
                     let new_heap_end = core::cmp::max(new_brk_aligned, heap_start);
 
@@ -440,7 +443,7 @@ impl VmMap {
                         remove_heap_va = Some((old_brk_aligned - 1) as u64);
                     } else {
                         vma.set_bounds(heap_start as u64, new_heap_end as u64);
-                        if let BackingStore::Object { object, .. } = &vma.store {
+                        if let Some(object) = vma.mapping.object() {
                             let new_pages =
                                 (new_heap_end - heap_start) / crate::hal_common::PAGE_SIZE;
                             let mut obj = object.write();

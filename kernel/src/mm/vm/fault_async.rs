@@ -10,8 +10,8 @@ use crate::{
     mm::{
         pmap_zero_page,
         vm::{
-            page_ref::PageRef, sync_fault_handler, BackingStore, FaultResult, MapPerm,
-            PageFaultAccessType, VmMap, VmObject,
+            page_ref::PageRef, sync_fault_handler, FaultResult, MapPerm, PageFaultAccessType,
+            VmMap, VmObject,
         },
     },
     proc::Task,
@@ -42,7 +42,7 @@ fn revalidate_vma(
     // Verify backing object identity — after execve, the same VA may
     // exist with a different object. Inserting into the old object would
     // create a dangling PTE when the old object drops.
-    if let BackingStore::Object { object, .. } = &vma.store {
+    if let Some(object) = vma.mapping.object() {
         if !Arc::ptr_eq(object, obj) {
             return None;
         }

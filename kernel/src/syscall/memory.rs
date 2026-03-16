@@ -39,7 +39,13 @@ fn prot_bits_to_perm(prot_bits: usize) -> Result<crate::mm::vm::MapPerm, Errno> 
     use crate::mm::vm::MapPerm;
 
     if prot_bits & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "prot_bits_to_perm: unsupported protection bits prot={:#x}",
+            prot_bits
+        ));
     }
 
     let mut perm = MapPerm::U;
@@ -67,9 +73,24 @@ fn resolve_mmap_base(
 ) -> Result<usize, Errno> {
     if map_fixed {
         if !is_page_aligned(addr) {
-            return Err(Errno::Einval);
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Einval,
+                "resolve_mmap_base: MAP_FIXED addr not page-aligned addr={:#x}",
+                addr
+            ));
         }
-        let end = addr.checked_add(aligned_len).ok_or(Errno::Einval)?;
+        let end = addr.checked_add(aligned_len).ok_or_else(|| {
+            kerr!(
+                syscall,
+                debug,
+                Errno::Einval,
+                "resolve_mmap_base: addr+len overflow addr={:#x} len={:#x}",
+                addr,
+                aligned_len
+            )
+        })?;
         let removed = vm.remove_range(VirtAddr::new(addr), VirtAddr::new(end));
         free_removed_frames(removed);
         return Ok(addr);
@@ -77,7 +98,16 @@ fn resolve_mmap_base(
 
     if addr != 0 {
         let hint = addr & !(PAGE_SIZE - 1);
-        let hint_end = hint.checked_add(aligned_len).ok_or(Errno::Einval)?;
+        let hint_end = hint.checked_add(aligned_len).ok_or_else(|| {
+            kerr!(
+                syscall,
+                debug,
+                Errno::Einval,
+                "resolve_mmap_base: hint+len overflow hint={:#x} len={:#x}",
+                hint,
+                aligned_len
+            )
+        })?;
         if vm.is_range_free(hint as u64, hint_end as u64) {
             return Ok(hint);
         }
@@ -85,7 +115,15 @@ fn resolve_mmap_base(
 
     vm.find_free_area_topdown(aligned_len)
         .map(|va| va.as_usize())
-        .ok_or(Errno::Enomem)
+        .ok_or_else(|| {
+            kerr!(
+                syscall,
+                error,
+                Errno::Enomem,
+                "resolve_mmap_base: no free area found len={:#x}",
+                aligned_len
+            )
+        })
 }
 
 fn build_file_backed_object(
@@ -119,23 +157,43 @@ pub fn sys_mmap(
 ) -> KernelResult<usize> {
     use crate::{
         fs::VnodeType,
-        mm::vm::{BackingStore, EntryFlags, MapPerm, VmMapEntry, VmObject},
+        mm::vm::{MapPerm, VmMapEntry, VmMapping, VmObject},
     };
 
     let aligned_len = match align_up_to_page(len) {
         Some(aligned_len) if aligned_len != 0 => aligned_len,
-        _ => return Err(Errno::Einval),
+        _ => {
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Einval,
+                "sys_mmap: invalid or zero len len={:#x}",
+                len
+            ))
+        },
     };
 
     if flags & !SUPPORTED_MMAP_FLAGS != 0 {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_mmap: unsupported flags flags={:#x}",
+            flags
+        ));
     }
 
     let map_type = flags & MAP_TYPE_MASK;
     let map_shared = map_type == MAP_SHARED;
     let map_private = map_type == MAP_PRIVATE;
     if !map_shared && !map_private {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_mmap: neither MAP_SHARED nor MAP_PRIVATE flags={:#x}",
+            flags
+        ));
     }
 
     let map_fixed = flags & MAP_FIXED != 0;
@@ -144,35 +202,80 @@ pub fn sys_mmap(
     let perm: MapPerm = prot_bits_to_perm(prot_bits)?;
 
     if offset % PAGE_SIZE as u64 != 0 {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_mmap: offset not page-aligned offset={:#x}",
+            offset
+        ));
     }
 
     let object = if map_anon {
         if !map_private {
-            return Err(Errno::Enosys);
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Enosys,
+                "sys_mmap: MAP_SHARED+MAP_ANONYMOUS not supported"
+            ));
         }
         VmObject::new_anon(aligned_len)
     } else {
         let fd_table = task.fd_table.lock();
         let desc = match fd_table.get(fd) {
             Some(desc) => Arc::clone(desc),
-            None => return Err(Errno::Ebadf),
+            None => {
+                return Err(kerr!(
+                    syscall,
+                    debug,
+                    Errno::Ebadf,
+                    "sys_mmap: fd not found fd={}",
+                    fd
+                ))
+            },
         };
         drop(fd_table);
 
         let vnode = match &desc.object {
             FileObject::Vnode(vnode) => Arc::clone(vnode),
-            _ => return Err(Errno::Enodev),
+            _ => {
+                return Err(kerr!(
+                    syscall,
+                    debug,
+                    Errno::Enodev,
+                    "sys_mmap: fd is not a vnode fd={}",
+                    fd
+                ))
+            },
         };
 
         if vnode.vtype() != VnodeType::Regular {
-            return Err(Errno::Enodev);
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Enodev,
+                "sys_mmap: vnode is not a regular file fd={}",
+                fd
+            ));
         }
         if perm.contains(MapPerm::R) && !desc.flags.read {
-            return Err(Errno::Ebadf);
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Ebadf,
+                "sys_mmap: PROT_READ but fd not open for read fd={}",
+                fd
+            ));
         }
         if perm.contains(MapPerm::W) && !desc.flags.write {
-            return Err(Errno::Ebadf);
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Ebadf,
+                "sys_mmap: PROT_WRITE but fd not open for write fd={}",
+                fd
+            ));
         }
 
         let _ = aligned_len;
@@ -183,35 +286,75 @@ pub fn sys_mmap(
     let mut vm = task.vm_map.write();
     let base = resolve_mmap_base(&mut vm, addr, aligned_len, map_fixed)?;
 
-    let vma = VmMapEntry::new(
-        base as u64,
-        (base + aligned_len) as u64,
-        BackingStore::Object { object, offset },
-        EntryFlags::empty(),
-        perm,
-    );
+    let mapping = if map_anon {
+        VmMapping::AnonPrivate { object, offset }
+    } else if map_shared {
+        VmMapping::FileShared { object, offset }
+    } else {
+        VmMapping::FilePrivate { object, offset }
+    };
+
+    let vma = VmMapEntry::new(base as u64, (base + aligned_len) as u64, mapping, perm);
 
     match vm.insert_entry(vma) {
         Ok(()) => Ok(base),
-        Err(_) => Err(Errno::Einval),
+        Err(_) => Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_mmap: insert_entry failed base={:#x} len={:#x}",
+            base,
+            aligned_len
+        )),
     }
 }
 
 /// sys_munmap: tear down PTEs + TLB + remove/split VMAs.
 pub fn sys_munmap(task: &Arc<Task>, addr: usize, len: usize) -> KernelResult<usize> {
     if len == 0 || !is_page_aligned(addr) {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_munmap: invalid args addr={:#x} len={:#x}",
+            addr,
+            len
+        ));
     }
 
-    let end = addr.checked_add(len).ok_or(Errno::Einval)?;
+    let end = addr.checked_add(len).ok_or_else(|| {
+        kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_munmap: addr+len overflow addr={:#x} len={:#x}",
+            addr,
+            len
+        )
+    })?;
 
     let aligned_end = match align_up_to_page(end) {
         Some(end) => VirtAddr::new(end),
-        None => return Err(Errno::Einval),
+        None => {
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Einval,
+                "sys_munmap: align_up_to_page failed end={:#x}",
+                end
+            ))
+        },
     };
     let aligned_start = VirtAddr::new(addr);
     if aligned_start >= aligned_end {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_munmap: start >= end after alignment start={:#x} end={:#x}",
+            aligned_start.as_usize(),
+            aligned_end.as_usize()
+        ));
     }
     let mut vm = task.vm_map.write();
     let removed = vm.remove_range(aligned_start, aligned_end);
@@ -227,18 +370,49 @@ pub fn sys_mprotect(
     prot_bits: usize,
 ) -> KernelResult<usize> {
     if len == 0 || !is_page_aligned(addr) {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_mprotect: invalid args addr={:#x} len={:#x}",
+            addr,
+            len
+        ));
     }
 
-    let end = addr.checked_add(len).ok_or(Errno::Einval)?;
+    let end = addr.checked_add(len).ok_or_else(|| {
+        kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_mprotect: addr+len overflow addr={:#x} len={:#x}",
+            addr,
+            len
+        )
+    })?;
 
     let end = match align_up_to_page(end) {
         Some(end) => VirtAddr::new(end),
-        None => return Err(Errno::Einval),
+        None => {
+            return Err(kerr!(
+                syscall,
+                debug,
+                Errno::Einval,
+                "sys_mprotect: align_up_to_page failed end={:#x}",
+                end
+            ))
+        },
     };
     let start = VirtAddr::new(addr);
     if start >= end {
-        return Err(Errno::Einval);
+        return Err(kerr!(
+            syscall,
+            debug,
+            Errno::Einval,
+            "sys_mprotect: start >= end after alignment start={:#x} end={:#x}",
+            start.as_usize(),
+            end.as_usize()
+        ));
     }
 
     let perm = prot_bits_to_perm(prot_bits)?;

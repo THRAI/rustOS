@@ -17,8 +17,8 @@ use crate::{
     fs::{resolve, VnodeType},
     hal_common::{Errno, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap_activate, pmap_create, pmap_destroy, pmap_enter, BackingStore, EntryFlags, MapPerm,
-        VmMap, VmMapEntry, VmObject,
+        pmap_activate, pmap_create, pmap_destroy, pmap_enter, MapPerm, VmMap, VmMapEntry,
+        VmMapping, VmObject,
     },
     proc::{map_sigcode_page, parse_elf_first_page, ExecContext, SigSet, Task, SIG_DFL, SIG_IGN},
 };
@@ -54,7 +54,12 @@ const AT_RANDOM: usize = 25;
 /// Map a VM insert error to an exec-appropriate errno.
 /// During exec, overlap/invalid-range means the ELF binary is malformed.
 fn map_insert_err(_err: Errno) -> Errno {
-    Errno::Enoexec
+    kerr!(
+        exec,
+        warn,
+        Errno::Enoexec,
+        "exec: vma insert failed (malformed ELF)"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +87,13 @@ pub async fn do_execve(
     // 1a. Resolve path to vnode
     let vnode = resolve(elf_path).await?;
     if vnode.vtype() != VnodeType::Regular {
-        return Err(Errno::Enoexec);
+        return Err(kerr!(
+            exec,
+            warn,
+            Errno::Enoexec,
+            "exec: vnode not regular file path={}",
+            elf_path
+        ));
     }
 
     // 1b. Create a file-backed VmObject for the ELF vnode and fetch page 0
@@ -90,19 +101,43 @@ pub async fn do_execve(
     let elf_obj = VmObject::new_file(&*vnode);
     VmObject::fetch_page_async(Arc::clone(&elf_obj), crate::mm::vm::VObjIndex::new(0))
         .await
-        .map_err(|_| Errno::Enoexec)?;
+        .map_err(|_| {
+            kerr!(
+                exec,
+                warn,
+                Errno::Enoexec,
+                "exec: page fetch for ELF header failed path={}",
+                elf_path
+            )
+        })?;
 
     // 1c. Parse ELF header + program headers via goblin
     let hdr_phys = elf_obj
         .read()
         .lookup_page(crate::mm::vm::VObjIndex::new(0))
-        .ok_or(Errno::Enoexec)?;
+        .ok_or_else(|| {
+            kerr!(
+                exec,
+                warn,
+                Errno::Enoexec,
+                "exec: page 0 lookup returned None path={}",
+                elf_path
+            )
+        })?;
 
     let hdr_buf = hdr_phys.as_slice();
 
     let (ehdr, phdrs) = match parse_elf_first_page(hdr_buf) {
         Ok(parsed) => parsed,
-        Err(_) => return Err(Errno::Enoexec),
+        Err(_) => {
+            return Err(kerr!(
+                exec,
+                warn,
+                Errno::Enoexec,
+                "exec: ELF first-page parse failed path={}",
+                elf_path
+            ))
+        },
     };
 
     // 1d. Build ExecContext (pure function, no side effects)
@@ -164,11 +199,10 @@ pub async fn do_execve(
         let vma = VmMapEntry::new(
             va_start as u64,
             va_end as u64,
-            BackingStore::Object {
+            VmMapping::FilePrivate {
                 object: obj,
                 offset: file_offset_page_aligned as u64,
             },
-            EntryFlags::empty(),
             region.prot,
         );
 
@@ -221,15 +255,19 @@ pub async fn do_execve(
     let stack_vma = VmMapEntry::new(
         stack_bottom as u64,
         USER_STACK_TOP as u64,
-        BackingStore::Object {
+        VmMapping::AnonPrivate {
             object: stack_obj,
             offset: 0,
         },
-        EntryFlags::empty(),
         crate::map_perm!(R, W, U),
     );
     if new_vm.insert_entry(stack_vma).is_err() {
-        return Err(Errno::Enomem);
+        return Err(kerr!(
+            exec,
+            error,
+            Errno::Enomem,
+            "exec: stack VMA insert failed"
+        ));
     }
 
     // 2e. Set up argv/envp/auxv on top stack page
@@ -242,7 +280,7 @@ pub async fn do_execve(
         let phys = {
             let mut obj = stack_obj_ref.write();
             obj.fault_allocate_anon(stack_page_idx)
-                .map_err(|_| Errno::Enomem)?
+                .map_err(|_| kerr!(exec, error, Errno::Enomem, "exec: stack page alloc failed"))?
         };
 
         // Map in new pmap
@@ -303,14 +341,29 @@ pub async fn do_execve(
 
         let prev_offset = cursor.current_offset();
         if prev_offset < slots_bytes {
-            return Err(Errno::Enomem);
+            return Err(kerr!(
+                exec,
+                error,
+                Errno::Enomem,
+                "exec: not enough stack for argv needed={} avail={}",
+                slots_bytes,
+                prev_offset
+            ));
         }
         let new_offset = prev_offset - slots_bytes;
         let sp = stack_page_vbase.as_usize() + new_offset;
 
         let slice_ptr: *mut u8;
         {
-            let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or(Errno::Enomem)?;
+            let allocated = cursor.alloc_down_bytes(slots_bytes).ok_or_else(|| {
+                kerr!(
+                    exec,
+                    error,
+                    Errno::Enomem,
+                    "exec: cursor alloc failed size={}",
+                    slots_bytes
+                )
+            })?;
             slice_ptr = allocated.as_mut_ptr();
         }
         let slice = unsafe { core::slice::from_raw_parts_mut(slice_ptr, slots_bytes) };
@@ -419,19 +472,41 @@ async fn load_interp_into(
 ) -> Result<usize, Errno> {
     let vnode = resolve(interp_path).await?;
     if vnode.vtype() != VnodeType::Regular {
-        return Err(Errno::Enoexec);
+        return Err(kerr!(
+            exec,
+            warn,
+            Errno::Enoexec,
+            "exec: interpreter vnode not regular path={}",
+            interp_path
+        ));
     }
 
     // Fetch the interpreter's first page through a VmObject
     let interp_obj = VmObject::new_file(&*vnode);
     VmObject::fetch_page_async(Arc::clone(&interp_obj), crate::mm::vm::VObjIndex::new(0))
         .await
-        .map_err(|_| Errno::Enoexec)?;
+        .map_err(|_| {
+            kerr!(
+                exec,
+                warn,
+                Errno::Enoexec,
+                "exec: interpreter page fetch failed path={}",
+                interp_path
+            )
+        })?;
 
     let hdr_phys = interp_obj
         .read()
         .lookup_page(crate::mm::vm::VObjIndex::new(0))
-        .ok_or(Errno::Enoexec)?;
+        .ok_or_else(|| {
+            kerr!(
+                exec,
+                warn,
+                Errno::Enoexec,
+                "exec: interpreter page 0 lookup failed path={}",
+                interp_path
+            )
+        })?;
     let hdr_buf = hdr_phys.as_slice();
 
     // Use the hand-rolled parser for interp (same as legacy path, works fine)
@@ -484,11 +559,10 @@ async fn load_interp_into(
         let vma = VmMapEntry::new(
             va_start as u64,
             va_end as u64,
-            BackingStore::Object {
+            VmMapping::FilePrivate {
                 object: obj,
                 offset: file_offset_page_aligned as u64,
             },
-            EntryFlags::empty(),
             prot,
         );
 
@@ -550,17 +624,42 @@ struct Elf64Phdr {
 
 fn parse_elf_header(buf: &[u8]) -> Result<&Elf64Header, Errno> {
     if buf.len() < core::mem::size_of::<Elf64Header>() {
-        return Err(Errno::Enoexec);
+        return Err(kerr!(
+            exec,
+            debug,
+            Errno::Enoexec,
+            "parse_elf: buf too small len={}",
+            buf.len()
+        ));
     }
     let hdr = unsafe { &*(buf.as_ptr() as *const Elf64Header) };
     if hdr.e_ident[0..4] != ELF_MAGIC {
-        return Err(Errno::Enoexec);
+        return Err(kerr!(
+            exec,
+            debug,
+            Errno::Enoexec,
+            "parse_elf: bad ELF magic"
+        ));
     }
     if hdr.e_ident[4] != ELFCLASS64 || hdr.e_ident[5] != ELFDATA2LSB {
-        return Err(Errno::Enoexec);
+        return Err(kerr!(
+            exec,
+            debug,
+            Errno::Enoexec,
+            "parse_elf: wrong class={} or endianness={}",
+            hdr.e_ident[4],
+            hdr.e_ident[5]
+        ));
     }
     if (hdr.e_type != ET_EXEC && hdr.e_type != ET_DYN) || hdr.e_machine != EM_RISCV {
-        return Err(Errno::Enoexec);
+        return Err(kerr!(
+            exec,
+            debug,
+            Errno::Enoexec,
+            "parse_elf: wrong type={} or machine={}",
+            hdr.e_type,
+            hdr.e_machine
+        ));
     }
     Ok(hdr)
 }
@@ -571,7 +670,14 @@ fn parse_phdrs<'a>(buf: &'a [u8], hdr: &Elf64Header) -> Result<&'a [Elf64Phdr], 
     let ent = hdr.e_phentsize as usize;
     let end = off + num * ent;
     if end > buf.len() || ent < core::mem::size_of::<Elf64Phdr>() {
-        return Err(Errno::Enoexec);
+        return Err(kerr!(
+            exec,
+            debug,
+            Errno::Enoexec,
+            "parse_elf: phdr table out of bounds end={} buf_len={}",
+            end,
+            buf.len()
+        ));
     }
     let ptr = unsafe { buf.as_ptr().add(off) as *const Elf64Phdr };
     Ok(unsafe { core::slice::from_raw_parts(ptr, num) })
@@ -600,16 +706,10 @@ fn elf_flags_to_prot(flags: u32) -> MapPerm {
 /// only called during exec where all segments originate from the same
 /// vnode.
 fn insert_or_merge_file_vma(vm: &mut VmMap, new_vma: VmMapEntry) -> Result<(), Errno> {
-    if let BackingStore::Object { .. } = new_vma.store {
+    if !matches!(new_vma.mapping, VmMapping::Guard) {
         if let Some(existing) = vm.lookup_mut(new_vma.start()) {
             if existing.start() == new_vma.start() && existing.end() == new_vma.end() {
-                let same_backing = match (&existing.store, &new_vma.store) {
-                    (
-                        BackingStore::Object { offset: f1, .. },
-                        BackingStore::Object { offset: f2, .. },
-                    ) => f1 == f2,
-                    _ => false,
-                };
+                let same_backing = existing.mapping.offset() == new_vma.mapping.offset();
                 if same_backing {
                     // Merge segment perms (e.g. text R|X|U + rodata R|U = R|X|U)
                     existing.protection |= new_vma.protection;

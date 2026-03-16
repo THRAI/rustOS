@@ -23,7 +23,7 @@ pub mod test_integration;
 pub use fault::{sync_fault_handler, FaultResult, PageFaultAccessType};
 pub use fault_async::resolve_user_fault;
 pub use map::{
-    entry::{BackingStore, EntryFlags, MapPerm, VmMapEntry},
+    entry::{CowState, MapPerm, VmMapEntry, VmMapping},
     VmMap,
 };
 pub use object::{VObjIndex, VmObject, VnodePager};

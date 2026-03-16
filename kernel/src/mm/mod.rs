@@ -69,6 +69,6 @@ pub use pmap::{
 };
 pub use uio::{uiomove, UioDir};
 pub use vm::{
-    resolve_user_fault, BackingStore, EntryFlags, MapPerm, PageFaultAccessType, VmMap, VmMapEntry,
+    resolve_user_fault, CowState, MapPerm, PageFaultAccessType, VmMap, VmMapEntry, VmMapping,
     VmObject, VmPage,
 };

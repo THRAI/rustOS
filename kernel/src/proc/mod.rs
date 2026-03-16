@@ -4,7 +4,7 @@ pub mod clone;
 pub mod elf;
 pub mod exec;
 pub mod exit_wait;
-pub mod fork;
+
 pub mod pid;
 pub mod signal;
 pub mod syscall_result;

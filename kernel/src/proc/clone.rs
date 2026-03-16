@@ -99,17 +99,10 @@ pub fn do_clone(
         let task_mut = Arc::get_mut(&mut child).expect("child is not shared yet");
         task_mut.vm_map = Arc::clone(&parent.vm_map);
     } else {
-        // COW fork (default path)
-        #[cfg(not(feature = "fork-hardcopy"))]
-        {
-            let mut parent_vm = parent.vm_map.write();
-            let mut child_vm = child.vm_map.write();
-            parent_vm.cow_fork_into(&mut child_vm)?;
-        }
-        #[cfg(feature = "fork-hardcopy")]
-        {
-            super::fork::deep_copy_pages(parent, &child);
-        }
+        // COW fork
+        let mut parent_vm = parent.vm_map.write();
+        let mut child_vm = child.vm_map.write();
+        parent_vm.cow_fork_into(&mut child_vm)?;
     }
 
     // --- File descriptors ---

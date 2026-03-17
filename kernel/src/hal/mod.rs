@@ -1,8 +1,11 @@
 pub mod console;
 pub mod cpu;
 pub mod entry;
+#[cfg(target_arch = "loongarch64")]
+pub mod la64;
 pub mod paging;
 pub mod platform;
+#[cfg(target_arch = "riscv64")]
 pub mod rv64;
 pub mod signal_abi;
 pub mod syscall_abi;
@@ -24,6 +27,17 @@ pub use platform::{
     boot_id_to_cpu, boot_secondary_cpus, cpu_to_boot_id, init_external_irq_this_cpu,
     parse_boot_platform, platform, shutdown, stop_this_cpu,
 };
+#[cfg(target_arch = "loongarch64")]
+pub use la64::{
+    ipi::{handle_ipi, send_ipi},
+    irq,
+    irq::{disable, enable, is_enabled},
+    platform::{MemRegion, PlatformInfo, VirtioMmioDevice},
+    tlb::{flush_all, flush_asid},
+    trap as arch_trap, uart,
+    uart::init as init_uart,
+};
+#[cfg(target_arch = "riscv64")]
 pub use rv64::{
     fdt::{hart_to_cpu, parse_fdt},
     ipi::{handle_ipi, send_ipi},

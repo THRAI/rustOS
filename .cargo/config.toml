@@ -8,4 +8,10 @@ rustflags = [
     "-C", "target-feature=+zaamo,+zalrsc",
 ]
 
+[target.loongarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker/la64-qemu.ld",
+    "-C", "force-frame-pointers=yes",
+]
+
 # runner = "qemu-system-riscv64 -machine virt -nographic -bios default -kernel"

@@ -2,23 +2,56 @@
 
 HOST_TARGET := $(shell rustc -vV | grep host | cut -d' ' -f2)
 UNAME_S := $(shell uname -s)
-TARGET_RV64 := riscv64gc-unknown-none-elf
-KERNEL_ELF_RV64 := target/$(TARGET_RV64)/release/kernel
-USER_ELF_RV64 := target/$(TARGET_RV64)/release/initproc
-KERNEL_BIN_RV64 := kernel-rv64.bin
+ARCH ?= rv64
 
-QEMU_RV64 := qemu-system-riscv64
+TARGET_rv64 := riscv64gc-unknown-none-elf
+TARGET_la64 := loongarch64-unknown-none
+KERNEL_ELF_rv64 := target/$(TARGET_rv64)/release/kernel
+KERNEL_ELF_la64 := target/$(TARGET_la64)/release/kernel
+USER_ELF_rv64 := user/target/$(TARGET_rv64)/release/initproc
+USER_ELF_la64 := user/target/$(TARGET_la64)/release/initproc
+KERNEL_BIN_rv64 := kernel-rv64.bin
+KERNEL_BIN_la64 := kernel-la64.bin
+USER_INSTALL_rv64 := scripts/initproc
+USER_INSTALL_la64 := scripts/initproc-la64
+USER_LINKER_rv64 := src/linker.ld
+USER_LINKER_la64 := src/linker-la64.ld
+USER_RUSTFLAGS_rv64 := -Clink-arg=-Tsrc/linker.ld
+USER_RUSTFLAGS_la64 := -Clink-arg=-Tsrc/linker-la64.ld
+
+QEMU_rv64 := qemu-system-riscv64
+QEMU_la64 := qemu-system-loongarch64
 SMP ?= 4
 QEMU_TRACE ?=
-DISK_IMG := scripts/test.img
-QEMU_RV64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_RV64) -smp $(SMP) -m 128M \
-	-drive file=$(DISK_IMG),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 $(QEMU_TRACE)
+DISK_IMG_rv64 := scripts/test.img
+DISK_IMG_la64 :=
+OBJCOPY_ARCH_rv64 := riscv64
+OBJCOPY_ARCH_la64 := loongarch64
+QEMU_rv64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_rv64) -smp $(SMP) -m 128M \
+	-drive file=$(DISK_IMG_rv64),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 $(QEMU_TRACE)
+QEMU_la64_FLAGS := -machine virt -cpu la464 -nographic -kernel $(KERNEL_BIN_la64) -smp $(SMP) -m 128M $(QEMU_TRACE)
+
+TARGET = $(TARGET_$(ARCH))
+KERNEL_ELF = $(KERNEL_ELF_$(ARCH))
+USER_ELF = $(USER_ELF_$(ARCH))
+KERNEL_BIN = $(KERNEL_BIN_$(ARCH))
+USER_INSTALL = $(USER_INSTALL_$(ARCH))
+USER_LINKER = $(USER_LINKER_$(ARCH))
+USER_RUSTFLAGS = $(USER_RUSTFLAGS_$(ARCH))
+QEMU = $(QEMU_$(ARCH))
+QEMU_FLAGS = $(QEMU_$(ARCH)_FLAGS)
+DISK_IMG = $(DISK_IMG_$(ARCH))
+OBJCOPY_ARCH = $(OBJCOPY_ARCH_$(ARCH))
+
+RUN_DEPS_rv64 := $(DISK_IMG_rv64)
+RUN_DEPS_la64 :=
+RUN_DEPS = $(RUN_DEPS_$(ARCH))
 
 # ---- 赛题评测标准参数 ----
 # TEST_FS: 含测试程序的 ext4 磁盘镜像（sdcard-rv.img 或赛平台注入的 fs 镜像）
 TEST_FS ?= scripts/sdcard-rv.img
 # OSCOMP_FLAGS 严格对齐赛题 README 的 QEMU 启动命令
-OSCOMP_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_RV64) \
+OSCOMP_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_rv64) \
 	-smp $(SMP) -m 128M -no-reboot \
 	-drive file=$(TEST_FS),if=none,format=raw,id=x0 \
 	-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
@@ -51,53 +84,84 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean
+.PHONY: all kernel user run debug gdbserver smoke kernel-rv kernel-rv64 kernel-la64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-la64 user-rv64-autotest run-rv64 run-la64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all debug-rv64 debug-la64 gdbserver-rv64 gdbserver-la64 smoke-la64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
 
 kernel-rv:
-	cargo build --release -p kernel --target $(TARGET_RV64) --features autotest,$(_LOG_LEVEL_FEATURE)
-	cp $(KERNEL_ELF_RV64) kernel-rv
+	cargo build --release -p kernel --target $(TARGET_rv64) --features autotest,$(_LOG_LEVEL_FEATURE)
+	cp $(KERNEL_ELF_rv64) kernel-rv
 
-user-rv64:
-	cd user && CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-Tsrc/linker.ld" cargo build --release --target $(TARGET_RV64)
-	cp user/target/$(TARGET_RV64)/release/initproc scripts/initproc
+kernel:
+	cargo build --release -p kernel --target $(TARGET) $(_CARGO_LOG)
+	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
+
+kernel-rv64: ARCH=rv64
+kernel-rv64: kernel
+
+kernel-la64: ARCH=la64
+kernel-la64: kernel
+
+user:
+	@if [ "$(ARCH)" = "rv64" ]; then \
+		cd /tmp && RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_rv64) --config 'build.target="$(TARGET_rv64)"' --config 'target.$(TARGET_rv64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_rv64)"]'; \
+	else \
+		cd /tmp && RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_la64) --config 'build.target="$(TARGET_la64)"' --config 'target.$(TARGET_la64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_la64)"]'; \
+	fi
+	cp $(USER_ELF) $(USER_INSTALL)
+
+user-rv64: ARCH=rv64
+user-rv64: user
+
+user-la64: ARCH=la64
+user-la64: user
 
 user-rv64-autotest:
-	cd user && CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-Tsrc/linker.ld" cargo build --release --target $(TARGET_RV64) --features autotest
-	cp user/target/$(TARGET_RV64)/release/initproc scripts/initproc
-
-kernel-rv64:
-	cargo build --release -p kernel --target $(TARGET_RV64) $(_CARGO_LOG)
-	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
+	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_rv64) --features autotest --config 'build.target="$(TARGET_rv64)"' --config 'target.$(TARGET_rv64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_rv64)"]'
+	cp $(USER_ELF_rv64) $(USER_INSTALL_rv64)
 
 kernel-rv64-test:
-	cargo build --release -p kernel --target $(TARGET_RV64) --features $(_TEST_FEATURES)
-	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
+	cargo build --release -p kernel --target $(TARGET_rv64) --features $(_TEST_FEATURES)
+	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH_rv64) $(KERNEL_ELF_rv64) --strip-all -O binary $(KERNEL_BIN_rv64)
 
 # 编译带 autotest feature 的内核（自动运行测试脚本，完成后关机）
 kernel-rv64-autotest:
-	cargo build --release -p kernel --target $(TARGET_RV64) --features autotest,$(_LOG_LEVEL_FEATURE)
-	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF_RV64) --strip-all -O binary $(KERNEL_BIN_RV64)
+	cargo build --release -p kernel --target $(TARGET_rv64) --features autotest,$(_LOG_LEVEL_FEATURE)
+	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH_rv64) $(KERNEL_ELF_rv64) --strip-all -O binary $(KERNEL_BIN_rv64)
 
-$(DISK_IMG): user-rv64 scripts/make_test_img.sh $(wildcard scripts/init)
-	rm -f $(DISK_IMG)
+
+$(DISK_IMG_rv64): user-rv64 scripts/make_test_img.sh $(wildcard scripts/init)
+	rm -f $(DISK_IMG_rv64)
 	cd scripts && ./make_test_img.sh
 
 disk-img: user-rv64
-	rm -f $(DISK_IMG)
+	rm -f $(DISK_IMG_rv64)
 	cd scripts && ./make_test_img.sh
 
-run-rv64: kernel-rv64 $(DISK_IMG)
-	@echo "=== Running QEMU Interactively (LOG=$(_LOG_FEATURES)) ==="
-	uv run --with pexpect python3 scripts/test_runner.py --interactive $(QEMU_RV64) -- $(QEMU_RV64_FLAGS)
+run: kernel $(RUN_DEPS)
+	@echo "=== Running QEMU for ARCH=$(ARCH) (LOG=$(_LOG_FEATURES)) ==="
+	@if [ "$(ARCH)" = "rv64" ]; then \
+		uv run --with pexpect python3 scripts/test_runner.py --interactive $(QEMU) -- $(QEMU_FLAGS); \
+	else \
+		$(QEMU) $(QEMU_FLAGS); \
+	fi
+
+run-rv64: ARCH=rv64
+run-rv64: kernel-rv64 $(DISK_IMG_rv64)
+	@echo "=== Running QEMU for ARCH=rv64 (LOG=$(_LOG_FEATURES)) ==="
+	uv run --with pexpect python3 scripts/test_runner.py --interactive $(QEMU_rv64) -- $(QEMU_rv64_FLAGS)
+
+run-la64: ARCH=la64
+run-la64: kernel-la64
+	@echo "=== Running QEMU for ARCH=la64 (LOG=$(_LOG_FEATURES)) ==="
+	$(QEMU_la64) $(QEMU_la64_FLAGS)
 
 # 赛题标准评测：编译 autotest 内核 + 赛题磁盘镜像，直接用赛题 QEMU 参数运行
 run-oscomp: kernel-rv
 	@echo "=== OS COMP 评测模式 TEST_FS=$(TEST_FS) ==="
 	@test -f $(TEST_FS) || (echo "ERROR: $(TEST_FS) 不存在，请先准备测试镜像" && exit 1)
-	$(QEMU_RV64) -machine virt -nographic -bios default -kernel kernel-rv \
+	$(QEMU_rv64) -machine virt -nographic -bios default -kernel kernel-rv \
 		-smp $(SMP) -m 128M -no-reboot \
 		-drive file=$(TEST_FS),if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
@@ -178,11 +242,38 @@ endif
 
 # GDB debug: halt on start, GDB server on port 1234
 debug-rv64: kernel-rv64
-	$(QEMU_RV64) $(QEMU_RV64_FLAGS) -s -S
+
+debug: kernel
+	$(QEMU) $(QEMU_FLAGS) -s -S
+
+debug-rv64: ARCH=rv64
+debug-rv64: kernel-rv64
+	$(QEMU_rv64) $(QEMU_rv64_FLAGS) -s -S
+
+debug-la64: ARCH=la64
+debug-la64: kernel-la64
+	$(QEMU_la64) $(QEMU_la64_FLAGS) -s -S
 
 # GDB server without halt (attach to running kernel)
 gdbserver-rv64: kernel-rv64
-	$(QEMU_RV64) $(QEMU_RV64_FLAGS) -s
+
+gdbserver: kernel
+	$(QEMU) $(QEMU_FLAGS) -s
+
+gdbserver-rv64: ARCH=rv64
+gdbserver-rv64: kernel-rv64
+	$(QEMU_rv64) $(QEMU_rv64_FLAGS) -s
+
+gdbserver-la64: ARCH=la64
+gdbserver-la64: kernel-la64
+	$(QEMU_la64) $(QEMU_la64_FLAGS) -s
+
+smoke: kernel user
+	@echo "=== Smoke build complete for ARCH=$(ARCH) ==="
+
+smoke-la64: ARCH=la64
+smoke-la64: kernel-la64 user-la64
+	@echo "=== Smoke build complete for ARCH=la64 ==="
 
 # QEMU integration test: boot, capture output, check expected strings
 # Kernel calls SBI shutdown after tests; fallback kill after 30s timeout.
@@ -214,10 +305,10 @@ QEMU_TEST_PATTERNS := \
 	"device nodes PASS" \
 	"futex wake PASS"
 
-qemu-test-rv64: kernel-rv64-test $(DISK_IMG)
+qemu-test-rv64: kernel-rv64-test $(DISK_IMG_rv64)
 	@echo "=== QEMU integration test (SMP=$(SMP)) ==="
 	@TMPOUT=$$(mktemp); \
-	$(QEMU_RV64) $(QEMU_RV64_FLAGS) > $$TMPOUT 2>&1 & \
+	$(QEMU_rv64) $(QEMU_rv64_FLAGS) > $$TMPOUT 2>&1 & \
 	QPID=$$!; \
 	( sleep 30; kill $$QPID 2>/dev/null ) & WATCHDOG=$$!; \
 	wait $$QPID 2>/dev/null; \
@@ -243,10 +334,10 @@ AGENT_TEST_PATTERNS := \
 	"delegate running" \
 	"exec OK"
 
-agent-test: kernel-rv64 $(DISK_IMG)
+agent-test: kernel-rv64 $(DISK_IMG_rv64)
 	@echo "=== Agent smoke test (timeout=$(AGENT_TEST_TIMEOUT)s) ==="
 	@TMPOUT=$$(mktemp); \
-	$(QEMU_RV64) $(QEMU_RV64_FLAGS) > $$TMPOUT 2>&1 & \
+	$(QEMU_rv64) $(QEMU_rv64_FLAGS) > $$TMPOUT 2>&1 & \
 	QPID=$$!; \
 	( sleep $(AGENT_TEST_TIMEOUT); kill $$QPID 2>/dev/null ) & WATCHDOG=$$!; \
 	wait $$QPID 2>/dev/null; \
@@ -274,13 +365,13 @@ test:
 test-all: test qemu-test-rv64 python-test-rv64
 
 # QEMU python interactive test
-python-test-rv64: kernel-rv64 $(DISK_IMG)
+python-test-rv64: kernel-rv64 $(DISK_IMG_rv64)
 	@echo "=== QEMU Python Integration Test (SMP=$(SMP), LOG=$(_LOG_FEATURES)) ==="
-	uv run --with pexpect python3 scripts/test_runner.py $(QEMU_RV64) -- $(QEMU_RV64_FLAGS)
+	uv run --with pexpect python3 scripts/test_runner.py $(QEMU_rv64) -- $(QEMU_rv64_FLAGS)
 
 clean:
 	cargo clean
-	rm -f $(KERNEL_BIN_RV64)
+	rm -f $(KERNEL_BIN_rv64) $(KERNEL_BIN_la64) $(USER_INSTALL_la64)
 
 # Create zig-based riscv64-linux-musl-cc/ar wrappers (matches CI).
 # Replaces any existing wrappers that may use newlib headers (which break lwext4).

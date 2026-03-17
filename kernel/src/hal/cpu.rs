@@ -6,10 +6,10 @@ pub fn disable_local_irq_save() -> usize {
     super::rv64::irq::disable_and_save()
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
 pub fn disable_local_irq_save() -> usize {
-    0
+    super::la64::irq::disable_and_save()
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -18,9 +18,11 @@ pub fn restore_local_irq(saved: usize) {
     super::rv64::irq::restore(saved);
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
-pub fn restore_local_irq(_saved: usize) {}
+pub fn restore_local_irq(saved: usize) {
+    super::la64::irq::restore(saved);
+}
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
@@ -28,9 +30,11 @@ pub fn local_irq_enable() {
     super::rv64::irq::enable();
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
-pub fn local_irq_enable() {}
+pub fn local_irq_enable() {
+    super::la64::irq::enable();
+}
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
@@ -38,9 +42,11 @@ pub fn local_irq_disable() {
     super::rv64::irq::disable();
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
-pub fn local_irq_disable() {}
+pub fn local_irq_disable() {
+    super::la64::irq::disable();
+}
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
@@ -48,10 +54,10 @@ pub fn local_irq_is_enabled() -> bool {
     super::rv64::irq::is_enabled()
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
 pub fn local_irq_is_enabled() -> bool {
-    false
+    super::la64::irq::is_enabled()
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -62,10 +68,10 @@ pub fn idle_once() {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
 pub fn idle_once() {
-    core::hint::spin_loop();
+    super::la64::cpu::idle_once();
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -78,10 +84,10 @@ pub fn read_cpu_local_ptr() -> usize {
     tp
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
 pub fn read_cpu_local_ptr() -> usize {
-    0
+    super::la64::cpu::read_cpu_local_ptr()
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -92,9 +98,11 @@ pub unsafe fn write_cpu_local_ptr(ptr: usize) {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "loongarch64")]
 #[inline(always)]
-pub unsafe fn write_cpu_local_ptr(_ptr: usize) {}
+pub unsafe fn write_cpu_local_ptr(ptr: usize) {
+    super::la64::cpu::write_cpu_local_ptr(ptr);
+}
 
 #[cfg(all(feature = "qemu-test", target_arch = "riscv64"))]
 pub fn register_clobber_self_test() -> bool {

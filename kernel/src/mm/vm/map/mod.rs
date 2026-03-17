@@ -23,7 +23,7 @@ pub struct VmMap {
     pub pmap: Arc<SpinMutex<Pmap, 2>>,
 
     /// Global total size of memory mapped
-    pub size: u64,
+    pub size: usize,
 
     /// Entry count
     pub nentries: usize,
@@ -76,15 +76,8 @@ impl VmMap {
     /// Clear all mappings in the address space
     pub fn clear(&mut self) {
         // Unmap every existing VMA from hardware page tables first.
-        let ranges: alloc::vec::Vec<(VirtAddr, VirtAddr)> = self
-            .iter()
-            .map(|e| {
-                (
-                    VirtAddr::new(e.start() as usize),
-                    VirtAddr::new(e.end() as usize),
-                )
-            })
-            .collect();
+        let ranges: alloc::vec::Vec<(VirtAddr, VirtAddr)> =
+            self.iter().map(|e| (e.start(), e.end())).collect();
         {
             let mut pmap = self.pmap.lock();
             for (start, end) in ranges {
@@ -101,7 +94,7 @@ impl VmMap {
     }
 
     /// Remove an entry from the tree by key, updating size/nentries bookkeeping.
-    fn remove_tree_entry(&mut self, key: u64) -> Option<VmMapEntry> {
+    fn remove_tree_entry(&mut self, key: VirtAddr) -> Option<VmMapEntry> {
         let entry = *self.tree.remove(key)?;
         self.size = self.size.saturating_sub(entry.size());
         self.nentries = self.nentries.saturating_sub(1);
@@ -122,8 +115,7 @@ impl VmMap {
             return Err(Errno::Einval);
         }
 
-        let page_size = PAGE_SIZE as u64;
-        if entry.start() % page_size != 0 || entry.end() % page_size != 0 {
+        if entry.start().as_usize() % PAGE_SIZE != 0 || entry.end().as_usize() % PAGE_SIZE != 0 {
             return Err(Errno::Einval);
         }
 
@@ -142,17 +134,13 @@ impl VmMap {
     }
 
     /// Remove the entry containing `va`.
-    pub fn remove_entry_containing(&mut self, va: u64) -> Option<VmMapEntry> {
+    pub fn remove_entry_containing(&mut self, va: VirtAddr) -> Option<VmMapEntry> {
         let entry = self.remove_tree_entry(va)?;
 
         // Remove hardware page table mappings for this entry's VA range
         {
             let mut pmap = self.pmap.lock();
-            pmap_remove(
-                &mut pmap,
-                VirtAddr::new(entry.start() as usize),
-                VirtAddr::new(entry.end() as usize),
-            );
+            pmap_remove(&mut pmap, entry.start(), entry.end());
         }
 
         self.timestamp.fetch_add(1, Ordering::SeqCst);
@@ -163,7 +151,6 @@ impl VmMap {
         if start >= end {
             return alloc::vec::Vec::new();
         }
-        let (s, e) = (start.as_usize() as u64, end.as_usize() as u64);
 
         // Pmap: tear down entire range upfront (preserves dirty bit attribution)
         {
@@ -171,14 +158,14 @@ impl VmMap {
             pmap_remove(&mut pmap, start, end);
         }
 
-        let keys = overlapping_keys(self, s, e);
+        let keys = overlapping_keys(self, start, end);
         let mut removed = alloc::vec::Vec::new();
         for key in keys {
             let entry = match self.remove_tree_entry(key) {
                 Some(e) => e,
                 None => continue,
             };
-            let split = split_entry_at(entry, s, e);
+            let split = split_entry_at(entry, start, end);
             self.reinsert_entries([split.left, split.right].into_iter().flatten());
             removed.push(split.middle);
         }
@@ -187,19 +174,19 @@ impl VmMap {
         removed
     }
 
-    pub fn lookup(&mut self, va: u64) -> Option<&VmMapEntry> {
+    pub fn lookup(&mut self, va: VirtAddr) -> Option<&VmMapEntry> {
         self.tree.lookup(va)
     }
 
-    pub fn lookup_readonly(&self, va: u64) -> Option<&VmMapEntry> {
+    pub fn lookup_readonly(&self, va: VirtAddr) -> Option<&VmMapEntry> {
         self.tree.lookup_readonly(va)
     }
 
-    pub fn lookup_mut(&mut self, va: u64) -> Option<&mut VmMapEntry> {
+    pub fn lookup_mut(&mut self, va: VirtAddr) -> Option<&mut VmMapEntry> {
         self.tree.lookup_mut(va)
     }
 
-    pub fn is_range_free(&self, start: u64, end: u64) -> bool {
+    pub fn is_range_free(&self, start: VirtAddr, end: VirtAddr) -> bool {
         for vma in self.iter() {
             if core::cmp::max(vma.start(), start) < core::cmp::min(vma.end(), end) {
                 return false;
@@ -209,25 +196,25 @@ impl VmMap {
     }
 
     pub fn find_free_area_topdown(&self, len: usize) -> Option<VirtAddr> {
-        let max_va = 0x0003_FFFF_0000_u64; // Approx user max VA
+        let max_va: usize = 0x0003_FFFF_0000; // Approx user max VA
         let mut current_top = max_va;
 
         let mut occupied = alloc::vec::Vec::new();
         for vma in self.iter() {
-            occupied.push((vma.start(), vma.end()));
+            occupied.push((vma.start().as_usize(), vma.end().as_usize()));
         }
         occupied.sort_unstable_by_key(|&(s, _)| s);
 
         for (start, end) in occupied.into_iter().rev() {
-            if current_top >= end && current_top - end >= len as u64 {
-                return Some(VirtAddr::new((current_top - len as u64) as usize));
+            if current_top >= end && current_top - end >= len {
+                return Some(VirtAddr::new(current_top - len));
             }
             if start < current_top {
                 current_top = start;
             }
         }
-        if current_top >= len as u64 + 0x10000 {
-            return Some(VirtAddr::new((current_top - len as u64) as usize));
+        if current_top >= len + 0x10000 {
+            return Some(VirtAddr::new(current_top - len));
         }
         None
     }
@@ -241,19 +228,18 @@ impl VmMap {
         if start >= end {
             return Err(Errno::Einval);
         }
-        let (s, e) = (start.as_usize() as u64, end.as_usize() as u64);
 
         // Validate: full coverage + max_protection (pure, no mutation)
-        validate_protect_coverage(self, s, e, perm)?;
+        validate_protect_coverage(self, start, end, perm)?;
 
         // Split + re-protect affected middles
-        let keys = overlapping_keys(self, s, e);
+        let keys = overlapping_keys(self, start, end);
         for key in keys {
             let entry = match self.remove_tree_entry(key) {
                 Some(e) => e,
                 None => continue,
             };
-            let mut split = split_entry_at(entry, s, e);
+            let mut split = split_entry_at(entry, start, end);
             split.middle.protection = perm;
             self.reinsert_entries(
                 [split.left, Some(split.middle), split.right]
@@ -286,8 +272,8 @@ impl VmMap {
         mapping: VmMapping,
     ) -> Result<(), Errno> {
         let entry = VmMapEntry::new(
-            start.as_usize() as u64,
-            end.as_usize() as u64,
+            start,
+            end,
             mapping,
             perm,
         );
@@ -304,8 +290,8 @@ impl VmMap {
         perm: MapPerm,
         mapping: VmMapping,
     ) -> Result<(), Errno> {
-        let s = start.as_usize() as u64;
-        let e = end.as_usize() as u64;
+        let s = start;
+        let e = end;
         if let Some(existing) = self.lookup_mut(s) {
             if existing.start() == s
                 && existing.end() == e
@@ -326,7 +312,7 @@ impl VmMap {
     /// Preserves the variant discriminant. Bumps timestamp.
     pub fn rebind_store(
         &mut self,
-        va: u64,
+        va: VirtAddr,
         new_object: Arc<LeveledRwLock<VmObject, 3>>,
     ) -> Result<(), Errno> {
         let vma = self.lookup_mut(va).ok_or(Errno::Esrch)?;
@@ -336,7 +322,7 @@ impl VmMap {
     }
 
     /// Set the COW lifecycle state on an entry. Bumps timestamp.
-    pub fn set_cow_state(&mut self, va: u64, state: CowState) -> Result<(), Errno> {
+    pub fn set_cow_state(&mut self, va: VirtAddr, state: CowState) -> Result<(), Errno> {
         let vma = self.lookup_mut(va).ok_or(Errno::Esrch)?;
         vma.cow_state = state;
         self.timestamp.fetch_add(1, Ordering::SeqCst);
@@ -388,22 +374,22 @@ impl VmMap {
 
     pub fn grow_heap(
         &mut self,
-        old_brk_aligned: usize,
-        new_brk_aligned: usize,
+        old_brk_aligned: VirtAddr,
+        new_brk_aligned: VirtAddr,
     ) -> Result<(), Errno> {
         if new_brk_aligned <= old_brk_aligned {
             return Err(Errno::Einval);
         }
 
-        if old_brk_aligned > 0 {
+        if old_brk_aligned > VirtAddr::new(0) {
             let mut extended = false;
             {
-                if let Some(vma) = self.lookup_mut((old_brk_aligned - 1) as u64) {
-                    if vma.end() == old_brk_aligned as u64
+                if let Some(vma) = self.lookup_mut(old_brk_aligned - 1) {
+                    if vma.end() == old_brk_aligned
                         && matches!(vma.mapping, VmMapping::Heap { .. })
                     {
-                        let heap_start = vma.start() as usize;
-                        vma.set_bounds(heap_start as u64, new_brk_aligned as u64);
+                        let heap_start = vma.start();
+                        vma.set_bounds(heap_start, new_brk_aligned);
                         if let Some(object) = vma.mapping.object() {
                             object.write().set_size(new_brk_aligned - heap_start);
                         }
@@ -415,13 +401,13 @@ impl VmMap {
             if extended {
                 self.size = self
                     .size
-                    .saturating_add((new_brk_aligned - old_brk_aligned) as u64);
+                    .saturating_add((new_brk_aligned - old_brk_aligned) as usize);
                 self.timestamp.fetch_add(1, Ordering::SeqCst);
                 return Ok(());
             }
         }
 
-        if !self.is_range_free(old_brk_aligned as u64, new_brk_aligned as u64) {
+        if !self.is_range_free(old_brk_aligned, new_brk_aligned) {
             return Err(Errno::Einval);
         }
 
@@ -431,8 +417,8 @@ impl VmMap {
             offset: 0,
         };
         self.map(
-            VirtAddr::new(old_brk_aligned),
-            VirtAddr::new(new_brk_aligned),
+            old_brk_aligned,
+            new_brk_aligned,
             MapPerm::R | MapPerm::W | MapPerm::U,
             mapping,
         )
@@ -440,32 +426,33 @@ impl VmMap {
 
     pub fn shrink_heap(
         &mut self,
-        old_brk_aligned: usize,
-        new_brk_aligned: usize,
+        old_brk_aligned: VirtAddr,
+        new_brk_aligned: VirtAddr,
     ) -> Result<alloc::vec::Vec<VmMapEntry>, Errno> {
         if new_brk_aligned >= old_brk_aligned {
             return Err(Errno::Einval);
         }
 
-        if old_brk_aligned == 0 {
+        if old_brk_aligned == VirtAddr::new(0) {
             return Ok(alloc::vec::Vec::new());
         }
+
 
         let mut unmap_range = None;
         let mut remove_heap_va = None;
 
         {
-            if let Some(vma) = self.lookup_mut((old_brk_aligned - 1) as u64) {
-                if vma.end() == old_brk_aligned as u64
+            if let Some(vma) = self.lookup_mut(old_brk_aligned - 1) {
+                if vma.end()  == old_brk_aligned
                     && matches!(vma.mapping, VmMapping::Heap { .. })
                 {
-                    let heap_start = vma.start() as usize;
+                    let heap_start = vma.start();
                     let new_heap_end = core::cmp::max(new_brk_aligned, heap_start);
 
                     if new_heap_end <= heap_start {
-                        remove_heap_va = Some((old_brk_aligned - 1) as u64);
+                        remove_heap_va = Some(old_brk_aligned - 1);
                     } else {
-                        vma.set_bounds(heap_start as u64, new_heap_end as u64);
+                        vma.set_bounds(heap_start, new_heap_end);
                         if let Some(object) = vma.mapping.object() {
                             let new_pages =
                                 (new_heap_end - heap_start) / crate::hal_common::PAGE_SIZE;
@@ -492,12 +479,12 @@ impl VmMap {
                 let mut pmap = self.pmap.lock();
                 pmap_remove(
                     &mut pmap,
-                    VirtAddr::new(new_heap_end),
-                    VirtAddr::new(old_heap_end),
+                    new_heap_end,
+                    old_heap_end,
                 );
                 self.size = self
                     .size
-                    .saturating_sub((old_heap_end - new_heap_end) as u64);
+                    .saturating_sub(old_heap_end - new_heap_end);
                 self.timestamp.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -557,15 +544,15 @@ impl Drop for VmMap {
 enum ForkDescriptor {
     /// Read-only region: share the VmObject, copy pmap entries as-is.
     Share {
-        start: u64,
-        end: u64,
+        start: VirtAddr,
+        end: VirtAddr,
         prot: MapPerm,
         child_mapping: VmMapping,
     },
     /// Writable region: shadow both sides, downgrade parent pmap to RO.
     Cow {
-        start: u64,
-        end: u64,
+        start: VirtAddr,
+        end: VirtAddr,
         prot: MapPerm,
         parent_shadow: VmMapping,
         child_shadow: VmMapping,
@@ -617,9 +604,7 @@ impl ForkDescriptor {
                 // VMA: insert child entry (parent unchanged)
                 child.insert_entry(VmMapEntry::new(start, end, child_mapping, prot))?;
                 // Pmap: copy parent pages into child as-is
-                let va_start = VirtAddr::new(start as usize);
-                let va_end = VirtAddr::new(end as usize);
-                for (va, pa, _) in parent_pmap.range(va_start, va_end) {
+                for (va, pa, _) in parent_pmap.range(start, end) {
                     child_pmap.entry_or_insert(va, pa, prot).ok();
                 }
             },
@@ -637,9 +622,7 @@ impl ForkDescriptor {
                 child.insert_entry(VmMapEntry::new(start, end, child_shadow, prot))?;
                 // Pmap: downgrade parent W→RO, copy to child as RO
                 let ro = prot & !MapPerm::W;
-                let va_start = VirtAddr::new(start as usize);
-                let va_end = VirtAddr::new(end as usize);
-                parent_pmap.for_each_in_range_mut(va_start, va_end, |mut entry| {
+                parent_pmap.for_each_in_range_mut(start, end, |mut entry| {
                     child_pmap.entry_or_insert(entry.va(), entry.pa(), ro).ok();
                     batch.add(entry.set_perm(ro));
                 });
@@ -691,7 +674,7 @@ struct SplitResult {
 }
 
 /// Pure geometry: split an entry at [clip_start, clip_end) boundaries.
-fn split_entry_at(entry: VmMapEntry, clip_start: u64, clip_end: u64) -> SplitResult {
+fn split_entry_at(entry: VmMapEntry, clip_start: VirtAddr, clip_end: VirtAddr) -> SplitResult {
     let left = (entry.start() < clip_start).then(|| {
         let mut l = entry.clone_for_split(entry.start());
         l.set_bounds(entry.start(), clip_start);
@@ -714,7 +697,7 @@ fn split_entry_at(entry: VmMapEntry, clip_start: u64, clip_end: u64) -> SplitRes
 }
 
 /// Collect keys of all entries overlapping [start, end).
-fn overlapping_keys(vm: &VmMap, start: u64, end: u64) -> alloc::vec::Vec<u64> {
+fn overlapping_keys(vm: &VmMap, start: VirtAddr, end: VirtAddr) -> alloc::vec::Vec<VirtAddr> {
     vm.iter()
         .filter(|e| e.start() < end && e.end() > start)
         .map(|e| e.start())
@@ -722,7 +705,7 @@ fn overlapping_keys(vm: &VmMap, start: u64, end: u64) -> alloc::vec::Vec<u64> {
 }
 
 /// Validate that [start, end) is fully covered by VMAs and perm ≤ max_protection.
-fn validate_protect_coverage(vm: &VmMap, start: u64, end: u64, perm: MapPerm) -> Result<(), Errno> {
+fn validate_protect_coverage(vm: &VmMap, start: VirtAddr, end: VirtAddr, perm: MapPerm) -> Result<(), Errno> {
     let mut entries: alloc::vec::Vec<_> = vm
         .iter()
         .filter(|e| e.start() < end && e.end() > start)

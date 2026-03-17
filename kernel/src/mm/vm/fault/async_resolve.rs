@@ -29,7 +29,7 @@ use crate::{
 /// on top without changing this function.
 fn revalidate_vma(
     map: &VmMap,
-    fault_va: usize,
+    fault_va: VirtAddr,
     obj: &Arc<LeveledRwLock<VmObject, 3>>,
     saved_ts: u32,
     vma_perm: MapPerm,
@@ -37,7 +37,7 @@ fn revalidate_vma(
     if map.timestamp.load(core::sync::atomic::Ordering::Relaxed) == saved_ts {
         return Some(vma_perm);
     }
-    let vma = map.lookup_readonly(fault_va as u64)?;
+    let vma = map.lookup_readonly(fault_va)?;
     // Verify backing object identity — after execve, the same VA may
     // exist with a different object. Inserting into the old object would
     // create a dangling PTE when the old object drops.
@@ -169,7 +169,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let map = task.vm_map.read();
         let ts = map.timestamp.load(core::sync::atomic::Ordering::Relaxed);
         let vma = map
-            .lookup_readonly(fault_va.as_usize() as u64)
+            .lookup_readonly(fault_va)
             .ok_or_else(|| {
                 kerr!(
                     vm,
@@ -200,7 +200,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     // 2. Check if the page is already in the object (walks shadow chain)
     if let Some(existing_pa) = obj.read().lookup_page(obj_offset) {
         let map = task.vm_map.read();
-        let current_perm = match revalidate_vma(&map, fault_va.as_usize(), &obj, saved_ts, vma_perm)
+        let current_perm = match revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm)
         {
             Some(perm) => perm,
             None => return Ok(()), // VMA gone or object identity changed
@@ -281,7 +281,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
         let current_perm = if let Some(perm) =
-            revalidate_vma(&map, fault_va.as_usize(), &obj, saved_ts, vma_perm)
+            revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm)
         {
             perm
         } else {

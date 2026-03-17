@@ -16,11 +16,12 @@ use alloc::sync::Arc;
 use crate::{
     hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap::Pmap,
+        pmap::{ Pmap,
+                container::PmapEntry
+        },
         vm::{MapPerm, VObjIndex, VmMap, VmMapEntry},
     },
 };
-
 /// Result of a synchronous page fault resolution attempt.
 #[derive(Debug)]
 pub enum FaultResult {
@@ -99,17 +100,17 @@ pub fn sync_fault_handler(
     fault_va: VirtAddr,
     access_type: PageFaultAccessType,
 ) -> FaultResult {
-    let fault_va_aligned = VirtAddr(fault_va.0 & !(PAGE_SIZE - 1));
+    let fault_va_aligned = fault_va.page_align_down();
 
     // 1. Find the VMA containing the faulting address.
-    let vma = match vm_map.lookup_readonly(fault_va.0 as u64) {
+    let vma = match vm_map.lookup_readonly(fault_va) {
         None => {
             return FaultResult::Error(kerr!(
                 vm,
                 debug,
                 Errno::Efault,
                 "fault NOT_MAPPED va={:#x}",
-                fault_va.0
+                fault_va
             ));
         },
         Some(vma) => vma,
@@ -133,7 +134,7 @@ pub fn sync_fault_handler(
             debug,
             Errno::Efault,
             "fault PERM_DENIED va={:#x} prot={:?} w={} r={} x={}",
-            fault_va.0,
+            fault_va,
             vma.protection,
             access_type.write,
             access_type.read,
@@ -150,7 +151,7 @@ pub fn sync_fault_handler(
                 debug,
                 Errno::Efault,
                 "fault INVALID_BACKING va={:#x} store=SubMap|Guard",
-                fault_va_aligned.0
+                fault_va_aligned
             ));
         },
     };
@@ -168,7 +169,7 @@ pub fn sync_fault_handler(
         vm,
         debug,
         "fault RESULT va={:#x} => {:?}",
-        fault_va.0,
+        fault_va,
         result
     );
     result
@@ -200,7 +201,7 @@ fn classify_and_handle(
             };
 
             if is_file_backed {
-                crate::klog!(vm, debug, "fault NeedsAsyncIO va={:#x}", fault_va_aligned.0);
+                crate::klog!(vm, debug, "fault NeedsAsyncIO va={:#x}", fault_va_aligned);
                 FaultResult::NeedsAsyncIO
             } else {
                 handle_anonymous_fault(vma, obj, obj_page_offset, fault_va_aligned, pmap)
@@ -219,8 +220,8 @@ fn classify_and_handle(
                     error,
                     Errno::Enomem,
                     "fault map FAILED va={:#x} pa={:#x} perm={:?}",
-                    fault_va_aligned.0,
-                    phys.as_usize(),
+                    fault_va_aligned,
+                    phys,
                     vma.protection
                 ));
             }
@@ -249,7 +250,7 @@ fn handle_anonymous_fault(
                     error,
                     Errno::Enomem,
                     "anon fault OOM: alloc failed va={:#x}",
-                    fault_va_aligned.0
+                    fault_va_aligned
                 ))
             },
         }
@@ -265,8 +266,8 @@ fn handle_anonymous_fault(
             error,
             Errno::Enomem,
             "anon fault map FAILED va={:#x} pa={:#x}",
-            fault_va_aligned.0,
-            new_frame_phys.as_usize()
+            fault_va_aligned,
+            new_frame_phys
         ));
     }
 
@@ -312,8 +313,7 @@ fn handle_cow_fault(
                 obj_write.collapse();
                 if obj_write.has_page(obj_page_offset) {
                     drop(obj_write);
-                    if let crate::mm::pmap::container::PmapEntry::Occupied(mut e) =
-                        pmap.entry(fault_va_aligned)
+                    if let PmapEntry::Occupied(mut e) = pmap.entry(fault_va_aligned)
                     {
                         e.promote(vma.protection);
                     }
@@ -334,7 +334,7 @@ fn handle_cow_fault(
                     error,
                     Errno::Enomem,
                     "cow fault OOM: copy alloc failed va={:#x}",
-                    fault_va_aligned.0
+                    fault_va_aligned
                 ))
             },
         }
@@ -352,8 +352,8 @@ fn handle_cow_fault(
                     error,
                     Errno::Enomem,
                     "cow fault map FAILED va={:#x} pa={:#x}",
-                    fault_va_aligned.0,
-                    new_frame_phys.as_usize()
+                    fault_va_aligned,
+                    new_frame_phys
                 ));
             }
         },

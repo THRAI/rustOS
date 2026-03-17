@@ -155,7 +155,7 @@ impl Node {
 pub struct VmMapEntry {
     /// Half-open virtual address range [start, end).
     pub(crate) range: VirtAddrRange,
-    pub(crate) max_free: u64,
+    pub(crate) max_free: usize,
 
     /// Intrusive Splay Node
     pub(crate) splay_node: Node,
@@ -168,9 +168,9 @@ pub struct VmMapEntry {
 }
 
 impl VmMapEntry {
-    pub fn new(start: u64, end: u64, mapping: VmMapping, protection: MapPerm) -> Self {
+    pub fn new(start: VirtAddr, end: VirtAddr, mapping: VmMapping, protection: MapPerm) -> Self {
         Self {
-            range: VirtAddrRange::from_raw(start as usize, end as usize),
+            range: VirtAddrRange::from_raw(start.as_usize(), end.as_usize()),
             max_free: 0,
             splay_node: Node::new(),
             mapping,
@@ -180,19 +180,19 @@ impl VmMapEntry {
         }
     }
 
-    /// Start address as u64 (for splay tree key compatibility).
-    pub fn start(&self) -> u64 {
-        self.range.start().as_usize() as u64
+    /// Start address.
+    pub fn start(&self) -> VirtAddr {
+        self.range.start()
     }
 
-    /// End address as u64 (for splay tree key compatibility).
-    pub fn end(&self) -> u64 {
-        self.range.end().as_usize() as u64
+    /// End address.
+    pub fn end(&self) -> VirtAddr {
+        self.range.end()
     }
 
     /// Size in bytes.
-    pub fn size(&self) -> u64 {
-        self.range.len() as u64
+    pub fn size(&self) -> usize {
+        self.range.len()
     }
 
     /// Get the typed address range.
@@ -212,14 +212,14 @@ impl VmMapEntry {
             _ => match (self.mapping.object(), next.mapping.object()) {
                 (Some(o1), Some(o2)) => {
                     Arc::ptr_eq(o1, o2)
-                        && (self.mapping.offset() + self.size() == next.mapping.offset())
+                        && (self.mapping.offset() + self.size() as u64 == next.mapping.offset())
                 },
                 _ => false,
             },
         }
     }
 
-    pub fn clone_for_split(&self, split_addr: u64) -> Self {
+    pub fn clone_for_split(&self, split_addr: VirtAddr) -> Self {
         let mut new_entry = Self {
             range: self.range,
             max_free: 0,
@@ -230,7 +230,7 @@ impl VmMapEntry {
             cow_state: self.cow_state,
         };
 
-        let delta = split_addr - self.start();
+        let delta = (split_addr.as_usize() - self.start().as_usize()) as u64;
         match &mut new_entry.mapping {
             VmMapping::AnonPrivate { offset, .. }
             | VmMapping::FilePrivate { offset, .. }
@@ -244,8 +244,8 @@ impl VmMapEntry {
         new_entry
     }
 
-    pub(crate) fn set_bounds(&mut self, new_start: u64, new_end: u64) {
-        self.range = VirtAddrRange::from_raw(new_start as usize, new_end as usize);
+    pub(crate) fn set_bounds(&mut self, new_start: VirtAddr, new_end: VirtAddr) {
+        self.range = VirtAddrRange::from_raw(new_start.as_usize(), new_end.as_usize());
     }
 
     /// Extract the backing VmObject and compute the page offset for a fault VA.
@@ -257,7 +257,7 @@ impl VmMapEntry {
     ) -> Option<(Arc<LeveledRwLock<VmObject, 3>>, VObjIndex)> {
         let object = self.mapping.object()?;
         let offset = self.mapping.offset();
-        let offset_bytes = offset + (fault_va_aligned.as_usize() as u64 - self.start());
+        let offset_bytes = offset + (fault_va_aligned.as_usize() - self.start().as_usize()) as u64;
         Some((
             object.clone(),
             VObjIndex::from_bytes_floor(offset_bytes as usize),

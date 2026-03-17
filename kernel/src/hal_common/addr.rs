@@ -165,6 +165,18 @@ impl Display for PhysAddr {
     }
 }
 
+impl core::fmt::LowerHex for VirtAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "VA 0x{:x}", self.0)
+    }
+}
+
+impl Display for VirtAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "VA 0x{:x}", self.0)
+    }
+}
+
 impl VirtAddr {
     pub const fn new(addr: usize) -> Self {
         Self(addr)

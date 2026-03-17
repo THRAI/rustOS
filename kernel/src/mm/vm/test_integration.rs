@@ -21,8 +21,8 @@ use crate::{
 pub fn test_anonymous_page_fault() {
     let obj = VmObject::new_anon(PAGE_SIZE);
     let vma = VmMapEntry::new(
-        0x1000_0000,
-        0x1000_0000 + PAGE_SIZE as u64,
+        VirtAddr::new(0x1000_0000),
+        VirtAddr::new(0x1000_0000 + PAGE_SIZE as usize),
         VmMapping::AnonPrivate {
             object: obj,
             offset: 0,
@@ -43,7 +43,7 @@ pub fn test_anonymous_page_fault() {
     match result {
         FaultResult::Resolved => {
             // Verify a page was inserted into the VmObject
-            let vma = map.lookup_readonly(0x1000_0000).unwrap();
+            let vma = map.lookup_readonly(VirtAddr::new(0x1000_0000)).unwrap();
             let obj = match vma.mapping.object() {
                 Some(obj) => obj.read(),
                 None => panic!("Expected object-backed mapping"),
@@ -85,8 +85,8 @@ pub fn test_cow_fault() {
     let _sibling = Arc::clone(&shadow);
 
     let vma = VmMapEntry::new(
-        0x2000_0000,
-        0x2000_0000 + PAGE_SIZE as u64,
+        VirtAddr::new(0x2000_0000),
+        VirtAddr::new(0x2000_0000 + PAGE_SIZE),
         VmMapping::AnonPrivate {
             object: shadow,
             offset: 0,
@@ -106,7 +106,7 @@ pub fn test_cow_fault() {
     );
     match result {
         FaultResult::Resolved => {
-            let vma = map.lookup_readonly(0x2000_0000).unwrap();
+            let vma = map.lookup_readonly(VirtAddr::new(0x2000_0000)).unwrap();
             let obj = match vma.mapping.object() {
                 Some(obj) => obj.read(),
                 None => panic!("Expected object-backed mapping"),

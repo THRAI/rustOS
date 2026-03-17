@@ -108,7 +108,7 @@ fn resolve_mmap_base(
                 aligned_len
             )
         })?;
-        if vm.is_range_free(hint as u64, hint_end as u64) {
+        if vm.is_range_free(VirtAddr::new(hint), VirtAddr::new(hint_end)) {
             return Ok(hint);
         }
     }
@@ -453,11 +453,20 @@ pub fn sys_brk(task: &Arc<Task>, addr: usize) -> usize {
     }
 
     if new_brk_aligned > old_brk_aligned {
-        if vm.grow_heap(old_brk_aligned, new_brk_aligned).is_err() {
+        if vm
+            .grow_heap(
+                VirtAddr::new(old_brk_aligned),
+                VirtAddr::new(new_brk_aligned),
+            )
+            .is_err()
+        {
             return current_brk;
         }
     } else if new_brk_aligned < old_brk_aligned {
-        match vm.shrink_heap(old_brk_aligned, new_brk_aligned) {
+        match vm.shrink_heap(
+            VirtAddr::new(old_brk_aligned),
+            VirtAddr::new(new_brk_aligned),
+        ) {
             Ok(removed) => free_removed_frames(removed),
             Err(_) => return current_brk,
         }

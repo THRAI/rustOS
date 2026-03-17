@@ -16,7 +16,34 @@ kernel/          — Main kernel crate (the only workspace member)
     hal/         — Hardware abstraction layer (RISC-V specific)
     hal_common/  — Platform-agnostic HAL traits and types
     mm/          — Memory management (pmap, vm, buddy allocator)
-    proc/        — Process management (fork, exec, wait, signals)
+      pmap/      — Hardware page table (Sv39) as a Rust container
+        mod.rs       — Pmap struct, get/entry/entry_or_insert/range/for_each_in_range_mut
+        container.rs — PmapRef, PmapEntry, OccupiedEntry, VacantEntry, OccupiedEntryMut, PmapRange
+        shootdown.rs — TLB shootdown (ShootdownBatch, QuiesceGuard, per-CPU IPI)
+        walk.rs      — Generic page table walker
+        pte.rs       — PTE encoding/decoding, PteFlags
+        asid.rs      — ASID allocator
+      vm/        — Virtual memory subsystem
+        page/        — Physical page lifecycle
+          vm_page.rs     — VmPage metadata, busy-lock state machine
+          page_ref.rs    — PageRef RAII frame handle
+          wait_queue.rs  — Hashed waker queue for VmPage busy-state
+        object/      — VmObject + backing store
+          vm_object.rs   — VmObject, VObjIndex, shadow chains, page cache
+          pager.rs       — Pager trait, AnonPager, VnodePager
+          page_daemon.rs — Dirty-page writeback daemon
+        map/         — Address space map (VmMap)
+          mod.rs         — VmMap: insert, remove, lookup, protect, fork, mmap
+          entry.rs       — VmMapEntry, VmMapping enum, MapPerm, CowState
+          splay.rs       — Intrusive splay tree
+        fault/       — Page fault handling
+          sync.rs        — Synchronous fault handler (trap-stack safe)
+          async_resolve.rs — Async fault handler (yields for I/O)
+    proc/        — Process management (clone, exec, wait, signals)
+      clone.rs   — do_clone(), CloneFlags, VforkDone (replaces fork.rs)
+      exec.rs    — do_execve (ELF loading)
+      signal.rs  — POSIX signals, sigcode VMA (SIGCODE_OBJ)
+      task.rs    — Task struct (Arc-wrapped vm_map, fd_table)
     syscall/     — Syscall dispatch and handlers
     fs/          — VFS layer, ext4 via lwext4_rust
     ipc/         — IPC (futex)
@@ -34,6 +61,10 @@ testcase/        — Test program binaries
 ai/              — AI-generated architecture analysis and planning docs
 concept_docs/    — High-level project concept documents
 freebsd-src/     — Partial FreeBSD source tree (C reference)
+                   See freebsd-src/AGENTS.md for BSD architecture reference
+                   covering VM, threading, and kqueue/knote subsystems.
+                   Consult it when working on mm/, proc/, ipc/, or
+                   implementing event-driven / async mechanisms.
 chronix/         — Reference OS kernel project (competition entry)
 delonix/         — Reference OS kernel project (competition entry)
 firmware/        — (reserved, currently empty)
@@ -222,7 +253,6 @@ git config core.hooksPath .githooks
 | `log-level-{level}` | Hierarchical: `error`, `warn` (implies error), `info` (implies warn), `debug` (implies info), `trace` (implies debug) |
 | `log-level-all` | Enable all log levels (implies trace) |
 | `exec-legacy` | Use legacy exec path |
-| `fork-hardcopy` | Use deep-copy fork instead of CoW |
 
 ## Runtime Feature Flags
 
@@ -245,6 +275,78 @@ Flags are stored as bits in an `AtomicU32`. See the `Flag` enum:
 - **Async**: Custom executor for kernel async tasks
 - **Signals**: POSIX-like signal model
 - **No `std`**: Everything is `#![no_std]`, no heap until buddy allocator is initialized
+
+### VM / Pmap Architecture
+
+The virtual memory subsystem has four layers:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Callers (sys_mmap, do_execve, map_sigcode)                  │
+│    Build VmObject, choose VmMapping variant                  │
+│    Call: VmMap.map(start, end, perm, VmMapping::*)            │
+├──────────────────────────────────────────────────────────────┤
+│  VmMap Builder + Business Methods                            │
+│    map()           — construct entry from VmMapping enum      │
+│    cow_fork_into() — COW fork (ForkDescriptor pipeline)       │
+│    share_into()    — shared address space (CLONE_VM)          │
+│    map_sigcode()   — sigcode VMA via VmMapping::Shared        │
+├──────────────────────────────────────────────────────────────┤
+│  VmMap Accountant (CRUD + pmap bind + invariant enforcement) │
+│    insert_entry, remove_range, protect_range                 │
+│    grow_heap, shrink_heap, clear                             │
+│    rebind_store, set_cow_state                               │
+│    split_entry_at (shared geometry for range ops)             │
+├──────────────────────────────────────────────────────────────┤
+│  Pmap Container (hardware page table cache)                  │
+│    get(va) → PmapRef          (read-only lookup)             │
+│    entry(va) → Occupied|Vacant (mutable entry API)           │
+│    range(start, end) → Iterator (subtree-skipping)           │
+│    for_each_in_range_mut()    (mutable range visitor)         │
+│    ShootdownBatch             (quiesce-on-create, flush-drop) │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Key types:**
+
+- **`VmMapping`** enum (6 variants: `AnonPrivate`, `FilePrivate`, `FileShared`,
+  `Heap`, `Shared`, `Guard`) — stored directly in `VmMapEntry`. Each variant
+  carries its `VmObject`. Inheritance is derived from the variant discriminant
+  via `mapping.inheritance()`. Replaces the old `BackingStore` + `EntryFlags` +
+  `VmInherit` triple.
+
+- **`CowState`** (`None` | `CopyOnWrite`) — the only independent mutable axis
+  on `VmMapEntry`, set by `cow_fork_into` during fork.
+
+- **`ForkDescriptor`** (`Share` | `Cow`) — pure classification of per-VMA fork
+  action. `cow_fork_into` is a pipeline: `iter → filter_map(classify) → collect
+  → try_for_each(apply)` under one `ShootdownBatch`.
+
+- **`PmapEntry`** (`Occupied` | `Vacant`) — Rust Entry API for pmap. Point
+  mutations (insert, promote, remove) on single PTEs. `OccupiedEntry` borrows
+  the PTE slot, not `&mut Pmap` — no extra locking needed beyond `SpinMutex<Pmap>`.
+
+- **`ShootdownBatch`** — wraps `QuiesceGuard` (parks remote harts on create),
+  collects `ShootdownToken`s from PTE mutations, adaptive local flush on drop.
+
+**Invariant:** Every user-space pmap mapping is authorized by a `VmMapEntry`.
+No pmap-only mappings exist (sigcode is a proper `VmMapping::Shared` VMA).
+
+### Process Creation (clone)
+
+`do_clone(flags)` in `proc/clone.rs` is the universal process/thread creation
+primitive. `fork()` no longer exists. Flag-driven dispatch:
+
+| Flag | Behavior |
+|------|----------|
+| (none) | Traditional COW fork via `VmMap::cow_fork_into()` |
+| `CLONE_VM` | Share address space (`Arc::clone` of `vm_map`) |
+| `CLONE_FILES` | Share fd table (`Arc::clone` of `fd_table`) |
+| `CLONE_VFORK` | Parent blocks via `VforkDone` until child exits/execs |
+| `CLONE_SETTLS` | Set child TLS register |
+| `CLONE_THREAD` | Rejected (ENOSYS — future Phase D) |
+
+`Task` struct Arc-wraps `vm_map` and `fd_table` to support sharing.
 
 ### Error Encoding Policy
 

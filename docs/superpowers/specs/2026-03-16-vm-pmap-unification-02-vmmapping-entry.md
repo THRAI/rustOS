@@ -1,7 +1,7 @@
 # VM-Pmap Unification — VmMapping Enum and VmMapEntry
 
 **Date:** 2026-03-16
-**Status:** Draft
+**Status:** Implemented
 **Parent:** `00-overview`
 **Phase:** B
 

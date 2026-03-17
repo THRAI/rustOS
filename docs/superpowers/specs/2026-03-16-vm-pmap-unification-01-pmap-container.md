@@ -1,7 +1,7 @@
 # VM-Pmap Unification — Pmap Container API
 
 **Date:** 2026-03-16
-**Status:** Draft
+**Status:** Implemented
 **Parent:** `00-overview`
 **Phase:** A (pure refactor, no behavioral change)
 

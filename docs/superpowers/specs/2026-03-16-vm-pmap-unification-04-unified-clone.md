@@ -1,7 +1,7 @@
 # VM-Pmap Unification — Unified Clone and Task Changes
 
 **Date:** 2026-03-16
-**Status:** Draft
+**Status:** Implemented
 **Parent:** `00-overview`
 **Phase:** C
 **Depends on:** `01-pmap-container`, `02-vmmapping-entry`, `03-vmmap-builder-accountant`

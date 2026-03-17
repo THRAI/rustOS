@@ -9,6 +9,7 @@ pub mod lwext4_disk;
 pub mod mount;
 pub mod path;
 pub mod pipe;
+pub mod stat;
 pub mod symlink;
 pub mod vnode;
 
@@ -31,8 +32,12 @@ pub use ext4::{
 pub use fd_table::{DeviceKind, FdFlags, FdTable, FileDescription, FileObject, OpenFlags};
 pub use lwext4_disk::Disk;
 pub use mount::{register_mount, resolve_to_source, same_mount_domain, unregister_mount};
-pub use path::resolve;
-pub use pipe::Pipe;
+pub use path::{absolutize_path, normalize_absolute_path, resolve};
+pub use pipe::{ConsoleReadFuture, Pipe, PipeReadFuture, PipeWriteFuture};
+pub use stat::{
+    dirent_type_from_ext4, fill_stat_from_file_object, fill_stat_from_lookup, stat_mode_from_type,
+    stat_zeroed, LinuxDirent64, LinuxStat,
+};
 pub use vnode::{
     init_vnode_cache, vnode_destroy_object, vnode_object, vnode_object_if_exists,
     vnode_objects_lock, Ext4Vnode, Vnode, VnodeId, VnodeType,

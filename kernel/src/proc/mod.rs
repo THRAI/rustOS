@@ -1,7 +1,6 @@
 //! Process subsystem: Task lifecycle, clone/fork, exec, exit, wait4, signals.
 
 pub mod clone;
-pub mod elf;
 pub mod exec;
 pub mod exit_wait;
 
@@ -12,7 +11,6 @@ pub mod task;
 pub mod user_copy;
 
 pub use clone::{do_clone, CloneFlags, VforkDone};
-pub use elf::{parse_elf_first_page, ExecContext};
 pub use exec::do_execve;
 pub use exit_wait::{WaitChildFuture, WaitStatus};
 pub use pid::alloc_pid;

@@ -16,36 +16,17 @@ kernel/          — Main kernel crate (the only workspace member)
     hal/         — Hardware abstraction layer (RISC-V specific)
     hal_common/  — Platform-agnostic HAL traits and types
     mm/          — Memory management (pmap, vm, buddy allocator)
-      pmap/      — Hardware page table (Sv39) as a Rust container
-        mod.rs       — Pmap struct, get/entry/entry_or_insert/range/for_each_in_range_mut
-        container.rs — PmapRef, PmapEntry, OccupiedEntry, VacantEntry, OccupiedEntryMut, PmapRange
-        shootdown.rs — TLB shootdown (ShootdownBatch, QuiesceGuard, per-CPU IPI)
-        walk.rs      — Generic page table walker
-        pte.rs       — PTE encoding/decoding, PteFlags
-        asid.rs      — ASID allocator
-      vm/        — Virtual memory subsystem
-        page/        — Physical page lifecycle
-          vm_page.rs     — VmPage metadata, busy-lock state machine
-          page_ref.rs    — PageRef RAII frame handle
-          wait_queue.rs  — Hashed waker queue for VmPage busy-state
-        object/      — VmObject + backing store
-          vm_object.rs   — VmObject, VObjIndex, shadow chains, page cache
-          pager.rs       — Pager trait, AnonPager, VnodePager
-          page_daemon.rs — Dirty-page writeback daemon
-        map/         — Address space map (VmMap)
-          mod.rs         — VmMap: insert, remove, lookup, protect, fork, mmap
-          entry.rs       — VmMapEntry, VmMapping enum, MapPerm, CowState
-          splay.rs       — Intrusive splay tree
-        fault/       — Page fault handling
-          sync.rs        — Synchronous fault handler (trap-stack safe)
-          async_resolve.rs — Async fault handler (yields for I/O)
-    proc/        — Process management (clone, exec, wait, signals)
-      clone.rs   — do_clone(), CloneFlags, VforkDone (replaces fork.rs)
-      exec.rs    — do_execve (ELF loading)
-      signal.rs  — POSIX signals, sigcode VMA (SIGCODE_OBJ)
-      task.rs    — Task struct (Arc-wrapped vm_map, fd_table)
-    syscall/     — Syscall dispatch and handlers
+    proc/        — Process management (fork, exec, wait, signals)
+      exec/      — ELF loading and execve (IO shell + pure pipeline)
+        mod.rs   — Async IO shell: vnode fetch, pmap wiring, commit
+        elf.rs   — Pure ELF parsing (no kernel types, no IO)
+        exec_ctx.rs — Monadic pipeline: pure VmMap transforms
+    syscall/     — Syscall dispatch and handlers (thin IO shell)
     fs/          — VFS layer, ext4 via lwext4_rust
+      fd_table.rs — BSD 3-layer fd model + seek/fcntl/poll_ready methods
+      stat.rs    — Pure Linux ABI stat/dirent conversion (no IO)
+      path.rs    — Async resolve + normalize/absolutize (pure path algebra)
+      pipe.rs    — Ring buffer + PipeReadFuture/PipeWriteFuture/ConsoleReadFuture
     ipc/         — IPC (futex)
     drivers/     — Block device drivers (virtio)
     executor/    — Async task executor
@@ -57,7 +38,11 @@ kernel/          — Main kernel crate (the only workspace member)
 user/            — Userspace init process (initproc)
 scripts/         — Build helpers, QEMU runner, test images
 judge/           — Automated scoring for OS competition tests
-testcase/        — Test program binaries
+testcase/        — Pre-compiled test binaries (riscv/{musl,glibc})
+testsuits-for-oskernel/ — Upstream test suite source (git submodule)
+Dockerfile       — Multi-stage: Rust toolchain → QEMU test runner
+Dockerfile.ltp   — Dedicated LTP cross-compilation (competition image)
+docker-compose.yml — Two services: oscomp (main) + ltp (opt-in builder)
 ai/              — AI-generated architecture analysis and planning docs
 concept_docs/    — High-level project concept documents
 freebsd-src/     — Partial FreeBSD source tree (C reference)
@@ -242,6 +227,77 @@ git config core.hooksPath .githooks
 - **Feature flags** (compile-time): kebab-like in Cargo.toml (`log-boot`, `qemu-test`)
 - **Unsafe blocks**: must have a `// SAFETY:` comment explaining invariants
 
+### Code Style: IO/Pure Separation and Functional Pipelines
+
+Prefer a **functional, monadic style** that cleanly separates IO (side
+effects) from pure transforms.  The exec subsystem (`proc/exec/`) is the
+canonical example and should be used as a template when designing new
+multi-stage kernel operations.
+
+**Guiding principles:**
+
+1. **Separate IO from pure logic at the module level.**  IO (pager
+   fetches, pmap writes, vnode resolution, lock acquisition) belongs in
+   a thin "shell" module.  Pure transforms over data structures belong
+   in their own module.  The shell calls into the pure layer, never the
+   reverse.
+
+2. **Thread state through a single accumulator, not tuples.**  Define a
+   pipeline struct that carries all intermediate state.  Each step
+   consumes `self` and returns `Result<Self, Errno>`.  The caller never
+   destructures intermediate tuples or juggles separate variables
+   between stages.
+
+3. **Use `and_then` chains for fallible sequences.**  A simple `and_then`
+   method on the accumulator gives monadic composition without
+   language-level support:
+
+   ```rust
+   ExecPipeline::new(pmap)
+       .and_then(|p| p.with_segments(&main_elf, ...))?
+       .and_then(|p| p.with_stack())?
+       .finalize_auxv()
+       .with_sigcode()
+   ```
+
+   If any step fails, the partial state drops cleanly and no observable
+   side effects have occurred.
+
+4. **Keep error types local to the pure layer.**  Pure modules should
+   define their own error enum (e.g. `ElfError`) that carries no kernel
+   dependencies.  The IO shell maps these to `Errno` at the boundary —
+   the only bridge between the two worlds.  This keeps the pure module
+   testable in user-space.
+
+5. **Prefer iterators and combinators over mutable loops.**  Use `.iter()`,
+   `.map()`, `.filter()`, `.fold()`, `.collect()` where the logic is a
+   straightforward data transformation.  Reserve `for` loops for cases
+   with complex control flow or early exits that `?` inside a closure
+   cannot express cleanly.
+
+6. **Make the point of no return explicit.**  When an operation has
+   commit semantics (exec, fork, mmap), structure it in stages:
+   - *Stage 1*: IO / validation (can fail, no state change)
+   - *Stage 2*: pure pipeline (can fail, intermediate state drops)
+   - *Stage 3*: commit (infallible swap of old state with new)
+
+   Name the commit function `commit` and document that nothing after it
+   can fail.
+
+**Reference implementation — `proc/exec/`:**
+
+| File | Role | IO? |
+|------|------|-----|
+| `mod.rs` | Async IO shell: vnode fetch, pmap wiring, stack materialization, atomic commit | Yes |
+| `elf.rs` | Pure ELF parsing: `&[u8]` → `ElfParseResult`.  No kernel types, no `Errno`, no logging. | No |
+| `exec_ctx.rs` | Monadic pipeline: `ExecPipeline` accumulator with `with_segments`, `with_stack`, `finalize_auxv`.  Pure `VmMap` transforms, no pager/pmap/lock. | No |
+
+When adding a new multi-stage subsystem (e.g. a new mmap path, a loader,
+a device-attach sequence), follow this three-file pattern:
+- **`mod.rs`** — the IO shell that orchestrates async fetches and commits.
+- **`parse.rs` / `validate.rs`** — pure parsing or validation, own error type.
+- **`pipeline.rs` / `ctx.rs`** — accumulator struct with `and_then`-chainable steps.
+
 ## Cargo Features (compile-time)
 
 | Feature | Purpose |
@@ -253,6 +309,7 @@ git config core.hooksPath .githooks
 | `log-level-{level}` | Hierarchical: `error`, `warn` (implies error), `info` (implies warn), `debug` (implies info), `trace` (implies debug) |
 | `log-level-all` | Enable all log levels (implies trace) |
 | `exec-legacy` | Use legacy exec path |
+| `fork-hardcopy` | Use deep-copy fork instead of CoW |
 
 ## Runtime Feature Flags
 
@@ -275,78 +332,6 @@ Flags are stored as bits in an `AtomicU32`. See the `Flag` enum:
 - **Async**: Custom executor for kernel async tasks
 - **Signals**: POSIX-like signal model
 - **No `std`**: Everything is `#![no_std]`, no heap until buddy allocator is initialized
-
-### VM / Pmap Architecture
-
-The virtual memory subsystem has four layers:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Callers (sys_mmap, do_execve, map_sigcode)                  │
-│    Build VmObject, choose VmMapping variant                  │
-│    Call: VmMap.map(start, end, perm, VmMapping::*)            │
-├──────────────────────────────────────────────────────────────┤
-│  VmMap Builder + Business Methods                            │
-│    map()           — construct entry from VmMapping enum      │
-│    cow_fork_into() — COW fork (ForkDescriptor pipeline)       │
-│    share_into()    — shared address space (CLONE_VM)          │
-│    map_sigcode()   — sigcode VMA via VmMapping::Shared        │
-├──────────────────────────────────────────────────────────────┤
-│  VmMap Accountant (CRUD + pmap bind + invariant enforcement) │
-│    insert_entry, remove_range, protect_range                 │
-│    grow_heap, shrink_heap, clear                             │
-│    rebind_store, set_cow_state                               │
-│    split_entry_at (shared geometry for range ops)             │
-├──────────────────────────────────────────────────────────────┤
-│  Pmap Container (hardware page table cache)                  │
-│    get(va) → PmapRef          (read-only lookup)             │
-│    entry(va) → Occupied|Vacant (mutable entry API)           │
-│    range(start, end) → Iterator (subtree-skipping)           │
-│    for_each_in_range_mut()    (mutable range visitor)         │
-│    ShootdownBatch             (quiesce-on-create, flush-drop) │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Key types:**
-
-- **`VmMapping`** enum (6 variants: `AnonPrivate`, `FilePrivate`, `FileShared`,
-  `Heap`, `Shared`, `Guard`) — stored directly in `VmMapEntry`. Each variant
-  carries its `VmObject`. Inheritance is derived from the variant discriminant
-  via `mapping.inheritance()`. Replaces the old `BackingStore` + `EntryFlags` +
-  `VmInherit` triple.
-
-- **`CowState`** (`None` | `CopyOnWrite`) — the only independent mutable axis
-  on `VmMapEntry`, set by `cow_fork_into` during fork.
-
-- **`ForkDescriptor`** (`Share` | `Cow`) — pure classification of per-VMA fork
-  action. `cow_fork_into` is a pipeline: `iter → filter_map(classify) → collect
-  → try_for_each(apply)` under one `ShootdownBatch`.
-
-- **`PmapEntry`** (`Occupied` | `Vacant`) — Rust Entry API for pmap. Point
-  mutations (insert, promote, remove) on single PTEs. `OccupiedEntry` borrows
-  the PTE slot, not `&mut Pmap` — no extra locking needed beyond `SpinMutex<Pmap>`.
-
-- **`ShootdownBatch`** — wraps `QuiesceGuard` (parks remote harts on create),
-  collects `ShootdownToken`s from PTE mutations, adaptive local flush on drop.
-
-**Invariant:** Every user-space pmap mapping is authorized by a `VmMapEntry`.
-No pmap-only mappings exist (sigcode is a proper `VmMapping::Shared` VMA).
-
-### Process Creation (clone)
-
-`do_clone(flags)` in `proc/clone.rs` is the universal process/thread creation
-primitive. `fork()` no longer exists. Flag-driven dispatch:
-
-| Flag | Behavior |
-|------|----------|
-| (none) | Traditional COW fork via `VmMap::cow_fork_into()` |
-| `CLONE_VM` | Share address space (`Arc::clone` of `vm_map`) |
-| `CLONE_FILES` | Share fd table (`Arc::clone` of `fd_table`) |
-| `CLONE_VFORK` | Parent blocks via `VforkDone` until child exits/execs |
-| `CLONE_SETTLS` | Set child TLS register |
-| `CLONE_THREAD` | Rejected (ENOSYS — future Phase D) |
-
-`Task` struct Arc-wraps `vm_map` and `fd_table` to support sharing.
 
 ### Error Encoding Policy
 

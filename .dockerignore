@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+
+# Generated disk images (rebuilt inside container)
+scripts/test.img
+scripts/sdcard-rv.img
+scripts/mnt/
+
+# Large reference trees not needed in container
+freebsd-src/
+chronix/
+delonix/
+
+# Git history
+.git/
+
+# Docs / planning (not needed for builds)
+ai/
+concept_docs/
+.planning/
+.concept-dev/

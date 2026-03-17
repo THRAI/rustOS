@@ -110,7 +110,7 @@ pub async fn sys_execve_async(
         },
         Some(s) => s,
     };
-    let path = super::fs::absolutize_path(task, dirfd, &raw_path)?;
+    let path = crate::fs::absolutize_path(task, dirfd, &raw_path)?;
     // Read argv array from user memory (before exec destroys address space)
     let argv = copyin_argv(task, argv_ptr, 64, 4096).await;
     // Read envp array

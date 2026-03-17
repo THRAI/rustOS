@@ -1,0 +1,32 @@
+services:
+  # Main development & test container
+  oscomp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+
+  # Dedicated LTP cross-compilation (opt-in, ~10 min build)
+  # Copies built LTP binaries into testcase/ via volume mount.
+  ltp:
+    build:
+      context: .
+      dockerfile: Dockerfile.ltp
+    volumes:
+      - ./testcase/riscv:/host-testcase
+    command: >
+      sh -c "
+        if [ -d /out/riscv/musl/ltp ]; then
+          mkdir -p /host-testcase/musl/ltp/testcases;
+          cp -r /out/riscv/musl/ltp/testcases/* /host-testcase/musl/ltp/testcases/ 2>/dev/null;
+          echo 'Installed musl LTP binaries';
+        fi;
+        if [ -d /out/riscv/glibc/ltp ]; then
+          mkdir -p /host-testcase/glibc/ltp/testcases;
+          cp -r /out/riscv/glibc/ltp/testcases/* /host-testcase/glibc/ltp/testcases/ 2>/dev/null;
+          echo 'Installed glibc LTP binaries';
+        fi;
+        echo 'LTP binaries installed into testcase/riscv/{musl,glibc}/ltp/';
+      "

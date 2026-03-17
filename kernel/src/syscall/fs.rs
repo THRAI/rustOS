@@ -1,17 +1,17 @@
 //! File system related system calls.
+//!
+//! Thin IO shell: copies user pointers, resolves paths, delegates to
+//! `fs::` layer APIs, copies results back.  No ABI struct construction,
+//! no fd-table control logic, no pipe futures — those live in `fs/`.
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{
-    future::Future,
-    pin::Pin,
-    sync::atomic::Ordering,
-    task::{Context, Poll},
-};
+use core::sync::atomic::Ordering;
 
 use crate::{
     fs::{
-        self, vnode_destroy_object, vnode_object, vnode_object_if_exists, FdFlags, FdTable,
-        FileDescription, FileObject, OpenFlags, VnodeType,
+        self, absolutize_path, normalize_absolute_path, vnode_destroy_object, vnode_object,
+        vnode_object_if_exists, ConsoleReadFuture, FdFlags, FdTable, FileDescription, FileObject,
+        LinuxDirent64, LinuxStat, OpenFlags, PipeReadFuture, PipeWriteFuture, VnodeType,
     },
     hal_common::{Errno, VirtAddr},
     mm::{resolve_user_fault, uiomove, PageFaultAccessType, UioDir, VmObject},
@@ -20,39 +20,6 @@ use crate::{
 
 const AT_FDCWD: isize = -100;
 const PAGE_SIZE: usize = 4096;
-
-/// Linux struct stat for rv64 (128 bytes).
-#[repr(C)]
-struct LinuxStat {
-    st_dev: u64,
-    st_ino: u64,
-    st_mode: u32,
-    st_nlink: u32,
-    st_uid: u32,
-    st_gid: u32,
-    st_rdev: u64,
-    __pad1: u64,
-    st_size: i64,
-    st_blksize: i32,
-    __pad2: i32,
-    st_blocks: i64,
-    st_atime: i64,
-    st_atime_nsec: i64,
-    st_mtime: i64,
-    st_mtime_nsec: i64,
-    st_ctime: i64,
-    st_ctime_nsec: i64,
-    __unused: [i32; 2],
-}
-
-#[inline]
-fn stat_mode_from_type(file_type: u8) -> u32 {
-    match file_type {
-        2 => 0o040755, // directory
-        7 => 0o120777, // symlink
-        _ => 0o100644, // regular
-    }
-}
 
 /// Resolve path, create `FileDescription`, and insert into fd table.
 pub async fn open(
@@ -271,105 +238,20 @@ pub async fn read(
 
 /// sys_lseek: reposition file offset.
 pub fn sys_lseek(task: &Arc<Task>, fd: u32, offset: i64, whence: u32) -> Result<u64, Errno> {
-    use core::sync::atomic::Ordering;
-
-    use crate::fs::FileObject;
-
-    const SEEK_SET: u32 = 0;
-    const SEEK_CUR: u32 = 1;
-    const SEEK_END: u32 = 2;
-
     let tab = task.fd_table.lock();
     let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
-
-    // Pipes and devices are not seekable
-    match &desc.object {
-        FileObject::PipeRead(_) | FileObject::PipeWrite(_) => return Err(Errno::Espipe),
-        FileObject::Device(_) => return Err(Errno::Espipe),
-        FileObject::Vnode(_) => {},
-    }
-
-    let size = match &desc.object {
-        FileObject::Vnode(v) => v.size(),
-        _ => 0,
-    };
-
-    let cur = desc.offset.load(Ordering::Relaxed) as i64;
-    let new_off = match whence {
-        SEEK_SET => offset,
-        SEEK_CUR => cur + offset,
-        SEEK_END => size as i64 + offset,
-        _ => return Err(Errno::Einval),
-    };
-
-    if new_off < 0 {
-        return Err(Errno::Einval);
-    }
-
-    desc.offset.store(new_off as u64, Ordering::Relaxed);
-    Ok(new_off as u64)
+    desc.seek(offset, whence)
 }
 
 /// sys_fstat: write stat struct to user memory.
 pub fn sys_fstat(task: &Arc<Task>, fd: u32, statbuf: usize) -> Result<(), Errno> {
-    use crate::fs::FileObject;
-
     if statbuf == 0 {
         return Err(Errno::Efault);
     }
 
     let tab = task.fd_table.lock();
     let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
-
-    let mut st = LinuxStat {
-        st_dev: 0,
-        st_ino: 0,
-        st_mode: 0,
-        st_nlink: 1,
-        st_uid: 0,
-        st_gid: 0,
-        st_rdev: 0,
-        __pad1: 0,
-        st_size: 0,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: 0,
-        st_atime: 0,
-        st_atime_nsec: 0,
-        st_mtime: 0,
-        st_mtime_nsec: 0,
-        st_ctime: 0,
-        st_ctime_nsec: 0,
-        __unused: [0; 2],
-    };
-
-    match &desc.object {
-        FileObject::Vnode(v) => {
-            let size = v.size();
-            st.st_size = size as i64;
-            let num_blocks = size.div_ceil(512) as i64;
-            st.st_blocks = num_blocks;
-            st.st_ino = v.vnode_id();
-            use crate::fs::VnodeType;
-            let ftype = match v.vtype() {
-                VnodeType::Regular => 1u8,
-                VnodeType::Directory => 2u8,
-            };
-            st.st_mode = stat_mode_from_type(ftype);
-        },
-        FileObject::PipeRead(_) | FileObject::PipeWrite(_) => {
-            st.st_mode = 0o010600; // S_IFIFO | rw
-        },
-        FileObject::Device(dk) => {
-            use crate::fs::DeviceKind;
-            st.st_mode = 0o020666; // S_IFCHR | rw
-            st.st_rdev = match dk {
-                DeviceKind::Null => 0x0103,                                   // 1:3
-                DeviceKind::Zero => 0x0105,                                   // 1:5
-                DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite => 0x0501, // 5:1
-            };
-        },
-    }
+    let st = fs::fill_stat_from_file_object(&desc.object);
 
     // Copy stat struct to user memory
     let rc = unsafe {
@@ -429,32 +311,7 @@ pub async fn sys_fstatat_async(
     let path_str = absolutize_path(task, dirfd, &raw_path)?;
     let (ino, ftype, size) = fs::fs_lookup(0, &path_str).await?;
 
-    let mut st = LinuxStat {
-        st_dev: 0,
-        st_ino: 0,
-        st_mode: 0,
-        st_nlink: 1,
-        st_uid: 0,
-        st_gid: 0,
-        st_rdev: 0,
-        __pad1: 0,
-        st_size: 0,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: 0,
-        st_atime: 0,
-        st_atime_nsec: 0,
-        st_mtime: 0,
-        st_mtime_nsec: 0,
-        st_ctime: 0,
-        st_ctime_nsec: 0,
-        __unused: [0; 2],
-    };
-
-    st.st_ino = ino as u64;
-    st.st_size = size as i64;
-    st.st_blocks = ((size + 511) / 512) as i64;
-    st.st_mode = stat_mode_from_type(ftype);
+    let st = fs::fill_stat_from_lookup(ino, ftype, size);
 
     fault_in_user_buffer(
         task,
@@ -537,75 +394,7 @@ pub async fn sys_utimensat_async(
 
 /// sys_fcntl: file control operations.
 pub fn sys_fcntl(task: &Arc<Task>, fd: u32, cmd: u32, arg: usize) -> Result<usize, Errno> {
-    const F_DUPFD: u32 = 0;
-    const F_GETFD: u32 = 1;
-    const F_SETFD: u32 = 2;
-    const F_GETFL: u32 = 3;
-    const F_SETFL: u32 = 4;
-    const F_DUPFD_CLOEXEC: u32 = 1030;
-    const O_APPEND: usize = 0x0000_0400;
-    const O_NONBLOCK: usize = 0x0000_0800;
-
-    use crate::fs::FdFlags;
-
-    match cmd {
-        F_DUPFD | F_DUPFD_CLOEXEC => {
-            let mut tab = task.fd_table.lock();
-            let desc = Arc::clone(tab.get(fd).ok_or(Errno::Ebadf)?);
-            let flags = if cmd == F_DUPFD_CLOEXEC {
-                FdFlags::CLOEXEC
-            } else {
-                FdFlags::empty()
-            };
-            // Find lowest fd >= arg
-            let new_fd = tab.insert_from(arg as u32, desc, flags)?;
-            Ok(new_fd as usize)
-        },
-        F_GETFD => {
-            let tab = task.fd_table.lock();
-            let flags = tab.get_flags(fd).ok_or(Errno::Ebadf)?;
-            Ok(if flags.contains(FdFlags::CLOEXEC) {
-                1
-            } else {
-                0
-            })
-        },
-        F_SETFD => {
-            let mut tab = task.fd_table.lock();
-            let _ = tab.get(fd).ok_or(Errno::Ebadf)?;
-            let new_flags = if (arg & 1) != 0 {
-                FdFlags::CLOEXEC
-            } else {
-                FdFlags::empty()
-            };
-            tab.set_flags(fd, new_flags)?;
-            Ok(0)
-        },
-        F_GETFL => {
-            let tab = task.fd_table.lock();
-            let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
-            let mut fl: usize = 0;
-            if desc.flags.read && desc.flags.write {
-                fl = 2; // O_RDWR
-            } else if desc.flags.write {
-                fl = 1; // O_WRONLY
-            }
-            // O_RDONLY = 0
-            let status = desc.get_status_flags() as usize;
-            fl |= status & (O_APPEND | O_NONBLOCK);
-            Ok(fl)
-        },
-        F_SETFL => {
-            let tab = task.fd_table.lock();
-            let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
-            let settable_mask = (O_APPEND | O_NONBLOCK) as u32;
-            let cur = desc.get_status_flags();
-            let next = (cur & !settable_mask) | ((arg as u32) & settable_mask);
-            desc.set_status_flags(next);
-            Ok(0)
-        },
-        _ => Err(Errno::Einval),
-    }
+    task.fd_table.lock().fcntl(fd, cmd, arg)
 }
 
 /// sys_chdir: change current working directory.
@@ -1038,88 +827,6 @@ pub async fn sys_openat_async(
 /// sys_close: close a file descriptor.
 pub fn sys_close(task: &Arc<Task>, fd: u32) -> Result<(), Errno> {
     close(&task.fd_table, fd)
-}
-
-/// Normalize a path to an absolute canonical form.
-/// Collapses duplicate '/', '.' and '..' components.
-pub fn normalize_absolute_path(path: &str) -> String {
-    let mut comps: Vec<&str> = Vec::new();
-    for comp in path.split('/') {
-        match comp {
-            "" | "." => {},
-            ".." => {
-                let _ = comps.pop();
-            },
-            _ => comps.push(comp),
-        }
-    }
-
-    if comps.is_empty() {
-        return String::from("/");
-    }
-
-    let mut out = String::from("/");
-    for (idx, comp) in comps.iter().enumerate() {
-        if idx > 0 {
-            out.push('/');
-        }
-        out.push_str(comp);
-    }
-    out
-}
-
-/// Convert a user-provided path to an absolute path with cwd/dirfd semantics.
-pub fn absolutize_path(task: &Arc<Task>, dirfd: isize, raw_path: &str) -> Result<String, Errno> {
-    if raw_path.is_empty() {
-        return Err(Errno::Enoent);
-    }
-    if raw_path.starts_with('/') {
-        return Ok(normalize_absolute_path(raw_path));
-    }
-
-    // Relative path from cwd.
-    if dirfd == AT_FDCWD {
-        let cwd = task.cwd.lock().clone();
-        let mut combined = String::new();
-        if cwd == "/" {
-            combined.push('/');
-            combined.push_str(raw_path);
-        } else {
-            combined.push_str(&cwd);
-            combined.push('/');
-            combined.push_str(raw_path);
-        }
-        return Ok(normalize_absolute_path(&combined));
-    }
-
-    // Relative path from directory fd.
-    if dirfd >= 0 {
-        let base = {
-            let tab = task.fd_table.lock();
-            let desc = tab.get(dirfd as u32).ok_or(Errno::Ebadf)?;
-            match &desc.object {
-                crate::fs::FileObject::Vnode(v) => {
-                    if v.vtype() != crate::fs::VnodeType::Directory {
-                        return Err(Errno::Enotdir);
-                    }
-                    String::from(v.path())
-                },
-                _ => return Err(Errno::Enotdir),
-            }
-        };
-        let mut combined = String::new();
-        if base == "/" {
-            combined.push('/');
-            combined.push_str(raw_path);
-        } else {
-            combined.push_str(&base);
-            combined.push('/');
-            combined.push_str(raw_path);
-        }
-        return Ok(normalize_absolute_path(&combined));
-    }
-
-    Err(Errno::Einval)
 }
 
 /// sys_read_async: read from file descriptor.
@@ -1654,7 +1361,7 @@ pub async fn sys_ppoll_async(
             let off = i * 8;
             let fd = i32::from_le_bytes(poll_buf[off..off + 4].try_into().unwrap());
             let events = i16::from_le_bytes(poll_buf[off + 4..off + 6].try_into().unwrap());
-            let mut revents: i16 = 0;
+            let revents: i16;
 
             if fd < 0 {
                 poll_buf[off + 6..off + 8].copy_from_slice(&0i16.to_le_bytes());
@@ -1666,38 +1373,8 @@ pub async fn sys_ppoll_async(
                 None => {
                     revents = POLLNVAL;
                 },
-                Some(desc) => match &desc.object {
-                    FileObject::Device(DeviceKind::ConsoleRead) => {
-                        if events & POLLIN != 0 {
-                            revents |= POLLIN;
-                        }
-                    },
-                    FileObject::Device(DeviceKind::ConsoleWrite) => {
-                        if events & POLLOUT != 0 {
-                            revents |= POLLOUT;
-                        }
-                    },
-                    FileObject::Device(DeviceKind::Null | DeviceKind::Zero) => {
-                        revents |= events & (POLLIN | POLLOUT);
-                    },
-                    FileObject::PipeRead(pipe) => {
-                        if pipe.readable_len() > 0 {
-                            revents |= POLLIN;
-                        }
-                        if pipe.is_writer_closed() {
-                            revents |= POLLHUP;
-                        }
-                    },
-                    FileObject::PipeWrite(pipe) => {
-                        if pipe.is_reader_closed() {
-                            revents |= POLLERR;
-                        } else if events & POLLOUT != 0 {
-                            revents |= POLLOUT;
-                        }
-                    },
-                    FileObject::Vnode(_) => {
-                        revents |= events & (POLLIN | POLLOUT);
-                    },
+                Some(desc) => {
+                    revents = desc.object.poll_ready(events, events);
                 },
             }
 
@@ -1749,189 +1426,7 @@ pub async fn sys_ppoll_async(
     }
 }
 
-/// Future for async pipe read.
-pub struct PipeReadFuture<'a> {
-    pipe: alloc::sync::Arc<crate::fs::Pipe>,
-    task: &'a Arc<Task>,
-    user_buf: usize,
-    len: usize,
-}
-
-impl<'a> Future for PipeReadFuture<'a> {
-    type Output = Result<usize, Errno>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.task.signals.has_actionable_pending() {
-            return Poll::Ready(Err(Errno::Eintr));
-        }
-        let mut kbuf = alloc::vec![0u8; this.len];
-        match this.pipe.read(&mut kbuf) {
-            Ok(0) => Poll::Ready(Ok(0)),
-            Ok(n) => {
-                let rc = unsafe {
-                    crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf.as_ptr(), n)
-                };
-                if rc != 0 {
-                    Poll::Ready(Err(Errno::Efault))
-                } else {
-                    Poll::Ready(Ok(n))
-                }
-            },
-            Err(Errno::Eagain) => {
-                // Register waker FIRST, then re-check.  This closes the
-                // TOCTOU race where close_write() fires between read()
-                // returning Eagain and the waker being stored: close_write
-                // would take None from reader_waker and never wake us.
-                this.pipe.register_reader_waker(cx.waker());
-
-                // Double-check: if close_write() raced above, the waker
-                // we just stored will never be taken.  Re-try now.
-                let mut kbuf2 = alloc::vec![0u8; this.len];
-                match this.pipe.read(&mut kbuf2) {
-                    Ok(0) => Poll::Ready(Ok(0)), // EOF — caught the race
-                    Ok(n) => {
-                        let rc = unsafe {
-                            crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf2.as_ptr(), n)
-                        };
-                        if rc != 0 {
-                            Poll::Ready(Err(Errno::Efault))
-                        } else {
-                            Poll::Ready(Ok(n))
-                        }
-                    },
-                    Err(Errno::Eagain) => Poll::Pending, // genuinely blocked, waker stored
-                    Err(e) => Poll::Ready(Err(e)),
-                }
-            },
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-}
-
-/// Future for async console read.
-pub struct ConsoleReadFuture<'a> {
-    task: &'a Arc<Task>,
-    user_buf: usize,
-    len: usize,
-}
-
-impl<'a> Future for ConsoleReadFuture<'a> {
-    type Output = Result<usize, Errno>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.task.signals.has_actionable_pending() {
-            return Poll::Ready(Err(Errno::Eintr));
-        }
-        let mut kbuf = alloc::vec![0u8; this.len];
-        let n = crate::console::console_read(&mut kbuf);
-        if n > 0 {
-            let rc =
-                unsafe { crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf.as_ptr(), n) };
-            if rc != 0 {
-                Poll::Ready(Err(Errno::Efault))
-            } else {
-                Poll::Ready(Ok(n))
-            }
-        } else {
-            crate::console::console_register_waker(cx.waker());
-            Poll::Pending
-        }
-    }
-}
-
-/// Future for async pipe write.
-pub struct PipeWriteFuture<'a> {
-    pipe: alloc::sync::Arc<crate::fs::Pipe>,
-    task: &'a Arc<Task>,
-    data: alloc::vec::Vec<u8>,
-    written: usize,
-}
-
-impl<'a> Future for PipeWriteFuture<'a> {
-    type Output = Result<usize, Errno>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.task.signals.has_actionable_pending() {
-            if this.written > 0 {
-                return Poll::Ready(Ok(this.written));
-            }
-            return Poll::Ready(Err(Errno::Eintr));
-        }
-        if this.written >= this.data.len() {
-            return Poll::Ready(Ok(this.written));
-        }
-        match this.pipe.write(&this.data[this.written..]) {
-            Ok(n) => {
-                this.written += n;
-                if this.written >= this.data.len() {
-                    return Poll::Ready(Ok(this.written));
-                }
-                // Partial write — register waker, then double-check for
-                // close_read() race (same TOCTOU pattern as PipeReadFuture).
-                this.pipe.register_writer_waker(cx.waker());
-                match this.pipe.write(&this.data[this.written..]) {
-                    Ok(n2) => {
-                        this.written += n2;
-                        if this.written >= this.data.len() {
-                            Poll::Ready(Ok(this.written))
-                        } else {
-                            Poll::Pending
-                        }
-                    },
-                    Err(Errno::Eagain) => Poll::Pending, // genuinely full, waker stored
-                    Err(Errno::Epipe) => {
-                        this.task.signals.post_signal(crate::proc::SIGPIPE);
-                        Poll::Ready(Err(Errno::Epipe))
-                    },
-                    Err(e) => Poll::Ready(Err(e)),
-                }
-            },
-            Err(Errno::Eagain) => {
-                // Register waker FIRST, then re-check.  Closes the TOCTOU
-                // race where close_read() fires between write() returning
-                // Eagain and the waker being stored.
-                this.pipe.register_writer_waker(cx.waker());
-                match this.pipe.write(&this.data[this.written..]) {
-                    Ok(n) => {
-                        this.written += n;
-                        if this.written >= this.data.len() {
-                            Poll::Ready(Ok(this.written))
-                        } else {
-                            Poll::Pending
-                        }
-                    },
-                    Err(Errno::Eagain) => Poll::Pending, // genuinely full, waker stored
-                    Err(Errno::Epipe) => {
-                        this.task.signals.post_signal(crate::proc::SIGPIPE);
-                        Poll::Ready(Err(Errno::Epipe))
-                    },
-                    Err(e) => Poll::Ready(Err(e)),
-                }
-            },
-            Err(Errno::Epipe) => {
-                // Post SIGPIPE when writing to a pipe with no readers
-                this.task.signals.post_signal(crate::proc::SIGPIPE);
-                Poll::Ready(Err(Errno::Epipe))
-            },
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-}
-
 // ── 阶段 A：目录功能系统调用 ────────────────────────────────────────
-
-/// Linux `struct linux_dirent64` layout for getdents64.
-#[repr(C)]
-struct LinuxDirent64 {
-    d_ino: u64,
-    d_off: i64,
-    d_reclen: u16,
-    d_type: u8,
-    // d_name follows (variable length, null-terminated)
-}
 
 /// sys_mkdirat: create a directory relative to dirfd.
 pub async fn sys_mkdirat_async(
@@ -2134,12 +1629,7 @@ pub async fn sys_getdents64_async(
         }
 
         // Map lwext4 inode_type to Linux d_type
-        let d_type: u8 = match entry.inode_type {
-            2 => 4,  // EXT4_DE_DIR -> DT_DIR
-            1 => 8,  // EXT4_DE_REG_FILE -> DT_REG
-            7 => 10, // EXT4_DE_SYMLINK -> DT_LNK
-            _ => 0,  // DT_UNKNOWN
-        };
+        let d_type: u8 = fs::dirent_type_from_ext4(entry.inode_type);
 
         let dirent = LinuxDirent64 {
             d_ino: entry.inode as u64,

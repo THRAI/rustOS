@@ -68,11 +68,11 @@ if [[ -n "$INPUT_LOG" ]]; then
     LOG_FILE="$INPUT_LOG"
 else
     LOG_FILE="$(mktemp)"
-    # oscomp* targets in this repo require sudo (mount/cp/umount image)
-    # Pre-auth once here to avoid hanging on password prompt in piped make output.
-    if [[ "$TARGET" == oscomp* ]]; then
-        echo "=== sudo pre-auth required for image mount/copy ==="
-        sudo -v
+    # sdcard-rv used to require sudo for ext4 mount; now uses mke2fs -d.
+    # Pre-auth only if sudo is available (e.g. legacy flow or host builds).
+    if [[ "$TARGET" == oscomp* ]] && command -v sudo &>/dev/null; then
+        echo "=== sudo pre-auth (skip if not needed) ==="
+        sudo -v || true
     fi
     echo "=== Running: make $TARGET (timeout=${TIMEOUT_SECS}s) ==="
     set +e

@@ -51,7 +51,7 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean
+.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all oscomp-run debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean docker-build docker-agent-test docker-python-test docker-oscomp docker-oscomp-basic docker-oscomp-basic-all docker-oscomp-run docker-judge docker-shell docker-test-all docker-ltp-build
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
@@ -106,46 +106,79 @@ run-oscomp: kernel-rv
 
 OSCOMP_SRC := $(CURDIR)/scripts/oscomp
 OSCOMP_TC := $(CURDIR)/testcase
-OSCOMP_RUN := $(OSCOMP_SRC)/run-rv-oj.sh
+OSCOMP_RUN_SCRIPT ?= run-rv-basic.sh
+OSCOMP_GROUPS ?=
+OSCOMP_LIBC ?= musl
 
 
 # 便捷目标：一条命令完成构建镜像 + 运行
 # make oscomp        → 全量测试
 # make oscomp-basic  → 仅跑 basic 测试
 # make oscomp-basic-all → 跑 basic-musl + basic-glibc
-oscomp: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-oj.sh
+# make oscomp-run GROUPS=busybox,lua  → 选定测试组
+# make oscomp-run GROUPS=basic,busybox LIBC=all → 选定测试组 + 两种 libc
+oscomp: OSCOMP_RUN_SCRIPT=run-rv-oj.sh
 oscomp: sdcard-rv run-oscomp
 
-oscomp-basic: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-basic.sh
+oscomp-basic: OSCOMP_RUN_SCRIPT=run-rv-basic.sh
 oscomp-basic: sdcard-rv run-oscomp
 
-oscomp-basic-all: OSCOMP_RUN=$(OSCOMP_SRC)/run-rv-basic-all.sh
+oscomp-basic-all: OSCOMP_RUN_SCRIPT=run-rv-basic-all.sh
 oscomp-basic-all: sdcard-rv run-oscomp
 
+# Parameterized: run selected test groups
+# Usage: make oscomp-run GROUPS=busybox,lua LIBC=musl
+oscomp-run: OSCOMP_GROUPS=$(GROUPS)
+oscomp-run: OSCOMP_LIBC=$(LIBC)
+oscomp-run: sdcard-rv run-oscomp
 
+
+# Cross-platform sdcard image builder (no mount, no sudo, no Linux required).
+# Uses mke2fs -d to populate the ext4 image from a staging directory.
 sdcard-rv: user-rv64-autotest
-ifneq ($(UNAME_S),Linux)
-	@echo "ERROR: sdcard-rv target requires Linux for ext4 filesystem operations"
-	@echo "Please run this target on a Linux machine or use Docker with Linux container"
-	@exit 1
-endif
-	@test -d $(OSCOMP_TC) || (echo "missing $(OSCOMP_TC)"; exit 1)
-	@test -f $(OSCOMP_RUN) || (echo "missing $(OSCOMP_RUN)"; exit 1)
-	rm -f scripts/sdcard-rv.img
-	dd if=/dev/zero of=scripts/sdcard-rv.img bs=1M count=512
-	mkfs.ext4 -F -O ^metadata_csum_seed scripts/sdcard-rv.img
-	mkdir -p scripts/mnt
-	sudo mount scripts/sdcard-rv.img scripts/mnt
-	sudo cp -r $(OSCOMP_TC)/* scripts/mnt/
-	sudo cp $(OSCOMP_RUN) scripts/mnt/riscv/run-oj.sh
-	sudo find scripts/mnt -type f -name "*.sh" -exec chmod +x {} \;
-	sudo chmod +x scripts/mnt/riscv/run-oj.sh
-	sudo mkdir -p scripts/mnt/bin scripts/mnt/lib scripts/mnt/lib64 scripts/mnt/etc
-	sudo cp scripts/initproc scripts/mnt/bin/initproc
-	sudo chmod +x scripts/mnt/bin/initproc
-	sudo umount scripts/mnt
-	rmdir scripts/mnt
-	@echo "=== scripts/sdcard-rv.img ready ==="
+	@test -d $(OSCOMP_TC)/riscv || (echo "ERROR: testcase/riscv/ not found"; exit 1)
+	bash scripts/make_sdcard_img.sh $(OSCOMP_RUN_SCRIPT) "$(OSCOMP_GROUPS)" "$(OSCOMP_LIBC)"
+
+
+# ---- Docker targets (cross-platform test runner) ----
+
+docker-build:
+	docker compose build oscomp
+
+docker-agent-test:
+	docker compose run --rm oscomp make agent-test
+
+docker-python-test:
+	docker compose run --rm oscomp make python-test-rv64
+
+docker-oscomp:
+	docker compose run --rm oscomp make oscomp
+
+docker-oscomp-basic:
+	docker compose run --rm oscomp make oscomp-basic
+
+docker-oscomp-basic-all:
+	docker compose run --rm oscomp make oscomp-basic-all
+
+# Run selected test groups in Docker
+# Usage: make docker-oscomp-run GROUPS=busybox,lua LIBC=musl
+#        make docker-oscomp-run GROUPS=basic,busybox,lua LIBC=all
+docker-oscomp-run:
+	docker compose run --rm oscomp make oscomp-run GROUPS="$(GROUPS)" LIBC="$(LIBC)"
+
+docker-judge:
+	docker compose run --rm oscomp bash -c 'make oscomp-basic-all 2>&1 | tee /tmp/oscomp.log && ./judge/batch_judge.sh --log /tmp/oscomp.log'
+
+docker-shell:
+	docker compose run --rm oscomp bash
+
+docker-test-all: docker-agent-test docker-python-test docker-oscomp-basic-all
+
+# Dedicated LTP build (opt-in, ~10 min, requires competition Docker image)
+docker-ltp-build:
+	docker compose build ltp
+	docker compose run --rm ltp
+	@echo "LTP binaries now in testcase/riscv/{musl,glibc}/ltp/"
 
 
 # GDB debug: halt on start, GDB server on port 1234

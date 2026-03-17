@@ -12,7 +12,7 @@ use super::super::{
 use crate::{
     hal_common::{VirtAddr, PAGE_SIZE},
     mm::vm::{
-        page_ref::PageRef, sync_fault_handler, FaultResult, PageFaultAccessType, VmMap, VmMapEntry,
+        sync_fault_handler, FaultResult, PageFaultAccessType, PageRef, VmMap, VmMapEntry,
         VmMapping, VmObject,
     },
 };

@@ -10,8 +10,7 @@ use crate::{
     mm::{
         pmap_zero_page,
         vm::{
-            page_ref::PageRef, sync_fault_handler, FaultResult, MapPerm, PageFaultAccessType,
-            VmMap, VmObject,
+            sync_fault_handler, FaultResult, MapPerm, PageFaultAccessType, PageRef, VmMap, VmObject,
         },
     },
     proc::Task,

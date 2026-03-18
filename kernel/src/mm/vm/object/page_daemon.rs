@@ -172,44 +172,66 @@ async fn flush_dirty_vnodes() {
 
 /// Flush a single VmObject's dirty pages.
 async fn flush_object(obj_arc: &Arc<LeveledRwLock<VmObject, 3>>) {
-    // Collect dirty pages + pager + object size under read lock, then drop before I/O.
-    let (dirty_pages, pager, obj_size) = {
+    use crate::mm::vm::SharedBusyGuard;
+
+    // Phase 1: Collect dirty pages + acquire sBusy guards under read lock.
+    let (dirty_guards, pager, obj_size) = {
         let obj = obj_arc.read();
-        let pages = obj.collect_dirty_pages();
+        let mut guards = alloc::vec::Vec::new();
+        for (idx, page_ref) in obj.pages_with_index() {
+            if page_ref.meta().is_dirty() {
+                if let Some(guard) = SharedBusyGuard::try_new(page_ref.phys()) {
+                    guards.push((idx, guard));
+                }
+                // If sBusy fails (page is exBusy from fault handler), skip.
+                // It will be retried on the next daemon cycle.
+            }
+        }
         let pager = obj.pager.as_ref().map(Arc::clone);
         let size = obj.size();
-        (pages, pager, size)
+        (guards, pager, size)
     };
+    // Object lock released. sBusy guards keep pages pinned — collapse()
+    // will skip them (checks is_shared_busied after D-2 fix).
 
     let Some(pager) = pager else { return };
-    if dirty_pages.is_empty() {
+    if dirty_guards.is_empty() {
         return;
     }
 
-    // Write each dirty page through the pager (→ fs_write_at → delegate → lwext4).
-    // Clamp the last page to the actual file size so we don't inflate it with
-    // trailing zeros (a 16-byte file should write 16 bytes, not 4096).
-    for (idx, pa) in &dirty_pages {
+    // Phase 2: Write each dirty page through the pager.
+    for (idx, guard) in &dirty_guards {
         let offset = idx.to_bytes();
-        let len = if offset + crate::hal_common::PAGE_SIZE > obj_size {
-            obj_size.saturating_sub(offset)
-        } else {
-            crate::hal_common::PAGE_SIZE
-        };
+        let len = core::cmp::min(
+            crate::hal_common::PAGE_SIZE,
+            obj_size.saturating_sub(offset),
+        );
         if len > 0 {
-            let _ = pager.page_out(offset, *pa, len).await;
+            let _ = pager.page_out(offset, guard.phys(), len).await;
         }
     }
 
-    // Clear dirty bits + mark object clean.
+    // Phase 3: Clear dirty bits under read lock.
+    // Only clear for pages that are still in the object (a concurrent
+    // munmap/collapse could have removed them during I/O).
     {
         let obj = obj_arc.read();
-        for (idx, _) in &dirty_pages {
-            if let Some(page) = obj.get_page(*idx) {
-                page.clear_dirty_all();
+        let mut cleared = 0u32;
+        for (idx, guard) in &dirty_guards {
+            if let Some(pr) = obj.get_page(*idx) {
+                // Only clear if this is still the same page we wrote back.
+                // (PageRef is move-only, so if it's at the same index, it's
+                // the same physical frame — no ABA possible.)
+                if pr.phys() == guard.phys() {
+                    guard.meta().clear_dirty_all();
+                    cleared += 1;
+                }
             }
         }
-        DIRTY_PAGE_COUNT.fetch_sub(dirty_pages.len() as u32, Ordering::Relaxed);
-        obj.mark_clean();
+        if cleared > 0 {
+            DIRTY_PAGE_COUNT.fetch_sub(cleared, Ordering::Relaxed);
+            obj.mark_clean();
+        }
     }
+    // sBusy guards dropped here — pages unpinned.
 }

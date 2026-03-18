@@ -186,3 +186,177 @@ impl Pipe {
         self.buf.lock().available_read()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Async pipe IO futures
+// ---------------------------------------------------------------------------
+
+use core::{future::Future, pin::Pin, task::Context};
+
+use crate::proc::Task;
+
+/// Future for async pipe read into user memory.
+///
+/// Handles TOCTOU race: registers waker *first*, then double-checks
+/// the pipe, so a close_write() between read()==EAGAIN and waker
+/// registration cannot cause a missed wake.
+pub struct PipeReadFuture<'a> {
+    pub pipe: Arc<Pipe>,
+    pub task: &'a Arc<Task>,
+    pub user_buf: usize,
+    pub len: usize,
+}
+
+impl<'a> Future for PipeReadFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.task.signals.has_actionable_pending() {
+            return core::task::Poll::Ready(Err(Errno::Eintr));
+        }
+        let mut kbuf = alloc::vec![0u8; this.len];
+        match this.pipe.read(&mut kbuf) {
+            Ok(0) => core::task::Poll::Ready(Ok(0)),
+            Ok(n) => {
+                let rc = unsafe {
+                    crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf.as_ptr(), n)
+                };
+                if rc != 0 {
+                    core::task::Poll::Ready(Err(Errno::Efault))
+                } else {
+                    core::task::Poll::Ready(Ok(n))
+                }
+            },
+            Err(Errno::Eagain) => {
+                this.pipe.register_reader_waker(cx.waker());
+                let mut kbuf2 = alloc::vec![0u8; this.len];
+                match this.pipe.read(&mut kbuf2) {
+                    Ok(0) => core::task::Poll::Ready(Ok(0)),
+                    Ok(n) => {
+                        let rc = unsafe {
+                            crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf2.as_ptr(), n)
+                        };
+                        if rc != 0 {
+                            core::task::Poll::Ready(Err(Errno::Efault))
+                        } else {
+                            core::task::Poll::Ready(Ok(n))
+                        }
+                    },
+                    Err(Errno::Eagain) => core::task::Poll::Pending,
+                    Err(e) => core::task::Poll::Ready(Err(e)),
+                }
+            },
+            Err(e) => core::task::Poll::Ready(Err(e)),
+        }
+    }
+}
+
+/// Future for async console read (UART input).
+pub struct ConsoleReadFuture<'a> {
+    pub task: &'a Arc<Task>,
+    pub user_buf: usize,
+    pub len: usize,
+}
+
+impl<'a> Future for ConsoleReadFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.task.signals.has_actionable_pending() {
+            return core::task::Poll::Ready(Err(Errno::Eintr));
+        }
+        let mut kbuf = alloc::vec![0u8; this.len];
+        let n = crate::console::console_read(&mut kbuf);
+        if n > 0 {
+            let rc =
+                unsafe { crate::hal::copy_user_chunk(this.user_buf as *mut u8, kbuf.as_ptr(), n) };
+            if rc != 0 {
+                core::task::Poll::Ready(Err(Errno::Efault))
+            } else {
+                core::task::Poll::Ready(Ok(n))
+            }
+        } else {
+            crate::console::console_register_waker(cx.waker());
+            core::task::Poll::Pending
+        }
+    }
+}
+
+/// Future for async pipe write from kernel buffer.
+///
+/// Handles partial writes: if only part of the data fits, the future
+/// re-polls until all bytes are written or an error occurs.
+pub struct PipeWriteFuture<'a> {
+    pub pipe: Arc<Pipe>,
+    pub task: &'a Arc<Task>,
+    pub data: alloc::vec::Vec<u8>,
+    pub written: usize,
+}
+
+impl<'a> Future for PipeWriteFuture<'a> {
+    type Output = Result<usize, Errno>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.task.signals.has_actionable_pending() {
+            if this.written > 0 {
+                return core::task::Poll::Ready(Ok(this.written));
+            }
+            return core::task::Poll::Ready(Err(Errno::Eintr));
+        }
+        if this.written >= this.data.len() {
+            return core::task::Poll::Ready(Ok(this.written));
+        }
+        match this.pipe.write(&this.data[this.written..]) {
+            Ok(n) => {
+                this.written += n;
+                if this.written >= this.data.len() {
+                    return core::task::Poll::Ready(Ok(this.written));
+                }
+                this.pipe.register_writer_waker(cx.waker());
+                match this.pipe.write(&this.data[this.written..]) {
+                    Ok(n2) => {
+                        this.written += n2;
+                        if this.written >= this.data.len() {
+                            core::task::Poll::Ready(Ok(this.written))
+                        } else {
+                            core::task::Poll::Pending
+                        }
+                    },
+                    Err(Errno::Eagain) => core::task::Poll::Pending,
+                    Err(Errno::Epipe) => {
+                        this.task.signals.post_signal(crate::proc::SIGPIPE);
+                        core::task::Poll::Ready(Err(Errno::Epipe))
+                    },
+                    Err(e) => core::task::Poll::Ready(Err(e)),
+                }
+            },
+            Err(Errno::Eagain) => {
+                this.pipe.register_writer_waker(cx.waker());
+                match this.pipe.write(&this.data[this.written..]) {
+                    Ok(n) => {
+                        this.written += n;
+                        if this.written >= this.data.len() {
+                            core::task::Poll::Ready(Ok(this.written))
+                        } else {
+                            core::task::Poll::Pending
+                        }
+                    },
+                    Err(Errno::Eagain) => core::task::Poll::Pending,
+                    Err(Errno::Epipe) => {
+                        this.task.signals.post_signal(crate::proc::SIGPIPE);
+                        core::task::Poll::Ready(Err(Errno::Epipe))
+                    },
+                    Err(e) => core::task::Poll::Ready(Err(e)),
+                }
+            },
+            Err(Errno::Epipe) => {
+                this.task.signals.post_signal(crate::proc::SIGPIPE);
+                core::task::Poll::Ready(Err(Errno::Epipe))
+            },
+            Err(e) => core::task::Poll::Ready(Err(e)),
+        }
+    }
+}

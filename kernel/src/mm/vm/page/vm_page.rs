@@ -3,18 +3,14 @@
 //! Handles cross-thread sync (`exBusy`/`sBusy`), object linkage, and hardware
 //! referencing. Aligned to FreeBSD's definition.
 
-use alloc::sync::Arc;
-use core::{
-    ops::Deref,
-    sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering},
-};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use bitflags::bitflags;
 
 use crate::{
     hal_common::PhysAddr,
     mm::{
-        vm::{register_waker, remove_waker, wake_all, VmObject},
+        vm::{register_waker, remove_waker, wake_all},
         PageRole,
     },
 };
@@ -36,10 +32,6 @@ bitflags! {
 #[repr(C)]
 #[derive(Debug)]
 pub struct VmPage {
-    /// Which object owns this page (if any).
-    pub object: AtomicPtr<VmObject>,
-    /// Logical offset within the object.
-    pub pindex: u64,
     /// The physical address this struct represents.
     pub phys_addr: PhysAddr,
 
@@ -52,8 +44,6 @@ pub struct VmPage {
 
     /// Role of the page (from `PageRole` enum).
     pub role_flags: AtomicU8,
-    /// 1 if the page contains valid data, 0 if data is pending/I/O.
-    pub valid: AtomicU8,
     /// Has the page been modified since the last page-out?
     pub dirty: AtomicU8,
 }
@@ -61,13 +51,10 @@ pub struct VmPage {
 impl VmPage {
     pub const fn new() -> Self {
         Self {
-            object: AtomicPtr::new(core::ptr::null_mut()),
-            pindex: 0,
             phys_addr: PhysAddr::new(0),
             busy_state: AtomicU32::new(0),
             refs: AtomicU32::new(0),
             role_flags: AtomicU8::new(PageRole::Free as u8),
-            valid: AtomicU8::new(0),
             dirty: AtomicU8::new(0),
         }
     }
@@ -76,14 +63,6 @@ impl VmPage {
     pub fn new_test(pa: PhysAddr) -> Self {
         let mut p = Self::new();
         p.phys_addr = pa;
-        p.valid.store(1, Ordering::Relaxed);
-        p
-    }
-
-    /// Create a dummy cached page for tests.
-    pub fn new_cached_test(pa: PhysAddr) -> Self {
-        let p = Self::new_test(pa);
-        p.dirty.store(0, Ordering::Relaxed);
         p
     }
 
@@ -140,6 +119,13 @@ impl VmPage {
                 // Mark WANTED so the holder knows to call wake_all
                 self.busy_state
                     .fetch_or(BusyState::WANTED.bits(), Ordering::Relaxed);
+                // Recheck after registering waker to prevent lost wakeup:
+                // if the holder released between our caller's check and here,
+                // the wake_all() already fired before our waker was registered.
+                if !self.is_exclusive_busied() {
+                    remove_waker(token, cx.waker());
+                    return Poll::Ready(());
+                }
                 yielded = true;
                 Poll::Pending
             } else {
@@ -236,18 +222,6 @@ impl VmPage {
     // ------------------------------------------------------------------------
     // Pager Aux Methods
     // ------------------------------------------------------------------------
-
-    pub fn is_valid(&self) -> bool {
-        self.valid.load(Ordering::Relaxed) != 0
-    }
-
-    pub fn set_valid(&self) {
-        self.valid.store(1, Ordering::Relaxed);
-    }
-
-    pub fn clear_valid(&self) {
-        self.valid.store(0, Ordering::Relaxed);
-    }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed) != 0
@@ -364,98 +338,92 @@ impl VmPage {
 
 /// RAII guard for a shared busy lock (sBusy) on a `VmPage`.
 ///
+/// Holds a `PhysAddr` that resolves to `&'static VmPage` via FRAME_META.
 /// Automatically calls `release_steady_state()` on drop, preventing
 /// forgotten lock releases that would deadlock future page faults.
 pub struct SharedBusyGuard {
-    page: Arc<VmPage>,
+    pa: PhysAddr,
 }
 
 impl SharedBusyGuard {
-    /// Try to acquire the shared busy lock on the given page.
-    /// Returns `None` if the page is exclusively busied.
-    pub fn try_new(page: &Arc<VmPage>) -> Option<Self> {
-        if page.try_acquire_steady_state() {
-            Some(Self {
-                page: Arc::clone(page),
-            })
+    /// Try to acquire the shared busy lock on the page at `pa`.
+    /// Returns `None` if the page is exclusively busied or PA is invalid.
+    pub fn try_new(pa: PhysAddr) -> Option<Self> {
+        let meta = crate::mm::get_frame_meta(pa)?;
+        if meta.try_acquire_steady_state() {
+            Some(Self { pa })
         } else {
             None
         }
     }
 
-    /// Get a reference to the underlying `Arc<VmPage>`.
-    pub fn arc(&self) -> &Arc<VmPage> {
-        &self.page
+    /// Get the physical address.
+    pub fn phys(&self) -> PhysAddr {
+        self.pa
     }
-}
 
-impl Deref for SharedBusyGuard {
-    type Target = VmPage;
-
-    fn deref(&self) -> &VmPage {
-        &self.page
+    /// Resolve to the FRAME_META entry.
+    pub fn meta(&self) -> &'static VmPage {
+        crate::mm::get_frame_meta(self.pa).expect("SharedBusyGuard: invalid PA")
     }
 }
 
 impl Drop for SharedBusyGuard {
     fn drop(&mut self) {
-        self.page.release_steady_state();
+        if let Some(meta) = crate::mm::get_frame_meta(self.pa) {
+            meta.release_steady_state();
+        }
     }
 }
 
 /// RAII guard for an exclusive busy lock (exBusy) on a `VmPage`.
 ///
+/// Holds a `PhysAddr` that resolves to `&'static VmPage` via FRAME_META.
 /// Automatically calls `release_exclusive()` on drop, preventing
 /// forgotten lock releases that would deadlock future page faults.
 pub struct ExclusiveBusyGuard {
-    page: Arc<VmPage>,
+    pa: PhysAddr,
 }
 
 impl ExclusiveBusyGuard {
-    /// Try to acquire the exclusive busy lock on the given page.
-    /// Returns `None` if the page has any active busy lock (shared or exclusive).
-    pub fn try_new(page: &Arc<VmPage>) -> Option<Self> {
-        if page.try_acquire_exclusive() {
-            Some(Self {
-                page: Arc::clone(page),
-            })
+    /// Try to acquire the exclusive busy lock on the page at `pa`.
+    /// Returns `None` if the page has any active busy lock (shared or exclusive)
+    /// or PA is invalid.
+    pub fn try_new(pa: PhysAddr) -> Option<Self> {
+        let meta = crate::mm::get_frame_meta(pa)?;
+        if meta.try_acquire_exclusive() {
+            Some(Self { pa })
         } else {
             None
         }
     }
 
+    /// Get the physical address.
+    pub fn phys(&self) -> PhysAddr {
+        self.pa
+    }
+
+    /// Resolve to the FRAME_META entry.
+    pub fn meta(&self) -> &'static VmPage {
+        crate::mm::get_frame_meta(self.pa).expect("ExclusiveBusyGuard: invalid PA")
+    }
+
     /// Downgrade this exclusive lock to a shared lock.
     ///
     /// Consumes `self` (the exclusive guard) and returns a `SharedBusyGuard`.
-    /// Uses `core::ptr::read` + `core::mem::forget` to prevent the `Drop` impl
-    /// from releasing the exclusive lock before the atomic downgrade occurs.
     pub fn downgrade(self) -> SharedBusyGuard {
-        // Atomically downgrade exBusy -> sBusy on the page.
-        self.page.downgrade_exclusive_to_shared();
-        let page = unsafe {
-            // Read the Arc out without running Drop (which would release_exclusive).
-            core::ptr::read(&self.page)
-        };
-        core::mem::forget(self);
-        SharedBusyGuard { page }
-    }
-
-    /// Get a reference to the underlying `Arc<VmPage>`.
-    pub fn arc(&self) -> &Arc<VmPage> {
-        &self.page
-    }
-}
-
-impl Deref for ExclusiveBusyGuard {
-    type Target = VmPage;
-
-    fn deref(&self) -> &VmPage {
-        &self.page
+        let pa = self.pa;
+        let meta = self.meta();
+        meta.downgrade_exclusive_to_shared();
+        core::mem::forget(self); // prevent Drop from releasing exclusive
+        SharedBusyGuard { pa }
     }
 }
 
 impl Drop for ExclusiveBusyGuard {
     fn drop(&mut self) {
-        self.page.release_exclusive();
+        if let Some(meta) = crate::mm::get_frame_meta(self.pa) {
+            meta.release_exclusive();
+        }
     }
 }

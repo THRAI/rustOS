@@ -8,8 +8,9 @@ use crate::{
     hal_common::{Errno, KernelResult},
     mm::PageFaultAccessType,
     proc::{
-        copyin_argv, copyinstr, do_execve, do_exit, fault_in_user_buffer, find_task_by_pid, fork,
-        SigSet, Signal, Task, TaskState, WaitChildFuture, WaitStatus, SIGCHLD,
+        copyin_argv, copyinstr, do_clone, do_execve, do_exit, fault_in_user_buffer,
+        find_task_by_pid, CloneFlags, SigSet, Signal, Task, TaskState, WaitChildFuture, WaitStatus,
+        SIGCHLD,
     },
 };
 
@@ -57,32 +58,30 @@ pub fn sys_clone(
     tls: usize,
     _child_tid: usize,
 ) -> KernelResult<usize> {
-    // Minimal clone support:
-    // - process-style clone/fork is supported
-    // - thread-group clone is not supported yet
-    const CLONE_THREAD: usize = 0x0001_0000;
-    const CLONE_SETTLS: usize = 0x0008_0000;
+    let clone_flags = CloneFlags::from_bits_truncate(flags as u64);
 
-    if flags & CLONE_THREAD != 0 {
-        return Err(Errno::Enosys);
+    // CLONE_THREAD still not supported
+    if clone_flags.contains(CloneFlags::THREAD) {
+        return Err(kerr!(
+            proc,
+            debug,
+            Errno::Enosys,
+            "sys_clone: CLONE_THREAD not supported"
+        ));
     }
 
-    let child = fork(task);
-
-    // If caller supplied a child stack, override sp in the child's trap frame.
-    // musl __clone stores fn/arg on this stack before ecall; child reads them via sp.
-    if child_stack != 0 || ((flags & CLONE_SETTLS) != 0 && tls != 0) {
-        let mut child_tf = child.trap_frame.lock();
-        crate::hal::syscall_abi::setup_clone_child(
-            &mut child_tf,
-            (child_stack != 0).then_some(child_stack),
-            ((flags & CLONE_SETTLS) != 0 && tls != 0).then_some(tls),
-        );
-    }
-
+    let (child, vfork_done) = do_clone(task, clone_flags, child_stack, tls)?;
     let child_pid = child.pid;
     let cpu = current().cpu_id;
     spawn_user_task(child, cpu);
+
+    // CLONE_VFORK: parent blocks until child exits or execs
+    if let Some(vfork) = vfork_done {
+        while !vfork.is_done() {
+            core::hint::spin_loop();
+        }
+    }
+
     Ok(child_pid as usize)
 }
 
@@ -100,10 +99,18 @@ pub async fn sys_execve_async(
 ) -> Result<(usize, usize, usize, usize), Errno> {
     // Read pathname from user memory
     let raw_path = match copyinstr(task, pathname_ptr, 256).await {
-        None => return Err(Errno::Efault),
+        None => {
+            return Err(kerr!(
+                proc,
+                debug,
+                Errno::Efault,
+                "sys_execve: copyinstr failed ptr={:#x}",
+                pathname_ptr
+            ))
+        },
         Some(s) => s,
     };
-    let path = super::fs::absolutize_path(task, dirfd, &raw_path)?;
+    let path = crate::fs::absolutize_path(task, dirfd, &raw_path)?;
     // Read argv array from user memory (before exec destroys address space)
     let argv = copyin_argv(task, argv_ptr, 64, 4096).await;
     // Read envp array
@@ -130,7 +137,13 @@ pub async fn sys_wait4_async(
     {
         let children = task.children.lock();
         if children.is_empty() {
-            return Err(Errno::Echild);
+            return Err(kerr!(
+                proc,
+                debug,
+                Errno::Echild,
+                "sys_wait4: no children pid={}",
+                task.pid
+            ));
         }
     }
 
@@ -176,7 +189,13 @@ pub async fn sys_wait4_async(
                         )
                     };
                     if rc != 0 {
-                        return Err(Errno::Efault);
+                        return Err(kerr!(
+                            proc,
+                            debug,
+                            Errno::Efault,
+                            "sys_wait4: copy wstatus failed ptr={:#x} (WNOHANG)",
+                            wstatus_ptr
+                        ));
                     }
                 }
                 return Ok(child_pid);
@@ -208,16 +227,34 @@ pub async fn sys_wait4_async(
                     )
                 };
                 if rc != 0 {
-                    return Err(Errno::Efault);
+                    return Err(kerr!(
+                        proc,
+                        debug,
+                        Errno::Efault,
+                        "sys_wait4: copy wstatus failed ptr={:#x}",
+                        wstatus_ptr
+                    ));
                 }
             }
             Ok(child_pid)
         },
         None => {
             if task.signals.has_actionable_pending() {
-                Err(Errno::Eintr)
+                Err(kerr!(
+                    proc,
+                    trace,
+                    Errno::Eintr,
+                    "sys_wait4: interrupted by signal pid={}",
+                    task.pid
+                ))
             } else {
-                Err(Errno::Echild)
+                Err(kerr!(
+                    proc,
+                    debug,
+                    Errno::Echild,
+                    "sys_wait4: no zombie child pid={}",
+                    task.pid
+                ))
             }
         },
     }
@@ -242,7 +279,13 @@ pub fn sys_setpgid(task: &Arc<Task>, pid: u32, pgid: u32) -> Result<usize, Errno
                 return Ok(0);
             }
         }
-        Err(Errno::Esrch)
+        Err(kerr!(
+            proc,
+            debug,
+            Errno::Esrch,
+            "sys_setpgid: pid not found pid={}",
+            target_pid
+        ))
     }
 }
 
@@ -252,6 +295,12 @@ pub fn sys_getpgid(task: &Arc<Task>, pid: u32) -> Result<usize, Errno> {
     } else if let Some(t) = find_task_by_pid(pid) {
         Ok(t.pgid.load(Ordering::Relaxed) as usize)
     } else {
-        Err(Errno::Esrch)
+        Err(kerr!(
+            proc,
+            debug,
+            Errno::Esrch,
+            "sys_getpgid: pid not found pid={}",
+            pid
+        ))
     }
 }

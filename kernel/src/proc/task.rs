@@ -16,11 +16,10 @@ use alloc::{
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 // use crate::hal_common::IrqSafeSpinLock;
-use crate::proc::{alloc_pid, SignalState};
+use crate::proc::{alloc_pid, clone::VforkDone, SignalState};
 use crate::{
     fs::FdTable,
-    hal::{TrapFrame, TrapFrame as _},
-    hal_common::{PhysAddr, SpinMutex as Mutex, PAGE_SIZE},
+    hal_common::{LeveledRwLock, PhysAddr, SpinMutex as Mutex, TrapFrame, PAGE_SIZE},
     mm::{frame_alloc_contiguous, frame_free_contiguous, pmap, vm::VmMap},
 };
 
@@ -133,17 +132,15 @@ pub struct Task {
     pub parent: Weak<Task>,
     /// Child processes.
     pub children: Mutex<Vec<Arc<Task>>, 4>,
-    /// Virtual address space.
+    /// Virtual address space (Arc-wrapped for CLONE_VM sharing).
     ///
-    // SAFETY: SpinMutex (no IRQ disable). Currently safe because the timer
-    // IRQ handler only sets `needs_reschedule` and advances TimerWheel —
-    // it never accesses any VmMap. Page faults are synchronous traps on the
-    // faulting hart, not asynchronous IRQs, so they cannot preempt a holder
-    // on the same hart. Must be upgraded to IrqSafeSpinLock if any future
-    // IRQ/IPI path needs to inspect or modify a VmMap.
-    pub vm_map: Mutex<VmMap, 1>,
-    /// File descriptor table placeholder (expanded in VFS plan).
-    pub fd_table: Mutex<FdTable, 4>,
+    /// Uses `LeveledRwLock` so page faults (read lock) can proceed
+    /// concurrently with each other, while mutations like mmap/munmap
+    /// take the write lock for exclusive access. The pmap inside VmMap
+    /// is independently locked (SpinMutex level 2).
+    pub vm_map: Arc<LeveledRwLock<VmMap, 1>>,
+    /// File descriptor table (Arc-wrapped for CLONE_FILES sharing).
+    pub fd_table: Arc<Mutex<FdTable, 4>>,
     /// Current working directory (absolute normalized path).
     pub cwd: Mutex<String, 4>,
     /// Current state (Running / Zombie). Stored as AtomicU8 for lock-free access.
@@ -166,8 +163,8 @@ pub struct Task {
     pub pgid: AtomicU32,
     /// Top-level waker for async signal injection (wake from kill).
     pub top_level_waker: Mutex<Option<core::task::Waker>, 4>,
-    console_stdout_buf: Mutex<ConsoleWriteBuffer, 4>,
-    console_stderr_buf: Mutex<ConsoleWriteBuffer, 4>,
+    /// vfork completion handle: child signals this on exit or exec.
+    pub vfork_done: Option<Arc<VforkDone>>,
 }
 
 /// Allocate a kernel stack (2 pages) and return (base, sp_top).
@@ -198,8 +195,8 @@ impl Task {
             pid,
             parent,
             children: Mutex::new(Vec::new()),
-            vm_map: Mutex::new(VmMap::new(pmap)),
-            fd_table: Mutex::new(FdTable::new()),
+            vm_map: Arc::new(LeveledRwLock::new(VmMap::new(pmap))),
+            fd_table: Arc::new(Mutex::new(FdTable::new())),
             cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
@@ -211,8 +208,7 @@ impl Task {
             signals: SignalState::new(),
             pgid: AtomicU32::new(pgid),
             top_level_waker: Mutex::new(None),
-            console_stdout_buf: Mutex::new(ConsoleWriteBuffer::new()),
-            console_stderr_buf: Mutex::new(ConsoleWriteBuffer::new()),
+            vfork_done: None,
         })
     }
 
@@ -231,8 +227,8 @@ impl Task {
             pid,
             parent: Weak::new(),
             children: Mutex::new(Vec::new()),
-            vm_map: Mutex::new(VmMap::new(pmap)),
-            fd_table: Mutex::new(FdTable::new_with_stdio()),
+            vm_map: Arc::new(LeveledRwLock::new(VmMap::new(pmap))),
+            fd_table: Arc::new(Mutex::new(FdTable::new_with_stdio())),
             cwd: Mutex::new(String::from("/")),
             state: AtomicU8::new(TaskState::Running as u8),
             exit_status: AtomicI32::new(0),
@@ -244,8 +240,7 @@ impl Task {
             signals: SignalState::new(),
             pgid: AtomicU32::new(pid),
             top_level_waker: Mutex::new(None),
-            console_stdout_buf: Mutex::new(ConsoleWriteBuffer::new()),
-            console_stderr_buf: Mutex::new(ConsoleWriteBuffer::new()),
+            vfork_done: None,
         })
     }
 
@@ -272,7 +267,7 @@ impl Task {
     /// This keeps zombie tasks lightweight so parent-side `wait4()` reaping
     /// does not end up dropping a full address space on the current kernel stack.
     pub fn release_zombie_resources(&self) {
-        self.vm_map.lock().clear();
+        self.vm_map.write().clear();
         *self.fd_table.lock() = FdTable::new();
     }
 

@@ -6,14 +6,48 @@
 use alloc::sync::Arc;
 
 use crate::{
-    hal_common::{Errno, VirtAddr, PAGE_SIZE},
+    hal_common::{Errno, LeveledRwLock, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap_enter, pmap_extract, pmap_extract_with_flags, pmap_zero_page,
-        vm::{sync_fault_handler, FaultResult, PageFaultAccessType},
-        PteFlags,
+        pmap_zero_page,
+        vm::{
+            sync_fault_handler, FaultResult, MapPerm, PageFaultAccessType, PageRef, VmMap, VmObject,
+        },
     },
     proc::Task,
 };
+
+/// Re-check VMA after timestamp mismatch. Returns fresh permissions if
+/// the VMA still exists and backs the same object (`Arc::ptr_eq`), or
+/// `None` to bail (VMA gone or object identity changed).
+///
+/// This is the unified TOCTOU revalidation — it replaces the old
+/// `IN_TRANSITION` and `busy_count` mechanisms with a single detection
+/// protocol. See `VmMap.timestamp` doc comment for the full design.
+///
+/// If thread profiling later shows wasted I/O from concurrent
+/// munmap-during-fault, a `busy_count` prevention layer can be added
+/// on top without changing this function.
+fn revalidate_vma(
+    map: &VmMap,
+    fault_va: VirtAddr,
+    obj: &Arc<LeveledRwLock<VmObject, 3>>,
+    saved_ts: u32,
+    vma_perm: MapPerm,
+) -> Option<MapPerm> {
+    if map.timestamp.load(core::sync::atomic::Ordering::Relaxed) == saved_ts {
+        return Some(vma_perm);
+    }
+    let vma = map.lookup_readonly(fault_va)?;
+    // Verify backing object identity — after execve, the same VA may
+    // exist with a different object. Inserting into the old object would
+    // create a dangling PTE when the old object drops.
+    if let Some(object) = vma.mapping.object() {
+        if !Arc::ptr_eq(object, obj) {
+            return None;
+        }
+    }
+    Some(vma.protection)
+}
 
 /// Unified fault resolution: sync path first, async fallback for file-backed.
 pub async fn resolve_user_fault(
@@ -24,15 +58,15 @@ pub async fn resolve_user_fault(
     // Fast path: if the page is already mapped with sufficient permissions, skip.
     // Must check PTE flags — not just presence — to avoid bypassing COW faults.
     {
-        let vm_map = task.vm_map.lock();
+        let vm_map = task.vm_map.read();
         let pmap = vm_map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-        if let Some((_pa, flags)) = pmap_extract_with_flags(&pmap, fault_va_aligned) {
+        if let Some(entry) = pmap.get(fault_va_aligned) {
             let mut ok = true;
-            if access_type.write && !flags.contains(PteFlags::W) {
+            if access_type.write && !entry.permits_write() {
                 ok = false; // COW page — must go through fault handler
             }
-            if access_type.execute && !flags.contains(PteFlags::X) {
+            if access_type.execute && !entry.permits_exec() {
                 ok = false;
             }
             if ok {
@@ -44,7 +78,7 @@ pub async fn resolve_user_fault(
                 "resolve_user_fault fastpath miss: pid={} va={:#x} flags={:?} access(w={},x={})",
                 task.pid,
                 fault_va_aligned.as_usize(),
-                flags,
+                entry.flags(),
                 access_type.write,
                 access_type.execute
             );
@@ -53,7 +87,7 @@ pub async fn resolve_user_fault(
 
     // 1. Sync path: anonymous zero-fill, COW
     let sync_result = {
-        let vm_map = task.vm_map.lock();
+        let vm_map = task.vm_map.read();
         let mut pmap = vm_map.pmap_lock();
         sync_fault_handler(&vm_map, &mut pmap, fault_va, access_type)
     };
@@ -131,57 +165,60 @@ pub async fn resolve_user_fault(
 /// allocate a zeroed frame and map it directly.
 async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(), Errno> {
     // 1. Look up VMA and compute object offsets
-    let (obj, obj_offset, _vma_start, vma_perm) = {
-        let mut map = task.vm_map.lock();
-        let vma = map.lookup(fault_va.as_usize() as u64).ok_or_else(|| {
-            kerr!(
-                vm,
-                warn,
-                Errno::Efault,
-                "async fault NOT_MAPPED pid={} va={:#x}",
-                task.pid,
-                fault_va.as_usize()
-            )
-        })?;
+    let (obj, obj_offset, _vma_start, vma_perm, saved_ts) = {
+        let map = task.vm_map.read();
+        let ts = map.timestamp.load(core::sync::atomic::Ordering::Relaxed);
+        let vma = map
+            .lookup_readonly(fault_va)
+            .ok_or_else(|| {
+                kerr!(
+                    vm,
+                    warn,
+                    Errno::Efault,
+                    "async fault NOT_MAPPED pid={} va={:#x}",
+                    task.pid,
+                    fault_va.as_usize()
+                )
+            })?;
 
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
-        match &vma.store {
-            crate::mm::vm::BackingStore::Object { object, offset } => {
-                let obj_offset_bytes = offset + (fault_va_aligned.as_usize() as u64 - vma.start());
-                let obj_offset =
-                    crate::mm::vm::VObjIndex::from_bytes_floor(obj_offset_bytes as usize);
-                (object.clone(), obj_offset, vma.start(), vma.protection)
-            },
-            _ => {
-                return Err(kerr!(
+        let (object, obj_offset) =
+            vma.extract_object_offset(fault_va_aligned).ok_or_else(|| {
+                kerr!(
                     vm,
                     warn,
                     Errno::Efault,
                     "async fault INVALID_BACKING pid={} va={:#x}",
                     task.pid,
                     fault_va.as_usize()
-                ))
-            },
-        }
+                )
+            })?;
+        (object, obj_offset, vma.start(), vma.protection, ts)
     };
 
     // 2. Check if the page is already in the object (walks shadow chain)
     if let Some(existing_pa) = obj.read().lookup_page(obj_offset) {
-        let map = task.vm_map.lock();
+        let map = task.vm_map.read();
+        let current_perm = match revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm)
+        {
+            Some(perm) => perm,
+            None => return Ok(()), // VMA gone or object identity changed
+        };
         let mut pmap = map.pmap_lock();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
-        if pmap_extract(&pmap, fault_va_aligned).is_none() {
-            if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
-                return Err(kerr!(
-                    vm,
-                    error,
-                    Errno::Enomem,
-                    "async fault OOM: pmap_enter cached pid={} va={:#x}",
-                    task.pid,
-                    fault_va.as_usize()
-                ));
-            }
+        if pmap
+            .entry_or_insert(fault_va_aligned, existing_pa, current_perm)
+            .is_err()
+        {
+            return Err(kerr!(
+                vm,
+                error,
+                Errno::Enomem,
+                "async fault OOM: pmap_enter cached pid={} va={:#x}",
+                task.pid,
+                fault_va.as_usize()
+            ));
         }
         return Ok(());
     }
@@ -224,7 +261,8 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     if let Some(pager_ref) = pager.as_ref() {
         let file_offset = obj_offset.to_bytes();
         if pager_ref.page_in(file_offset, frame).await.is_err() {
-            crate::mm::free_raw_frame(frame);
+            // Decrement FRAME_META refs and free via PageRef drop.
+            drop(PageRef::new(frame));
             return Err(kerr!(
                 vm,
                 error,
@@ -239,50 +277,56 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
 
     // 5. Time-of-use revalidation and mapping
     {
-        let map = task.vm_map.lock();
-        let mut pmap = map.pmap_lock();
-        // recheck map bounds - just a simple overlap check to prevent inserting out of bound mapping
-        // due to map being rebuilt
+        let map = task.vm_map.read();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
+        let current_perm = if let Some(perm) =
+            revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm)
+        {
+            perm
+        } else {
+            // VMA gone or object identity changed — discard frame.
+            drop(PageRef::new(frame));
+            return Ok(());
+        };
+
+        let mut pmap = map.pmap_lock();
         let mut obj_write = obj.write();
 
         // Check if another thread raced us
         if let Some(existing_pa) = obj_write.lookup_page(obj_offset) {
-            crate::mm::free_raw_frame(frame);
-            if pmap_extract(&pmap, fault_va_aligned).is_none() {
-                if pmap_enter(&mut pmap, fault_va_aligned, existing_pa, vma_perm, false).is_err() {
-                    return Err(kerr!(
-                        vm,
-                        error,
-                        Errno::Enomem,
-                        "async fault OOM: pmap_enter race pid={} va={:#x}",
-                        task.pid,
-                        fault_va.as_usize()
-                    ));
-                }
-            }
-            return Ok(());
-        }
-
-        let vm_page_meta = crate::mm::get_frame_meta(frame).unwrap();
-        obj_write.insert_page(obj_offset, {
-            let mut page = crate::mm::VmPage::new();
-            page.phys_addr = vm_page_meta.phys();
-            Arc::new(page)
-        });
-
-        if pmap_extract(&pmap, fault_va_aligned).is_none() {
-            if pmap_enter(&mut pmap, fault_va_aligned, frame, vma_perm, false).is_err() {
+            // Another thread already inserted a page. Free ours via PageRef drop.
+            drop(PageRef::new(frame));
+            if pmap
+                .entry_or_insert(fault_va_aligned, existing_pa, current_perm)
+                .is_err()
+            {
                 return Err(kerr!(
                     vm,
                     error,
                     Errno::Enomem,
-                    "async fault OOM: pmap_enter final pid={} va={:#x}",
+                    "async fault OOM: pmap_enter race pid={} va={:#x}",
                     task.pid,
                     fault_va.as_usize()
                 ));
             }
+            return Ok(());
+        }
+
+        obj_write.insert_page(obj_offset, PageRef::new(frame));
+
+        if pmap
+            .entry_or_insert(fault_va_aligned, frame, current_perm)
+            .is_err()
+        {
+            return Err(kerr!(
+                vm,
+                error,
+                Errno::Enomem,
+                "async fault OOM: pmap_enter final pid={} va={:#x}",
+                task.pid,
+                fault_va.as_usize()
+            ));
         }
     }
 

@@ -136,6 +136,11 @@ pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::WaitStatus) {
     task.set_zombie();
     task.release_zombie_resources();
 
+    // Signal vfork parent (if any) that child has exited
+    if let Some(ref vfork) = task.vfork_done {
+        vfork.signal();
+    }
+
     // Unregister from global task registry
     crate::proc::unregister_task(task.pid);
 

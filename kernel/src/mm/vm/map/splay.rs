@@ -1,14 +1,18 @@
 use core::ptr::NonNull;
 
-use crate::mm::vm::VmMapEntry;
+use crate::{hal_common::VirtAddr, mm::vm::VmMapEntry};
 
 pub struct SplayTree {
     root: Option<NonNull<VmMapEntry>>,
 }
 
-// Safety: VmMap wraps SplayTree and is Send + Sync, and it protects access to the tree with its RwLock.
+// SAFETY: VmMap wraps SplayTree and protects access with LeveledRwLock<VmMap, 1>.
+// The RwLock guarantees that &SplayTree (shared reads) and &mut SplayTree
+// (exclusive writes) are never handed out concurrently, so it is safe to
+// implement Sync here.  The NonNull<VmMapEntry> inside is never aliased
+// across threads without the lock held.
 unsafe impl Send for SplayTree {}
-// unsafe impl Sync for SplayTree {}
+unsafe impl Sync for SplayTree {}
 
 impl SplayTree {
     pub const fn new() -> Self {
@@ -24,27 +28,29 @@ impl SplayTree {
         // SAFETY: Caller guarantees `node` is a valid, exclusively accessible VmMapEntry.
         unsafe {
             let n = node.as_ref();
-            let mut max = 0;
-            let mut gap_left = 0;
-            let mut gap_right = 0;
+            let mut max: usize = 0;
 
             if let Some(left) = n.splay_node.left {
                 let l = left.as_ref();
                 max = core::cmp::max(max, l.max_free);
-                gap_left = n.start().saturating_sub(l.end());
-            } else {
-                // Gap between 0 (or start of map) and n.start() handled generically outside?
-                // Actually, gap between node and its children. If no left child, gap is 0 towards children.
+                let gap_left = if n.start() > l.end() {
+                    n.start().as_usize() - l.end().as_usize()
+                } else {
+                    0
+                };
+                max = core::cmp::max(max, gap_left);
             }
 
             if let Some(right) = n.splay_node.right {
                 let r = right.as_ref();
                 max = core::cmp::max(max, r.max_free);
-                gap_right = r.start().saturating_sub(n.end());
+                let gap_right = if r.start() > n.end() {
+                    r.start().as_usize() - n.end().as_usize()
+                } else {
+                    0
+                };
+                max = core::cmp::max(max, gap_right);
             }
-
-            max = core::cmp::max(max, gap_left);
-            max = core::cmp::max(max, gap_right);
 
             node.as_mut().max_free = max;
         }
@@ -52,7 +58,7 @@ impl SplayTree {
 
     /// Splay the tree around the target address `addr`.
     /// Brings the node containing or closest to `addr` to the root.
-    unsafe fn splay(&mut self, addr: u64) {
+    unsafe fn splay(&mut self, addr: VirtAddr) {
         // SAFETY: Caller guarantees all NonNull nodes in the tree are valid
         // and exclusively accessible through the SplayTree.
         unsafe {
@@ -63,10 +69,9 @@ impl SplayTree {
             // Standard Top-Down Splay
             let mut n = self.root.take().unwrap();
             let mut dummy = VmMapEntry::new(
-                0,
-                0,
-                crate::mm::vm::BackingStore::Guard,
-                crate::mm::vm::EntryFlags::empty(),
+                VirtAddr::new(0),
+                VirtAddr::new(0),
+                crate::mm::vm::VmMapping::Guard,
                 crate::mm::vm::MapPerm::empty(),
             );
             let mut left_tail = NonNull::from(&mut dummy);
@@ -172,7 +177,7 @@ impl SplayTree {
         }
     }
 
-    pub fn lookup(&mut self, addr: u64) -> Option<&VmMapEntry> {
+    pub fn lookup(&mut self, addr: VirtAddr) -> Option<&VmMapEntry> {
         unsafe {
             self.splay(addr);
             if let Some(root) = self.root {
@@ -185,7 +190,7 @@ impl SplayTree {
         None
     }
 
-    pub fn lookup_readonly(&self, addr: u64) -> Option<&VmMapEntry> {
+    pub fn lookup_readonly(&self, addr: VirtAddr) -> Option<&VmMapEntry> {
         let mut curr = self.root;
         while let Some(n) = curr {
             let n_ref = unsafe { n.as_ref() };
@@ -200,7 +205,7 @@ impl SplayTree {
         None
     }
 
-    pub fn lookup_mut(&mut self, addr: u64) -> Option<&mut VmMapEntry> {
+    pub fn lookup_mut(&mut self, addr: VirtAddr) -> Option<&mut VmMapEntry> {
         unsafe {
             self.splay(addr);
             if let Some(mut root) = self.root {
@@ -213,7 +218,7 @@ impl SplayTree {
         None
     }
 
-    pub fn remove(&mut self, addr: u64) -> Option<alloc::boxed::Box<VmMapEntry>> {
+    pub fn remove(&mut self, addr: VirtAddr) -> Option<alloc::boxed::Box<VmMapEntry>> {
         unsafe {
             self.splay(addr);
             if let Some(mut root) = self.root {
@@ -227,7 +232,7 @@ impl SplayTree {
                         // Splay maximum element in left subtree
                         self.root = Some(l);
                         // We use a safe large value to splay max
-                        self.splay(u64::MAX);
+                        self.splay(VirtAddr::new(usize::MAX));
                         let mut new_root = self.root.unwrap();
                         new_root.as_mut().splay_node.right = right;
                         Self::update_max_free(new_root);

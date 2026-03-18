@@ -12,8 +12,8 @@ use super::super::{
 use crate::{
     hal_common::{VirtAddr, PAGE_SIZE},
     mm::vm::{
-        sync_fault_handler, BackingStore, FaultResult, PageFaultAccessType, VmMap, VmMapEntry,
-        VmObject, VmPage,
+        sync_fault_handler, FaultResult, PageFaultAccessType, PageRef, VmMap, VmMapEntry,
+        VmMapping, VmObject,
     },
 };
 
@@ -21,13 +21,12 @@ use crate::{
 pub fn test_anonymous_page_fault() {
     let obj = VmObject::new_anon(PAGE_SIZE);
     let vma = VmMapEntry::new(
-        0x1000_0000,
-        0x1000_0000 + PAGE_SIZE as u64,
-        BackingStore::Object {
+        VirtAddr::new(0x1000_0000),
+        VirtAddr::new(0x1000_0000 + PAGE_SIZE as usize),
+        VmMapping::AnonPrivate {
             object: obj,
             offset: 0,
         },
-        crate::mm::vm::EntryFlags::empty(),
         crate::map_perm!(R, W),
     );
     let pmap_arc = Arc::new(crate::hal_common::SpinMutex::new(pmap::pmap_create()));
@@ -44,10 +43,10 @@ pub fn test_anonymous_page_fault() {
     match result {
         FaultResult::Resolved => {
             // Verify a page was inserted into the VmObject
-            let vma = map.lookup_readonly(0x1000_0000).unwrap();
-            let obj = match &vma.store {
-                BackingStore::Object { object, .. } => object.read(),
-                _ => panic!("Expected Object store"),
+            let vma = map.lookup_readonly(VirtAddr::new(0x1000_0000)).unwrap();
+            let obj = match vma.mapping.object() {
+                Some(obj) => obj.read(),
+                None => panic!("Expected object-backed mapping"),
             };
             assert!(
                 obj.lookup_page(crate::mm::vm::VObjIndex::new(0)).is_some(),
@@ -74,9 +73,10 @@ pub fn test_cow_fault() {
     let parent_obj = VmObject::new_anon(PAGE_SIZE);
     {
         let mut w = parent_obj.write();
-        let mut p = VmPage::new();
-        p.phys_addr = parent_page.phys();
-        w.insert_page(crate::mm::vm::VObjIndex::new(0), Arc::new(p));
+        w.insert_page(
+            crate::mm::vm::VObjIndex::new(0),
+            PageRef::new(parent_page.phys()),
+        );
     }
 
     // Create shadow (simulates fork)
@@ -85,13 +85,12 @@ pub fn test_cow_fault() {
     let _sibling = Arc::clone(&shadow);
 
     let vma = VmMapEntry::new(
-        0x2000_0000,
-        0x2000_0000 + PAGE_SIZE as u64,
-        BackingStore::Object {
+        VirtAddr::new(0x2000_0000),
+        VirtAddr::new(0x2000_0000 + PAGE_SIZE),
+        VmMapping::AnonPrivate {
             object: shadow,
             offset: 0,
         },
-        crate::mm::vm::EntryFlags::empty(),
         crate::map_perm!(R, W),
     );
     let pmap_arc = Arc::new(crate::hal_common::SpinMutex::new(pmap::pmap_create()));
@@ -107,10 +106,10 @@ pub fn test_cow_fault() {
     );
     match result {
         FaultResult::Resolved => {
-            let vma = map.lookup_readonly(0x2000_0000).unwrap();
-            let obj = match &vma.store {
-                BackingStore::Object { object, .. } => object.read(),
-                _ => panic!("Expected Object store"),
+            let vma = map.lookup_readonly(VirtAddr::new(0x2000_0000)).unwrap();
+            let obj = match vma.mapping.object() {
+                Some(obj) => obj.read(),
+                None => panic!("Expected object-backed mapping"),
             };
             let _new_phys = obj
                 .lookup_page(crate::mm::vm::VObjIndex::new(0))
@@ -192,9 +191,7 @@ pub fn test_fork_bomb_stress() {
             core::ptr::write_bytes(ptr, (i + 1) as u8, PAGE_SIZE);
         }
         let mut w = root.write();
-        let mut p = VmPage::new();
-        p.phys_addr = page.phys();
-        w.insert_page(crate::mm::vm::VObjIndex::new(i), Arc::new(p));
+        w.insert_page(crate::mm::vm::VObjIndex::new(i), PageRef::new(page.phys()));
     }
 
     // Phase 1: Fork bomb -- create N children, each shadowing root.

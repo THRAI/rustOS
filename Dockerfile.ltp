@@ -1,0 +1,30 @@
+# ================================================================
+# LTP Cross-Compilation — Dedicated Builder
+#
+# Uses the oscomp competition Docker image which ships all six
+# cross-compilers (riscv64 + loongarch64, musl + glibc + bare).
+#
+# Build:
+#   docker compose build ltp
+# Run (copies binaries into testcase/ via volume mount):
+#   docker compose run --rm ltp
+# ================================================================
+
+FROM docker.educg.net/cg/os-contest:20250614
+
+COPY testsuits-for-oskernel/ltp-full-20240524 /build/ltp
+
+WORKDIR /build/ltp
+
+# Build LTP for riscv64-glibc.
+# build-oscomp.sh detects arch+libc from the DESTDIR path.
+# || true: some LTP sub-tests may fail to compile; the rest are usable.
+RUN mkdir -p /out/riscv/glibc/ltp/testcases && \
+    ./build-oscomp.sh /out/riscv/glibc || true
+
+# Build LTP for riscv64-musl.
+RUN mkdir -p /out/riscv/musl/ltp/testcases && \
+    ./build-oscomp.sh /out/riscv/musl || true
+
+# Default command: list what was built
+CMD ["sh", "-c", "echo 'LTP binaries built:' && find /out -type f | wc -l && echo 'files'"]

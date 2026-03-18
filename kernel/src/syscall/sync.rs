@@ -148,7 +148,7 @@ pub async fn sys_futex_async(
             }
             // Resolve physical address for futex key
             let pa = {
-                let vm_map = task.vm_map.lock();
+                let vm_map = task.vm_map.read();
                 let pmap = vm_map.pmap_lock();
                 pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF)).ok_or(Errno::Efault)?
             };
@@ -160,7 +160,7 @@ pub async fn sys_futex_async(
         FUTEX_WAKE => {
             // Resolve physical address for futex key
             let pa = {
-                let vm_map = task.vm_map.lock();
+                let vm_map = task.vm_map.read();
                 let pmap = vm_map.pmap_lock();
                 pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF)).ok_or(Errno::Efault)?
             };

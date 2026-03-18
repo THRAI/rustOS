@@ -88,6 +88,55 @@ impl Drop for FileObject {
     }
 }
 
+impl FileObject {
+    /// Poll readiness for this file object (used by ppoll).
+    ///
+    /// Returns `(readable, writable, hangup, error)`.
+    /// Pure query — no IO, no blocking.
+    pub fn poll_ready(&self, events_in: i16, events_out: i16) -> i16 {
+        const POLLIN: i16 = 0x001;
+        const POLLOUT: i16 = 0x004;
+        const POLLERR: i16 = 0x008;
+        const POLLHUP: i16 = 0x010;
+
+        let mut revents: i16 = 0;
+        match self {
+            FileObject::Device(DeviceKind::ConsoleRead) => {
+                if events_in & POLLIN != 0 {
+                    revents |= POLLIN;
+                }
+            },
+            FileObject::Device(DeviceKind::ConsoleWrite) => {
+                if events_out & POLLOUT != 0 {
+                    revents |= POLLOUT;
+                }
+            },
+            FileObject::Device(DeviceKind::Null | DeviceKind::Zero) => {
+                revents |= events_in & (POLLIN | POLLOUT);
+            },
+            FileObject::PipeRead(pipe) => {
+                if pipe.readable_len() > 0 {
+                    revents |= POLLIN;
+                }
+                if pipe.is_writer_closed() {
+                    revents |= POLLHUP;
+                }
+            },
+            FileObject::PipeWrite(pipe) => {
+                if pipe.is_reader_closed() {
+                    revents |= POLLERR;
+                } else if events_out & POLLOUT != 0 {
+                    revents |= POLLOUT;
+                }
+            },
+            FileObject::Vnode(_) => {
+                revents |= events_in & (POLLIN | POLLOUT);
+            },
+        }
+        revents
+    }
+}
+
 // ---- FileDescription (Layer 2) ----
 
 /// An open file description, shared across dup() and fork().
@@ -126,6 +175,46 @@ impl FileDescription {
 
     pub fn is_append(&self) -> bool {
         (self.get_status_flags() & Self::O_APPEND) != 0
+    }
+
+    /// Seek: reposition file offset.
+    ///
+    /// Returns the new absolute offset.  Rejects pipes and devices
+    /// with `Espipe`.
+    pub fn seek(&self, offset: i64, whence: u32) -> Result<u64, crate::hal_common::Errno> {
+        use core::sync::atomic::Ordering;
+
+        use crate::hal_common::Errno;
+
+        const SEEK_SET: u32 = 0;
+        const SEEK_CUR: u32 = 1;
+        const SEEK_END: u32 = 2;
+
+        match &self.object {
+            FileObject::PipeRead(_) | FileObject::PipeWrite(_) => return Err(Errno::Espipe),
+            FileObject::Device(_) => return Err(Errno::Espipe),
+            FileObject::Vnode(_) => {},
+        }
+
+        let size = match &self.object {
+            FileObject::Vnode(v) => v.size(),
+            _ => 0,
+        };
+
+        let cur = self.offset.load(Ordering::Relaxed) as i64;
+        let new_off = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur + offset,
+            SEEK_END => size as i64 + offset,
+            _ => return Err(Errno::Einval),
+        };
+
+        if new_off < 0 {
+            return Err(Errno::Einval);
+        }
+
+        self.offset.store(new_off as u64, Ordering::Relaxed);
+        Ok(new_off as u64)
     }
 }
 
@@ -294,6 +383,79 @@ impl FdTable {
                     *slot = None;
                 }
             }
+        }
+    }
+
+    /// Perform fcntl operations.
+    ///
+    /// Pure fd-table logic — no IO.
+    pub fn fcntl(
+        &mut self,
+        fd: u32,
+        cmd: u32,
+        arg: usize,
+    ) -> Result<usize, crate::hal_common::Errno> {
+        use crate::hal_common::Errno;
+
+        const F_DUPFD: u32 = 0;
+        const F_GETFD: u32 = 1;
+        const F_SETFD: u32 = 2;
+        const F_GETFL: u32 = 3;
+        const F_SETFL: u32 = 4;
+        const F_DUPFD_CLOEXEC: u32 = 1030;
+        const O_APPEND: usize = 0x0000_0400;
+        const O_NONBLOCK: usize = 0x0000_0800;
+
+        match cmd {
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let desc = alloc::sync::Arc::clone(self.get(fd).ok_or(Errno::Ebadf)?);
+                let flags = if cmd == F_DUPFD_CLOEXEC {
+                    FdFlags::CLOEXEC
+                } else {
+                    FdFlags::empty()
+                };
+                let new_fd = self.insert_from(arg as u32, desc, flags)?;
+                Ok(new_fd as usize)
+            },
+            F_GETFD => {
+                let flags = self.get_flags(fd).ok_or(Errno::Ebadf)?;
+                Ok(if flags.contains(FdFlags::CLOEXEC) {
+                    1
+                } else {
+                    0
+                })
+            },
+            F_SETFD => {
+                let _ = self.get(fd).ok_or(Errno::Ebadf)?;
+                let new_flags = if (arg & 1) != 0 {
+                    FdFlags::CLOEXEC
+                } else {
+                    FdFlags::empty()
+                };
+                self.set_flags(fd, new_flags)?;
+                Ok(0)
+            },
+            F_GETFL => {
+                let desc = self.get(fd).ok_or(Errno::Ebadf)?;
+                let mut fl: usize = 0;
+                if desc.flags.read && desc.flags.write {
+                    fl = 2; // O_RDWR
+                } else if desc.flags.write {
+                    fl = 1; // O_WRONLY
+                }
+                let status = desc.get_status_flags() as usize;
+                fl |= status & (O_APPEND | O_NONBLOCK);
+                Ok(fl)
+            },
+            F_SETFL => {
+                let desc = self.get(fd).ok_or(Errno::Ebadf)?;
+                let settable_mask = (O_APPEND | O_NONBLOCK) as u32;
+                let cur = desc.get_status_flags();
+                let next = (cur & !settable_mask) | ((arg as u32) & settable_mask);
+                desc.set_status_flags(next);
+                Ok(0)
+            },
+            _ => Err(Errno::Einval),
         }
     }
 }

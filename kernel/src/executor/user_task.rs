@@ -41,7 +41,7 @@ async fn run_tasks(task: Arc<Task>) {
         // sendsig writes the signal frame to the user stack via copy_user_chunk,
         // which requires the task's pmap to be active.
         {
-            let vm_map = task.vm_map.lock();
+            let vm_map = task.vm_map.read();
             let mut pmap = vm_map.pmap_lock();
             crate::hal::activate_pmap(&mut pmap);
         }
@@ -99,7 +99,7 @@ async fn run_tasks(task: Arc<Task>) {
 
         // Deactivate pmap (back in kernel context).
         {
-            let vm_map = task.vm_map.lock();
+            let vm_map = task.vm_map.read();
             let mut pmap = vm_map.pmap_lock();
             crate::hal::deactivate_pmap(&mut pmap);
         }
@@ -275,7 +275,7 @@ impl Future for UserTaskFuture {
 
         // Activate the task's page table before running.
         {
-            let vm_map = this.task.vm_map.lock();
+            let vm_map = this.task.vm_map.read();
             let mut pmap = vm_map.pmap_lock();
             crate::hal::activate_pmap(&mut pmap);
         }
@@ -285,7 +285,7 @@ impl Future for UserTaskFuture {
 
         // Deactivate the page table after running.
         {
-            let vm_map = this.task.vm_map.lock();
+            let vm_map = this.task.vm_map.read();
             let mut pmap = vm_map.pmap_lock();
             crate::hal::deactivate_pmap(&mut pmap);
         }

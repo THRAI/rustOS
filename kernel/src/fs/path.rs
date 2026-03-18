@@ -3,15 +3,19 @@
 //! Splits path on '/', calls delegate lookup for each component,
 //! caches results in the dentry cache.
 
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     fs::{fs_lookup, insert_dentry, lookup_dentry, Ext4Vnode, Vnode, VnodeType},
     hal_common::Errno,
+    proc::Task,
 };
 
 /// Root inode number for ext4.
 const EXT4_ROOT_INO: u32 = 2;
+
+/// Linux AT_FDCWD sentinel: "use process cwd".
+const AT_FDCWD: isize = -100;
 
 /// Get the root vnode.
 pub fn root_vnode() -> Arc<dyn Vnode> {
@@ -69,4 +73,86 @@ pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
     }
 
     Ok(current)
+}
+
+/// Normalize a path to an absolute canonical form.
+/// Collapses duplicate '/', '.' and '..' components.
+pub fn normalize_absolute_path(path: &str) -> String {
+    let mut comps: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {},
+            ".." => {
+                let _ = comps.pop();
+            },
+            _ => comps.push(comp),
+        }
+    }
+
+    if comps.is_empty() {
+        return String::from("/");
+    }
+
+    let mut out = String::from("/");
+    for (idx, comp) in comps.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        out.push_str(comp);
+    }
+    out
+}
+
+/// Convert a user-provided path to an absolute path with cwd/dirfd semantics.
+pub fn absolutize_path(task: &Arc<Task>, dirfd: isize, raw_path: &str) -> Result<String, Errno> {
+    if raw_path.is_empty() {
+        return Err(Errno::Enoent);
+    }
+    if raw_path.starts_with('/') {
+        return Ok(normalize_absolute_path(raw_path));
+    }
+
+    // Relative path from cwd.
+    if dirfd == AT_FDCWD {
+        let cwd = task.cwd.lock().clone();
+        let mut combined = String::new();
+        if cwd == "/" {
+            combined.push('/');
+            combined.push_str(raw_path);
+        } else {
+            combined.push_str(&cwd);
+            combined.push('/');
+            combined.push_str(raw_path);
+        }
+        return Ok(normalize_absolute_path(&combined));
+    }
+
+    // Relative path from directory fd.
+    if dirfd >= 0 {
+        let base = {
+            let tab = task.fd_table.lock();
+            let desc = tab.get(dirfd as u32).ok_or(Errno::Ebadf)?;
+            match &desc.object {
+                crate::fs::FileObject::Vnode(v) => {
+                    if v.vtype() != crate::fs::VnodeType::Directory {
+                        return Err(Errno::Enotdir);
+                    }
+                    String::from(v.path())
+                },
+                _ => return Err(Errno::Enotdir),
+            }
+        };
+        let mut combined = String::new();
+        if base == "/" {
+            combined.push('/');
+            combined.push_str(raw_path);
+        } else {
+            combined.push_str(&base);
+            combined.push('/');
+            combined.push_str(raw_path);
+        }
+        return Ok(normalize_absolute_path(&combined));
+    }
+
+    Err(Errno::Einval)
 }

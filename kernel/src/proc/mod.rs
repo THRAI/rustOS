@@ -1,28 +1,23 @@
-//! Process subsystem: Task lifecycle, fork, exec, exit, wait4, signals.
+//! Process subsystem: Task lifecycle, clone/fork, exec, exit, wait4, signals.
 
-pub mod elf;
+pub mod clone;
 pub mod exec;
 pub mod exit_wait;
-pub mod fork;
+
 pub mod pid;
 pub mod signal;
 pub mod syscall_result;
 pub mod task;
 pub mod user_copy;
 
-pub use elf::{parse_elf_first_page, ExecContext};
+pub use clone::{do_clone, CloneFlags, VforkDone};
 pub use exec::do_execve;
-#[cfg(feature = "exec-legacy")]
-pub use exec::exec;
-#[cfg(feature = "exec-legacy")]
-pub use exec::exec_with_args;
 pub use exit_wait::{WaitChildFuture, WaitStatus};
-pub use fork::fork;
 pub use pid::alloc_pid;
 pub use signal::{
-    check_pending_signals, map_sigcode_page, unregister_task, SigAction, SigFrame, SigSet, Signal,
-    SignalState, MAX_SIG, SA_NOCLDWAIT, SIGCHLD, SIGCODE_VA, SIGFRAME_SIZE, SIGKILL, SIGPIPE,
-    SIGSEGV, SIGSTOP, SIG_DFL, SIG_IGN,
+    check_pending_signals, unregister_task, SigAction, SigFrame, SigSet, Signal, SignalState,
+    MAX_SIG, SA_NOCLDWAIT, SIGCHLD, SIGCODE_VA, SIGFRAME_SIZE, SIGKILL, SIGPIPE, SIGSEGV, SIGSTOP,
+    SIG_DFL, SIG_IGN,
 };
 pub(crate) use signal::{find_task_by_pid, for_each_task, kill_pgrp};
 pub use syscall_result::SyscallResult;

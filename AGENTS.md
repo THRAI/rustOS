@@ -17,8 +17,16 @@ kernel/          — Main kernel crate (the only workspace member)
     hal_common/  — Platform-agnostic HAL traits and types
     mm/          — Memory management (pmap, vm, buddy allocator)
     proc/        — Process management (fork, exec, wait, signals)
-    syscall/     — Syscall dispatch and handlers
+      exec/      — ELF loading and execve (IO shell + pure pipeline)
+        mod.rs   — Async IO shell: vnode fetch, pmap wiring, commit
+        elf.rs   — Pure ELF parsing (no kernel types, no IO)
+        exec_ctx.rs — Monadic pipeline: pure VmMap transforms
+    syscall/     — Syscall dispatch and handlers (thin IO shell)
     fs/          — VFS layer, ext4 via lwext4_rust
+      fd_table.rs — BSD 3-layer fd model + seek/fcntl/poll_ready methods
+      stat.rs    — Pure Linux ABI stat/dirent conversion (no IO)
+      path.rs    — Async resolve + normalize/absolutize (pure path algebra)
+      pipe.rs    — Ring buffer + PipeReadFuture/PipeWriteFuture/ConsoleReadFuture
     ipc/         — IPC (futex)
     drivers/     — Block device drivers (virtio)
     executor/    — Async task executor
@@ -30,10 +38,18 @@ kernel/          — Main kernel crate (the only workspace member)
 user/            — Userspace init process (initproc)
 scripts/         — Build helpers, QEMU runner, test images
 judge/           — Automated scoring for OS competition tests
-testcase/        — Test program binaries
+testcase/        — Pre-compiled test binaries (riscv/{musl,glibc})
+testsuits-for-oskernel/ — Upstream test suite source (git submodule)
+Dockerfile       — Multi-stage: Rust toolchain → QEMU test runner
+Dockerfile.ltp   — Dedicated LTP cross-compilation (competition image)
+docker-compose.yml — Two services: oscomp (main) + ltp (opt-in builder)
 ai/              — AI-generated architecture analysis and planning docs
 concept_docs/    — High-level project concept documents
 freebsd-src/     — Partial FreeBSD source tree (C reference)
+                   See freebsd-src/AGENTS.md for BSD architecture reference
+                   covering VM, threading, and kqueue/knote subsystems.
+                   Consult it when working on mm/, proc/, ipc/, or
+                   implementing event-driven / async mechanisms.
 chronix/         — Reference OS kernel project (competition entry)
 delonix/         — Reference OS kernel project (competition entry)
 firmware/        — (reserved, currently empty)
@@ -210,6 +226,77 @@ git config core.hooksPath .githooks
 - **Constants**: `SCREAMING_SNAKE_CASE`
 - **Feature flags** (compile-time): kebab-like in Cargo.toml (`log-boot`, `qemu-test`)
 - **Unsafe blocks**: must have a `// SAFETY:` comment explaining invariants
+
+### Code Style: IO/Pure Separation and Functional Pipelines
+
+Prefer a **functional, monadic style** that cleanly separates IO (side
+effects) from pure transforms.  The exec subsystem (`proc/exec/`) is the
+canonical example and should be used as a template when designing new
+multi-stage kernel operations.
+
+**Guiding principles:**
+
+1. **Separate IO from pure logic at the module level.**  IO (pager
+   fetches, pmap writes, vnode resolution, lock acquisition) belongs in
+   a thin "shell" module.  Pure transforms over data structures belong
+   in their own module.  The shell calls into the pure layer, never the
+   reverse.
+
+2. **Thread state through a single accumulator, not tuples.**  Define a
+   pipeline struct that carries all intermediate state.  Each step
+   consumes `self` and returns `Result<Self, Errno>`.  The caller never
+   destructures intermediate tuples or juggles separate variables
+   between stages.
+
+3. **Use `and_then` chains for fallible sequences.**  A simple `and_then`
+   method on the accumulator gives monadic composition without
+   language-level support:
+
+   ```rust
+   ExecPipeline::new(pmap)
+       .and_then(|p| p.with_segments(&main_elf, ...))?
+       .and_then(|p| p.with_stack())?
+       .finalize_auxv()
+       .with_sigcode()
+   ```
+
+   If any step fails, the partial state drops cleanly and no observable
+   side effects have occurred.
+
+4. **Keep error types local to the pure layer.**  Pure modules should
+   define their own error enum (e.g. `ElfError`) that carries no kernel
+   dependencies.  The IO shell maps these to `Errno` at the boundary —
+   the only bridge between the two worlds.  This keeps the pure module
+   testable in user-space.
+
+5. **Prefer iterators and combinators over mutable loops.**  Use `.iter()`,
+   `.map()`, `.filter()`, `.fold()`, `.collect()` where the logic is a
+   straightforward data transformation.  Reserve `for` loops for cases
+   with complex control flow or early exits that `?` inside a closure
+   cannot express cleanly.
+
+6. **Make the point of no return explicit.**  When an operation has
+   commit semantics (exec, fork, mmap), structure it in stages:
+   - *Stage 1*: IO / validation (can fail, no state change)
+   - *Stage 2*: pure pipeline (can fail, intermediate state drops)
+   - *Stage 3*: commit (infallible swap of old state with new)
+
+   Name the commit function `commit` and document that nothing after it
+   can fail.
+
+**Reference implementation — `proc/exec/`:**
+
+| File | Role | IO? |
+|------|------|-----|
+| `mod.rs` | Async IO shell: vnode fetch, pmap wiring, stack materialization, atomic commit | Yes |
+| `elf.rs` | Pure ELF parsing: `&[u8]` → `ElfParseResult`.  No kernel types, no `Errno`, no logging. | No |
+| `exec_ctx.rs` | Monadic pipeline: `ExecPipeline` accumulator with `with_segments`, `with_stack`, `finalize_auxv`.  Pure `VmMap` transforms, no pager/pmap/lock. | No |
+
+When adding a new multi-stage subsystem (e.g. a new mmap path, a loader,
+a device-attach sequence), follow this three-file pattern:
+- **`mod.rs`** — the IO shell that orchestrates async fetches and commits.
+- **`parse.rs` / `validate.rs`** — pure parsing or validation, own error type.
+- **`pipeline.rs` / `ctx.rs`** — accumulator struct with `and_then`-chainable steps.
 
 ## Cargo Features (compile-time)
 

@@ -53,6 +53,7 @@ impl SyscallId {
     pub const READV: Self = Self(65);
     pub const WRITEV: Self = Self(66);
     pub const SENDFILE: Self = Self(71);
+    pub const PSELECT6: Self = Self(72);
     pub const READLINKAT: Self = Self(78);
     pub const FSTATAT: Self = Self(79);
     pub const SYNC: Self = Self(81);
@@ -101,6 +102,7 @@ impl SyscallId {
     pub const FCNTL: Self = Self(25);
     pub const PPOLL: Self = Self(73);
     pub const UMASK: Self = Self(166);
+    pub const GETRUSAGE: Self = Self(165);
     pub const GETTIMEOFDAY: Self = Self(169);
 }
 
@@ -125,6 +127,7 @@ impl core::fmt::Display for SyscallId {
             Self::WRITE => "write",
             Self::WRITEV => "writev",
             Self::SENDFILE => "sendfile",
+            Self::PSELECT6 => "pselect6",
             Self::READLINKAT => "readlinkat",
             Self::FSTATAT => "fstatat",
             Self::SYNC => "sync",
@@ -173,6 +176,7 @@ impl core::fmt::Display for SyscallId {
             Self::FCNTL => "fcntl",
             Self::PPOLL => "ppoll",
             Self::UMASK => "umask",
+            Self::GETRUSAGE => "getrusage",
             Self::GETTIMEOFDAY => "gettimeofday",
             _ => return write!(f, "unknown({})", self.0),
         };
@@ -462,6 +466,11 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
         SyscallId::SENDFILE => SyscallAction::Return(syscall_error_return(Errno::Einval)),
+        // pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
+        // Stub: behave as immediate timeout (return 0 = nothing ready).
+        // Enough for busybox/musl callers that use pselect6 as a sleep or
+        // non-critical readiness check.
+        SyscallId::PSELECT6 => SyscallAction::Return(0),
         SyscallId::READLINKAT => {
             let ret = match fs::sys_readlinkat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(n) => n,
@@ -636,6 +645,25 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::UMASK => {
             // Stub: return previous umask (0o022), accept silently
             SyscallAction::Return(0o022)
+        },
+        // getrusage(who, usage_ptr) — stub: zero-fill the rusage struct.
+        // Enough for benchmarks that call getrusage to measure user/sys time.
+        SyscallId::GETRUSAGE => {
+            let usage_ptr = a1;
+            if usage_ptr != 0 {
+                // struct rusage is 128 bytes on rv64 (two timeval + 14 longs)
+                let zeros = [0u8; 128];
+                let rc = unsafe {
+                    crate::hal::copy_user_chunk(usage_ptr as *mut u8, zeros.as_ptr(), 128)
+                };
+                if rc != 0 {
+                    SyscallAction::Return(syscall_error_return(Errno::Efault))
+                } else {
+                    SyscallAction::Return(0)
+                }
+            } else {
+                SyscallAction::Return(syscall_error_return(Errno::Efault))
+            }
         },
         SyscallId::FSTATAT => {
             let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2, a3).await {

@@ -15,7 +15,7 @@ use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
     phy::Loopback,
     time::Instant,
-    wire::{HardwareAddress, IpAddress, IpCidr},
+    wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint},
 };
 
 use crate::hal_common::{Errno, IrqSafeSpinLock, KernelResult, Once};
@@ -40,6 +40,8 @@ pub struct Socket {
     pub nonblocking: core::sync::atomic::AtomicBool,
     /// Bound local port (0 = not bound).
     pub local_port: core::sync::atomic::AtomicU16,
+    /// Connected peer endpoint (UDP "connect" stores default remote here).
+    pub connected_peer: spin::Mutex<Option<IpEndpoint>>,
 }
 
 impl Socket {
@@ -49,6 +51,7 @@ impl Socket {
             sock_type,
             nonblocking: core::sync::atomic::AtomicBool::new(false),
             local_port: core::sync::atomic::AtomicU16::new(0),
+            connected_peer: spin::Mutex::new(None),
         }
     }
 
@@ -124,6 +127,22 @@ pub fn init_network() {
     });
 
     crate::kprintln!("net: loopback interface initialized (127.0.0.1/8)");
+}
+
+/// Spawn a background task that periodically drives the smoltcp stack.
+/// Must be called after the executor is initialized.
+pub fn spawn_net_poll_task(cpu: usize) {
+    crate::executor::spawn_kernel_task(
+        async {
+            loop {
+                net_stack().poll_and_wake();
+                crate::executor::sleep(10).await;
+            }
+        },
+        cpu,
+    )
+    .detach();
+    crate::klog!(boot, info, "net: poll task spawned on cpu {}", cpu);
 }
 
 // ---------------------------------------------------------------------------

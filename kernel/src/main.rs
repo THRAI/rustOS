@@ -196,6 +196,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Initialize network subsystem (loopback interface)
         net::init_network();
+        net::spawn_net_poll_task(cpu0);
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {

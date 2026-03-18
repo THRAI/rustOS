@@ -469,6 +469,13 @@ impl FdTable {
                 let cur = desc.get_status_flags();
                 let next = (cur & !settable_mask) | ((arg as u32) & settable_mask);
                 desc.set_status_flags(next);
+                // Propagate O_NONBLOCK to socket if applicable
+                if let FileObject::Socket(ref sock) = desc.object {
+                    sock.nonblocking.store(
+                        (next & FileDescription::O_NONBLOCK) != 0,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 Ok(0)
             },
             _ => Err(Errno::Einval),

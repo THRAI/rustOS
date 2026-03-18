@@ -1163,8 +1163,12 @@ pub async fn sys_write_async(
             match sock.sock_type {
                 crate::net::SocketType::Tcp => crate::net::tcp::tcp_send(&sock, &kbuf).await,
                 crate::net::SocketType::Udp => {
-                    // write() on unconnected UDP has no destination — return error
-                    Err(Errno::Edestaddrreq)
+                    // write() on connected UDP uses stored peer
+                    let peer = sock
+                        .connected_peer
+                        .lock()
+                        .ok_or(Errno::Edestaddrreq)?;
+                    crate::net::udp::udp_sendto(&sock, &kbuf, &peer).await
                 }
             }
         },

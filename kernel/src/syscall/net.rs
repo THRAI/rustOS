@@ -123,6 +123,48 @@ pub async fn sys_accept(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_pt
     }
 }
 
+/// accept4(fd, addr, addrlen, flags) -> new_fd
+///
+/// Like accept but supports SOCK_CLOEXEC and SOCK_NONBLOCK flags.
+pub async fn sys_accept4(
+    task: &Arc<Task>,
+    fd: usize,
+    addr_ptr: usize,
+    addrlen_ptr: usize,
+    flags: usize,
+) -> KernelResult<usize> {
+    let sock = get_socket(task, fd as u32)?;
+    match sock.sock_type {
+        SocketType::Tcp => {
+            let (new_sock, remote_addr) = tcp::tcp_accept(&sock).await?;
+
+            if (flags & SOCK_NONBLOCK) != 0 {
+                new_sock
+                    .nonblocking
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+
+            let fd_flags = if (flags & SOCK_CLOEXEC) != 0 {
+                FdFlags::CLOEXEC
+            } else {
+                FdFlags::empty()
+            };
+
+            let desc = FileDescription::new(FileObject::Socket(new_sock), OpenFlags::RDWR);
+            let new_fd = task.fd_table.lock().insert(desc, fd_flags)?;
+
+            if addr_ptr != 0 {
+                remote_addr.to_user(addr_ptr, addrlen_ptr)?;
+            }
+
+            tcp::tcp_listen(&sock)?;
+
+            Ok(new_fd as usize)
+        }
+        SocketType::Udp => Err(Errno::Eopnotsupp),
+    }
+}
+
 /// connect(fd, addr, addrlen) -> 0
 pub async fn sys_connect(task: &Arc<Task>, fd: usize, addr_ptr: usize, addr_len: usize) -> KernelResult<usize> {
     let sock = get_socket(task, fd as u32)?;
@@ -163,8 +205,10 @@ pub async fn sys_sendto(
             let remote = if addr_ptr != 0 {
                 SockAddrIn4::from_user(addr_ptr, addr_len)?.to_endpoint()
             } else {
-                // Must have been connected
-                return Err(Errno::Edestaddrreq);
+                // Use connected peer if available
+                sock.connected_peer
+                    .lock()
+                    .ok_or(Errno::Edestaddrreq)?
             };
             udp::udp_sendto(&sock, &kbuf, &remote).await
         }
@@ -330,4 +374,101 @@ pub fn sys_shutdown(task: &Arc<Task>, fd: usize, how: usize) -> KernelResult<usi
         SocketType::Udp => {} // UDP shutdown is a no-op
     }
     Ok(0)
+}
+
+/// sendmsg(fd, msg_ptr, flags) -> bytes_sent
+///
+/// Minimal implementation: parse msghdr, use first iovec as buffer,
+/// extract optional destination address, delegate to sendto path.
+pub async fn sys_sendmsg(
+    task: &Arc<Task>,
+    fd: usize,
+    msg_ptr: usize,
+    _flags: usize,
+) -> KernelResult<usize> {
+    if msg_ptr == 0 {
+        return Err(Errno::Efault);
+    }
+
+    // struct msghdr layout on rv64 (each field 8 bytes):
+    //   msg_name(8), msg_namelen(8), msg_iov(8), msg_iovlen(8),
+    //   msg_control(8), msg_controllen(8), msg_flags(4+pad)
+    fault_in_user_buffer(task, msg_ptr, 56, PageFaultAccessType::READ).await;
+    let mut hdr = [0u8; 56];
+    let rc = unsafe { crate::hal::copy_user_chunk(hdr.as_mut_ptr(), msg_ptr as *const u8, 56) };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+
+    let name_ptr = usize::from_le_bytes(hdr[0..8].try_into().unwrap());
+    let name_len = usize::from_le_bytes(hdr[8..16].try_into().unwrap());
+    let iov_ptr = usize::from_le_bytes(hdr[16..24].try_into().unwrap());
+    let iov_len = usize::from_le_bytes(hdr[24..32].try_into().unwrap());
+
+    if iov_len == 0 {
+        return Ok(0);
+    }
+    if iov_ptr == 0 {
+        return Err(Errno::Efault);
+    }
+
+    // Read first iovec (base, len)
+    fault_in_user_buffer(task, iov_ptr, 16, PageFaultAccessType::READ).await;
+    let mut iov = [0u8; 16];
+    let rc = unsafe { crate::hal::copy_user_chunk(iov.as_mut_ptr(), iov_ptr as *const u8, 16) };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+    let buf_ptr = usize::from_le_bytes(iov[0..8].try_into().unwrap());
+    let buf_len = usize::from_le_bytes(iov[8..16].try_into().unwrap());
+
+    // Delegate to sendto
+    sys_sendto(task, fd, buf_ptr, buf_len, 0, name_ptr, name_len).await
+}
+
+/// recvmsg(fd, msg_ptr, flags) -> bytes_read
+///
+/// Minimal implementation: parse msghdr, use first iovec as buffer,
+/// delegate to recvfrom path, write back source address if requested.
+pub async fn sys_recvmsg(
+    task: &Arc<Task>,
+    fd: usize,
+    msg_ptr: usize,
+    _flags: usize,
+) -> KernelResult<usize> {
+    if msg_ptr == 0 {
+        return Err(Errno::Efault);
+    }
+
+    fault_in_user_buffer(task, msg_ptr, 56, PageFaultAccessType::READ).await;
+    let mut hdr = [0u8; 56];
+    let rc = unsafe { crate::hal::copy_user_chunk(hdr.as_mut_ptr(), msg_ptr as *const u8, 56) };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+
+    let name_ptr = usize::from_le_bytes(hdr[0..8].try_into().unwrap());
+    let name_len_ptr = usize::from_le_bytes(hdr[8..16].try_into().unwrap());
+    let iov_ptr = usize::from_le_bytes(hdr[16..24].try_into().unwrap());
+    let iov_len = usize::from_le_bytes(hdr[24..32].try_into().unwrap());
+
+    if iov_len == 0 {
+        return Ok(0);
+    }
+    if iov_ptr == 0 {
+        return Err(Errno::Efault);
+    }
+
+    // Read first iovec
+    fault_in_user_buffer(task, iov_ptr, 16, PageFaultAccessType::READ).await;
+    let mut iov = [0u8; 16];
+    let rc = unsafe { crate::hal::copy_user_chunk(iov.as_mut_ptr(), iov_ptr as *const u8, 16) };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+    let buf_ptr = usize::from_le_bytes(iov[0..8].try_into().unwrap());
+    let buf_len = usize::from_le_bytes(iov[8..16].try_into().unwrap());
+
+    // Delegate to recvfrom
+    sys_recvfrom(task, fd, buf_ptr, buf_len, 0, name_ptr, name_len_ptr).await
 }

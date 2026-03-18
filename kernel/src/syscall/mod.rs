@@ -120,6 +120,7 @@ impl SyscallId {
     pub const SHUTDOWN: Self = Self(210);
     pub const SENDMSG: Self = Self(211);
     pub const RECVMSG: Self = Self(212);
+    pub const ACCEPT4: Self = Self(242);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -208,6 +209,7 @@ impl core::fmt::Display for SyscallId {
             Self::SHUTDOWN => "shutdown",
             Self::SENDMSG => "sendmsg",
             Self::RECVMSG => "recvmsg",
+            Self::ACCEPT4 => "accept4",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -791,6 +793,27 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         },
         SyscallId::SHUTDOWN => {
             let ret = match net::sys_shutdown(task, a0, a1) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::SENDMSG => {
+            let ret = match net::sys_sendmsg(task, a0, a1, a2).await {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::RECVMSG => {
+            let ret = match net::sys_recvmsg(task, a0, a1, a2).await {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::ACCEPT4 => {
+            let ret = match net::sys_accept4(task, a0, a1, a2, a3).await {
                 Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };

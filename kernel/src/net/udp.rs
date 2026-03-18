@@ -61,6 +61,9 @@ pub fn udp_connect(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<IpEndpoint
         })?;
     }
 
+    // Store connected peer for sendto with no address
+    *sock.connected_peer.lock() = Some(remote);
+
     Ok(remote)
 }
 

@@ -3,6 +3,11 @@
 //! Bit layout follows RISC-V Privileged Spec §4.4 (Sv39) and
 //! FreeBSD `sys/riscv/include/pte.h` for RSW software bits.
 
+#[cfg(target_arch = "loongarch64")]
+pub use crate::hal::la64::paging::pte::{
+    encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa, PteFlags,
+};
+#[cfg(target_arch = "riscv64")]
 pub use crate::hal::rv64::paging::pte::{
     encode_pte, map_perm_to_pte_flags, pte_flags, pte_is_leaf, pte_is_valid, pte_pa, PteFlags,
 };

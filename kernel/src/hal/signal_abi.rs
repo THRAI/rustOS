@@ -69,10 +69,12 @@ pub fn setup_signal_entry(
         tf.set_arg(2, ucontext_ptr);
         tf.set_sp(new_sp);
         tf.set_ra(restorer.unwrap_or(sigcode_va()));
-        tf.sstatus = (tf.sstatus & !(1 << 8)) | (1 << 5);
-        if tf.sstatus & (3 << 13) == 0 {
-            tf.sstatus |= 1 << 13;
+        let mut status = tf.status();
+        status = (status & !(1 << 8)) | (1 << 5);
+        if status & (3 << 13) == 0 {
+            status |= 1 << 13;
         }
+        tf.set_status(status);
     }
     #[cfg(target_arch = "loongarch64")]
     {
@@ -107,10 +109,12 @@ pub fn restore_after_sigreturn(tf: &mut TrapFrame, saved: &TrapFrame) -> Result<
     {
         validate_sigreturn_frame(saved)?;
         *tf = *saved;
-        tf.sstatus = (saved.sstatus & !(1 << 8)) | (1 << 5);
-        if tf.sstatus & (3 << 13) == 0 {
-            tf.sstatus |= 1 << 13;
+        let mut status = saved.status();
+        status = (status & !(1 << 8)) | (1 << 5);
+        if status & (3 << 13) == 0 {
+            status |= 1 << 13;
         }
+        tf.set_status(status);
         Ok(())
     }
     #[cfg(target_arch = "loongarch64")]

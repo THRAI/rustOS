@@ -7,11 +7,25 @@
 
 #[inline]
 pub fn has_pending(cpu_id: usize) -> bool {
-    crate::hal::rv64::paging::shootdown::has_pending(cpu_id)
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::hal::rv64::paging::shootdown::has_pending(cpu_id)
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        crate::hal::la64::paging::shootdown::has_pending(cpu_id)
+    }
 }
 
 pub fn handle_shootdown_ipi(cpu_id: usize) {
-    crate::hal::rv64::paging::shootdown::handle_shootdown_ipi(cpu_id)
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::hal::rv64::paging::shootdown::handle_shootdown_ipi(cpu_id)
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        crate::hal::la64::paging::shootdown::handle_shootdown_ipi(cpu_id)
+    }
 }
 
 pub fn pmap_shootdown(
@@ -20,9 +34,23 @@ pub fn pmap_shootdown(
     va_end: usize,
     asid: u16,
 ) {
-    crate::hal::rv64::paging::shootdown::pmap_shootdown(active, va_start, va_end, asid)
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::hal::rv64::paging::shootdown::pmap_shootdown(active, va_start, va_end, asid)
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        crate::hal::la64::paging::shootdown::pmap_shootdown(active, va_start, va_end, asid)
+    }
 }
 
 pub fn ipi_broadcast_flush_all() {
-    crate::hal::rv64::paging::shootdown::ipi_broadcast_flush_all()
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::hal::rv64::paging::shootdown::ipi_broadcast_flush_all()
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        crate::hal::la64::paging::shootdown::ipi_broadcast_flush_all()
+    }
 }

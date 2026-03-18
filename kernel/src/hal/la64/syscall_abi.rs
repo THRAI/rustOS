@@ -1,5 +1,12 @@
 use crate::hal_common::trap_frame::TrapFrame;
 
+/// Current la64 user ABI policy for rustOS bring-up:
+/// - syscall number: `a7`
+/// - arguments: `a0..a5`
+/// - return value: `a0`
+///
+/// This matches the LoongArch Linux userspace syscall convention used by musl.
+
 #[inline]
 pub fn nr(tf: &TrapFrame) -> usize {
     tf.syscall_nr()

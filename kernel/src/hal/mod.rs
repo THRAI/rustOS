@@ -18,15 +18,6 @@ pub use cpu::{
     disable_local_irq_save, idle_once, local_irq_disable, local_irq_enable, local_irq_is_enabled,
     read_cpu_local_ptr, restore_local_irq, write_cpu_local_ptr,
 };
-pub use paging::{
-    alloc_asid, broadcast_flush_all, create_arch_root_mappings, global_asid_generation,
-    handle_shootdown_ipi, pmap_activate as activate_pmap, pmap_deactivate as deactivate_pmap,
-    shootdown,
-};
-pub use platform::{
-    boot_id_to_cpu, boot_secondary_cpus, cpu_to_boot_id, init_external_irq_this_cpu,
-    parse_boot_platform, platform, shutdown, stop_this_cpu,
-};
 #[cfg(target_arch = "loongarch64")]
 pub use la64::{
     ipi::{handle_ipi, send_ipi},
@@ -36,6 +27,15 @@ pub use la64::{
     tlb::{flush_all, flush_asid},
     trap as arch_trap, uart,
     uart::init as init_uart,
+};
+pub use paging::{
+    alloc_asid, broadcast_flush_all, create_arch_root_mappings, global_asid_generation,
+    handle_shootdown_ipi, pmap_activate as activate_pmap, pmap_deactivate as deactivate_pmap,
+    shootdown,
+};
+pub use platform::{
+    boot_id_to_cpu, boot_secondary_cpus, cpu_to_boot_id, init_external_irq_this_cpu,
+    parse_boot_platform, platform, shutdown, stop_this_cpu,
 };
 #[cfg(target_arch = "riscv64")]
 pub use rv64::{

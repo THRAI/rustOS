@@ -43,20 +43,46 @@ mod proc;
 mod syscall;
 mod trap;
 
-// Include boot assembly
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("hal/rv64/boot.S"));
-// Include trap assembly
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("hal/rv64/trap.S"));
-// Include memset/memcpy/memmove assembly (ported from FreeBSD)
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("hal/rv64/memops.S"));
+
+#[cfg(target_arch = "loongarch64")]
+global_asm!(include_str!("hal/la64/boot.S"));
+#[cfg(target_arch = "loongarch64")]
+global_asm!(include_str!("hal/la64/trap.S"));
+#[cfg(target_arch = "loongarch64")]
+global_asm!(include_str!("hal/la64/memops.S"));
 
 /// Atomic flag: first hart to reach rust_main claims boot role.
 static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Entry point called from boot.S
-/// a0 = hartid, a1 = dtb_ptr
-/// OpenSBI can pick any hart as boot hart, so we use an atomic flag.
+#[inline]
+fn la64_kernel_only_bringup() -> bool {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        true
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        false
+    }
+}
+
+/// Entry point called from the active architecture's boot stub.
+///
+/// Current boot-stub contract:
+/// - `arg0` (`hartid` here) carries the boot CPU identifier
+/// - `arg1` (`dtb_ptr` here) carries a firmware/device-tree blob pointer
+///
+/// The exact firmware source differs by architecture. rv64 currently follows
+/// the OpenSBI convention; la64 bring-up uses the same Rust signature while the
+/// backend boot contract is still being stabilized.
 #[no_mangle]
 pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     if !BOOT_HART_CLAIMED.swap(true, core::sync::atomic::Ordering::AcqRel) {
@@ -117,6 +143,17 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
         // Arm the first timer interrupt (10ms interval)
         hal::init_this_cpu_timer();
+
+        if la64_kernel_only_bringup() {
+            kprintln!("la64 kernel-only bring-up: skipping fs/init/userland path");
+            hal::local_irq_enable();
+            klog!(
+                boot,
+                info,
+                "interrupts enabled, entering kernel-only executor loop"
+            );
+            executor::executor_loop();
+        }
 
         // Initialize frame allocator with physical memory after kernel image
         {

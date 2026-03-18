@@ -4,6 +4,14 @@ HOST_TARGET := $(shell rustc -vV | grep host | cut -d' ' -f2)
 UNAME_S := $(shell uname -s)
 ARCH ?= rv64
 
+# LA64 bring-up note:
+# - `cargo build -p kernel --target loongarch64-unknown-none` currently reaches
+#   the external C dependency build for `lwext4_rust`.
+# - That path expects a host-visible `loongarch64-linux-musl-cc` toolchain
+#   (and matching binutils such as `ar`) for the ext4 C library build.
+# - Until that toolchain is installed or the ext4 path is gated off for
+#   kernel-only bring-up, la64 kernel builds may fail before reaching HAL code.
+
 TARGET_rv64 := riscv64gc-unknown-none-elf
 TARGET_la64 := loongarch64-unknown-none
 KERNEL_ELF_rv64 := target/$(TARGET_rv64)/release/kernel
@@ -18,6 +26,10 @@ USER_LINKER_rv64 := src/linker.ld
 USER_LINKER_la64 := src/linker-la64.ld
 USER_RUSTFLAGS_rv64 := -Clink-arg=-Tsrc/linker.ld
 USER_RUSTFLAGS_la64 := -Clink-arg=-Tsrc/linker-la64.ld
+KERNEL_LINKER_rv64 := kernel/linker/rv64-qemu.ld
+KERNEL_LINKER_la64 := kernel/linker/la64-qemu.ld
+KERNEL_RUSTFLAGS_rv64 := -Clink-arg=-Tkernel/linker/rv64-qemu.ld
+KERNEL_RUSTFLAGS_la64 := -Clink-arg=-Tkernel/linker/la64-qemu.ld
 
 QEMU_rv64 := qemu-system-riscv64
 QEMU_la64 := qemu-system-loongarch64
@@ -38,6 +50,8 @@ KERNEL_BIN = $(KERNEL_BIN_$(ARCH))
 USER_INSTALL = $(USER_INSTALL_$(ARCH))
 USER_LINKER = $(USER_LINKER_$(ARCH))
 USER_RUSTFLAGS = $(USER_RUSTFLAGS_$(ARCH))
+KERNEL_LINKER = $(KERNEL_LINKER_$(ARCH))
+KERNEL_RUSTFLAGS = $(KERNEL_RUSTFLAGS_$(ARCH))
 QEMU = $(QEMU_$(ARCH))
 QEMU_FLAGS = $(QEMU_$(ARCH)_FLAGS)
 DISK_IMG = $(DISK_IMG_$(ARCH))
@@ -94,7 +108,7 @@ kernel-rv:
 	cp $(KERNEL_ELF_rv64) kernel-rv
 
 kernel:
-	cargo build --release -p kernel --target $(TARGET) $(_CARGO_LOG)
+	cargo build --release -p kernel --target $(TARGET) $(_CARGO_LOG) --config 'target.$(TARGET).rustflags=["-C","link-arg=-T$(CURDIR)/$(KERNEL_LINKER)"]'
 	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
 kernel-rv64: ARCH=rv64
@@ -376,6 +390,8 @@ clean:
 # Create zig-based riscv64-linux-musl-cc/ar wrappers (matches CI).
 # Replaces any existing wrappers that may use newlib headers (which break lwext4).
 # Requires: zig (brew install zig)
+# Note: la64 bring-up needs analogous `loongarch64-linux-musl-cc/ar` wrappers or
+# a real loongarch64 musl cross toolchain in PATH when building ext4 dependencies.
 WRAPPER_DIR ?= $(HOME)/.local/bin
 setup-toolchain:
 	@command -v zig >/dev/null 2>&1 || (echo "ERROR: zig not found. Install with: brew install zig"; exit 1)

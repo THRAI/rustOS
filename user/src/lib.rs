@@ -5,11 +5,13 @@ use core::arch::global_asm;
 mod console;
 mod syscall;
 
-global_asm!(include_str!("entry.S"));
+#[cfg(target_arch = "riscv64")]
+global_asm!(include_str!("entry-rv64.S"));
 
-pub use syscall::{
-    execve, exit, fork, getpid, shutdown, wait, waitpid, write, yield_,
-};
+#[cfg(target_arch = "loongarch64")]
+global_asm!(include_str!("entry-la64.S"));
+
+pub use syscall::{execve, exit, fork, getpid, shutdown, wait, waitpid, write, yield_};
 
 pub fn print(args: core::fmt::Arguments<'_>) {
     console::print(args);

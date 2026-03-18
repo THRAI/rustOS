@@ -104,10 +104,43 @@ impl Pmap {
                 None
             }
         }
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(target_arch = "loongarch64")]
         {
-            None
+            if level <= 1 {
+                let frame = super::allocator::alloc_pte_l1_sync()
+                    .expect("failed to allocate la64 next-level page table");
+                let pa = frame.phys();
+                pmap_zero_page(pa);
+                self.l1_directories.push(frame);
+                Some(pa)
+            } else if level == 2 {
+                let frame = super::allocator::alloc_pte_l0_sync()
+                    .expect("failed to allocate la64 leaf page table");
+                let pa = frame.phys();
+                pmap_zero_page(pa);
+                self.l0_tables.push(frame);
+                Some(pa)
+            } else {
+                None
+            }
         }
+    }
+}
+
+#[inline]
+unsafe fn walk_pte(
+    root_pa: PhysAddr,
+    va: VirtAddr,
+    alloc: bool,
+    allocator: &mut dyn FnMut(usize) -> Option<PhysAddr>,
+) -> Option<*mut u64> {
+    #[cfg(target_arch = "riscv64")]
+    {
+        unsafe { crate::hal::rv64::paging::walk_sv39(root_pa, va, alloc, allocator) }
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        unsafe { crate::hal::la64::paging::walk(root_pa, va, alloc, allocator) }
     }
 }
 
@@ -118,9 +151,9 @@ impl Pmap {
 //TODO: make them impls of Pmap
 /// Create a new address space with an empty root page table.
 pub fn pmap_create() -> Pmap {
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     let (root_frame, l1_frame) = crate::hal::create_arch_root_mappings();
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     let (root_frame, l1_frame) = {
         let dummy_root = Box::leak(Box::new(VmPage::new()));
         let dummy_l1 = Box::leak(Box::new(VmPage::new()));
@@ -132,9 +165,9 @@ pub fn pmap_create() -> Pmap {
     Pmap {
         l0_tables: Vec::new(),
         l1_directories: {
-            #[cfg(target_arch = "riscv64")]
+            #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
             let v = Vec::from([l1_frame]);
-            #[cfg(not(target_arch = "riscv64"))]
+            #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
             let v = Vec::new();
             v
         },
@@ -205,7 +238,7 @@ pub fn pmap_enter(
     }
 
     unsafe {
-        let pte_ptr = crate::hal::paging::walk_sv39(pmap.root.phys(), va, true, &mut |level| {
+        let pte_ptr = walk_pte(pmap.root.phys(), va, true, &mut |level| {
             pmap.alloc_pt_page(level)
         })
         .ok_or(())?;
@@ -252,12 +285,9 @@ pub fn pmap_remove(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr) {
     let mut va = va_start.as_usize();
     while va < va_end.as_usize() {
         unsafe {
-            if let Some(pte_ptr) = crate::hal::paging::walk_sv39(
-                pmap.root.phys(),
-                VirtAddr::new(va),
-                false,
-                &mut |_| None,
-            ) {
+            if let Some(pte_ptr) =
+                walk_pte(pmap.root.phys(), VirtAddr::new(va), false, &mut |_| None)
+            {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) {
                     pte_ptr.write_volatile(0);
@@ -291,12 +321,9 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
     let mut va = va_start.as_usize();
     while va < va_end.as_usize() {
         unsafe {
-            if let Some(pte_ptr) = crate::hal::paging::walk_sv39(
-                pmap.root.phys(),
-                VirtAddr::new(va),
-                false,
-                &mut |_| None,
-            ) {
+            if let Some(pte_ptr) =
+                walk_pte(pmap.root.phys(), VirtAddr::new(va), false, &mut |_| None)
+            {
                 let old = pte_ptr.read_volatile();
                 if pte_is_valid(old) && pte_is_leaf(old) {
                     let pa = pte_pa(old);
@@ -325,7 +352,7 @@ pub fn pmap_protect(pmap: &mut Pmap, va_start: VirtAddr, va_end: VirtAddr, prot:
 pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
     unsafe {
         let mut no_alloc = |_| None;
-        let pte_ptr = crate::hal::paging::walk_sv39(pmap.root.phys(), va, false, &mut no_alloc)?;
+        let pte_ptr = walk_pte(pmap.root.phys(), va, false, &mut no_alloc)?;
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) && pte_is_leaf(raw) {
             Some(PhysAddr::new(pte_pa(raw) | va.page_offset()))
@@ -339,7 +366,7 @@ pub fn pmap_extract(pmap: &Pmap, va: VirtAddr) -> Option<PhysAddr> {
 /// Returns None if the page is not mapped (no valid leaf PTE).
 pub fn pmap_extract_with_flags(pmap: &Pmap, va: VirtAddr) -> Option<(PhysAddr, PteFlags)> {
     unsafe {
-        let pte_ptr = crate::hal::paging::walk_sv39(pmap.root.phys(), va, false, &mut |_| None)?;
+        let pte_ptr = walk_pte(pmap.root.phys(), va, false, &mut |_| None)?;
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) && pte_is_leaf(raw) {
             Some((
@@ -355,7 +382,6 @@ pub fn pmap_extract_with_flags(pmap: &Pmap, va: VirtAddr) -> Option<(PhysAddr, P
 /// Activate this pmap on the current CPU: write satp, set pm_active.
 ///
 /// If the pmap's generation is stale, re-allocate an ASID first.
-#[cfg(target_arch = "riscv64")]
 pub fn pmap_activate(pmap: &mut Pmap) {
     // Lazy ASID revalidation.
     if pmap.generation != crate::hal::global_asid_generation() {
@@ -371,7 +397,6 @@ pub fn pmap_activate(pmap: &mut Pmap) {
 }
 
 /// Deactivate this pmap on the current CPU: clear pm_active.
-#[cfg(target_arch = "riscv64")]
 pub fn pmap_deactivate(pmap: &mut Pmap) {
     let cpu_id = crate::executor::current().cpu_id;
     pmap.active[cpu_id].store(false, Ordering::Release);
@@ -381,11 +406,10 @@ pub fn pmap_deactivate(pmap: &mut Pmap) {
 /// Returns true if the fault was resolved (PTE updated), false otherwise.
 pub fn pmap_fault(pmap: &Pmap, va: VirtAddr, write: bool) -> bool {
     unsafe {
-        let pte_ptr =
-            match crate::hal::paging::walk_sv39(pmap.root.phys(), va, false, &mut |_| None) {
-                Some(p) => p,
-                None => return false,
-            };
+        let pte_ptr = match walk_pte(pmap.root.phys(), va, false, &mut |_| None) {
+            Some(p) => p,
+            None => return false,
+        };
         let raw = pte_ptr.read_volatile();
         if !pte_is_valid(raw) || !pte_is_leaf(raw) {
             return false;
@@ -465,11 +489,10 @@ pub fn pmap_enter_range(pmap: &mut Pmap, pa_start: usize, pa_end: usize, prot: M
 
 fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
     unsafe {
-        let pte_ptr =
-            match crate::hal::paging::walk_sv39(pmap.root.phys(), va, false, &mut |_| None) {
-                Some(p) => p,
-                None => return false,
-            };
+        let pte_ptr = match walk_pte(pmap.root.phys(), va, false, &mut |_| None) {
+            Some(p) => p,
+            None => return false,
+        };
         let raw = pte_ptr.read_volatile();
         pte_is_valid(raw) && pte_flags(raw).contains(bit)
     }
@@ -477,11 +500,10 @@ fn pte_bit_check(pmap: &Pmap, va: VirtAddr, bit: PteFlags) -> bool {
 
 fn pte_bit_clear(pmap: &mut Pmap, va: VirtAddr, bit: PteFlags) {
     unsafe {
-        let pte_ptr =
-            match crate::hal::paging::walk_sv39(pmap.root.phys(), va, false, &mut |_| None) {
-                Some(p) => p,
-                None => return,
-            };
+        let pte_ptr = match walk_pte(pmap.root.phys(), va, false, &mut |_| None) {
+            Some(p) => p,
+            None => return,
+        };
         let raw = pte_ptr.read_volatile();
         if pte_is_valid(raw) {
             let flags = pte_flags(raw) & !bit;

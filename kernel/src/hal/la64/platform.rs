@@ -1,8 +1,10 @@
-use crate::executor::per_cpu::MAX_CPUS;
+use crate::{executor::per_cpu::MAX_CPUS, hal_common::Once};
 
 pub const MAX_HARTS: usize = 64;
 const MAX_VIRTIO_MMIO: usize = 8;
 const MAX_MEMORY_REGIONS: usize = 4;
+const QEMU_VIRT_UART_BASE: usize = 0x1fe0_01e0;
+const QEMU_VIRT_UART_IRQ: u32 = 66;
 
 #[derive(Debug, Copy, Clone)]
 pub struct MemRegion {
@@ -32,33 +34,41 @@ pub struct PlatformInfo {
     pub hartids: [usize; MAX_CPUS],
 }
 
-static PLATFORM: PlatformInfo = PlatformInfo {
-    uart_base: 0,
-    uart_irq: 0,
-    plic_base: 0,
-    plic_size: 0,
-    virtio_mmio: [None; MAX_VIRTIO_MMIO],
-    virtio_count: 0,
-    memory: [MemRegion { base: 0, size: 0 }; MAX_MEMORY_REGIONS],
-    memory_count: 0,
-    hart_to_cpu: [None; MAX_HARTS],
-    cpu_to_hart: [0; MAX_CPUS],
-    num_cpus: 1,
-    hartids: [0; MAX_CPUS],
-};
+static PLATFORM: Once<PlatformInfo> = Once::new();
 
-pub fn parse_boot_platform(_boot_info_ptr: usize) {}
+pub fn parse_boot_platform(_boot_info_ptr: usize) {
+    PLATFORM.call_once(|| PlatformInfo {
+        uart_base: QEMU_VIRT_UART_BASE,
+        uart_irq: QEMU_VIRT_UART_IRQ,
+        plic_base: 0,
+        plic_size: 0,
+        virtio_mmio: [None; MAX_VIRTIO_MMIO],
+        virtio_count: 0,
+        memory: [MemRegion { base: 0, size: 0 }; MAX_MEMORY_REGIONS],
+        memory_count: 0,
+        hart_to_cpu: {
+            let mut map = [None; MAX_HARTS];
+            map[0] = Some(0);
+            map
+        },
+        cpu_to_hart: [0; MAX_CPUS],
+        num_cpus: 1,
+        hartids: [0; MAX_CPUS],
+    });
+}
 
 pub fn platform() -> &'static PlatformInfo {
-    &PLATFORM
+    PLATFORM
+        .get()
+        .expect("la64 platform() called before parse_boot_platform()")
 }
 
 pub fn boot_id_to_cpu(boot_id: usize) -> Option<usize> {
-    PLATFORM.hart_to_cpu.get(boot_id).copied().flatten()
+    platform().hart_to_cpu.get(boot_id).copied().flatten()
 }
 
 pub fn cpu_to_boot_id(cpu_id: usize) -> usize {
-    PLATFORM.cpu_to_hart.get(cpu_id).copied().unwrap_or(0)
+    platform().cpu_to_hart.get(cpu_id).copied().unwrap_or(0)
 }
 
 pub fn init_external_irq_this_cpu(_boot_id: usize) {}

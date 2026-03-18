@@ -80,7 +80,7 @@ async fn run_tasks(task: Arc<Task>) {
             "PRE-SRET pid={} a0={:#x} sepc={:#x} sp={:#x} ra={:#x}",
             task.pid,
             task.trap_frame.lock().arg(0),
-            task.trap_frame.lock().sepc,
+            task.trap_frame.lock().pc(),
             task.trap_frame.lock().sp(),
             task.trap_frame.lock().ra()
         );
@@ -191,7 +191,7 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                 Err(e) => {
                     // No fixup here — kernel-mode copy_user faults are handled in
                     // the HAL trap path via pcb_onfault.
-                    let pc = task.trap_frame.lock().sepc;
+                    let pc = task.trap_frame.lock().pc();
                     klog!(
                         trap,
                         error,

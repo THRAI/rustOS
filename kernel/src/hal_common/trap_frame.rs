@@ -53,6 +53,18 @@ impl TrapFrame {
         self.sepc = val;
     }
 
+    /// Architecture-private status snapshot.
+    #[inline]
+    pub fn status(&self) -> usize {
+        self.sstatus
+    }
+
+    /// Set architecture-private status snapshot.
+    #[inline]
+    pub fn set_status(&mut self, val: usize) {
+        self.sstatus = val;
+    }
+
     /// Advance the program counter to the next instruction (useful for skipping ecall).
     #[inline]
     pub fn advance_pc(&mut self) {
@@ -136,9 +148,21 @@ impl TrapFrame {
         self.scause
     }
 
+    /// Architecture-private cause snapshot.
+    #[inline]
+    pub fn cause_bits(&self) -> usize {
+        self.scause
+    }
+
     /// Supervisor trap value.
     #[inline]
     pub fn stval(&self) -> usize {
+        self.stval
+    }
+
+    /// Architecture-private fault address / trap auxiliary value.
+    #[inline]
+    pub fn fault_addr(&self) -> usize {
         self.stval
     }
 

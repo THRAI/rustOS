@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::{
     fs::{Pipe, Vnode},
     hal_common::Errno,
+    net::Socket,
 };
 
 /// Maximum number of file descriptors per process.
@@ -76,6 +77,8 @@ pub enum FileObject {
     PipeWrite(Arc<Pipe>),
     /// Static device node.
     Device(DeviceKind),
+    /// Network socket.
+    Socket(Arc<Socket>),
 }
 
 impl Drop for FileObject {
@@ -83,6 +86,7 @@ impl Drop for FileObject {
         match self {
             FileObject::PipeRead(pipe) => pipe.close_read(),
             FileObject::PipeWrite(pipe) => pipe.close_write(),
+            // Socket cleanup handled by Arc<Socket>::drop
             _ => {},
         }
     }
@@ -131,6 +135,18 @@ impl FileObject {
             },
             FileObject::Vnode(_) => {
                 revents |= events_in & (POLLIN | POLLOUT);
+            },
+            FileObject::Socket(sock) => {
+                let state = sock.poll_ready();
+                if state.readable {
+                    revents |= POLLIN;
+                }
+                if state.writable {
+                    revents |= POLLOUT;
+                }
+                if state.hangup {
+                    revents |= POLLHUP;
+                }
             },
         }
         revents
@@ -192,7 +208,7 @@ impl FileDescription {
 
         match &self.object {
             FileObject::PipeRead(_) | FileObject::PipeWrite(_) => return Err(Errno::Espipe),
-            FileObject::Device(_) => return Err(Errno::Espipe),
+            FileObject::Device(_) | FileObject::Socket(_) => return Err(Errno::Espipe),
             FileObject::Vnode(_) => {},
         }
 

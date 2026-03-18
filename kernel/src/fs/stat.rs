@@ -101,6 +101,9 @@ pub fn fill_stat_from_file_object(obj: &FileObject) -> LinuxStat {
                 DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite => 0x0501,
             };
         },
+        FileObject::Socket(_) => {
+            st.st_mode = 0o140777; // S_IFSOCK | rwx
+        },
     }
     st
 }

@@ -185,6 +185,7 @@ pub fn stat(
         },
         FileObject::Device(_) => Ok((0, 3)),
         FileObject::PipeRead(_) | FileObject::PipeWrite(_) => Ok((0, 4)),
+        FileObject::Socket(_) => Ok((0, 5)),
     }
 }
 
@@ -852,6 +853,7 @@ pub async fn sys_read_async(
         DevNull,
         DevZero,
         DevConsole,
+        Socket(alloc::sync::Arc<crate::net::Socket>),
     }
 
     let (source, desc) = {
@@ -872,6 +874,7 @@ pub async fn sys_read_async(
             FileObject::Device(DeviceKind::Zero) => ReadSource::DevZero,
             FileObject::Device(DeviceKind::ConsoleRead) => ReadSource::DevConsole,
             FileObject::Device(DeviceKind::ConsoleWrite) => return Err(Errno::Ebadf),
+            FileObject::Socket(s) => ReadSource::Socket(Arc::clone(s)),
         };
         (src, Arc::clone(d))
     };
@@ -951,6 +954,26 @@ pub async fn sys_read_async(
                 .store(offset, core::sync::atomic::Ordering::Relaxed);
             Ok(total)
         },
+        ReadSource::Socket(sock) => {
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::WRITE).await;
+            let mut kbuf = alloc::vec![0u8; len];
+            let n = match sock.sock_type {
+                crate::net::SocketType::Tcp => crate::net::tcp::tcp_recv(&sock, &mut kbuf).await?,
+                crate::net::SocketType::Udp => {
+                    let (n, _) = crate::net::udp::udp_recvfrom(&sock, &mut kbuf).await?;
+                    n
+                }
+            };
+            if n > 0 {
+                let rc = unsafe {
+                    crate::hal::copy_user_chunk(user_buf as *mut u8, kbuf.as_ptr(), n)
+                };
+                if rc != 0 {
+                    return Err(Errno::Efault);
+                }
+            }
+            Ok(n)
+        },
     }
 }
 
@@ -976,6 +999,7 @@ pub async fn sys_write_async(
             offset: u64,
             append: bool,
         },
+        Socket(alloc::sync::Arc<crate::net::Socket>),
     }
 
     let (target, desc) = {
@@ -992,6 +1016,7 @@ pub async fn sys_write_async(
             },
             FileObject::PipeWrite(p) => WriteTarget::PipeWrite(Arc::clone(p)),
             FileObject::PipeRead(_) => return Err(Errno::Ebadf),
+            FileObject::Socket(s) => WriteTarget::Socket(Arc::clone(s)),
             FileObject::Vnode(v) => WriteTarget::Vnode {
                 path: String::from(v.path()),
                 offset: d.offset.load(core::sync::atomic::Ordering::Relaxed),
@@ -1126,10 +1151,25 @@ pub async fn sys_write_async(
 
             Ok(total)
         },
+        WriteTarget::Socket(sock) => {
+            fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::READ).await;
+            let mut kbuf = alloc::vec![0u8; len];
+            let rc = unsafe {
+                crate::hal::copy_user_chunk(kbuf.as_mut_ptr(), user_buf as *const u8, len)
+            };
+            if rc != 0 {
+                return Err(Errno::Efault);
+            }
+            match sock.sock_type {
+                crate::net::SocketType::Tcp => crate::net::tcp::tcp_send(&sock, &kbuf).await,
+                crate::net::SocketType::Udp => {
+                    // write() on unconnected UDP has no destination — return error
+                    Err(Errno::Edestaddrreq)
+                }
+            }
+        },
     }
 }
-
-/// sys_readv_async: read into multiple buffers.
 pub async fn sys_readv_async(
     task: &Arc<Task>,
     fd: u32,

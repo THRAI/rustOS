@@ -39,6 +39,7 @@ mod ipc;
 mod libc_stubs;
 mod lockdep;
 mod mm;
+mod net;
 mod proc;
 mod syscall;
 mod trap;
@@ -192,6 +193,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Spawn the UBC page daemon (flushes dirty VmObject pages to disk)
         mm::vm::page_daemon::spawn_page_daemon();
         klog!(boot, info, "page daemon spawned");
+
+        // Initialize network subsystem (loopback interface)
+        net::init_network();
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {

@@ -15,6 +15,7 @@ use crate::{
 pub mod fs;
 pub mod memory;
 pub mod misc;
+pub mod net;
 pub mod process;
 pub mod signal;
 pub mod sync;
@@ -104,6 +105,21 @@ impl SyscallId {
     pub const UMASK: Self = Self(166);
     pub const GETRUSAGE: Self = Self(165);
     pub const GETTIMEOFDAY: Self = Self(169);
+    // Network syscalls
+    pub const SOCKET: Self = Self(198);
+    pub const BIND: Self = Self(200);
+    pub const LISTEN: Self = Self(201);
+    pub const ACCEPT: Self = Self(202);
+    pub const CONNECT: Self = Self(203);
+    pub const GETSOCKNAME: Self = Self(204);
+    pub const GETPEERNAME: Self = Self(205);
+    pub const SENDTO: Self = Self(206);
+    pub const RECVFROM: Self = Self(207);
+    pub const SETSOCKOPT: Self = Self(208);
+    pub const GETSOCKOPT: Self = Self(209);
+    pub const SHUTDOWN: Self = Self(210);
+    pub const SENDMSG: Self = Self(211);
+    pub const RECVMSG: Self = Self(212);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -178,6 +194,20 @@ impl core::fmt::Display for SyscallId {
             Self::UMASK => "umask",
             Self::GETRUSAGE => "getrusage",
             Self::GETTIMEOFDAY => "gettimeofday",
+            Self::SOCKET => "socket",
+            Self::BIND => "bind",
+            Self::LISTEN => "listen",
+            Self::ACCEPT => "accept",
+            Self::CONNECT => "connect",
+            Self::GETSOCKNAME => "getsockname",
+            Self::GETPEERNAME => "getpeername",
+            Self::SENDTO => "sendto",
+            Self::RECVFROM => "recvfrom",
+            Self::SETSOCKOPT => "setsockopt",
+            Self::GETSOCKOPT => "getsockopt",
+            Self::SHUTDOWN => "shutdown",
+            Self::SENDMSG => "sendmsg",
+            Self::RECVMSG => "recvmsg",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -677,6 +707,91 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::FSTATAT => {
             let ret = match fs::sys_fstatat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(()) => 0,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        // ---- Network syscalls ----
+        SyscallId::SOCKET => {
+            let ret = match net::sys_socket(task, a0, a1, a2) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::BIND => {
+            let ret = match net::sys_bind(task, a0, a1, a2) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::LISTEN => {
+            let ret = match net::sys_listen(task, a0, a1) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::ACCEPT => {
+            let ret = match net::sys_accept(task, a0, a1, a2).await {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::CONNECT => {
+            let ret = match net::sys_connect(task, a0, a1, a2).await {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::GETSOCKNAME => {
+            let ret = match net::sys_getsockname(task, a0, a1, a2) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::GETPEERNAME => {
+            let ret = match net::sys_getpeername(task, a0, a1, a2) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::SENDTO => {
+            let ret = match net::sys_sendto(task, a0, a1, a2, a3, a4, a5).await {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::RECVFROM => {
+            let ret = match net::sys_recvfrom(task, a0, a1, a2, a3, a4, a5).await {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::SETSOCKOPT => {
+            let ret = match net::sys_setsockopt(task, a0, a1, a2, a3, a4) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::GETSOCKOPT => {
+            let ret = match net::sys_getsockopt(task, a0, a1, a2, a3, a4) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::SHUTDOWN => {
+            let ret = match net::sys_shutdown(task, a0, a1) {
+                Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)

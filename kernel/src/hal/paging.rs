@@ -79,7 +79,7 @@ pub fn flush_addr_asid(vaddr: usize, asid: usize) {
     }
 }
 
-pub fn create_arch_root_mappings() -> (&'static mut VmPage, &'static mut VmPage) {
+pub fn create_arch_root_mappings() -> (&'static VmPage, &'static VmPage) {
     #[cfg(target_arch = "riscv64")]
     {
         crate::hal::rv64::paging::create_arch_root_mappings()

@@ -24,7 +24,8 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain nightly-2025-06-01 \
         --component rust-src,llvm-tools,rustfmt,clippy \
-        --target riscv64gc-unknown-none-elf && \
+        --target riscv64gc-unknown-none-elf \
+        --target loongarch64-unknown-none && \
     cargo install cargo-binutils && \
     rm -rf /usr/local/cargo/registry /tmp/*
 
@@ -49,14 +50,20 @@ RUN curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz |
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
-# Create zig-based riscv64-linux-musl cross-compiler wrappers
+# Create zig-based musl cross-compiler wrappers
 # (same as `make setup-toolchain` but baked into the image)
 RUN printf '#!/bin/sh\nexec zig cc -target riscv64-linux-musl "$@"\n' \
         > /usr/local/bin/riscv64-linux-musl-cc && \
     printf '#!/bin/sh\nexec zig ar "$@"\n' \
         > /usr/local/bin/riscv64-linux-musl-ar && \
+    printf '#!/bin/sh\nexec zig cc -target loongarch64-linux-musl "$@"\n' \
+        > /usr/local/bin/loongarch64-linux-musl-cc && \
+    printf '#!/bin/sh\nexec zig ar "$@"\n' \
+        > /usr/local/bin/loongarch64-linux-musl-ar && \
     chmod +x /usr/local/bin/riscv64-linux-musl-cc \
-             /usr/local/bin/riscv64-linux-musl-ar
+             /usr/local/bin/riscv64-linux-musl-ar \
+             /usr/local/bin/loongarch64-linux-musl-cc \
+             /usr/local/bin/loongarch64-linux-musl-ar
 
 # Copy Rust toolchain from stage 1
 COPY --from=toolchain /usr/local/rustup /usr/local/rustup

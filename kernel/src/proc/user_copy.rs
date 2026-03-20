@@ -130,7 +130,6 @@ pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::WaitStatus) {
         task.pid,
         wstatus.0
     );
-    task.flush_all_console_write_buffers();
     task.exit_status
         .store(wstatus.0, core::sync::atomic::Ordering::Release);
     task.set_zombie();

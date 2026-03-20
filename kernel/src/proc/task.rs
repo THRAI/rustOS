@@ -26,77 +26,6 @@ use crate::{
 /// Kernel stack size: 4 pages (16KB).
 const KSTACK_ORDER: usize = 2; // 2^2 = 4 pages
 const KSTACK_SIZE: usize = PAGE_SIZE * (1 << KSTACK_ORDER);
-const CONSOLE_WRITE_BUF_CAP: usize = 256;
-
-struct ConsoleWriteBuffer {
-    data: [u8; CONSOLE_WRITE_BUF_CAP],
-    len: usize,
-}
-
-impl ConsoleWriteBuffer {
-    const fn new() -> Self {
-        Self {
-            data: [0; CONSOLE_WRITE_BUF_CAP],
-            len: 0,
-        }
-    }
-
-    fn append_with_flushes<F: FnMut(&[u8])>(&mut self, bytes: &[u8], mut flush: F) {
-        for &byte in bytes {
-            if self.len == CONSOLE_WRITE_BUF_CAP {
-                flush(&self.data[..self.len]);
-                self.len = 0;
-            }
-            self.data[self.len] = byte;
-            self.len += 1;
-            if byte == b'\n' {
-                flush(&self.data[..self.len]);
-                self.len = 0;
-            }
-        }
-    }
-
-    fn flush_pending<F: FnMut(&[u8])>(&mut self, mut flush: F) {
-        if self.len > 0 {
-            flush(&self.data[..self.len]);
-            self.len = 0;
-        }
-    }
-}
-
-#[cfg(test)]
-mod console_write_buffer_tests {
-    use std::{vec, vec::Vec};
-
-    use super::ConsoleWriteBuffer;
-
-    #[test]
-    fn buffers_fragmented_line_until_newline() {
-        let mut buf = ConsoleWriteBuffer::new();
-        let mut flushed = Vec::new();
-
-        buf.append_with_flushes(b"cpid: ", |chunk| flushed.push(chunk.to_vec()));
-        assert!(flushed.is_empty());
-
-        buf.append_with_flushes(b"35", |chunk| flushed.push(chunk.to_vec()));
-        assert!(flushed.is_empty());
-
-        buf.append_with_flushes(b"\n", |chunk| flushed.push(chunk.to_vec()));
-        assert_eq!(flushed, vec![b"cpid: 35\n".to_vec()]);
-    }
-
-    #[test]
-    fn flush_pending_emits_partial_line() {
-        let mut buf = ConsoleWriteBuffer::new();
-        let mut flushed = Vec::new();
-
-        buf.append_with_flushes(b"# ", |chunk| flushed.push(chunk.to_vec()));
-        assert!(flushed.is_empty());
-
-        buf.flush_pending(|chunk| flushed.push(chunk.to_vec()));
-        assert_eq!(flushed, vec![b"# ".to_vec()]);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // TaskState
@@ -269,33 +198,6 @@ impl Task {
     pub fn release_zombie_resources(&self) {
         self.vm_map.write().clear();
         *self.fd_table.lock() = FdTable::new();
-    }
-
-    pub fn append_console_write_bytes(&self, fd: u32, bytes: &[u8]) {
-        let mut buf = if fd == 2 {
-            self.console_stderr_buf.lock()
-        } else {
-            self.console_stdout_buf.lock()
-        };
-        buf.append_with_flushes(bytes, crate::console::putchars);
-    }
-
-    pub fn flush_console_write_buffer(&self, fd: u32) {
-        let mut buf = if fd == 2 {
-            self.console_stderr_buf.lock()
-        } else {
-            self.console_stdout_buf.lock()
-        };
-        buf.flush_pending(crate::console::putchars);
-    }
-
-    pub fn flush_all_console_write_buffers(&self) {
-        self.console_stdout_buf
-            .lock()
-            .flush_pending(crate::console::putchars);
-        self.console_stderr_buf
-            .lock()
-            .flush_pending(crate::console::putchars);
     }
 }
 

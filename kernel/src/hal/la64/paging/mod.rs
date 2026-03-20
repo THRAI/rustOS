@@ -49,7 +49,7 @@ pub fn flush_addr_asid(_vaddr: usize, _asid: usize) {
     }
 }
 
-pub fn create_arch_root_mappings() -> (&'static mut VmPage, &'static mut VmPage) {
+pub fn create_arch_root_mappings() -> (&'static VmPage, &'static VmPage) {
     let root = mm::alloc_pte_l2_sync().expect("failed to allocate la64 root page table");
     mm::pmap_zero_page(root.phys());
 

@@ -34,7 +34,7 @@ pub fn flush_addr_asid(vaddr: usize, asid: usize) {
     }
 }
 
-pub fn create_arch_root_mappings() -> (&'static mut VmPage, &'static mut VmPage) {
+pub fn create_arch_root_mappings() -> (&'static VmPage, &'static VmPage) {
     let frame = mm::alloc_pte_l2_sync().expect("failed to allocate page table directory");
     mm::pmap_zero_page(frame.phys());
 

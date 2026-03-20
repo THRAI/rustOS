@@ -35,15 +35,15 @@ pub(crate) fn alloc_anon_sync() -> Option<&'static vm::VmPage> {
     allocator::alloc_anon_sync()
 }
 
-pub(crate) fn alloc_pte_l0_sync() -> Option<&'static mut vm::VmPage> {
+pub(crate) fn alloc_pte_l0_sync() -> Option<&'static vm::VmPage> {
     allocator::alloc_pte_l0_sync()
 }
 
-pub(crate) fn alloc_pte_l1_sync() -> Option<&'static mut vm::VmPage> {
+pub(crate) fn alloc_pte_l1_sync() -> Option<&'static vm::VmPage> {
     allocator::alloc_pte_l1_sync()
 }
 
-pub(crate) fn alloc_pte_l2_sync() -> Option<&'static mut vm::VmPage> {
+pub(crate) fn alloc_pte_l2_sync() -> Option<&'static vm::VmPage> {
     allocator::alloc_pte_l2_sync()
 }
 

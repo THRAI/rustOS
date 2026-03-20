@@ -31,6 +31,27 @@ use crate::{
 };
 #[cfg(not(target_arch = "riscv64"))]
 const MAX_CPUS: usize = 8;
+#[cfg(target_arch = "riscv64")]
+const PT_LEVELS: usize = 3;
+#[cfg(target_arch = "loongarch64")]
+const PT_LEVELS: usize = crate::hal::la64::paging::walk::LEVELS;
+
+#[inline]
+unsafe fn walk_pte(
+    root_pa: PhysAddr,
+    va: VirtAddr,
+    alloc: bool,
+    allocator: &mut dyn FnMut(usize) -> Option<PhysAddr>,
+) -> Option<*mut u64> {
+    #[cfg(target_arch = "riscv64")]
+    {
+        unsafe { walk::walk::<{ PT_LEVELS }>(root_pa, va, alloc, allocator) }
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        unsafe { walk::walk(root_pa, va, alloc, allocator) }
+    }
+}
 
 /// Pmap statistics.
 #[derive(Debug, Default)]
@@ -117,7 +138,7 @@ impl Pmap {
         // We pass `alloc = false` so no pages are allocated.
         // The kernel is identity-mapped so PA == VA for page table pages.
         unsafe {
-            let pte_ptr = walk::walk::<SV39_LEVELS>(self.root.phys(), va, false, &mut |_| None)?;
+            let pte_ptr = walk_pte(self.root.phys(), va, false, &mut |_| None)?;
             let raw = pte_ptr.read_volatile();
             if pte_is_valid(raw) && pte_is_leaf(raw) {
                 Some(container::PmapRef {
@@ -136,7 +157,7 @@ impl Pmap {
     pub fn entry(&mut self, va: VirtAddr) -> container::PmapEntry<'_> {
         // SAFETY: same as `get` — valid root PA, no allocation, identity map.
         unsafe {
-            let pte_ptr = walk::walk::<SV39_LEVELS>(self.root.phys(), va, false, &mut |_| None);
+            let pte_ptr = walk_pte(self.root.phys(), va, false, &mut |_| None);
             match pte_ptr {
                 Some(ptr) => {
                     let raw = ptr.read_volatile();
@@ -182,11 +203,12 @@ impl Pmap {
         let root_pa = self.root.phys().as_usize();
         let start_va = start.as_usize();
         let end_va = end.as_usize();
-        let start_idx = (start_va >> 30) & 0x1FF;
+        let root_shift = 12 + 9 * (PT_LEVELS - 1);
+        let start_idx = (start_va >> root_shift) & 0x1FF;
         let end_idx = if end_va == 0 {
             511
         } else {
-            ((end_va - 1) >> 30) & 0x1FF
+            ((end_va - 1) >> root_shift) & 0x1FF
         };
         container::PmapRange::new(self, start_va, end_va, (root_pa, start_idx, end_idx))
     }
@@ -228,7 +250,7 @@ impl Pmap {
             return;
         }
 
-        let shift = 12 + 9 * (SV39_LEVELS - 1 - level);
+        let shift = 12 + 9 * (PT_LEVELS - 1 - level);
         let span: usize = 1usize << shift;
         let idx_mask = 0x1FFusize;
 
@@ -264,7 +286,7 @@ impl Pmap {
             }
 
             // Non-leaf: descend with clipped range.
-            if level < SV39_LEVELS - 1 {
+            if level < PT_LEVELS - 1 {
                 let subtree_start = (start & !((span << 9) - 1)) | (idx << shift);
                 let subtree_end = subtree_start + span;
                 let child_start = core::cmp::max(start, subtree_start);
@@ -304,7 +326,7 @@ pub fn pmap_create() -> Pmap {
         l0_tables: Vec::new(),
         l1_directories: {
             #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-            let v = Vec::from([l1_frame]);
+            let v: Vec<&'static VmPage> = Vec::from([l1_frame]);
             #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
             let v = Vec::new();
             v
@@ -494,14 +516,7 @@ pub fn pmap_activate(pmap: &mut Pmap) {
 pub fn pmap_deactivate(pmap: &mut Pmap) {
     let cpu_id = crate::executor::current().cpu_id;
     pmap.active[cpu_id].store(false, Ordering::Release);
-    // SAFETY: Flush TLB entries for this ASID to prevent stale translations
-    // when another hart reuses this pmap or its pages are freed.
-    unsafe {
-        core::arch::asm!(
-            "sfence.vma zero, {asid}",
-            asid = in(reg) pmap.asid as usize,
-        );
-    }
+    crate::hal::paging::deactivate_current();
 }
 
 /// Handle A/D bit fault: set A and/or D bits on the PTE.

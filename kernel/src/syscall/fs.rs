@@ -889,15 +889,12 @@ pub async fn sys_read_async(
                 Ok(len)
             }
         },
-        ReadSource::DevConsole => {
-            task.flush_all_console_write_buffers();
-            ConsoleReadFuture {
-                task,
-                user_buf,
-                len,
-            }
-            .await
-        },
+        ReadSource::DevConsole => ConsoleReadFuture {
+            task,
+            user_buf,
+            len,
+        }
+        .await,
         ReadSource::PipeRead(pipe) => {
             PipeReadFuture {
                 pipe,
@@ -1013,12 +1010,7 @@ pub async fn sys_write_async(
             if rc != 0 {
                 return Err(Errno::Efault);
             }
-            if len > CONSOLE_AGGREGATE_LIMIT {
-                task.flush_console_write_buffer(fd);
-                crate::console::putchars(&kbuf);
-            } else {
-                task.append_console_write_bytes(fd, &kbuf);
-            }
+            crate::console::putchars(&kbuf);
             Ok(len)
         },
         WriteTarget::PipeWrite(pipe) => {
@@ -1246,7 +1238,7 @@ pub async fn sys_writev_async(
         if combined.is_empty() {
             return Ok(0);
         }
-        task.append_console_write_bytes(fd, &combined);
+        crate::console::putchars(&combined);
         return Ok(combined.len());
     }
 

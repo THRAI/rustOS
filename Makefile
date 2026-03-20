@@ -41,7 +41,7 @@ OBJCOPY_ARCH_rv64 := riscv64
 OBJCOPY_ARCH_la64 := loongarch64
 QEMU_rv64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_rv64) -smp $(SMP) -m 128M \
 	-drive file=$(DISK_IMG_rv64),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 $(QEMU_TRACE)
-QEMU_la64_FLAGS := -machine virt -cpu la464 -nographic -kernel $(KERNEL_BIN_la64) -smp $(SMP) -m 128M $(QEMU_TRACE)
+QEMU_la64_FLAGS := -machine virt -cpu la464 -nographic -kernel $(KERNEL_BIN_la64) -smp $(SMP) -m 1G $(QEMU_TRACE)
 
 TARGET = $(TARGET_$(ARCH))
 KERNEL_ELF = $(KERNEL_ELF_$(ARCH))
@@ -98,7 +98,7 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel-rv kernel-rv64 kernel-rv64-test kernel-rv64-autotest user-rv64 user-rv64-autotest run-rv64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all oscomp-run debug-rv64 gdbserver-rv64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean docker-build docker-agent-test docker-python-test docker-oscomp docker-oscomp-basic docker-oscomp-basic-all docker-oscomp-run docker-judge docker-shell docker-test-all docker-ltp-build
+.PHONY: all kernel kernel-rv kernel-rv64 kernel-la64 kernel-rv64-test kernel-rv64-autotest user user-rv64 user-la64 user-rv64-autotest run-rv64 run-la64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all oscomp-run debug-rv64 debug-la64 gdbserver-rv64 gdbserver-la64 smoke smoke-la64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean docker-build docker-kernel-rv64 docker-run-rv64 docker-kernel-la64 docker-user-la64 docker-run-la64 docker-debug-la64 docker-gdbserver-la64 docker-smoke-la64 docker-agent-test docker-python-test docker-oscomp docker-oscomp-basic docker-oscomp-basic-all docker-oscomp-run docker-judge docker-shell docker-test-all docker-ltp-build
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
@@ -108,7 +108,7 @@ kernel-rv:
 	cp $(KERNEL_ELF_rv64) kernel-rv
 
 kernel:
-	cargo build --release -p kernel --target $(TARGET) $(_CARGO_LOG) --config 'target.$(TARGET).rustflags=["-C","link-arg=-T$(CURDIR)/$(KERNEL_LINKER)"]'
+	PATH="$(WRAPPER_DIR):$$PATH" cargo build --release -p kernel --target $(TARGET) $(_CARGO_LOG) --config 'target.$(TARGET).rustflags=["-C","link-arg=-T$(CURDIR)/$(KERNEL_LINKER)"]'
 	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
 kernel-rv64: ARCH=rv64
@@ -119,9 +119,9 @@ kernel-la64: kernel
 
 user:
 	@if [ "$(ARCH)" = "rv64" ]; then \
-		cd /tmp && RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_rv64) --config 'build.target="$(TARGET_rv64)"' --config 'target.$(TARGET_rv64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_rv64)"]'; \
+		cd /tmp && PATH='$(WRAPPER_DIR):'$$PATH RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_rv64) --config 'build.target="$(TARGET_rv64)"' --config 'target.$(TARGET_rv64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_rv64)"]'; \
 	else \
-		cd /tmp && RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_la64) --config 'build.target="$(TARGET_la64)"' --config 'target.$(TARGET_la64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_la64)"]'; \
+		cd /tmp && PATH='$(WRAPPER_DIR):'$$PATH RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_la64) --config 'build.target="$(TARGET_la64)"' --config 'target.$(TARGET_la64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_la64)"]'; \
 	fi
 	cp $(USER_ELF) $(USER_INSTALL)
 
@@ -220,42 +220,70 @@ sdcard-rv: user-rv64-autotest
 
 # ---- Docker targets (cross-platform test runner) ----
 
+DOCKER_COMPOSE ?= docker compose
+DOCKER_SERVICE ?= oscomp
+DOCKER_RUN = $(DOCKER_COMPOSE) run --rm $(DOCKER_SERVICE)
+
 docker-build:
-	docker compose build oscomp
+	$(DOCKER_COMPOSE) build $(DOCKER_SERVICE)
+
+docker-kernel-rv64:
+	$(DOCKER_RUN) make kernel-rv64
+
+docker-run-rv64:
+	$(DOCKER_RUN) make run-rv64
+
+docker-kernel-la64:
+	$(DOCKER_RUN) make kernel-la64
+
+docker-user-la64:
+	$(DOCKER_RUN) make user-la64
+
+docker-run-la64:
+	$(DOCKER_RUN) make run-la64
+
+docker-debug-la64:
+	$(DOCKER_RUN) make debug-la64
+
+docker-gdbserver-la64:
+	$(DOCKER_RUN) make gdbserver-la64
+
+docker-smoke-la64:
+	$(DOCKER_RUN) make smoke-la64
 
 docker-agent-test:
-	docker compose run --rm oscomp make agent-test
+	$(DOCKER_RUN) make agent-test
 
 docker-python-test:
-	docker compose run --rm oscomp make python-test-rv64
+	$(DOCKER_RUN) make python-test-rv64
 
 docker-oscomp:
-	docker compose run --rm oscomp make oscomp
+	$(DOCKER_RUN) make oscomp
 
 docker-oscomp-basic:
-	docker compose run --rm oscomp make oscomp-basic
+	$(DOCKER_RUN) make oscomp-basic
 
 docker-oscomp-basic-all:
-	docker compose run --rm oscomp make oscomp-basic-all
+	$(DOCKER_RUN) make oscomp-basic-all
 
 # Run selected test groups in Docker
 # Usage: make docker-oscomp-run GROUPS=busybox,lua LIBC=musl
 #        make docker-oscomp-run GROUPS=basic,busybox,lua LIBC=all
 docker-oscomp-run:
-	docker compose run --rm oscomp make oscomp-run GROUPS="$(GROUPS)" LIBC="$(LIBC)"
+	$(DOCKER_RUN) make oscomp-run GROUPS="$(GROUPS)" LIBC="$(LIBC)"
 
 docker-judge:
-	docker compose run --rm oscomp bash -c 'make oscomp-basic-all 2>&1 | tee /tmp/oscomp.log && ./judge/batch_judge.sh --log /tmp/oscomp.log'
+	$(DOCKER_RUN) bash -c 'make oscomp-basic-all 2>&1 | tee /tmp/oscomp.log && ./judge/batch_judge.sh --log /tmp/oscomp.log'
 
 docker-shell:
-	docker compose run --rm oscomp bash
+	$(DOCKER_RUN) bash
 
 docker-test-all: docker-agent-test docker-python-test docker-oscomp-basic-all
 
 # Dedicated LTP build (opt-in, ~10 min, requires competition Docker image)
 docker-ltp-build:
-	docker compose build ltp
-	docker compose run --rm ltp
+	$(DOCKER_COMPOSE) build ltp
+	$(DOCKER_COMPOSE) run --rm ltp
 	@echo "LTP binaries now in testcase/riscv/{musl,glibc}/ltp/"
 
 
@@ -392,14 +420,12 @@ clean:
 	cargo clean
 	rm -f $(KERNEL_BIN_rv64) $(KERNEL_BIN_la64) $(USER_INSTALL_la64)
 
-# Create zig-based riscv64-linux-musl-cc/ar wrappers (matches CI).
+# Create zig-based musl cross-compiler wrappers (matches CI).
 # Replaces any existing wrappers that may use newlib headers (which break lwext4).
-# Requires: zig (brew install zig)
-# Note: la64 bring-up needs analogous `loongarch64-linux-musl-cc/ar` wrappers or
-# a real loongarch64 musl cross toolchain in PATH when building ext4 dependencies.
+# Requires: zig in PATH.
 WRAPPER_DIR ?= $(HOME)/.local/bin
 setup-toolchain:
-	@command -v zig >/dev/null 2>&1 || (echo "ERROR: zig not found. Install with: brew install zig"; exit 1)
+	@command -v zig >/dev/null 2>&1 || (echo "ERROR: zig not found. Install zig first, then rerun 'make setup-toolchain'."; exit 1)
 	@mkdir -p $(WRAPPER_DIR)
 	@rm -f $(WRAPPER_DIR)/riscv64-linux-musl-cc
 	@printf '#!/bin/sh\nexec zig cc -target riscv64-linux-musl "$$@"\n' > $(WRAPPER_DIR)/riscv64-linux-musl-cc
@@ -407,6 +433,14 @@ setup-toolchain:
 	@rm -f $(WRAPPER_DIR)/riscv64-linux-musl-ar
 	@printf '#!/bin/sh\nexec zig ar "$$@"\n' > $(WRAPPER_DIR)/riscv64-linux-musl-ar
 	@chmod +x $(WRAPPER_DIR)/riscv64-linux-musl-ar
+	@rm -f $(WRAPPER_DIR)/loongarch64-linux-musl-cc
+	@printf '#!/bin/sh\nexec zig cc -target loongarch64-linux-musl "$$@"\n' > $(WRAPPER_DIR)/loongarch64-linux-musl-cc
+	@chmod +x $(WRAPPER_DIR)/loongarch64-linux-musl-cc
+	@rm -f $(WRAPPER_DIR)/loongarch64-linux-musl-ar
+	@printf '#!/bin/sh\nexec zig ar "$$@"\n' > $(WRAPPER_DIR)/loongarch64-linux-musl-ar
+	@chmod +x $(WRAPPER_DIR)/loongarch64-linux-musl-ar
 	@echo "Installed zig-based wrappers in $(WRAPPER_DIR):"
 	@echo "  riscv64-linux-musl-cc -> zig cc -target riscv64-linux-musl"
 	@echo "  riscv64-linux-musl-ar -> zig ar"
+	@echo "  loongarch64-linux-musl-cc -> zig cc -target loongarch64-linux-musl"
+	@echo "  loongarch64-linux-musl-ar -> zig ar"

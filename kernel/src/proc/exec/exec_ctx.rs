@@ -155,6 +155,7 @@ pub struct AuxvEntry {
 
 const AT_NULL: usize = 0;
 const AT_PAGESZ: usize = 6;
+const AT_BASE: usize = 7;
 const AT_ENTRY: usize = 9;
 const AT_PHDR: usize = 3;
 const AT_PHENT: usize = 4;
@@ -392,6 +393,12 @@ impl ExecPipeline {
 
         // Override entry to the interpreter's entry point.
         self.entry = parse.entry as usize + load_base;
+
+        // AT_BASE: load base of the dynamic linker (needed for self-relocation).
+        self.auxv.push(AuxvEntry {
+            atype: AT_BASE,
+            value: load_base,
+        });
 
         Ok(self)
     }

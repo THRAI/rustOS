@@ -57,6 +57,8 @@ impl TaskState {
 pub struct Task {
     /// Process ID (unique, monotonic).
     pub pid: u32,
+    /// Thread group ID (Linux getpid semantic).
+    pub tgid: u32,
     /// Parent process (Weak to prevent circular Arc).
     pub parent: Weak<Task>,
     /// Child processes.
@@ -94,6 +96,8 @@ pub struct Task {
     pub top_level_waker: Mutex<Option<core::task::Waker>, 4>,
     /// vfork completion handle: child signals this on exit or exec.
     pub vfork_done: Option<Arc<VforkDone>>,
+    /// User address used by CLONE_CHILD_CLEARTID on thread exit (0 = disabled).
+    pub clear_child_tid: AtomicUsize,
 }
 
 /// Allocate a kernel stack (2 pages) and return (base, sp_top).
@@ -122,6 +126,7 @@ impl Task {
         // );
         Arc::new(Self {
             pid,
+            tgid: pid,
             parent,
             children: Mutex::new(Vec::new()),
             vm_map: Arc::new(LeveledRwLock::new(VmMap::new(pmap))),
@@ -138,6 +143,7 @@ impl Task {
             pgid: AtomicU32::new(pgid),
             top_level_waker: Mutex::new(None),
             vfork_done: None,
+            clear_child_tid: AtomicUsize::new(0),
         })
     }
 
@@ -154,6 +160,7 @@ impl Task {
         );
         Arc::new(Self {
             pid,
+            tgid: pid,
             parent: Weak::new(),
             children: Mutex::new(Vec::new()),
             vm_map: Arc::new(LeveledRwLock::new(VmMap::new(pmap))),
@@ -170,6 +177,7 @@ impl Task {
             pgid: AtomicU32::new(pid),
             top_level_waker: Mutex::new(None),
             vfork_done: None,
+            clear_child_tid: AtomicUsize::new(0),
         })
     }
 

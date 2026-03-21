@@ -589,7 +589,7 @@ fn test_fork_exit_wait4() {
     let init_pid = init.pid;
 
     // Fork to create child (via do_clone with no special flags)
-    let child = do_clone(&init, CloneFlags::empty(), 0, 0).expect("do_clone failed");
+    let child = do_clone(&init, CloneFlags::empty(), 0, 0, 0).expect("do_clone failed");
     let child_pid = child.pid;
 
     // Verify child has different pid
@@ -745,7 +745,7 @@ async fn test_fork_exec_wait4() {
     let init = Task::new_init();
 
     // Fork child (via do_clone with no special flags)
-    let child = do_clone(&init, CloneFlags::empty(), 0, 0).expect("do_clone failed");
+    let child = do_clone(&init, CloneFlags::empty(), 0, 0, 0).expect("do_clone failed");
     let child_pid = child.pid;
 
     // Try do_execve on the child — use /hello.txt which is NOT an ELF

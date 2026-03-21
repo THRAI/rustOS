@@ -67,12 +67,17 @@ impl SyscallId {
     pub const SET_TID_ADDRESS: Self = Self(96);
     pub const FUTEX: Self = Self(98);
     pub const NANOSLEEP: Self = Self(101);
+    pub const SETITIMER: Self = Self(103);
+    pub const GETITIMER: Self = Self(102);
     pub const CLOCK_GETTIME: Self = Self(113);
     pub const SCHED_YIELD: Self = Self(124);
     pub const KILL: Self = Self(129);
+    pub const TKILL: Self = Self(130);
+    pub const TGKILL: Self = Self(131);
     pub const SIGALTSTACK: Self = Self(132);
     pub const SIGACTION: Self = Self(134);
     pub const SIGPROCMASK: Self = Self(135);
+    pub const SIGTIMEDWAIT: Self = Self(137);
     pub const SIGRETURN: Self = Self(139);
     pub const REBOOT: Self = Self(142);
     pub const TIMES: Self = Self(153);
@@ -121,6 +126,16 @@ impl SyscallId {
     pub const SENDMSG: Self = Self(211);
     pub const RECVMSG: Self = Self(212);
     pub const ACCEPT4: Self = Self(242);
+    // Stubs needed by musl libc init
+    pub const SET_ROBUST_LIST: Self = Self(99);
+    pub const CLOCK_NANOSLEEP: Self = Self(115);
+    pub const SCHED_GETSCHEDULER: Self = Self(120);
+    pub const SCHED_GET_PRIORITY_MAX: Self = Self(125);
+    pub const SCHED_GET_PRIORITY_MIN: Self = Self(126);
+    pub const PRLIMIT64: Self = Self(261);
+    pub const GETRANDOM: Self = Self(278);
+    pub const RSEQ: Self = Self(293);
+    pub const RISCV_FLUSH_ICACHE: Self = Self(258);
 }
 
 impl core::fmt::Display for SyscallId {
@@ -157,12 +172,17 @@ impl core::fmt::Display for SyscallId {
             Self::SET_TID_ADDRESS => "set_tid_address",
             Self::FUTEX => "futex",
             Self::NANOSLEEP => "nanosleep",
+            Self::GETITIMER => "getitimer",
+            Self::SETITIMER => "setitimer",
             Self::CLOCK_GETTIME => "clock_gettime",
             Self::SCHED_YIELD => "sched_yield",
             Self::KILL => "kill",
+            Self::TKILL => "tkill",
+            Self::TGKILL => "tgkill",
             Self::SIGALTSTACK => "sigaltstack",
             Self::SIGACTION => "sigaction",
             Self::SIGPROCMASK => "sigprocmask",
+            Self::SIGTIMEDWAIT => "rt_sigtimedwait",
             Self::SIGRETURN => "sigreturn",
             Self::REBOOT => "reboot",
             Self::TIMES => "times",
@@ -210,6 +230,15 @@ impl core::fmt::Display for SyscallId {
             Self::SENDMSG => "sendmsg",
             Self::RECVMSG => "recvmsg",
             Self::ACCEPT4 => "accept4",
+            Self::SET_ROBUST_LIST => "set_robust_list",
+            Self::CLOCK_NANOSLEEP => "clock_nanosleep",
+            Self::SCHED_GETSCHEDULER => "sched_getscheduler",
+            Self::SCHED_GET_PRIORITY_MAX => "sched_get_priority_max",
+            Self::SCHED_GET_PRIORITY_MIN => "sched_get_priority_min",
+            Self::PRLIMIT64 => "prlimit64",
+            Self::GETRANDOM => "getrandom",
+            Self::RSEQ => "rseq",
+            Self::RISCV_FLUSH_ICACHE => "riscv_flush_icache",
             _ => return write!(f, "unknown({})", self.0),
         };
         write!(f, "{}", name)
@@ -358,12 +387,43 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             };
             SyscallAction::Return(ret)
         },
+        SyscallId::SIGTIMEDWAIT => {
+            // a0=set, a1=info, a2=timeout, a3=sigsetsize
+            if a0 != 0 {
+                fault_in_user_buffer(task, a0, 8, PageFaultAccessType::READ).await;
+            }
+            if a1 != 0 {
+                fault_in_user_buffer(task, a1, 128, PageFaultAccessType::WRITE).await;
+            }
+            if a2 != 0 {
+                fault_in_user_buffer(task, a2, 16, PageFaultAccessType::READ).await;
+            }
+            let ret = match signal::sys_rt_sigtimedwait(task, a0, a1, a2, a3).await {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
         SyscallId::SIGRETURN => {
             let _ = signal::sys_sigreturn(task);
             SyscallAction::Continue
         },
         SyscallId::KILL => {
             let ret = match signal::sys_kill(task, a0 as isize, a1 as u8) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::TKILL => {
+            let ret = match signal::sys_tkill(task, a0 as isize, a1 as u8) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::TGKILL => {
+            let ret = match signal::sys_tgkill(task, a0 as isize, a1 as isize, a2 as u8) {
                 Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };
@@ -407,6 +467,20 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
         SyscallId::NANOSLEEP => {
             let ret = match sync::sys_nanosleep_async(task, a0, a1).await {
                 Ok(()) => 0,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::GETITIMER => {
+            let ret = match process::sys_getitimer(task, a0, a1) {
+                Ok(v) => v,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        SyscallId::SETITIMER => {
+            let ret = match process::sys_setitimer(task, a0, a1, a2) {
+                Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
@@ -498,11 +572,16 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             Err(e) => SyscallAction::Return(syscall_error_return(e)),
         },
         SyscallId::SENDFILE => SyscallAction::Return(syscall_error_return(Errno::Einval)),
-        // pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
-        // Stub: behave as immediate timeout (return 0 = nothing ready).
-        // Enough for busybox/musl callers that use pselect6 as a sleep or
-        // non-critical readiness check.
-        SyscallId::PSELECT6 => SyscallAction::Return(0),
+        SyscallId::PSELECT6 => {
+            let ret = match fs::sys_pselect6_async(task, a0, a1, a2, a3, a4).await {
+                Ok(n) => n,
+                Err(Errno::Eintr) if should_restart_syscall(task) => {
+                    return SyscallAction::Continue;
+                },
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
         SyscallId::READLINKAT => {
             let ret = match fs::sys_readlinkat_async(task, a0 as isize, a1, a2, a3).await {
                 Ok(n) => n,
@@ -627,7 +706,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         },
         SyscallId::FUTEX => {
-            let ret = match sync::sys_futex_async(task, a0, a1 as u32, a2 as u32).await {
+            let ret = match sync::sys_futex_async(task, a0, a1 as u32, a2 as u32, a3).await {
                 Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };
@@ -722,7 +801,7 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         },
         SyscallId::BIND => {
-            let ret = match net::sys_bind(task, a0, a1, a2) {
+            let ret = match net::sys_bind(task, a0, a1, a2).await {
                 Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };
@@ -750,14 +829,14 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
             SyscallAction::Return(ret)
         },
         SyscallId::GETSOCKNAME => {
-            let ret = match net::sys_getsockname(task, a0, a1, a2) {
+            let ret = match net::sys_getsockname(task, a0, a1, a2).await {
                 Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
         },
         SyscallId::GETPEERNAME => {
-            let ret = match net::sys_getpeername(task, a0, a1, a2) {
+            let ret = match net::sys_getpeername(task, a0, a1, a2).await {
                 Ok(v) => v,
                 Err(e) => syscall_error_return(e),
             };
@@ -818,6 +897,75 @@ pub async fn syscall(task: &Arc<Task>, syscall_id: usize, args: [usize; 6]) -> S
                 Err(e) => syscall_error_return(e),
             };
             SyscallAction::Return(ret)
+        },
+        // set_robust_list — musl pthread init calls this; stub returning 0 is fine.
+        SyscallId::SET_ROBUST_LIST => SyscallAction::Return(0),
+        // clock_nanosleep(clockid, flags, req, rem) — forward to nanosleep logic.
+        SyscallId::CLOCK_NANOSLEEP => {
+            // a0=clockid, a1=flags, a2=req, a3=rem
+            let ret = match sync::sys_nanosleep_async(task, a2, a3).await {
+                Ok(()) => 0,
+                Err(e) => syscall_error_return(e),
+            };
+            SyscallAction::Return(ret)
+        },
+        // sched_getscheduler — return SCHED_OTHER (0).
+        SyscallId::SCHED_GETSCHEDULER => SyscallAction::Return(0),
+        // sched_get_priority_max/min — SCHED_OTHER range is 0..0.
+        SyscallId::SCHED_GET_PRIORITY_MAX => SyscallAction::Return(0),
+        SyscallId::SCHED_GET_PRIORITY_MIN => SyscallAction::Return(0),
+        // rseq — restartable sequences; not supported, ENOSYS is expected by musl.
+        SyscallId::RSEQ => SyscallAction::Return(syscall_error_return(Errno::Enosys)),
+        // riscv_flush_icache — no-op, our icache is coherent after trap return.
+        SyscallId::RISCV_FLUSH_ICACHE => SyscallAction::Return(0),
+        // prlimit64(pid, resource, new_rlim, old_rlim) — stub: if old_rlim != NULL,
+        // fill with generous defaults; ignore new_rlim.
+        SyscallId::PRLIMIT64 => {
+            let old_rlim = a3;
+            if old_rlim != 0 {
+                // struct rlimit { rlim_cur, rlim_max } = 2 × u64
+                // Return a large soft/hard limit (1GB / unlimited).
+                let rlim = [1u64 << 30, u64::MAX];
+                let rc = unsafe {
+                    crate::hal::copy_user_chunk(
+                        old_rlim as *mut u8,
+                        rlim.as_ptr() as *const u8,
+                        16,
+                    )
+                };
+                if rc != 0 {
+                    SyscallAction::Return(syscall_error_return(Errno::Efault))
+                } else {
+                    SyscallAction::Return(0)
+                }
+            } else {
+                SyscallAction::Return(0)
+            }
+        },
+        // getrandom(buf, buflen, flags) — fill buffer with pseudo-random bytes.
+        SyscallId::GETRANDOM => {
+            let buf = a0;
+            let buflen = a1;
+            if buf == 0 || buflen == 0 {
+                SyscallAction::Return(0)
+            } else {
+                let len = buflen.min(256);
+                let mut rand_buf = [0u8; 256];
+                // Simple PRNG seeded from timer — good enough for musl stack guard.
+                let mut seed = crate::hal::rv64::timer::read_time() as u64;
+                for b in rand_buf[..len].iter_mut() {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    *b = (seed >> 33) as u8;
+                }
+                let rc = unsafe {
+                    crate::hal::copy_user_chunk(buf as *mut u8, rand_buf.as_ptr(), len)
+                };
+                if rc != 0 {
+                    SyscallAction::Return(syscall_error_return(Errno::Efault))
+                } else {
+                    SyscallAction::Return(len)
+                }
+            }
         },
         _ => {
             crate::klog!(

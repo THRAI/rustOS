@@ -958,9 +958,9 @@ pub async fn sys_read_async(
             fault_in_user_buffer(task, user_buf, len, PageFaultAccessType::WRITE).await;
             let mut kbuf = alloc::vec![0u8; len];
             let n = match sock.sock_type {
-                crate::net::SocketType::Tcp => crate::net::tcp::tcp_recv(&sock, &mut kbuf).await?,
+                crate::net::SocketType::Tcp => crate::net::tcp::tcp_recv(&sock, &mut kbuf, task).await?,
                 crate::net::SocketType::Udp => {
-                    let (n, _) = crate::net::udp::udp_recvfrom(&sock, &mut kbuf).await?;
+                    let (n, _) = crate::net::udp::udp_recvfrom(&sock, &mut kbuf, task).await?;
                     n
                 }
             };
@@ -1161,14 +1161,14 @@ pub async fn sys_write_async(
                 return Err(Errno::Efault);
             }
             match sock.sock_type {
-                crate::net::SocketType::Tcp => crate::net::tcp::tcp_send(&sock, &kbuf).await,
+                crate::net::SocketType::Tcp => crate::net::tcp::tcp_send(&sock, &kbuf, task).await,
                 crate::net::SocketType::Udp => {
                     // write() on connected UDP uses stored peer
                     let peer = sock
                         .connected_peer
                         .lock()
                         .ok_or(Errno::Edestaddrreq)?;
-                    crate::net::udp::udp_sendto(&sock, &kbuf, &peer).await
+                    crate::net::udp::udp_sendto(&sock, &kbuf, &peer, task).await
                 }
             }
         },
@@ -1306,14 +1306,25 @@ pub async fn sys_ioctl_async(
     match request {
         TCGETS => {
             if argp != 0 {
-                fault_in_user_buffer(task, argp, 60, PageFaultAccessType::WRITE).await;
-                let mut termios = [0u32; 15];
-                termios[0] = 0;
-                termios[1] = 0;
-                termios[2] = 0o000017;
-                termios[3] = 0o000012;
+                // Linux kernel TCGETS returns struct __kernel_termios (36 bytes):
+                //   c_iflag:  u32  (offset 0)
+                //   c_oflag:  u32  (offset 4)
+                //   c_cflag:  u32  (offset 8)
+                //   c_lflag:  u32  (offset 12)
+                //   c_line:   u8   (offset 16)
+                //   c_cc:     [u8; 19] (offset 17)
+                // Total: 36 bytes. Do NOT write 60 (userspace termios size)
+                // or it will overflow the caller's stack frame.
+                fault_in_user_buffer(task, argp, 36, PageFaultAccessType::WRITE).await;
+                let mut termios = [0u8; 36];
+                // c_cflag at offset 8 (little-endian u32)
+                let c_cflag: u32 = 0o000017;
+                termios[8..12].copy_from_slice(&c_cflag.to_le_bytes());
+                // c_lflag at offset 12 (little-endian u32)
+                let c_lflag: u32 = 0o000012;
+                termios[12..16].copy_from_slice(&c_lflag.to_le_bytes());
                 let rc = unsafe {
-                    crate::hal::copy_user_chunk(argp as *mut u8, termios.as_ptr() as *const u8, 60)
+                    crate::hal::copy_user_chunk(argp as *mut u8, termios.as_ptr(), 36)
                 };
                 if rc != 0 {
                     return Err(Errno::Efault);
@@ -1337,6 +1348,165 @@ pub async fn sys_ioctl_async(
         TCSETS | TCSETSW | TCSETSF => Ok(0),
         FIONBIO => Ok(0),
         _ => Err(Errno::Enotty),
+    }
+}
+
+/// sys_pselect6_async: select(2) / pselect6(2) — fd_set based readiness poll.
+///
+/// nfds: highest fd + 1 (max 1024)
+/// readfds_ptr:  ptr to fd_set (128-byte bitmask) or 0
+/// writefds_ptr: ptr to fd_set (128-byte bitmask) or 0
+/// exceptfds_ptr: ptr to fd_set (128-byte bitmask) or 0
+/// timeout_ptr:  ptr to struct timespec { i64 sec, i64 nsec } or 0 (block forever)
+/// _sigmask:     ignored (we don't fully support signal masking here)
+pub async fn sys_pselect6_async(
+    task: &Arc<Task>,
+    nfds: usize,
+    readfds_ptr: usize,
+    writefds_ptr: usize,
+    _exceptfds_ptr: usize,
+    timeout_ptr: usize,
+) -> Result<usize, Errno> {
+    use crate::fs::FileObject;
+
+    if nfds > 1024 {
+        return Err(Errno::Einval);
+    }
+
+    const FD_SET_SIZE: usize = 128; // 1024 bits
+
+    // Read in the fd_sets.
+    let mut read_set = [0u8; FD_SET_SIZE];
+    let mut write_set = [0u8; FD_SET_SIZE];
+
+    if readfds_ptr != 0 && nfds > 0 {
+        let sz = (nfds + 7) / 8;
+        fault_in_user_buffer(task, readfds_ptr, sz, PageFaultAccessType::READ).await;
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(read_set.as_mut_ptr(), readfds_ptr as *const u8, sz)
+        };
+        if rc != 0 {
+            return Err(Errno::Efault);
+        }
+    }
+    if writefds_ptr != 0 && nfds > 0 {
+        let sz = (nfds + 7) / 8;
+        fault_in_user_buffer(task, writefds_ptr, sz, PageFaultAccessType::READ).await;
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(write_set.as_mut_ptr(), writefds_ptr as *const u8, sz)
+        };
+        if rc != 0 {
+            return Err(Errno::Efault);
+        }
+    }
+
+    // Parse timeout.
+    let timeout_ms: Option<u64> = if timeout_ptr != 0 {
+        fault_in_user_buffer(task, timeout_ptr, 16, PageFaultAccessType::READ).await;
+        let mut ts_buf = [0u8; 16];
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(ts_buf.as_mut_ptr(), timeout_ptr as *const u8, 16)
+        };
+        if rc != 0 {
+            return Err(Errno::Efault);
+        }
+        let sec = i64::from_le_bytes(ts_buf[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts_buf[8..16].try_into().unwrap());
+        if sec < 0 || nsec < 0 {
+            return Err(Errno::Einval);
+        }
+        Some(sec as u64 * 1000 + nsec as u64 / 1_000_000)
+    } else {
+        None
+    };
+
+    let deadline = timeout_ms.map(|ms| crate::hal::read_time_ms() + ms);
+
+    loop {
+        let mut out_read = [0u8; FD_SET_SIZE];
+        let mut out_write = [0u8; FD_SET_SIZE];
+        let mut ready = 0usize;
+
+        for fd in 0..nfds {
+            let byte = fd / 8;
+            let bit = 1u8 << (fd % 8);
+            let want_read = readfds_ptr != 0 && (read_set[byte] & bit) != 0;
+            let want_write = writefds_ptr != 0 && (write_set[byte] & bit) != 0;
+            if !want_read && !want_write {
+                continue;
+            }
+
+            let tab = task.fd_table.lock();
+            let r = match tab.get(fd as u32) {
+                None => {
+                    return Err(Errno::Ebadf);
+                },
+                Some(desc) => desc.object.poll_ready(
+                    if want_read { 0x001 } else { 0 },
+                    if want_write { 0x004 } else { 0 },
+                ),
+            };
+            drop(tab);
+
+            if want_read && (r & 0x001) != 0 {
+                out_read[byte] |= bit;
+                ready += 1;
+            }
+            if want_write && (r & 0x004) != 0 {
+                out_write[byte] |= bit;
+                ready += 1;
+            }
+        }
+
+        if ready > 0 || matches!(timeout_ms, Some(0)) {
+            let sz = if nfds > 0 { (nfds + 7) / 8 } else { 0 };
+            if readfds_ptr != 0 && sz > 0 {
+                fault_in_user_buffer(task, readfds_ptr, sz, PageFaultAccessType::WRITE).await;
+                unsafe {
+                    crate::hal::copy_user_chunk(readfds_ptr as *mut u8, out_read.as_ptr(), sz);
+                }
+            }
+            if writefds_ptr != 0 && sz > 0 {
+                fault_in_user_buffer(task, writefds_ptr, sz, PageFaultAccessType::WRITE).await;
+                unsafe {
+                    crate::hal::copy_user_chunk(writefds_ptr as *mut u8, out_write.as_ptr(), sz);
+                }
+            }
+            return Ok(ready);
+        }
+
+        if let Some(dl) = deadline {
+            if crate::hal::read_time_ms() >= dl {
+                let sz = if nfds > 0 { (nfds + 7) / 8 } else { 0 };
+                if readfds_ptr != 0 && sz > 0 {
+                    fault_in_user_buffer(task, readfds_ptr, sz, PageFaultAccessType::WRITE).await;
+                    unsafe {
+                        crate::hal::copy_user_chunk(
+                            readfds_ptr as *mut u8,
+                            out_read.as_ptr(),
+                            sz,
+                        );
+                    }
+                }
+                if writefds_ptr != 0 && sz > 0 {
+                    fault_in_user_buffer(task, writefds_ptr, sz, PageFaultAccessType::WRITE).await;
+                    unsafe {
+                        crate::hal::copy_user_chunk(
+                            writefds_ptr as *mut u8,
+                            out_write.as_ptr(),
+                            sz,
+                        );
+                    }
+                }
+                return Ok(0);
+            }
+        }
+
+        if task.signals.has_actionable_pending() {
+            return Err(Errno::Eintr);
+        }
+
+        crate::executor::sleep(10).await;
     }
 }
 

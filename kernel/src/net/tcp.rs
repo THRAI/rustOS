@@ -9,6 +9,7 @@ use crate::hal_common::{Errno, KernelResult};
 use crate::net::{net_stack, Socket, SocketType};
 use crate::net::addr::SockAddrIn4;
 use crate::net::util::{get_ephemeral_port, net_block_on};
+use crate::proc::Task;
 
 /// Create a new TCP socket and register it with the network stack.
 pub fn tcp_create() -> Arc<Socket> {
@@ -21,7 +22,12 @@ pub fn tcp_create() -> Arc<Socket> {
 
 /// Bind a TCP socket to a local address.
 pub fn tcp_bind(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<()> {
-    sock.local_port.store(addr.sin_port, Ordering::Relaxed);
+    let port = if addr.sin_port == 0 {
+        crate::net::util::get_ephemeral_port()
+    } else {
+        addr.sin_port
+    };
+    sock.local_port.store(port, Ordering::Relaxed);
     Ok(())
 }
 
@@ -32,7 +38,7 @@ pub fn tcp_listen(sock: &Socket) -> KernelResult<()> {
         return Err(Errno::Einval);
     }
     let stack = net_stack();
-    stack.with_socket_mut::<tcp::Socket, _>(sock.handle, |tcp| {
+    stack.with_socket_mut::<tcp::Socket, _>(sock.handle(), |tcp| {
         tcp.listen(port).map_err(|_| Errno::Eaddrinuse)
     })
 }
@@ -40,12 +46,12 @@ pub fn tcp_listen(sock: &Socket) -> KernelResult<()> {
 /// Accept a connection on a listening TCP socket.
 ///
 /// Returns a new connected socket and the remote address.
-pub async fn tcp_accept(sock: &Socket) -> KernelResult<(Arc<Socket>, SockAddrIn4)> {
-    let handle = sock.handle;
+pub async fn tcp_accept(sock: &Socket, task: &Arc<Task>) -> KernelResult<(Arc<Socket>, SockAddrIn4)> {
+    let handle = sock.handle();
     let nonblocking = sock.is_nonblocking();
 
     // Wait until the listening socket has received a SYN and completed handshake
-    net_block_on(nonblocking, handle, || {
+    net_block_on(nonblocking, handle, true, Some(&task.signals), || {
         let stack = net_stack();
         stack.with_socket::<tcp::Socket, _>(handle, |tcp| {
             if tcp.is_active() {
@@ -62,14 +68,8 @@ pub async fn tcp_accept(sock: &Socket) -> KernelResult<(Arc<Socket>, SockAddrIn4
         tcp.remote_endpoint().ok_or(Errno::Enotconn)
     })?;
 
-    // The original listening socket is now consumed (connected).
-    // Create a new socket to replace the listener.
-    let connected = Arc::new(Socket::new(handle, SocketType::Tcp));
-    connected
-        .local_port
-        .store(sock.local_port.load(Ordering::Relaxed), Ordering::Relaxed);
-
-    // Re-create a fresh listening socket on the same port for future accepts
+    // The original listening socket is now consumed (connected) by smoltcp.
+    // Re-create a fresh listening socket on the same port for future accepts.
     let port = sock.local_port.load(Ordering::Relaxed);
     let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 65536]);
     let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; 65536]);
@@ -79,20 +79,20 @@ pub async fn tcp_accept(sock: &Socket) -> KernelResult<(Arc<Socket>, SockAddrIn4
         tcp.listen(port).map_err(|_| Errno::Eaddrinuse)
     })?;
 
-    // Swap the handle in the original socket so it continues listening.
-    // Since SocketHandle is just a usize index, we need to update it atomically.
-    // We store the new handle via an atomic — but Socket::handle is not atomic.
-    // Instead, we return the new_handle and let the caller update the fd_table.
-    // For simplicity in this design, the caller (sys_accept) will:
-    //   1. Insert `connected` as a new fd
-    //   2. Replace the listener's FileDescription with one pointing to new_handle
+    // Swap: the original sock now owns the new listener handle,
+    // and we wrap the old (connected) handle in a new Socket.
+    let connected_handle = sock.swap_handle(new_handle);
+    let connected = Arc::new(Socket::new(connected_handle, SocketType::Tcp));
+    connected
+        .local_port
+        .store(port, Ordering::Relaxed);
 
     let addr = SockAddrIn4::from_endpoint(&remote_ep);
     Ok((connected, addr))
 }
 
 /// Connect a TCP socket to a remote address.
-pub async fn tcp_connect(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<()> {
+pub async fn tcp_connect(sock: &Socket, addr: &SockAddrIn4, task: &Arc<Task>) -> KernelResult<()> {
     let remote = addr.to_endpoint();
     let local_port = {
         let p = sock.local_port.load(Ordering::Relaxed);
@@ -105,13 +105,13 @@ pub async fn tcp_connect(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<()> 
         }
     };
 
-    net_stack().connect_tcp(sock.handle, remote, local_port)?;
+    net_stack().connect_tcp(sock.handle(), remote, local_port)?;
 
-    let handle = sock.handle;
+    let handle = sock.handle();
     let nonblocking = sock.is_nonblocking();
 
     // Wait for connection to complete
-    net_block_on(nonblocking, handle, || {
+    net_block_on(nonblocking, handle, false, Some(&task.signals), || {
         let stack = net_stack();
         stack.with_socket::<tcp::Socket, _>(handle, |tcp| {
             if tcp.may_send() {
@@ -127,11 +127,11 @@ pub async fn tcp_connect(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<()> 
 }
 
 /// Send data on a connected TCP socket.
-pub async fn tcp_send(sock: &Socket, data: &[u8]) -> KernelResult<usize> {
-    let handle = sock.handle;
+pub async fn tcp_send(sock: &Socket, data: &[u8], task: &Arc<Task>) -> KernelResult<usize> {
+    let handle = sock.handle();
     let nonblocking = sock.is_nonblocking();
 
-    net_block_on(nonblocking, handle, || {
+    net_block_on(nonblocking, handle, false, Some(&task.signals), || {
         let stack = net_stack();
         stack.poll_and_wake();
         stack.with_socket_mut::<tcp::Socket, _>(handle, |tcp| {
@@ -150,11 +150,11 @@ pub async fn tcp_send(sock: &Socket, data: &[u8]) -> KernelResult<usize> {
 }
 
 /// Receive data from a connected TCP socket.
-pub async fn tcp_recv(sock: &Socket, buf: &mut [u8]) -> KernelResult<usize> {
-    let handle = sock.handle;
+pub async fn tcp_recv(sock: &Socket, buf: &mut [u8], task: &Arc<Task>) -> KernelResult<usize> {
+    let handle = sock.handle();
     let nonblocking = sock.is_nonblocking();
 
-    net_block_on(nonblocking, handle, || {
+    net_block_on(nonblocking, handle, true, Some(&task.signals), || {
         let stack = net_stack();
         stack.poll_and_wake();
         stack.with_socket_mut::<tcp::Socket, _>(handle, |tcp| {
@@ -162,7 +162,6 @@ pub async fn tcp_recv(sock: &Socket, buf: &mut [u8]) -> KernelResult<usize> {
                 let n = tcp.recv_slice(buf).map_err(|_| Errno::Econnreset)?;
                 Ok(n)
             } else if !tcp.may_recv() {
-                // Connection closed — EOF
                 Ok(0)
             } else {
                 Err(Errno::Eagain)
@@ -174,7 +173,7 @@ pub async fn tcp_recv(sock: &Socket, buf: &mut [u8]) -> KernelResult<usize> {
 
 /// Shutdown a TCP socket.
 pub fn tcp_shutdown(sock: &Socket) -> KernelResult<()> {
-    net_stack().with_socket_mut::<tcp::Socket, _>(sock.handle, |tcp| {
+    net_stack().with_socket_mut::<tcp::Socket, _>(sock.handle(), |tcp| {
         tcp.close();
         Ok(())
     })
@@ -183,7 +182,7 @@ pub fn tcp_shutdown(sock: &Socket) -> KernelResult<()> {
 /// Get the local endpoint of a TCP socket.
 pub fn tcp_local_endpoint(sock: &Socket) -> KernelResult<SockAddrIn4> {
     let stack = net_stack();
-    stack.with_socket::<tcp::Socket, _>(sock.handle, |tcp| {
+    stack.with_socket::<tcp::Socket, _>(sock.handle(), |tcp| {
         if let Some(ep) = tcp.local_endpoint() {
             Ok(SockAddrIn4::from_endpoint(&ep))
         } else {
@@ -201,7 +200,7 @@ pub fn tcp_local_endpoint(sock: &Socket) -> KernelResult<SockAddrIn4> {
 /// Get the remote endpoint of a TCP socket.
 pub fn tcp_remote_endpoint(sock: &Socket) -> KernelResult<SockAddrIn4> {
     let stack = net_stack();
-    stack.with_socket::<tcp::Socket, _>(sock.handle, |tcp| {
+    stack.with_socket::<tcp::Socket, _>(sock.handle(), |tcp| {
         tcp.remote_endpoint()
             .map(|ep| SockAddrIn4::from_endpoint(&ep))
             .ok_or(Errno::Enotconn)

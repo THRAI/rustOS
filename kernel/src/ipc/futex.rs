@@ -20,17 +20,18 @@ use crate::{
 /// Lock ordering: **Level 9** (leaf lock).  Accessed only from syscall
 /// context (`futex_wait`, `futex_wake`).  Never nests inside or outside
 /// any other lock.  IRQ-safe by type, but not accessed from IRQ handlers.
-static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<Waker>>, 9> =
+static FUTEX_TABLE: IrqSafeSpinLock<BTreeMap<PhysAddr, Vec<(u32, Waker)>>, 9> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Park the current task on a futex key (physical address).
-/// Returns a future that completes when woken by futex_wake or interrupted by signal.
-pub async fn futex_wait(pa_key: PhysAddr, task: &Arc<Task>) -> Result<(), Errno> {
+/// `deadline_ms` = 0 means no timeout; otherwise returns Err(Etimedout) after that time.
+pub async fn futex_wait(pa_key: PhysAddr, task: &Arc<Task>, deadline_ms: u64) -> Result<(), Errno> {
     klog!(proc, debug, "futex_wait pid={} key={:#x}", task.pid, pa_key);
     FutexWaitFuture {
         pa_key,
         registered: false,
         task,
+        deadline_ms,
     }
     .await
 }
@@ -48,7 +49,7 @@ pub fn futex_wake(pa_key: PhysAddr, count: usize) -> usize {
     let to_wake = core::cmp::min(count, waiters.len());
     let mut woken = 0;
     for _ in 0..to_wake {
-        if let Some(waker) = waiters.pop() {
+        if let Some((_pid, waker)) = waiters.pop() {
             waker.wake();
             woken += 1;
         }
@@ -68,28 +69,75 @@ struct FutexWaitFuture<'a> {
     pa_key: PhysAddr,
     registered: bool,
     task: &'a Arc<Task>,
+    /// Absolute deadline in ms (0 = no timeout).
+    deadline_ms: u64,
 }
 
 impl<'a> Future for FutexWaitFuture<'a> {
     type Output = Result<(), Errno>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // EINTR guard: check for pending signals before blocking
+        // Timeout check: if deadline passed, remove from table and return ETIMEDOUT.
+        if self.deadline_ms > 0 {
+            let now = crate::hal::read_time_ms();
+            if now >= self.deadline_ms {
+                if self.registered {
+                    let mut table = FUTEX_TABLE.lock();
+                    if let Some(waiters) = table.get_mut(&self.pa_key) {
+                        waiters.retain(|(pid, _)| *pid != self.task.pid);
+                        if waiters.is_empty() {
+                            table.remove(&self.pa_key);
+                        }
+                    }
+                }
+                return Poll::Ready(Err(Errno::Etimedout));
+            }
+        }
+
+        // EINTR guard: pending signal interrupts futex wait.
         if self.task.signals.has_actionable_pending() {
+            if self.registered {
+                let mut table = FUTEX_TABLE.lock();
+                if let Some(waiters) = table.get_mut(&self.pa_key) {
+                    waiters.retain(|(pid, _)| *pid != self.task.pid);
+                    if waiters.is_empty() {
+                        table.remove(&self.pa_key);
+                    }
+                }
+            }
             return Poll::Ready(Err(Errno::Eintr));
         }
-        if self.registered {
-            // We were woken
-            Poll::Ready(Ok(()))
-        } else {
-            // First poll: register waker in the futex table
+
+        if !self.registered {
+            // First poll: register waker in the futex table.
             let mut table = FUTEX_TABLE.lock();
             table
                 .entry(self.pa_key)
                 .or_default()
-                .push(cx.waker().clone());
+                .push((self.task.pid, cx.waker().clone()));
             self.registered = true;
-            Poll::Pending
+            return Poll::Pending;
+        }
+
+        // Already registered: return Ready only if we were actually removed
+        // by futex_wake(). Otherwise keep waiting.
+        let mut table = FUTEX_TABLE.lock();
+        if let Some(waiters) = table.get_mut(&self.pa_key) {
+            if waiters.iter().any(|(pid, _)| *pid == self.task.pid) {
+                // Still queued; refresh waker for future wakeups.
+                for (pid, w) in waiters.iter_mut() {
+                    if *pid == self.task.pid {
+                        *w = cx.waker().clone();
+                        break;
+                    }
+                }
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        } else {
+            // Key vanished -> this waiter has been woken.
+            Poll::Ready(Ok(()))
         }
     }
 }

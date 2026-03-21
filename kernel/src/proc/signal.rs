@@ -268,7 +268,7 @@ impl SigAction {
 /// Signal state embedded in Task.
 pub struct SignalState {
     /// Per-signal actions (indexed by signo - 1, 0..63).
-    pub actions: Mutex<[SigAction; MAX_SIG as usize]>,
+    pub actions: Arc<Mutex<[SigAction; MAX_SIG as usize]>>,
     /// Pending signals bitmap (atomic for lock-free post_signal).
     pub pending: AtomicSigSet,
     /// Blocked signals bitmap.
@@ -280,7 +280,7 @@ pub struct SignalState {
 impl SignalState {
     pub fn new() -> Self {
         Self {
-            actions: Mutex::new([SigAction::default(); MAX_SIG as usize]),
+            actions: Arc::new(Mutex::new([SigAction::default(); MAX_SIG as usize])),
             pending: AtomicSigSet::new(SigSet::empty()),
             blocked: AtomicSigSet::new(SigSet::empty()),
             altstack: Mutex::new((0, 0, 0)),
@@ -401,21 +401,71 @@ pub fn build_sigcode_page() -> [u8; PAGE_SIZE] {
 }
 
 // ---------------------------------------------------------------------------
-// Signal frame (sigframe) on user stack
+// Signal frame (rt_sigframe) on user stack
 // ---------------------------------------------------------------------------
 
-/// Signal frame pushed onto user stack before redirecting to handler.
-/// Layout must match what sigreturn expects.
+/// Linux siginfo_t size on rv64.
+const SIGINFO_SIZE: usize = 128;
+/// Keep ucontext layout compatible with userspace libc (musl/glibc) on rv64:
+/// sigset_t is treated as 16 bytes in ucontext, and mcontext starts at +176.
+const SIGSET_SIZE: usize = 16;
+const UC_SIGMASK_PAD_SIZE: usize = 120;
+/// Conservative size matching Linux/glibc RISC-V fp state union.
+const FPSTATE_SIZE: usize = 528;
+
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UContext {
+    pub uc_flags: u64,
+    pub uc_link: u64,
+    pub uc_stack_sp: u64,
+    pub uc_stack_flags: u32,
+    pub uc_stack_pad: u32,
+    pub uc_stack_size: u64,
+    pub uc_sigmask: [u64; 2],
+    pub uc_sigmask_pad: [u8; UC_SIGMASK_PAD_SIZE],
+    /// Linux RISC-V gregs: [pc, ra, sp, gp, tp, t0..t6].
+    pub uc_gregs: [u64; 32],
+    pub uc_fpregs: [u8; FPSTATE_SIZE],
+}
+
+impl UContext {
+    fn from_trap_frame(tf: &TrapFrame, sigmask: u64, altstack: (usize, usize, u32)) -> Self {
+        let mut gregs = [0u64; 32];
+        gregs[0] = tf.sepc as u64;
+        for (i, reg) in tf.x.iter().enumerate().skip(1) {
+            gregs[i] = *reg as u64;
+        }
+        Self {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack_sp: altstack.0 as u64,
+            uc_stack_flags: altstack.2,
+            uc_stack_pad: 0,
+            uc_stack_size: altstack.1 as u64,
+            uc_sigmask: [sigmask, 0],
+            uc_sigmask_pad: [0u8; UC_SIGMASK_PAD_SIZE],
+            uc_gregs: gregs,
+            uc_fpregs: [0u8; FPSTATE_SIZE],
+        }
+    }
+
+    fn apply_to_trap_frame(&self, tf: &mut TrapFrame) {
+        tf.sepc = self.uc_gregs[0] as usize;
+        tf.x = [0usize; 32];
+        for (i, reg) in self.uc_gregs.iter().enumerate().skip(1) {
+            tf.x[i] = *reg as usize;
+        }
+    }
+}
+
+/// Signal frame pushed onto user stack before redirecting to handler.
+/// This follows Linux rv64 rt_sigframe shape: siginfo_t + ucontext.
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SigFrame {
-    /// Saved trap frame (full register state at point of interruption).
-    pub saved_tf: TrapFrame,
-    /// Signal number.
-    pub signo: u32,
-    /// Padding for alignment.
-    pub _pad: u32,
-    /// Signal mask to restore on sigreturn.
-    pub saved_mask: u64,
+    pub info: [u8; SIGINFO_SIZE],
+    pub uc: UContext,
 }
 
 pub const SIGFRAME_SIZE: usize = core::mem::size_of::<SigFrame>();
@@ -423,9 +473,6 @@ pub const SIGFRAME_SIZE: usize = core::mem::size_of::<SigFrame>();
 // ---------------------------------------------------------------------------
 // sendsig: build sigframe on user stack, redirect to handler
 // ---------------------------------------------------------------------------
-
-/// Linux siginfo_t size on rv64 (128 bytes).
-const SIGINFO_SIZE: usize = 128;
 
 /// Build a minimal siginfo_t in a 128-byte buffer.
 /// Fields: si_signo (i32 @ 0), si_errno (i32 @ 4), si_code (i32 @ 8).
@@ -435,8 +482,10 @@ fn build_siginfo(sig: u8) -> [u8; SIGINFO_SIZE] {
     let signo = sig as i32;
     buf[0..4].copy_from_slice(&signo.to_le_bytes());
     // si_errno at offset 4 = 0
-    // si_code at offset 8: SI_KERNEL=128 (generic)
-    let si_code: i32 = 128;
+    // si_code at offset 8.
+    // Use SI_TKILL (-6) so pthread cancellation handlers (musl/glibc)
+    // can recognize thread-directed cancellation signals.
+    let si_code: i32 = -6;
     buf[8..12].copy_from_slice(&si_code.to_le_bytes());
     buf
 }
@@ -481,34 +530,21 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
         }
     }
 
-    // If SA_SIGINFO, allocate siginfo_t on the user stack first
-    let siginfo_va = if action.flags & SA_SIGINFO != 0 {
-        sp = (sp - SIGINFO_SIZE) & !0xF;
-        let si = build_siginfo(sig);
-        let ok = unsafe { crate::hal::copy_user_chunk(sp as *mut u8, si.as_ptr(), SIGINFO_SIZE) };
-        if ok != 0 {
-            return Err(());
-        }
-        sp // pointer to siginfo_t
-    } else {
-        0 // NULL when SA_SIGINFO not set
-    };
-
     // Align SP down and make room for SigFrame
     sp = (sp - SIGFRAME_SIZE) & !0xF; // 16-byte aligned
 
-    // Build the sigframe in kernel memory
+    // Build Linux-shaped rt_sigframe in kernel memory.
+    let saved_mask = sig_state.blocked.load(Ordering::Relaxed).as_u64();
+    let altstack = *sig_state.altstack.lock();
     let frame = SigFrame {
-        saved_tf: *tf,
-        signo: sig as u32,
-        _pad: 0,
-        saved_mask: sig_state.blocked.load(Ordering::Relaxed).as_u64(),
+        info: build_siginfo(sig),
+        uc: UContext::from_trap_frame(&tf, saved_mask, altstack),
     };
 
     // Update blocked mask (add this signal's mask, plus the signal itself
     // unless SA_NOMASK/SA_NODEFER is set - but we don't implement those yet,
     // so standard POSIX says the signal is blocked while handled).
-    let mut new_blocked = SigSet::from_u64(frame.saved_mask | action.mask);
+    let mut new_blocked = SigSet::from_u64(saved_mask | action.mask);
     new_blocked.add(Signal::new_unchecked(sig));
     sig_state.blocked.store(new_blocked, Ordering::Relaxed);
     // Copyout to user stack using pcb_onfault guard
@@ -543,8 +579,54 @@ pub fn sendsig(task: &Arc<Task>, sig: u8, action: &SigAction) -> Result<(), ()> 
     //TODO: manually controlling trap frame is acceptable. make it a method.
     tf.sepc = action.handler;
     tf.x[10] = sig as usize; // a0 = signo
-    tf.x[11] = siginfo_va; // a1 = siginfo (valid ptr if SA_SIGINFO, else NULL)
-    tf.x[12] = sp; // a2 = ucontext (pointer to sigframe)
+    if action.flags & SA_SIGINFO != 0 {
+        tf.x[11] = sp; // a1 = &siginfo_t
+        tf.x[12] = sp + SIGINFO_SIZE; // a2 = &ucontext
+    } else {
+        tf.x[11] = 0;
+        tf.x[12] = 0;
+    }
+    if sig == 33 {
+        let mut cancel_word = 0i32;
+        let mut cancel_type = 0u8;
+        let mut cancel_state = 0u8;
+        let tp = tf.x[4];
+        let _ = unsafe {
+            crate::hal::copy_user_chunk(
+                &mut cancel_word as *mut i32 as *mut u8,
+                (tp.wrapping_sub(156)) as *const u8,
+                core::mem::size_of::<i32>(),
+            )
+        };
+        let _ = unsafe {
+            crate::hal::copy_user_chunk(
+                &mut cancel_type as *mut u8,
+                (tp.wrapping_sub(152)) as *const u8,
+                1,
+            )
+        };
+        let _ = unsafe {
+            crate::hal::copy_user_chunk(
+                &mut cancel_state as *mut u8,
+                (tp.wrapping_sub(151)) as *const u8,
+                1,
+            )
+        };
+        crate::kprintln!(
+            "[sendsig] pid={} sig=33 handler={:#x} flags={:#x} restorer={:#x} tp={:#x} cancel={} type={} state={} sp={:#x} a1={:#x} a2={:#x}",
+            task.pid,
+            action.handler,
+            action.flags,
+            action.restorer,
+            tp,
+            cancel_word,
+            cancel_type,
+            cancel_state,
+            tf.x[2],
+            tf.x[11],
+            tf.x[12]
+        );
+    }
     tf.x[2] = sp; // sp = sigframe
     tf.x[1] = SIGCODE_VA; // ra = sigreturn trampoline
 
@@ -692,6 +774,13 @@ pub(crate) fn kill_pgrp(pgid: u32, sig: u8) {
             }
         }
     }
+}
+
+pub(crate) fn thread_group_has_live_peer(tgid: u32, self_pid: u32) -> bool {
+    let registry = TASK_REGISTRY.lock();
+    registry
+        .iter()
+        .any(|t| t.tgid == tgid && t.pid != self_pid && t.state() == crate::proc::TaskState::Running)
 }
 
 // ---------------------------------------------------------------------------

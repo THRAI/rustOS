@@ -230,7 +230,16 @@ async fn user_trap_handler(task: &Arc<Task>) -> TrapResult {
                         return TrapResult::Continue;
                     }
                     // No fixup — truly fatal user fault.
-                    let pc = task.trap_frame.lock().sepc;
+                    let tf = task.trap_frame.lock();
+                    let pc = tf.sepc;
+                    kprintln!("[FATAL] pid={} va={:#x} pc={:#x} code={}", task.pid, stval, pc, code);
+                    kprintln!("  x1(ra)={:#x} x2(sp)={:#x} x3(gp)={:#x} x4(tp)={:#x}",
+                        tf.x[1], tf.x[2], tf.x[3], tf.x[4]);
+                    kprintln!("  x8(s0)={:#x} x9(s1)={:#x} x10(a0)={:#x} x11(a1)={:#x}",
+                        tf.x[8], tf.x[9], tf.x[10], tf.x[11]);
+                    kprintln!("  x18(s2)={:#x} x19(s3)={:#x} x20(s4)={:#x} x21(s5)={:#x}",
+                        tf.x[18], tf.x[19], tf.x[20], tf.x[21]);
+                    drop(tf);
                     klog!(
                         trap,
                         error,
@@ -286,6 +295,7 @@ async fn dispatch_syscall(task: &Arc<Task>) -> TrapResult {
 /// Spawn a user task on the specified CPU.
 pub fn spawn_user_task(task: Arc<Task>, cpu: usize) {
     //crate::kprintln!("[DEBUG] spawn_user_task pid={} cpu={}", task.pid, cpu);
+    crate::proc::signal::register_task(&task);
     spawn_kernel_task(UserTaskFuture::new(task), cpu).detach();
 }
 

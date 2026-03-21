@@ -7,7 +7,9 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     hal_common::{VirtAddr, PAGE_SIZE},
+    ipc::futex_wake,
     mm::PageFaultAccessType,
+    mm::pmap_extract,
     proc::Task,
 };
 
@@ -133,7 +135,37 @@ pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::WaitStatus) {
     task.exit_status
         .store(wstatus.0, core::sync::atomic::Ordering::Release);
     task.set_zombie();
-    task.release_zombie_resources();
+    let has_live_peer = crate::proc::thread_group_has_live_peer(task.tgid, task.pid);
+    let thread_like_exit = task.pid != task.tgid || has_live_peer;
+
+    // CLONE_CHILD_CLEARTID: store 0 then wake futex waiter (pthread_join).
+    let clear_tid = task
+        .clear_child_tid
+        .swap(0, core::sync::atomic::Ordering::AcqRel);
+    if clear_tid != 0 {
+        let zero: u32 = 0;
+        let _ = unsafe {
+            crate::hal::copy_user_chunk(
+                clear_tid as *mut u8,
+                &zero as *const u32 as *const u8,
+                core::mem::size_of::<u32>(),
+            )
+        };
+        let pa_key = {
+            let vm_map = task.vm_map.read();
+            let pmap = vm_map.pmap_lock();
+            pmap_extract(&pmap, VirtAddr::new(clear_tid & !(PAGE_SIZE - 1)))
+                .map(|pa| pa + (clear_tid & (PAGE_SIZE - 1)))
+        };
+        if let Some(key) = pa_key {
+            futex_wake(key, 1);
+        }
+    }
+
+    // Thread exit must not tear down shared CLONE_VM / CLONE_FILES state.
+    if !thread_like_exit {
+        task.release_zombie_resources();
+    }
 
     // Signal vfork parent (if any) that child has exited
     if let Some(ref vfork) = task.vfork_done {
@@ -143,26 +175,30 @@ pub fn do_exit(task: &Arc<Task>, wstatus: crate::proc::WaitStatus) {
     // Unregister from global task registry
     crate::proc::unregister_task(task.pid);
 
-    // Post SIGCHLD to parent
+    // Post SIGCHLD to parent only for thread-group leaders (process exits).
     if let Some(parent) = task.parent.upgrade() {
-        parent.signals.post_signal(crate::proc::SIGCHLD);
+        if !thread_like_exit {
+            parent.signals.post_signal(crate::proc::SIGCHLD);
+        }
 
         // SA_NOCLDWAIT: auto-reap child (remove from parent's children list)
         let sigchld_action = {
             let actions = parent.signals.actions.lock();
             actions[(crate::proc::SIGCHLD - 1) as usize]
         };
-        if sigchld_action.flags & crate::proc::SA_NOCLDWAIT != 0 {
+        if !thread_like_exit && sigchld_action.flags & crate::proc::SA_NOCLDWAIT != 0 {
             parent.children.lock().retain(|c| c.pid != task.pid);
         }
 
-        // Wake parent's WaitChildFuture
-        if let Some(waker) = parent.parent_waker.lock().take() {
-            waker.wake();
-        }
-        // Wake parent's top-level waker for signal delivery
-        if let Some(waker) = parent.top_level_waker.lock().take() {
-            waker.wake();
+        if !thread_like_exit {
+            // Wake parent's WaitChildFuture
+            if let Some(waker) = parent.parent_waker.lock().take() {
+                waker.wake();
+            }
+            // Wake parent's top-level waker for signal delivery
+            if let Some(waker) = parent.top_level_waker.lock().take() {
+                waker.wake();
+            }
         }
     }
 

@@ -5,7 +5,9 @@ use core::sync::atomic::Ordering;
 
 // use crate::klog;
 use crate::hal_common::Errno;
-use crate::proc::{SigAction, SigFrame, Signal, Task, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP};
+use crate::proc::{
+    SigAction, SigFrame, SigSet, Signal, Task, MAX_SIG, SIGFRAME_SIZE, SIGKILL, SIGSTOP,
+};
 
 pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
     klog!(signal, debug, "sigreturn pid={}", task.pid);
@@ -27,17 +29,20 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
 
     // Validate sepc: must be in user space (< 0x0000_0040_0000_0000)
     const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
-    if frame.saved_tf.sepc >= USER_MAX_VA {
+    if frame.uc.uc_gregs[0] as usize >= USER_MAX_VA {
         return Err(Errno::Einval);
     }
 
-    // Restore trap frame with sanitization
+    // Restore trap frame from user-provided ucontext (Linux rt_sigreturn semantics).
     {
         let mut tf = task.trap_frame.lock();
-        tf.x = frame.saved_tf.x;
-        tf.sepc = frame.saved_tf.sepc;
+        tf.x = [0usize; 32];
+        tf.sepc = frame.uc.uc_gregs[0] as usize;
+        for (i, reg) in frame.uc.uc_gregs.iter().enumerate().skip(1) {
+            tf.x[i] = *reg as usize;
+        }
         // Sanitize sstatus: SPP cleared (user mode), SPIE set, FS>=Initial
-        tf.sstatus = (frame.saved_tf.sstatus & !(1 << 8)) | (1 << 5);
+        tf.sstatus = (tf.sstatus & !(1 << 8)) | (1 << 5);
         if tf.sstatus & (3 << 13) == 0 {
             tf.sstatus |= 1 << 13; // FS=Initial if Off
         }
@@ -45,7 +50,7 @@ pub fn sys_sigreturn(task: &Arc<Task>) -> Result<(), Errno> {
 
     // Restore signal mask
     task.signals.blocked.store(
-        crate::proc::SigSet::from_u64(frame.saved_mask),
+        crate::proc::SigSet::from_u64(frame.uc.uc_sigmask[0]),
         Ordering::Release,
     );
 
@@ -113,6 +118,136 @@ pub fn sys_sigaction(
 pub const SIG_BLOCK: usize = 0;
 pub const SIG_UNBLOCK: usize = 1;
 pub const SIG_SETMASK: usize = 2;
+
+const SIGSET_SIZE: usize = 8;
+const TIMESPEC_SIZE: usize = 16;
+const SIGINFO_SIZE: usize = 128;
+
+fn dequeue_pending_from_set(task: &Arc<Task>, wait_set: SigSet) -> Option<u8> {
+    let sig_state = &task.signals;
+    loop {
+        let pending = sig_state.pending.load(Ordering::Acquire);
+
+        // SIGKILL/SIGSTOP are never waitable via sigtimedwait.
+        let mut unblockable = SigSet::empty();
+        unblockable
+            .add(Signal::new_unchecked(SIGKILL))
+            .add(Signal::new_unchecked(SIGSTOP));
+        let eligible = pending.intersect(wait_set).difference(unblockable);
+
+        if eligible.is_empty() {
+            return None;
+        }
+
+        let bit = eligible.as_u64().trailing_zeros() as u8;
+        let sig = Signal::new_unchecked(bit + 1);
+        let old = sig_state.pending.fetch_remove(sig, Ordering::AcqRel);
+        if old.contains(sig) {
+            return Some(sig.as_u8());
+        }
+    }
+}
+
+fn write_min_siginfo(siginfo_ptr: usize, signo: u8) -> Result<(), Errno> {
+    if siginfo_ptr == 0 {
+        return Ok(());
+    }
+
+    // Minimal Linux-compatible siginfo_t head:
+    // si_signo (i32 @0), si_errno (i32 @4), si_code (i32 @8).
+    let mut buf = [0u8; SIGINFO_SIZE];
+    let signo_i32 = (signo as i32).to_le_bytes();
+    buf[0..4].copy_from_slice(&signo_i32);
+    // si_errno = 0
+    let si_code_kernel = 128i32.to_le_bytes(); // SI_KERNEL
+    buf[8..12].copy_from_slice(&si_code_kernel);
+
+    let rc = unsafe { crate::hal::copy_user_chunk(siginfo_ptr as *mut u8, buf.as_ptr(), SIGINFO_SIZE) };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+    Ok(())
+}
+
+pub async fn sys_rt_sigtimedwait(
+    task: &Arc<Task>,
+    set_ptr: usize,
+    info_ptr: usize,
+    timeout_ptr: usize,
+    sigsetsize: usize,
+) -> Result<usize, Errno> {
+    if set_ptr == 0 {
+        return Err(Errno::Efault);
+    }
+    if sigsetsize < SIGSET_SIZE {
+        return Err(Errno::Einval);
+    }
+
+    let mut raw_set = 0u64;
+    let rc = unsafe {
+        crate::hal::copy_user_chunk(
+            &mut raw_set as *mut u64 as *mut u8,
+            set_ptr as *const u8,
+            SIGSET_SIZE,
+        )
+    };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+    let wait_set = SigSet::from_u64(raw_set);
+
+    // timeout == NULL means wait indefinitely.
+    let mut deadline_ms: Option<u64> = None;
+    if timeout_ptr != 0 {
+        let mut ts = [0u64; 2];
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(ts.as_mut_ptr() as *mut u8, timeout_ptr as *const u8, TIMESPEC_SIZE)
+        };
+        if rc != 0 {
+            return Err(Errno::Efault);
+        }
+        let secs = ts[0];
+        let nsecs = ts[1];
+        if nsecs >= 1_000_000_000 {
+            return Err(Errno::Einval);
+        }
+        let timeout_ms = secs
+            .saturating_mul(1000)
+            .saturating_add((nsecs + 999_999) / 1_000_000);
+        deadline_ms = Some(crate::hal::read_time_ms().saturating_add(timeout_ms));
+    }
+
+    loop {
+        if let Some(sig) = dequeue_pending_from_set(task, wait_set) {
+            write_min_siginfo(info_ptr, sig)?;
+            return Ok(sig as usize);
+        }
+
+        if let Some(deadline) = deadline_ms {
+            let now = crate::hal::read_time_ms();
+            if now >= deadline {
+                return Err(Errno::Eagain);
+            }
+        }
+
+        // Signals outside wait_set should still interrupt this syscall.
+        if task.signals.has_actionable_pending() {
+            return Err(Errno::Eintr);
+        }
+
+        let sleep_ms = if let Some(deadline) = deadline_ms {
+            let now = crate::hal::read_time_ms();
+            core::cmp::min(deadline.saturating_sub(now), 10)
+        } else {
+            10
+        };
+        if sleep_ms == 0 {
+            crate::executor::yield_now().await;
+        } else {
+            crate::executor::sleep(sleep_ms).await;
+        }
+    }
+}
 
 pub fn sys_sigprocmask(
     task: &Arc<Task>,
@@ -221,4 +356,35 @@ pub fn sys_kill(sender: &Arc<Task>, pid: isize, sig: u8) -> Result<usize, Errno>
         crate::proc::kill_pgrp(pgid, sig);
         Ok(0)
     }
+}
+
+pub fn sys_tkill(_sender: &Arc<Task>, tid: isize, sig: u8) -> Result<usize, Errno> {
+    if tid <= 0 || sig > MAX_SIG {
+        return Err(Errno::Einval);
+    }
+    let target = crate::proc::find_task_by_pid(tid as u32).ok_or(Errno::Esrch)?;
+    if sig > 0 {
+        target.signals.post_signal(sig);
+        if let Some(w) = target.top_level_waker.lock().take() {
+            w.wake();
+        }
+    }
+    Ok(0)
+}
+
+pub fn sys_tgkill(_sender: &Arc<Task>, tgid: isize, tid: isize, sig: u8) -> Result<usize, Errno> {
+    if tgid <= 0 || tid <= 0 || sig > MAX_SIG {
+        return Err(Errno::Einval);
+    }
+    let target = crate::proc::find_task_by_pid(tid as u32).ok_or(Errno::Esrch)?;
+    if target.tgid != tgid as u32 {
+        return Err(Errno::Esrch);
+    }
+    if sig > 0 {
+        target.signals.post_signal(sig);
+        if let Some(w) = target.top_level_waker.lock().take() {
+            w.wake();
+        }
+    }
+    Ok(0)
 }

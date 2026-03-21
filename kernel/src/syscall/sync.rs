@@ -144,6 +144,7 @@ pub async fn sys_futex_async(
     uaddr: usize,
     op: u32,
     val: u32,
+    timeout_ptr: usize,
 ) -> Result<usize, Errno> {
     const FUTEX_WAIT: u32 = 0;
     const FUTEX_WAKE: u32 = 1;
@@ -152,10 +153,27 @@ pub async fn sys_futex_async(
 
     match cmd {
         FUTEX_WAIT => {
-            // Read current value at uaddr
-            let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+            // Read current value at uaddr via safe user-copy path.
+            let mut current: u32 = 0;
+            let rc = unsafe {
+                crate::hal::copy_user_chunk(
+                    &mut current as *mut u32 as *mut u8,
+                    uaddr as *const u8,
+                    core::mem::size_of::<u32>(),
+                )
+            };
+            if rc != 0 {
+                kprintln!("[futex] WAIT EFAULT uaddr={:#x}", uaddr);
+                return Err(Errno::Efault);
+            }
             if current != val {
                 // Value changed — don't sleep
+                kprintln!(
+                    "[futex] WAIT EAGAIN uaddr={:#x} cur={} want={}",
+                    uaddr,
+                    current,
+                    val
+                );
                 return Err(Errno::Eagain);
             }
             // Resolve physical address for futex key
@@ -165,8 +183,57 @@ pub async fn sys_futex_async(
                 pmap_extract(&pmap, VirtAddr::new(uaddr & !0xFFF)).ok_or(Errno::Efault)?
             };
             let pa_key = pa + (uaddr & 0xFFF);
-            // Park on the futex
-            futex_wait(pa_key, task).await?;
+
+            // Parse optional timeout: struct timespec { u64 tv_sec; u64 tv_nsec; }
+            // deadline_ms=0 means no timeout.
+            let deadline_ms: u64 = if timeout_ptr != 0 {
+                let mut ts = [0u64; 2];
+                let rc = unsafe {
+                    crate::hal::copy_user_chunk(
+                        ts.as_mut_ptr() as *mut u8,
+                        timeout_ptr as *const u8,
+                        16,
+                    )
+                };
+                if rc != 0 {
+                    return Err(Errno::Efault);
+                }
+                let timeout_ms = ts[0] * 1000 + ts[1] / 1_000_000;
+                let dl = crate::hal::read_time_ms() + timeout_ms.max(1);
+                // Spawn a timer that wakes the task when timeout expires so FutexWaitFuture
+                // gets re-polled and can detect the deadline.
+                let task2 = Arc::clone(task);
+                let cpu = crate::executor::current().cpu_id;
+                crate::executor::spawn_kernel_task(
+                    async move {
+                        crate::executor::sleep(timeout_ms.max(1)).await;
+                        if let Some(w) = task2.top_level_waker.lock().take() {
+                            w.wake();
+                        }
+                    },
+                    cpu,
+                ).detach();
+                dl
+            } else {
+                0
+            };
+
+            // Park on the futex (FutexWaitFuture handles timeout and EINTR internally)
+            let ret = futex_wait(pa_key, task, deadline_ms).await;
+            match ret {
+                Ok(()) => {
+                    kprintln!("[futex] WAIT woke pid={} key={:#x}", task.pid, pa_key);
+                    Ok(0)
+                },
+                Err(Errno::Etimedout) => {
+                    kprintln!("[futex] WAIT timeout pid={} key={:#x}", task.pid, pa_key);
+                    Err(Errno::Etimedout)
+                },
+                Err(e) => {
+                    kprintln!("[futex] WAIT interrupted pid={} key={:#x} err={:?}", task.pid, pa_key, e);
+                    Err(e)
+                },
+            }?;
             Ok(0)
         },
         FUTEX_WAKE => {
@@ -178,6 +245,7 @@ pub async fn sys_futex_async(
             };
             let pa_key = pa + (uaddr & 0xFFF);
             let woken = futex_wake(pa_key, val as usize);
+            kprintln!("[futex] WAKE pid={} key={:#x} n={}", task.pid, pa_key, woken);
             Ok(woken)
         },
         _ => Err(Errno::Enosys),

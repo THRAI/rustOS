@@ -48,7 +48,17 @@ pub fn get_ephemeral_port() -> u16 {
 ///
 /// - `nonblocking=true`: call `f()` once, return EAGAIN on failure.
 /// - `nonblocking=false`: loop calling `f()`, yield on EAGAIN, retry.
-pub async fn net_block_on<F, T>(nonblocking: bool, handle: SocketHandle, mut f: F) -> KernelResult<T>
+/// - `want_read=true`: wait for RX ready; `want_read=false`: wait for TX ready.
+/// - `signals`: optional reference to the task's signal state; if a pending
+///   signal is detected at the start of each retry, returns EINTR so the
+///   signal can be delivered before the next blocking attempt.
+pub async fn net_block_on<F, T>(
+    nonblocking: bool,
+    handle: SocketHandle,
+    want_read: bool,
+    signals: Option<&crate::proc::signal::SignalState>,
+    mut f: F,
+) -> KernelResult<T>
 where
     F: FnMut() -> KernelResult<T>,
 {
@@ -56,11 +66,18 @@ where
         return f();
     }
     loop {
+        // Return EINTR if a signal became pending (e.g. SIGALRM from setitimer).
+        // This allows signal delivery between blocking retries.
+        if let Some(sigs) = signals {
+            if sigs.has_actionable_pending() {
+                return Err(Errno::Eintr);
+            }
+        }
         super::net_stack().poll_and_wake();
         match f() {
             Ok(val) => return Ok(val),
             Err(Errno::Eagain) => {
-                SocketReadyFuture::new(handle).await;
+                SocketReadyFuture::new(handle, want_read).await;
             }
             Err(e) => return Err(e),
         }
@@ -73,13 +90,15 @@ where
 
 struct SocketReadyFuture {
     handle: SocketHandle,
+    want_read: bool,
     registered: bool,
 }
 
 impl SocketReadyFuture {
-    fn new(handle: SocketHandle) -> Self {
+    fn new(handle: SocketHandle, want_read: bool) -> Self {
         Self {
             handle,
+            want_read,
             registered: false,
         }
     }
@@ -93,12 +112,20 @@ impl Future for SocketReadyFuture {
         stack.poll_and_wake();
 
         if self.registered {
-            stack.unregister_waker(self.handle);
+            if self.want_read {
+                stack.unregister_read_waker(self.handle);
+            } else {
+                stack.unregister_write_waker(self.handle);
+            }
             return Poll::Ready(());
         }
 
         self.registered = true;
-        stack.register_waker(self.handle, cx.waker().clone());
+        if self.want_read {
+            stack.register_read_waker(self.handle, cx.waker().clone());
+        } else {
+            stack.register_write_waker(self.handle, cx.waker().clone());
+        }
         Poll::Pending
     }
 }

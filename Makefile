@@ -123,6 +123,9 @@ oscomp: sdcard-rv run-oscomp
 oscomp-basic: OSCOMP_RUN_SCRIPT=run-rv-basic.sh
 oscomp-basic: sdcard-rv run-oscomp
 
+oscomp-nettest: OSCOMP_RUN_SCRIPT=run-rv-nettest.sh
+oscomp-nettest: sdcard-rv run-oscomp
+
 oscomp-basic-all: OSCOMP_RUN_SCRIPT=run-rv-basic-all.sh
 oscomp-basic-all: sdcard-rv run-oscomp
 

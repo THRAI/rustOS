@@ -10,6 +10,7 @@ use crate::hal_common::{Errno, KernelResult};
 use crate::net::{net_stack, Socket, SocketType};
 use crate::net::addr::SockAddrIn4;
 use crate::net::util::{get_ephemeral_port, net_block_on};
+use crate::proc::Task;
 
 /// Create a new UDP socket and register it with the network stack.
 pub fn udp_create() -> Arc<Socket> {
@@ -29,21 +30,23 @@ pub fn udp_create() -> Arc<Socket> {
 }
 
 /// Bind a UDP socket to a local address.
+/// If port is 0, auto-assign an ephemeral port (smoltcp doesn't do this).
 pub fn udp_bind(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<()> {
-    let ep = addr.to_listen_endpoint();
-    sock.local_port.store(addr.sin_port, Ordering::Relaxed);
-    net_stack().with_socket_mut::<udp::Socket, _>(sock.handle, |udp| {
+    let mut ep = addr.to_listen_endpoint();
+    let port = if addr.sin_port == 0 {
+        let p = get_ephemeral_port();
+        ep.port = p;
+        p
+    } else {
+        addr.sin_port
+    };
+    sock.local_port.store(port, Ordering::Relaxed);
+    net_stack().with_socket_mut::<udp::Socket, _>(sock.handle(), |udp| {
         udp.bind(ep).map_err(|_| Errno::Eaddrinuse)
     })
 }
 
 /// "Connect" a UDP socket — just stores the default remote endpoint.
-/// smoltcp UDP sockets don't have a connect concept, so we store it
-/// in the socket metadata and use it as default for send.
-///
-/// For simplicity, we store the remote endpoint in an atomic-friendly way.
-/// Since smoltcp doesn't track this, we use a separate field.
-/// For now, we just bind if not already bound.
 pub fn udp_connect(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<IpEndpoint> {
     let remote = addr.to_endpoint();
 
@@ -56,7 +59,7 @@ pub fn udp_connect(sock: &Socket, addr: &SockAddrIn4) -> KernelResult<IpEndpoint
             addr: None,
             port: ep,
         };
-        net_stack().with_socket_mut::<udp::Socket, _>(sock.handle, |udp| {
+        net_stack().with_socket_mut::<udp::Socket, _>(sock.handle(), |udp| {
             udp.bind(listen_ep).map_err(|_| Errno::Eaddrinuse)
         })?;
     }
@@ -72,8 +75,9 @@ pub async fn udp_sendto(
     sock: &Socket,
     data: &[u8],
     remote: &IpEndpoint,
+    task: &Arc<Task>,
 ) -> KernelResult<usize> {
-    let handle = sock.handle;
+    let handle = sock.handle();
     let nonblocking = sock.is_nonblocking();
 
     // Auto-bind if not bound
@@ -91,7 +95,7 @@ pub async fn udp_sendto(
     }
 
     let remote = *remote;
-    net_block_on(nonblocking, handle, || {
+    net_block_on(nonblocking, handle, false, Some(&task.signals), || {
         let stack = net_stack();
         stack.poll_and_wake();
         stack.with_socket_mut::<udp::Socket, _>(handle, |udp| {
@@ -107,11 +111,12 @@ pub async fn udp_sendto(
 pub async fn udp_recvfrom(
     sock: &Socket,
     buf: &mut [u8],
+    task: &Arc<Task>,
 ) -> KernelResult<(usize, SockAddrIn4)> {
-    let handle = sock.handle;
+    let handle = sock.handle();
     let nonblocking = sock.is_nonblocking();
 
-    net_block_on(nonblocking, handle, || {
+    net_block_on(nonblocking, handle, true, Some(&task.signals), || {
         let stack = net_stack();
         stack.poll_and_wake();
         stack.with_socket_mut::<udp::Socket, _>(handle, |udp| {
@@ -131,7 +136,7 @@ pub async fn udp_recvfrom(
 /// Get the local endpoint of a UDP socket.
 pub fn udp_local_endpoint(sock: &Socket) -> KernelResult<SockAddrIn4> {
     let stack = net_stack();
-    stack.with_socket::<udp::Socket, _>(sock.handle, |udp| {
+    stack.with_socket::<udp::Socket, _>(sock.handle(), |udp| {
         if let Some(ep) = udp.endpoint().port.checked_sub(0).and_then(|p| {
             if p > 0 {
                 Some(smoltcp::wire::IpEndpoint {

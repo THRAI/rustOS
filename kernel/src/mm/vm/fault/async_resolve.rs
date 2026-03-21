@@ -70,6 +70,10 @@ pub async fn resolve_user_fault(
                 ok = false;
             }
             if ok {
+                if fault_va_aligned.as_usize() >= 0x83000 && fault_va_aligned.as_usize() < 0x8e000 {
+                    kprintln!("[DBG-FAST] fastpath hit pid={} va={:#x} flags={:?}",
+                        task.pid, fault_va_aligned.as_usize(), entry.flags());
+                }
                 return Ok(());
             }
             crate::klog!(

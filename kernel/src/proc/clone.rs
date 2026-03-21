@@ -76,6 +76,7 @@ pub fn do_clone(
     flags: CloneFlags,
     child_stack: usize,
     tls: usize,
+    child_tid: usize,
 ) -> KernelResult<(Arc<Task>, Option<Arc<VforkDone>>)> {
     // Validate: CLONE_THREAD requires CLONE_VM | CLONE_SIGHAND
     if flags.contains(CloneFlags::THREAD) && !flags.contains(CloneFlags::VM | CloneFlags::SIGHAND) {
@@ -147,9 +148,12 @@ pub fn do_clone(
         .pending
         .store(SigSet::empty(), Ordering::Relaxed);
 
-    // Copy signal actions from parent.
-    // TODO(C2): CLONE_SIGHAND — Arc-wrap signal actions for sharing
-    {
+    // Signal actions: CLONE_SIGHAND shares the handler table.
+    // Without CLONE_SIGHAND, child gets a private copy.
+    if flags.contains(CloneFlags::SIGHAND) {
+        let task_mut = Arc::get_mut(&mut child).expect("child is not shared yet");
+        task_mut.signals.actions = Arc::clone(&parent.signals.actions);
+    } else {
         let parent_actions = parent.signals.actions.lock();
         *child.signals.actions.lock() = *parent_actions;
     }
@@ -159,6 +163,33 @@ pub fn do_clone(
         parent.signals.blocked.load(Ordering::Relaxed),
         Ordering::Relaxed,
     );
+
+    // --- Thread-group semantics ---
+    if flags.contains(CloneFlags::THREAD) {
+        let task_mut = Arc::get_mut(&mut child).expect("child is not shared yet");
+        task_mut.tgid = parent.tgid;
+    }
+
+    // --- Child TID semantics ---
+    if flags.contains(CloneFlags::CHILD_CLEARTID) && child_tid != 0 {
+        child
+            .clear_child_tid
+            .store(child_tid, Ordering::Relaxed);
+    }
+
+    if flags.contains(CloneFlags::CHILD_SETTID) && child_tid != 0 {
+        let tid = child.pid;
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(
+                child_tid as *mut u8,
+                &tid as *const u32 as *const u8,
+                core::mem::size_of::<u32>(),
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::Efault);
+        }
+    }
 
     // --- CLONE_VFORK ---
     let vfork_done = if flags.contains(CloneFlags::VFORK) {
@@ -171,7 +202,11 @@ pub fn do_clone(
     };
 
     // --- Parent-child linkage ---
-    parent.children.lock().push(Arc::clone(&child));
+    // CLONE_THREAD tasks are threads in the same thread group; they should
+    // not participate in process-level wait4/SIGCHLD child accounting.
+    if !flags.contains(CloneFlags::THREAD) {
+        parent.children.lock().push(Arc::clone(&child));
+    }
 
     Ok((child, vfork_done))
 }

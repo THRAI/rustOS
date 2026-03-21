@@ -193,17 +193,18 @@ fn classify_and_handle(
         None => {
             let is_file_backed = {
                 let obj_read = obj.read();
-                // If it has a pager and it's not the anon pager, it's file backed
-                // Actually an easier way is to just return NeedsAsyncIO unless the pager is specifically AnonPager
-                // Currently, any fault without page in object can be deferred to async if we want!
-                obj_read.pager.is_some() && !obj_read.pager.as_ref().unwrap().is_anon()
-                // All object faults can be async in phase 3
+                let has_pager = obj_read.pager.is_some();
+                let is_anon = obj_read.pager.as_ref().map_or(true, |p| p.is_anon());
+                has_pager && !is_anon
             };
 
             if is_file_backed {
                 crate::klog!(vm, debug, "fault NeedsAsyncIO va={:#x}", fault_va_aligned);
                 FaultResult::NeedsAsyncIO
             } else {
+                if fault_va_aligned.as_usize() >= 0x83000 && fault_va_aligned.as_usize() < 0x8e000 {
+                    kprintln!("[DBG] ANON fault va={:#x} obj_idx={}", fault_va_aligned, obj_page_offset);
+                }
                 handle_anonymous_fault(vma, obj, obj_page_offset, fault_va_aligned, pmap)
             }
         },

@@ -4,13 +4,13 @@ use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
 use crate::{
-    executor::{current, spawn_user_task},
+    executor::{current, sleep, spawn_kernel_task, spawn_user_task},
     hal_common::{Errno, KernelResult},
     mm::PageFaultAccessType,
     proc::{
         copyin_argv, copyinstr, do_clone, do_execve, do_exit, fault_in_user_buffer,
-        find_task_by_pid, CloneFlags, SigSet, Signal, Task, TaskState, WaitChildFuture, WaitStatus,
-        SIGCHLD,
+        find_task_by_pid, CloneFlags, SigSet, Signal, Task, TaskState,
+        WaitChildFuture, WaitStatus, SIGCHLD,
     },
 };
 
@@ -19,7 +19,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 pub fn sys_getpid(task: &Arc<Task>) -> usize {
-    task.pid as usize
+    task.tgid as usize
 }
 
 pub fn sys_getppid(task: &Arc<Task>) -> usize {
@@ -54,24 +54,61 @@ pub fn sys_clone(
     task: &Arc<Task>,
     flags: usize,
     child_stack: usize,
-    _parent_tid: usize,
+    parent_tid: usize,
+    child_tid: usize,
     tls: usize,
-    _child_tid: usize,
 ) -> KernelResult<usize> {
     let clone_flags = CloneFlags::from_bits_truncate(flags as u64);
 
-    // CLONE_THREAD still not supported
-    if clone_flags.contains(CloneFlags::THREAD) {
-        return Err(kerr!(
-            proc,
-            debug,
-            Errno::Enosys,
-            "sys_clone: CLONE_THREAD not supported"
-        ));
+    let (child, vfork_done) = match do_clone(task, clone_flags, child_stack, tls, child_tid) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(kerr!(
+                proc,
+                error,
+                e,
+                "sys_clone: do_clone failed flags={:#x} stack={:#x} tls={:#x} child_tid={:#x}",
+                flags,
+                child_stack,
+                tls,
+                child_tid
+            ))
+        },
+    };
+    let child_pid = child.pid;
+    if clone_flags.contains(CloneFlags::SETTLS) {
+        crate::kprintln!(
+            "[clone] parent={} child={} flags={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
+            task.pid,
+            child_pid,
+            flags,
+            parent_tid,
+            child_tid
+            ,
+            tls
+        );
     }
 
-    let (child, vfork_done) = do_clone(task, clone_flags, child_stack, tls)?;
-    let child_pid = child.pid;
+    if clone_flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(
+                parent_tid as *mut u8,
+                &child_pid as *const u32 as *const u8,
+                core::mem::size_of::<u32>(),
+            )
+        };
+        if rc != 0 {
+            return Err(kerr!(
+                proc,
+                error,
+                Errno::Efault,
+                "sys_clone: parent_tid copyout failed ptr={:#x} child_pid={}",
+                parent_tid,
+                child_pid
+            ));
+        }
+    }
+
     let cpu = current().cpu_id;
     spawn_user_task(child, cpu);
 
@@ -303,4 +340,110 @@ pub fn sys_getpgid(task: &Arc<Task>, pid: u32) -> Result<usize, Errno> {
             pid
         ))
     }
+}
+
+// ITIMER_REAL = 0: delivers SIGALRM when value expires
+const ITIMER_REAL: usize = 0;
+
+/// sys_getitimer: return zeros (we don't persist interval timer state)
+pub fn sys_getitimer(_task: &Arc<Task>, _which: usize, value_ptr: usize) -> KernelResult<usize> {
+    if value_ptr != 0 {
+        // Write zeroed itimerval (4 * u64 = 32 bytes)
+        let zeros = [0u64; 4];
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(
+                value_ptr as *mut u8,
+                zeros.as_ptr() as *const u8,
+                32,
+            )
+        };
+        if rc != 0 {
+            return Err(Errno::Efault);
+        }
+    }
+    Ok(0)
+}
+
+/// sys_setitimer: set an interval timer.
+///
+/// `struct itimerval` layout (RISC-V 64-bit):
+///   [0..8]   it_interval.tv_sec
+///   [8..16]  it_interval.tv_usec
+///   [16..24] it_value.tv_sec
+///   [24..32] it_value.tv_usec
+///
+/// Only ITIMER_REAL is supported; it spawns a kernel task that delivers
+/// SIGALRM after `it_value` time, then repeats at `it_interval` intervals.
+pub fn sys_setitimer(
+    task: &Arc<Task>,
+    which: usize,
+    new_ptr: usize,
+    old_ptr: usize,
+) -> KernelResult<usize> {
+    if which != ITIMER_REAL {
+        return Err(Errno::Einval);
+    }
+
+    // Write zeroed old value if requested
+    if old_ptr != 0 {
+        let zeros = [0u64; 4];
+        let rc = unsafe {
+            crate::hal::copy_user_chunk(old_ptr as *mut u8, zeros.as_ptr() as *const u8, 32)
+        };
+        if rc != 0 {
+            return Err(Errno::Efault);
+        }
+    }
+
+    if new_ptr == 0 {
+        return Ok(0);
+    }
+
+    // Read new itimerval
+    let mut val = [0u64; 4];
+    let rc = unsafe {
+        crate::hal::copy_user_chunk(val.as_mut_ptr() as *mut u8, new_ptr as *const u8, 32)
+    };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+
+    let value_sec = val[2];
+    let value_usec = val[3];
+    let interval_sec = val[0];
+    let interval_usec = val[1];
+
+    let initial_ms = value_sec * 1000 + value_usec / 1000;
+    let interval_ms = interval_sec * 1000 + interval_usec / 1000;
+
+    if initial_ms == 0 {
+        // Disarm timer - just return success
+        return Ok(0);
+    }
+
+    let cpu = current().cpu_id;
+    let task_clone = Arc::clone(task);
+    spawn_kernel_task(
+        async move {
+            sleep(initial_ms).await;
+            task_clone.signals.post_signal(crate::proc::signal::SIGALRM);
+            // Wake the task if it is parked in a blocking syscall (net I/O, futex, etc.)
+            if let Some(w) = task_clone.top_level_waker.lock().take() {
+                w.wake();
+            }
+            if interval_ms > 0 {
+                loop {
+                    sleep(interval_ms).await;
+                    task_clone.signals.post_signal(crate::proc::signal::SIGALRM);
+                    if let Some(w) = task_clone.top_level_waker.lock().take() {
+                        w.wake();
+                    }
+                }
+            }
+        },
+        cpu,
+    )
+    .detach();
+
+    Ok(0)
 }

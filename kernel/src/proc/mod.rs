@@ -19,7 +19,7 @@ pub use signal::{
     MAX_SIG, SA_NOCLDWAIT, SIGCHLD, SIGCODE_VA, SIGFRAME_SIZE, SIGKILL, SIGPIPE, SIGSEGV, SIGSTOP,
     SIG_DFL, SIG_IGN,
 };
-pub(crate) use signal::{find_task_by_pid, for_each_task, kill_pgrp};
+pub(crate) use signal::{find_task_by_pid, for_each_task, kill_pgrp, thread_group_has_live_peer};
 pub use syscall_result::SyscallResult;
 pub use task::{Task, TaskState};
 pub use user_copy::{copyin_argv, copyinstr, do_exit, fault_in_user_buffer};

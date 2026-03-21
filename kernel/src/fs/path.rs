@@ -3,10 +3,10 @@
 //! Splits path on '/', calls delegate lookup for each component,
 //! caches results in the dentry cache.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use crate::{
-    fs::{fs_lookup, insert_dentry, lookup_dentry, Ext4Vnode, Vnode, VnodeType},
+    fs::{fs_lookup, fs_readlink, insert_dentry, lookup_dentry, Ext4Vnode, Vnode, VnodeType},
     hal_common::Errno,
     proc::Task,
 };
@@ -26,20 +26,34 @@ pub fn root_vnode() -> Arc<dyn Vnode> {
 ///
 /// Path must be absolute (starts with '/').
 /// Each component is looked up via dentry cache first, then delegate.
+/// Symlinks (ext4 type 7) are followed transparently, up to 8 hops.
 pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
-    let path = path.trim_start_matches('/');
-    if path.is_empty() {
+    resolve_depth(path, 0).await
+}
+
+fn parent_dir(path: &str) -> &str {
+    if let Some(pos) = path.rfind('/') {
+        if pos == 0 { "/" } else { &path[..pos] }
+    } else {
+        "/"
+    }
+}
+
+async fn resolve_depth(path: &str, depth: u32) -> Result<Arc<dyn Vnode>, Errno> {
+    if depth > 8 {
+        return Err(Errno::Enoent); // symlink loop depth exceeded
+    }
+
+    let tail = path.trim_start_matches('/');
+    if tail.is_empty() {
         return Ok(root_vnode());
     }
 
     let mut current: Arc<dyn Vnode> = root_vnode();
     let mut built_path = String::new();
+    let components: Vec<&str> = tail.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
 
-    for component in path.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-
+    for (i, component) in components.iter().enumerate() {
         let parent_id = current.vnode_id();
 
         // Build the full path as we walk
@@ -58,6 +72,31 @@ pub async fn resolve(path: &str) -> Result<Arc<dyn Vnode>, Errno> {
 
         match result {
             Ok((child_ino, child_type, child_size)) => {
+                if child_type == 7 {
+                    // Symlink: read target and follow it.
+                    let (len, buf) =
+                        fs_readlink(&built_path).await.map_err(|_| Errno::Enoent)?;
+                    let raw = core::str::from_utf8(&buf[..len])
+                        .map_err(|_| Errno::Enoent)?
+                        .trim_end_matches('\0');
+                    // Build full new path: symlink_target + remaining components.
+                    let mut new_path = if raw.starts_with('/') {
+                        String::from(raw)
+                    } else {
+                        let parent = parent_dir(&built_path);
+                        let mut s = String::from(parent);
+                        if !s.ends_with('/') {
+                            s.push('/');
+                        }
+                        s.push_str(raw);
+                        s
+                    };
+                    for rem in &components[i + 1..] {
+                        new_path.push('/');
+                        new_path.push_str(rem);
+                    }
+                    return Box::pin(resolve_depth(&new_path, depth + 1)).await;
+                }
                 let vtype = if child_type == 2 {
                     VnodeType::Directory
                 } else {

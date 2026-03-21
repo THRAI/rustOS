@@ -35,7 +35,7 @@ pub enum SocketType {
 
 /// A kernel socket — wraps a smoltcp SocketHandle + metadata.
 pub struct Socket {
-    pub handle: SocketHandle,
+    handle: spin::Mutex<SocketHandle>,
     pub sock_type: SocketType,
     pub nonblocking: core::sync::atomic::AtomicBool,
     /// Bound local port (0 = not bound).
@@ -47,12 +47,25 @@ pub struct Socket {
 impl Socket {
     pub fn new(handle: SocketHandle, sock_type: SocketType) -> Self {
         Self {
-            handle,
+            handle: spin::Mutex::new(handle),
             sock_type,
             nonblocking: core::sync::atomic::AtomicBool::new(false),
             local_port: core::sync::atomic::AtomicU16::new(0),
             connected_peer: spin::Mutex::new(None),
         }
+    }
+
+    /// Get the current socket handle.
+    pub fn handle(&self) -> SocketHandle {
+        *self.handle.lock()
+    }
+
+    /// Swap the socket handle, returning the old one.
+    pub fn swap_handle(&self, new_handle: SocketHandle) -> SocketHandle {
+        let mut guard = self.handle.lock();
+        let old = *guard;
+        *guard = new_handle;
+        old
     }
 
     pub fn is_nonblocking(&self) -> bool {
@@ -62,17 +75,19 @@ impl Socket {
     /// Query readiness for ppoll.
     pub fn poll_ready(&self) -> PollState {
         let stack = net_stack();
+        let handle = self.handle();
         match self.sock_type {
             SocketType::Tcp => stack.with_socket::<smoltcp::socket::tcp::Socket, _>(
-                self.handle,
+                handle,
                 |tcp| PollState {
-                    readable: tcp.can_recv(),
+                    // Report readable on data OR EOF (remote sent FIN → may_recv=false)
+                    readable: tcp.can_recv() || !tcp.may_recv(),
                     writable: tcp.can_send(),
                     hangup: !tcp.is_active(),
                 },
             ),
             SocketType::Udp => stack.with_socket::<smoltcp::socket::udp::Socket, _>(
-                self.handle,
+                handle,
                 |udp| PollState {
                     readable: udp.can_recv(),
                     writable: udp.can_send(),
@@ -86,8 +101,28 @@ impl Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         let stack = net_stack();
-        stack.unregister_waker(self.handle);
-        stack.remove_socket(self.handle);
+        let handle = self.handle();
+        stack.unregister_waker(handle);
+        match self.sock_type {
+            SocketType::Tcp => {
+                // Send FIN and flush any pending TX data before removing.
+                let _ = stack.with_socket_mut::<smoltcp::socket::tcp::Socket, _>(handle, |tcp| {
+                    tcp.close();
+                });
+                // Poll several times to give smoltcp a chance to transmit the FIN
+                // and any buffered data via the loopback device.
+                for _ in 0..8 {
+                    stack.poll_and_wake();
+                }
+            }
+            SocketType::Udp => {
+                // Flush pending UDP TX data before removing the socket.
+                for _ in 0..4 {
+                    stack.poll_and_wake();
+                }
+            }
+        }
+        stack.remove_socket(handle);
     }
 }
 
@@ -149,9 +184,16 @@ pub fn spawn_net_poll_task(cpu: usize) {
 // NetStack: single-lock wrapper around smoltcp
 // ---------------------------------------------------------------------------
 
+/// Per-socket waker pair: separate read and write wakers.
+#[derive(Default)]
+struct SocketWakers {
+    read: Option<Waker>,
+    write: Option<Waker>,
+}
+
 pub struct NetStack {
     inner: IrqSafeSpinLock<NetStackInner, 6>,
-    wakers: IrqSafeSpinLock<BTreeMap<SocketHandle, Waker>, 6>,
+    wakers: IrqSafeSpinLock<BTreeMap<SocketHandle, SocketWakers>, 6>,
 }
 
 struct NetStackInner {
@@ -181,19 +223,27 @@ impl NetStack {
             let inner = self.inner.lock();
             let wakers = self.wakers.lock();
             let mut out = alloc::vec::Vec::new();
-            for (&handle, waker) in wakers.iter() {
-                let ready = inner
+            for (&handle, sw) in wakers.iter() {
+                let (rx_ready, tx_ready) = inner
                     .sockets
                     .iter()
                     .find(|(h, _)| *h == handle)
-                    .map_or(false, |(_, sock)| match sock {
-                        smoltcp::socket::Socket::Tcp(tcp) => {
-                            tcp.can_recv() || tcp.can_send() || !tcp.is_active()
-                        }
-                        smoltcp::socket::Socket::Udp(udp) => udp.can_recv() || udp.can_send(),
+                    .map_or((false, false), |(_, sock)| match sock {
+                        smoltcp::socket::Socket::Tcp(tcp) => (
+                            tcp.can_recv() || !tcp.is_active(),
+                            tcp.can_send() || !tcp.is_active(),
+                        ),
+                        smoltcp::socket::Socket::Udp(udp) => (udp.can_recv(), udp.can_send()),
                     });
-                if ready {
-                    out.push(waker.clone());
+                if rx_ready {
+                    if let Some(w) = &sw.read {
+                        out.push(w.clone());
+                    }
+                }
+                if tx_ready {
+                    if let Some(w) = &sw.write {
+                        out.push(w.clone());
+                    }
                 }
             }
             out
@@ -260,12 +310,31 @@ impl NetStack {
             .map_err(|_| crate::hal_common::Errno::Econnrefused)
     }
 
-    /// Register a waker for a socket handle.
-    pub fn register_waker(&self, handle: SocketHandle, waker: Waker) {
-        self.wakers.lock().insert(handle, waker);
+    /// Register a read waker for a socket handle.
+    pub fn register_read_waker(&self, handle: SocketHandle, waker: Waker) {
+        self.wakers.lock().entry(handle).or_default().read = Some(waker);
     }
 
-    /// Unregister a waker for a socket handle.
+    /// Register a write waker for a socket handle.
+    pub fn register_write_waker(&self, handle: SocketHandle, waker: Waker) {
+        self.wakers.lock().entry(handle).or_default().write = Some(waker);
+    }
+
+    /// Unregister the read waker for a socket handle.
+    pub fn unregister_read_waker(&self, handle: SocketHandle) {
+        if let Some(sw) = self.wakers.lock().get_mut(&handle) {
+            sw.read = None;
+        }
+    }
+
+    /// Unregister the write waker for a socket handle.
+    pub fn unregister_write_waker(&self, handle: SocketHandle) {
+        if let Some(sw) = self.wakers.lock().get_mut(&handle) {
+            sw.write = None;
+        }
+    }
+
+    /// Unregister all wakers for a socket handle (called on socket drop).
     pub fn unregister_waker(&self, handle: SocketHandle) {
         self.wakers.lock().remove(&handle);
     }

@@ -234,6 +234,10 @@ pub extern "C" fn abort() -> ! {
 #[no_mangle]
 pub static _impure_ptr: usize = 0;
 
+/// stdout — lwext4 debug code references this directly (e.g. fprintf(stdout, ...)).
+#[no_mangle]
+pub static stdout: usize = 0;
+
 /// fflush — no-op, lwext4 calls this after printf for debug output.
 #[no_mangle]
 pub unsafe extern "C" fn fflush(_stream: *mut u8) -> i32 {

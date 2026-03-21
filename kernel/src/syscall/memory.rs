@@ -300,7 +300,15 @@ pub fn sys_mmap(
         perm,
         mapping,
     ) {
-        Ok(()) => Ok(base),
+        Ok(()) => {
+            // Linux allows mprotect to raise permissions within mapping policy
+            // (e.g. pthread stack: mmap(PROT_NONE) then mprotect(RW) subrange).
+            // Keep max_protection broad for mmap-created regions.
+            if let Some(vma) = vm.lookup_mut(VirtAddr::new(base)) {
+                vma.max_protection = crate::map_perm!(R, W, X, U);
+            }
+            Ok(base)
+        },
         Err(_) => Err(kerr!(
             syscall,
             debug,

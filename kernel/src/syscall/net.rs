@@ -28,12 +28,26 @@ const SHUT_RDWR: usize = 2;
 // Socket option levels/names
 const SOL_SOCKET: usize = 1;
 const SO_REUSEADDR: usize = 2;
+const SO_TYPE: usize = 3;
 const SO_ERROR: usize = 4;
-const SO_KEEPALIVE: usize = 9;
+const SO_DONTROUTE: usize = 5;
+const SO_BROADCAST: usize = 6;
 const SO_SNDBUF: usize = 7;
 const SO_RCVBUF: usize = 8;
+const SO_KEEPALIVE: usize = 9;
+const SO_RCVLOWAT: usize = 18;
+const SO_SNDLOWAT: usize = 19;
+const SO_RCVTIMEO: usize = 20;
+const SO_SNDTIMEO: usize = 21;
+const IPPROTO_IP: usize = 0;
+const IP_TOS: usize = 1;
+const IP_TTL: usize = 2;
+const IP_RECVERR: usize = 11;
+const IP_MTU_DISCOVER: usize = 10;
 const IPPROTO_TCP: usize = 6;
 const TCP_NODELAY: usize = 1;
+const TCP_MAXSEG: usize = 2;
+const TCP_CORK: usize = 3;
 
 /// Helper: extract Arc<Socket> from fd, or return EBADF/ENOTSOCK.
 fn get_socket(task: &Arc<Task>, fd: u32) -> KernelResult<Arc<Socket>> {
@@ -79,7 +93,8 @@ pub fn sys_socket(task: &Arc<Task>, domain: usize, sock_type: usize, _protocol: 
 }
 
 /// bind(fd, addr, addrlen) -> 0
-pub fn sys_bind(task: &Arc<Task>, fd: usize, addr_ptr: usize, addr_len: usize) -> KernelResult<usize> {
+pub async fn sys_bind(task: &Arc<Task>, fd: usize, addr_ptr: usize, addr_len: usize) -> KernelResult<usize> {
+    fault_in_user_buffer(task, addr_ptr, addr_len.min(SockAddrIn4::SIZE), PageFaultAccessType::READ).await;
     let sock = get_socket(task, fd as u32)?;
     let addr = SockAddrIn4::from_user(addr_ptr, addr_len)?;
 
@@ -105,7 +120,7 @@ pub async fn sys_accept(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_pt
     let sock = get_socket(task, fd as u32)?;
     match sock.sock_type {
         SocketType::Tcp => {
-            let (new_sock, remote_addr) = tcp::tcp_accept(&sock).await?;
+            let (new_sock, remote_addr) = tcp::tcp_accept(&sock, task).await?;
             let desc = FileDescription::new(FileObject::Socket(new_sock), OpenFlags::RDWR);
             let new_fd = task.fd_table.lock().insert(desc, FdFlags::empty())?;
 
@@ -113,9 +128,6 @@ pub async fn sys_accept(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_pt
             if addr_ptr != 0 {
                 remote_addr.to_user(addr_ptr, addrlen_ptr)?;
             }
-
-            // Re-listen on the original socket's port
-            tcp::tcp_listen(&sock)?;
 
             Ok(new_fd as usize)
         }
@@ -136,7 +148,7 @@ pub async fn sys_accept4(
     let sock = get_socket(task, fd as u32)?;
     match sock.sock_type {
         SocketType::Tcp => {
-            let (new_sock, remote_addr) = tcp::tcp_accept(&sock).await?;
+            let (new_sock, remote_addr) = tcp::tcp_accept(&sock, task).await?;
 
             if (flags & SOCK_NONBLOCK) != 0 {
                 new_sock
@@ -157,8 +169,6 @@ pub async fn sys_accept4(
                 remote_addr.to_user(addr_ptr, addrlen_ptr)?;
             }
 
-            tcp::tcp_listen(&sock)?;
-
             Ok(new_fd as usize)
         }
         SocketType::Udp => Err(Errno::Eopnotsupp),
@@ -167,11 +177,12 @@ pub async fn sys_accept4(
 
 /// connect(fd, addr, addrlen) -> 0
 pub async fn sys_connect(task: &Arc<Task>, fd: usize, addr_ptr: usize, addr_len: usize) -> KernelResult<usize> {
+    fault_in_user_buffer(task, addr_ptr, addr_len.min(SockAddrIn4::SIZE), PageFaultAccessType::READ).await;
     let sock = get_socket(task, fd as u32)?;
     let addr = SockAddrIn4::from_user(addr_ptr, addr_len)?;
 
     match sock.sock_type {
-        SocketType::Tcp => tcp::tcp_connect(&sock, &addr).await?,
+        SocketType::Tcp => tcp::tcp_connect(&sock, &addr, task).await?,
         SocketType::Udp => {
             // UDP "connect" just sets default remote
             let _ = udp::udp_connect(&sock, &addr)?;
@@ -200,17 +211,17 @@ pub async fn sys_sendto(
     }
 
     match sock.sock_type {
-        SocketType::Tcp => tcp::tcp_send(&sock, &kbuf).await,
+        SocketType::Tcp => tcp::tcp_send(&sock, &kbuf, task).await,
         SocketType::Udp => {
             let remote = if addr_ptr != 0 {
+                fault_in_user_buffer(task, addr_ptr, addr_len.min(SockAddrIn4::SIZE), PageFaultAccessType::READ).await;
                 SockAddrIn4::from_user(addr_ptr, addr_len)?.to_endpoint()
             } else {
-                // Use connected peer if available
                 sock.connected_peer
                     .lock()
                     .ok_or(Errno::Edestaddrreq)?
             };
-            udp::udp_sendto(&sock, &kbuf, &remote).await
+            udp::udp_sendto(&sock, &kbuf, &remote, task).await
         }
     }
 }
@@ -232,7 +243,7 @@ pub async fn sys_recvfrom(
     match sock.sock_type {
         SocketType::Tcp => {
             let mut kbuf = alloc::vec![0u8; len];
-            let n = tcp::tcp_recv(&sock, &mut kbuf).await?;
+            let n = tcp::tcp_recv(&sock, &mut kbuf, task).await?;
             if n > 0 {
                 let rc = unsafe {
                     crate::hal::copy_user_chunk(buf_ptr as *mut u8, kbuf.as_ptr(), n)
@@ -245,7 +256,7 @@ pub async fn sys_recvfrom(
         }
         SocketType::Udp => {
             let mut kbuf = alloc::vec![0u8; len];
-            let (n, remote_addr) = udp::udp_recvfrom(&sock, &mut kbuf).await?;
+            let (n, remote_addr) = udp::udp_recvfrom(&sock, &mut kbuf, task).await?;
             if n > 0 {
                 let rc = unsafe {
                     crate::hal::copy_user_chunk(buf_ptr as *mut u8, kbuf.as_ptr(), n)
@@ -263,7 +274,8 @@ pub async fn sys_recvfrom(
 }
 
 /// getsockname(fd, addr, addrlen) -> 0
-pub fn sys_getsockname(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> KernelResult<usize> {
+pub async fn sys_getsockname(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> KernelResult<usize> {
+    fault_in_user_buffer(task, addr_ptr, SockAddrIn4::SIZE, PageFaultAccessType::WRITE).await;
     let sock = get_socket(task, fd as u32)?;
     let addr = match sock.sock_type {
         SocketType::Tcp => tcp::tcp_local_endpoint(&sock)?,
@@ -274,7 +286,8 @@ pub fn sys_getsockname(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_ptr
 }
 
 /// getpeername(fd, addr, addrlen) -> 0
-pub fn sys_getpeername(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> KernelResult<usize> {
+pub async fn sys_getpeername(task: &Arc<Task>, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> KernelResult<usize> {
+    fault_in_user_buffer(task, addr_ptr, SockAddrIn4::SIZE, PageFaultAccessType::WRITE).await;
     let sock = get_socket(task, fd as u32)?;
     let addr = match sock.sock_type {
         SocketType::Tcp => tcp::tcp_remote_endpoint(&sock)?,
@@ -297,8 +310,21 @@ pub fn sys_setsockopt(
 ) -> KernelResult<usize> {
     let _sock = get_socket(task, fd as u32)?;
     match (level, optname) {
-        (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE | SO_SNDBUF | SO_RCVBUF) => Ok(0),
-        (IPPROTO_TCP, TCP_NODELAY) => Ok(0),
+        (
+            SOL_SOCKET,
+            SO_REUSEADDR
+            | SO_KEEPALIVE
+            | SO_SNDBUF
+            | SO_RCVBUF
+            | SO_DONTROUTE
+            | SO_BROADCAST
+            | SO_RCVLOWAT
+            | SO_SNDLOWAT
+            | SO_RCVTIMEO
+            | SO_SNDTIMEO,
+        ) => Ok(0),
+        (IPPROTO_TCP, TCP_NODELAY | TCP_MAXSEG | TCP_CORK) => Ok(0),
+        (IPPROTO_IP, IP_TOS | IP_TTL | IP_RECVERR | IP_MTU_DISCOVER) => Ok(0),
         _ => Err(Errno::Enoprotoopt),
     }
 }
@@ -312,7 +338,7 @@ pub fn sys_getsockopt(
     optval: usize,
     optlen_ptr: usize,
 ) -> KernelResult<usize> {
-    let _sock = get_socket(task, fd as u32)?;
+    let sock = get_socket(task, fd as u32)?;
     match (level, optname) {
         (SOL_SOCKET, SO_ERROR) => {
             // Return 0 (no error)
@@ -336,8 +362,45 @@ pub fn sys_getsockopt(
             }
             Ok(0)
         }
-        (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE | SO_SNDBUF | SO_RCVBUF)
-        | (IPPROTO_TCP, TCP_NODELAY) => {
+        (SOL_SOCKET, SO_TYPE) => {
+            // Return socket type: SOCK_STREAM=1 or SOCK_DGRAM=2
+            let val = match sock.sock_type {
+                SocketType::Tcp => SOCK_STREAM as u32,
+                SocketType::Udp => SOCK_DGRAM as u32,
+            };
+            let rc = unsafe {
+                crate::hal::copy_user_chunk(optval as *mut u8, &val as *const u32 as *const u8, 4)
+            };
+            if rc != 0 {
+                return Err(Errno::Efault);
+            }
+            let len = 4u32;
+            let rc = unsafe {
+                crate::hal::copy_user_chunk(
+                    optlen_ptr as *mut u8,
+                    &len as *const u32 as *const u8,
+                    4,
+                )
+            };
+            if rc != 0 {
+                return Err(Errno::Efault);
+            }
+            Ok(0)
+        }
+        (
+            SOL_SOCKET,
+            SO_REUSEADDR
+            | SO_KEEPALIVE
+            | SO_SNDBUF
+            | SO_RCVBUF
+            | SO_DONTROUTE
+            | SO_BROADCAST
+            | SO_RCVLOWAT
+            | SO_SNDLOWAT
+            | SO_RCVTIMEO
+            | SO_SNDTIMEO,
+        )
+        | (IPPROTO_TCP, TCP_NODELAY | TCP_MAXSEG | TCP_CORK) => {
             let val = 0u32;
             let rc = unsafe {
                 crate::hal::copy_user_chunk(optval as *mut u8, &val as *const u32 as *const u8, 4)

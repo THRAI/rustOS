@@ -16,9 +16,7 @@ use alloc::sync::Arc;
 use crate::{
     hal_common::{Errno, PhysAddr, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap::{ Pmap,
-                container::PmapEntry
-        },
+        pmap::{container::PmapEntry, Pmap},
         vm::{MapPerm, VObjIndex, VmMap, VmMapEntry},
     },
 };
@@ -165,13 +163,7 @@ pub fn sync_fault_handler(
         access_type,
         pmap,
     );
-    crate::klog!(
-        vm,
-        debug,
-        "fault RESULT va={:#x} => {:?}",
-        fault_va,
-        result
-    );
+    crate::klog!(vm, debug, "fault RESULT va={:#x} => {:?}", fault_va, result);
     result
 }
 
@@ -313,8 +305,7 @@ fn handle_cow_fault(
                 obj_write.collapse();
                 if obj_write.has_page(obj_page_offset) {
                     drop(obj_write);
-                    if let PmapEntry::Occupied(mut e) = pmap.entry(fault_va_aligned)
-                    {
+                    if let PmapEntry::Occupied(mut e) = pmap.entry(fault_va_aligned) {
                         e.promote(vma.protection);
                     }
                     return FaultResult::Resolved;

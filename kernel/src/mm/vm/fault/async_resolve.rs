@@ -168,18 +168,16 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     let (obj, obj_offset, _vma_start, vma_perm, saved_ts) = {
         let map = task.vm_map.read();
         let ts = map.timestamp.load(core::sync::atomic::Ordering::Relaxed);
-        let vma = map
-            .lookup_readonly(fault_va)
-            .ok_or_else(|| {
-                kerr!(
-                    vm,
-                    warn,
-                    Errno::Efault,
-                    "async fault NOT_MAPPED pid={} va={:#x}",
-                    task.pid,
-                    fault_va.as_usize()
-                )
-            })?;
+        let vma = map.lookup_readonly(fault_va).ok_or_else(|| {
+            kerr!(
+                vm,
+                warn,
+                Errno::Efault,
+                "async fault NOT_MAPPED pid={} va={:#x}",
+                task.pid,
+                fault_va.as_usize()
+            )
+        })?;
 
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
@@ -200,8 +198,7 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
     // 2. Check if the page is already in the object (walks shadow chain)
     if let Some(existing_pa) = obj.read().lookup_page(obj_offset) {
         let map = task.vm_map.read();
-        let current_perm = match revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm)
-        {
+        let current_perm = match revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm) {
             Some(perm) => perm,
             None => return Ok(()), // VMA gone or object identity changed
         };
@@ -280,15 +277,14 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         let map = task.vm_map.read();
         let fault_va_aligned = VirtAddr::new(fault_va.as_usize() & !(PAGE_SIZE - 1));
 
-        let current_perm = if let Some(perm) =
-            revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm)
-        {
-            perm
-        } else {
-            // VMA gone or object identity changed — discard frame.
-            drop(PageRef::new(frame));
-            return Ok(());
-        };
+        let current_perm =
+            if let Some(perm) = revalidate_vma(&map, fault_va, &obj, saved_ts, vma_perm) {
+                perm
+            } else {
+                // VMA gone or object identity changed — discard frame.
+                drop(PageRef::new(frame));
+                return Ok(());
+            };
 
         let mut pmap = map.pmap_lock();
         let mut obj_write = obj.write();

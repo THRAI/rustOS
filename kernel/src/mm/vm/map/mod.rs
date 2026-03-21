@@ -271,12 +271,7 @@ impl VmMap {
         perm: MapPerm,
         mapping: VmMapping,
     ) -> Result<(), Errno> {
-        let entry = VmMapEntry::new(
-            start,
-            end,
-            mapping,
-            perm,
-        );
+        let entry = VmMapEntry::new(start, end, mapping, perm);
         self.insert_entry(entry)
     }
 
@@ -385,8 +380,7 @@ impl VmMap {
             let mut extended = false;
             {
                 if let Some(vma) = self.lookup_mut(old_brk_aligned - 1) {
-                    if vma.end() == old_brk_aligned
-                        && matches!(vma.mapping, VmMapping::Heap { .. })
+                    if vma.end() == old_brk_aligned && matches!(vma.mapping, VmMapping::Heap { .. })
                     {
                         let heap_start = vma.start();
                         vma.set_bounds(heap_start, new_brk_aligned);
@@ -437,15 +431,12 @@ impl VmMap {
             return Ok(alloc::vec::Vec::new());
         }
 
-
         let mut unmap_range = None;
         let mut remove_heap_va = None;
 
         {
             if let Some(vma) = self.lookup_mut(old_brk_aligned - 1) {
-                if vma.end()  == old_brk_aligned
-                    && matches!(vma.mapping, VmMapping::Heap { .. })
-                {
+                if vma.end() == old_brk_aligned && matches!(vma.mapping, VmMapping::Heap { .. }) {
                     let heap_start = vma.start();
                     let new_heap_end = core::cmp::max(new_brk_aligned, heap_start);
 
@@ -477,14 +468,8 @@ impl VmMap {
         if let Some((new_heap_end, old_heap_end)) = unmap_range {
             if new_heap_end < old_heap_end {
                 let mut pmap = self.pmap.lock();
-                pmap_remove(
-                    &mut pmap,
-                    new_heap_end,
-                    old_heap_end,
-                );
-                self.size = self
-                    .size
-                    .saturating_sub(old_heap_end - new_heap_end);
+                pmap_remove(&mut pmap, new_heap_end, old_heap_end);
+                self.size = self.size.saturating_sub(old_heap_end - new_heap_end);
                 self.timestamp.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -705,7 +690,12 @@ fn overlapping_keys(vm: &VmMap, start: VirtAddr, end: VirtAddr) -> alloc::vec::V
 }
 
 /// Validate that [start, end) is fully covered by VMAs and perm ≤ max_protection.
-fn validate_protect_coverage(vm: &VmMap, start: VirtAddr, end: VirtAddr, perm: MapPerm) -> Result<(), Errno> {
+fn validate_protect_coverage(
+    vm: &VmMap,
+    start: VirtAddr,
+    end: VirtAddr,
+    perm: MapPerm,
+) -> Result<(), Errno> {
     let mut entries: alloc::vec::Vec<_> = vm
         .iter()
         .filter(|e| e.start() < end && e.end() > start)

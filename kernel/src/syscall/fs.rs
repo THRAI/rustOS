@@ -889,12 +889,14 @@ pub async fn sys_read_async(
                 Ok(len)
             }
         },
-        ReadSource::DevConsole => ConsoleReadFuture {
-            task,
-            user_buf,
-            len,
-        }
-        .await,
+        ReadSource::DevConsole => {
+            ConsoleReadFuture {
+                task,
+                user_buf,
+                len,
+            }
+            .await
+        },
         ReadSource::PipeRead(pipe) => {
             PipeReadFuture {
                 pipe,

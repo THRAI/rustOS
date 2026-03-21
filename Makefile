@@ -14,8 +14,10 @@ ARCH ?= rv64
 
 TARGET_rv64 := riscv64gc-unknown-none-elf
 TARGET_la64 := loongarch64-unknown-none
-KERNEL_ELF_rv64 := target/$(TARGET_rv64)/release/kernel
-KERNEL_ELF_la64 := target/$(TARGET_la64)/release/kernel
+KERNEL_TARGET_DIR ?= $(CURDIR)/.target-kernel
+KERNEL_TMPDIR ?= $(CURDIR)/.tmp/rustc
+KERNEL_ELF_rv64 := $(KERNEL_TARGET_DIR)/$(TARGET_rv64)/release/kernel
+KERNEL_ELF_la64 := $(KERNEL_TARGET_DIR)/$(TARGET_la64)/release/kernel
 USER_ELF_rv64 := user/target/$(TARGET_rv64)/release/initproc
 USER_ELF_la64 := user/target/$(TARGET_la64)/release/initproc
 KERNEL_BIN_rv64 := kernel-rv64.bin
@@ -28,8 +30,8 @@ USER_RUSTFLAGS_rv64 := -Clink-arg=-Tsrc/linker.ld
 USER_RUSTFLAGS_la64 := -Clink-arg=-Tsrc/linker-la64.ld
 KERNEL_LINKER_rv64 := kernel/linker/rv64-qemu.ld
 KERNEL_LINKER_la64 := kernel/linker/la64-qemu.ld
-KERNEL_RUSTFLAGS_rv64 := -Clink-arg=-Tkernel/linker/rv64-qemu.ld
-KERNEL_RUSTFLAGS_la64 := -Clink-arg=-Tkernel/linker/la64-qemu.ld
+KERNEL_RUSTFLAGS_rv64 := ["-C","link-arg=-T$(CURDIR)/kernel/linker/rv64-qemu.ld"]
+KERNEL_RUSTFLAGS_la64 := ["-C","link-arg=-T$(CURDIR)/kernel/linker/la64-qemu.ld","-C","target-feature=-lsx,-lasx"]
 
 QEMU_rv64 := qemu-system-riscv64
 QEMU_la64 := qemu-system-loongarch64
@@ -41,7 +43,7 @@ OBJCOPY_ARCH_rv64 := riscv64
 OBJCOPY_ARCH_la64 := loongarch64
 QEMU_rv64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_rv64) -smp $(SMP) -m 128M \
 	-drive file=$(DISK_IMG_rv64),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 $(QEMU_TRACE)
-QEMU_la64_FLAGS := -machine virt -cpu la464 -nographic -kernel $(KERNEL_BIN_la64) -smp $(SMP) -m 1G $(QEMU_TRACE)
+QEMU_la64_FLAGS := -machine virt -cpu la464 -nographic -kernel $(KERNEL_ELF_la64) -smp $(SMP) -m 1G $(QEMU_TRACE)
 
 TARGET = $(TARGET_$(ARCH))
 KERNEL_ELF = $(KERNEL_ELF_$(ARCH))
@@ -56,6 +58,9 @@ QEMU = $(QEMU_$(ARCH))
 QEMU_FLAGS = $(QEMU_$(ARCH)_FLAGS)
 DISK_IMG = $(DISK_IMG_$(ARCH))
 OBJCOPY_ARCH = $(OBJCOPY_ARCH_$(ARCH))
+KERNEL_FEATURE_ARGS_rv64 :=
+KERNEL_FEATURE_ARGS_la64 := --no-default-features --features la64-bringup
+KERNEL_FEATURE_ARGS = $(KERNEL_FEATURE_ARGS_$(ARCH))
 
 RUN_DEPS_rv64 := $(DISK_IMG_rv64)
 RUN_DEPS_la64 :=
@@ -98,17 +103,19 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel kernel-rv kernel-rv64 kernel-la64 kernel-rv64-test kernel-rv64-autotest user user-rv64 user-la64 user-rv64-autotest run-rv64 run-la64 run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all oscomp-run debug-rv64 debug-la64 gdbserver-rv64 gdbserver-la64 smoke smoke-la64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean docker-build docker-kernel-rv64 docker-run-rv64 docker-kernel-la64 docker-user-la64 docker-run-la64 docker-debug-la64 docker-gdbserver-la64 docker-smoke-la64 docker-agent-test docker-python-test docker-oscomp docker-oscomp-basic docker-oscomp-basic-all docker-oscomp-run docker-judge docker-shell docker-test-all docker-ltp-build
+.PHONY: all kernel kernel-rv kernel-rv64 kernel-la64 kernel-la64-bringup kernel-rv64-test kernel-rv64-autotest user user-rv64 user-la64 user-rv64-autotest run-rv64 run-la64 run-la64-kernel-only smoke-la64-boot run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all oscomp-run debug-rv64 debug-la64 gdbserver-rv64 gdbserver-la64 smoke smoke-la64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean docker-build docker-kernel-rv64 docker-run-rv64 docker-kernel-la64 docker-user-la64 docker-run-la64 docker-debug-la64 docker-gdbserver-la64 docker-smoke-la64 docker-agent-test docker-python-test docker-oscomp docker-oscomp-basic docker-oscomp-basic-all docker-oscomp-run docker-judge docker-shell docker-test-all docker-ltp-build
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
 
 kernel-rv:
-	cargo build --release -p kernel --target $(TARGET_rv64) --features autotest,$(_LOG_LEVEL_FEATURE)
+	mkdir -p $(KERNEL_TMPDIR)
+	TMPDIR="$(KERNEL_TMPDIR)" CARGO_TARGET_DIR="$(KERNEL_TARGET_DIR)" cargo build --release -p kernel --target $(TARGET_rv64) --features autotest,$(_LOG_LEVEL_FEATURE)
 	cp $(KERNEL_ELF_rv64) kernel-rv
 
 kernel:
-	PATH="$(WRAPPER_DIR):$$PATH" cargo build --release -p kernel --target $(TARGET) $(_CARGO_LOG) --config 'target.$(TARGET).rustflags=["-C","link-arg=-T$(CURDIR)/$(KERNEL_LINKER)"]'
+	mkdir -p $(KERNEL_TMPDIR)
+	PATH="$(WRAPPER_DIR):$$PATH" TMPDIR="$(KERNEL_TMPDIR)" CARGO_TARGET_DIR="$(KERNEL_TARGET_DIR)" cargo build --release -p kernel --target $(TARGET) $(KERNEL_FEATURE_ARGS) $(_CARGO_LOG) --config 'target.$(TARGET).rustflags=$(KERNEL_RUSTFLAGS)'
 	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
 kernel-rv64: ARCH=rv64
@@ -116,6 +123,9 @@ kernel-rv64: kernel
 
 kernel-la64: ARCH=la64
 kernel-la64: kernel
+
+kernel-la64-bringup: ARCH=la64
+kernel-la64-bringup: kernel
 
 user:
 	@if [ "$(ARCH)" = "rv64" ]; then \
@@ -136,12 +146,14 @@ user-rv64-autotest:
 	cp $(USER_ELF_rv64) $(USER_INSTALL_rv64)
 
 kernel-rv64-test:
-	cargo build --release -p kernel --target $(TARGET_rv64) --features $(_TEST_FEATURES)
+	mkdir -p $(KERNEL_TMPDIR)
+	TMPDIR="$(KERNEL_TMPDIR)" CARGO_TARGET_DIR="$(KERNEL_TARGET_DIR)" cargo build --release -p kernel --target $(TARGET_rv64) --features $(_TEST_FEATURES)
 	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH_rv64) $(KERNEL_ELF_rv64) --strip-all -O binary $(KERNEL_BIN_rv64)
 
 # 编译带 autotest feature 的内核（自动运行测试脚本，完成后关机）
 kernel-rv64-autotest:
-	cargo build --release -p kernel --target $(TARGET_rv64) --features autotest,$(_LOG_LEVEL_FEATURE)
+	mkdir -p $(KERNEL_TMPDIR)
+	TMPDIR="$(KERNEL_TMPDIR)" CARGO_TARGET_DIR="$(KERNEL_TARGET_DIR)" cargo build --release -p kernel --target $(TARGET_rv64) --features autotest,$(_LOG_LEVEL_FEATURE)
 	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH_rv64) $(KERNEL_ELF_rv64) --strip-all -O binary $(KERNEL_BIN_rv64)
 
 
@@ -170,6 +182,13 @@ run-la64: ARCH=la64
 run-la64: kernel-la64
 	@echo "=== Running QEMU for ARCH=la64 (LOG=$(_LOG_FEATURES)) ==="
 	$(QEMU_la64) $(QEMU_la64_FLAGS)
+
+run-la64-kernel-only: ARCH=la64
+run-la64-kernel-only: run-la64
+
+smoke-la64-boot: ARCH=la64
+smoke-la64-boot: kernel-la64
+	bash scripts/la64-smoke.sh
 
 # 赛题标准评测：编译 autotest 内核 + 赛题磁盘镜像，直接用赛题 QEMU 参数运行
 run-oscomp: kernel-rv

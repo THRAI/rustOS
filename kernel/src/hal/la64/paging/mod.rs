@@ -43,6 +43,16 @@ pub fn deactivate_current() {
     }
 }
 
+pub fn debug_status() -> (bool, bool, usize) {
+    let crmd: usize;
+    let asid: usize;
+    unsafe {
+        core::arch::asm!("csrrd {}, {}", out(reg) crmd, const CSR_CRMD);
+        core::arch::asm!("csrrd {}, {}", out(reg) asid, const CSR_ASID);
+    }
+    (crmd & CRMD_PG != 0, crmd & CRMD_DA != 0, asid & ASID_MASK)
+}
+
 pub fn flush_addr_asid(_vaddr: usize, _asid: usize) {
     unsafe {
         core::arch::asm!("invtlb 0x0, $zero, $zero");

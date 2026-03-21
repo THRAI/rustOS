@@ -63,15 +63,7 @@ static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool =
 
 #[inline]
 fn la64_kernel_only_bringup() -> bool {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        true
-    }
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        false
-    }
+    cfg!(all(target_arch = "loongarch64", feature = "la64-bringup"))
 }
 
 /// Entry point called from the active architecture's boot stub.
@@ -144,9 +136,62 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // Arm the first timer interrupt (10ms interval)
         hal::init_this_cpu_timer();
 
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if crate::hal::la64::irq::self_check() {
+                kprintln!("la64 irq save/restore self-check PASS");
+            } else {
+                kprintln!("la64 irq save/restore self-check FAIL");
+            }
+
+            let (pg, da, asid) = crate::hal::la64::paging::debug_status();
+            kprintln!(
+                "la64 mmu status: pg={} da={} asid={}",
+                pg as u8,
+                da as u8,
+                asid
+            );
+        }
+
         if la64_kernel_only_bringup() {
             kprintln!("la64 kernel-only bring-up: skipping fs/init/userland path");
+            kprintln!("la64 bring-up: trap/timer armed, entering idle loop");
             hal::local_irq_enable();
+            // Prime first exception return path; LA64 QEMU timer starts delivering after first trap.
+            unsafe {
+                core::arch::asm!("syscall 0");
+            }
+            executor::spawn_kernel_task(
+                async {
+                    kprintln!("la64 executor online");
+                    let mut spin: u64 = 0;
+                    loop {
+                        executor::yield_now().await;
+                        spin = spin.wrapping_add(1);
+                        if spin % 5_000_000 == 0 {
+                            let ticks = crate::hal::la64::time::tick_count();
+                            let timer_enters = crate::hal::la64::time::timer_handler_enter_count();
+                            let (k, u) = crate::hal::la64::trap::trap_counts();
+                            let (t, s, e, y, f) = crate::hal::la64::trap::trap_cause_counts();
+                            kprintln!(
+                                "la64 runtime probe: spin={} timer_enters={} ticks={} traps=({},{}) causes(t,s,e,y,f)=({},{},{},{},{})",
+                                spin,
+                                timer_enters,
+                                ticks,
+                                k,
+                                u,
+                                t,
+                                s,
+                                e,
+                                y,
+                                f,
+                            );
+                        }
+                    }
+                },
+                cpu0,
+            )
+            .detach();
             klog!(
                 boot,
                 info,

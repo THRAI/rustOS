@@ -14,27 +14,32 @@ fn run_init_payload() -> i32 {
     let env0 = b"PATH=/bin:/sbin:/usr/bin:/usr/sbin\0";
     let env1 = b"HOME=/\0";
 
-    let argv = [
-        arg0.as_ptr(),
-        arg1.as_ptr(),
-        core::ptr::null(),
-    ];
-    let envp = [
-        env0.as_ptr(),
-        env1.as_ptr(),
-        core::ptr::null(),
-    ];
+    let argv = [arg0.as_ptr(), arg1.as_ptr(), core::ptr::null()];
+    let envp = [env0.as_ptr(), env1.as_ptr(), core::ptr::null()];
 
     execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) as i32
 }
 
 #[cfg(feature = "autotest")]
 fn run_init_payload() -> i32 {
+    #[cfg(target_arch = "riscv64")]
     let path = b"/riscv/musl/busybox\0";
+    #[cfg(target_arch = "loongarch64")]
+    let path = b"/bin/busybox\0";
+
     let arg0 = b"busybox\0";
     let arg1 = b"sh\0";
+
+    #[cfg(target_arch = "riscv64")]
     let arg2 = b"/riscv/run-oj.sh\0";
+    #[cfg(target_arch = "loongarch64")]
+    let arg2 = b"/bin/run-oj.sh\0";
+
+    #[cfg(target_arch = "riscv64")]
     let env0 = b"PATH=/riscv/musl:/riscv/glibc:/bin:/sbin\0";
+    #[cfg(target_arch = "loongarch64")]
+    let env0 = b"PATH=/bin:/sbin:/usr/bin:/usr/sbin\0";
+
     let env1 = b"HOME=/\0";
 
     let argv = [
@@ -43,11 +48,7 @@ fn run_init_payload() -> i32 {
         arg2.as_ptr(),
         core::ptr::null(),
     ];
-    let envp = [
-        env0.as_ptr(),
-        env1.as_ptr(),
-        core::ptr::null(),
-    ];
+    let envp = [env0.as_ptr(), env1.as_ptr(), core::ptr::null()];
 
     execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) as i32
 }
@@ -69,8 +70,7 @@ fn main() -> i32 {
         if child > 0 {
             println!(
                 "[initproc] released child pid={} status={:#x}",
-                child,
-                status
+                child, status
             );
             #[cfg(feature = "autotest")]
             {

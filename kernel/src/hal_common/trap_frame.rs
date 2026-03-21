@@ -1,25 +1,25 @@
 //! Machine-independent TrapFrame definition.
 //!
 //! Layout is `#[repr(C)]` so assembly code can access fields at known offsets.
-//! 32 GPRs (x0-x31) + sstatus + sepc + scause + stval + kernel_tp = 37 fields.
+//! The trailing status/pc/cause/fault slots are architecture-private snapshots.
 //! Total size: 37 * 8 = 296 bytes.
 
 /// TrapFrame holds all register state saved on trap entry.
 ///
-/// Field order: x0..x31 (32 GPRs), sstatus, sepc, scause, stval, kernel_tp.
+/// Field order: x0..x31 (32 GPRs), status, pc, cause, fault, kernel_tp.
 /// x0 is always zero but included for consistent indexing (offset = reg_index * 8).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
     /// x0-x31: General purpose registers
     pub x: [usize; 32],
-    /// Supervisor status register
+    /// Architecture-private status snapshot
     pub sstatus: usize,
-    /// Supervisor exception program counter
+    /// Architecture-private program counter snapshot
     pub sepc: usize,
-    /// Supervisor cause register
+    /// Architecture-private cause bits snapshot
     pub scause: usize,
-    /// Supervisor trap value
+    /// Architecture-private fault address / trap auxiliary snapshot
     pub stval: usize,
     /// Saved kernel tp (per-CPU data pointer)
     pub kernel_tp: usize,
@@ -41,13 +41,13 @@ impl TrapFrame {
         }
     }
 
-    /// Program counter (sepc).
+    /// Program counter.
     #[inline]
     pub fn pc(&self) -> usize {
         self.sepc
     }
 
-    /// Set program counter (sepc).
+    /// Set program counter.
     #[inline]
     pub fn set_pc(&mut self, val: usize) {
         self.sepc = val;
@@ -110,7 +110,7 @@ impl TrapFrame {
         self.x[1] = val;
     }
 
-    /// Syscall number register (a7 = x17 on rv64 Linux ABI).
+    /// Syscall number register slot (policy defined by architecture ABI layer).
     #[inline]
     pub fn syscall_nr(&self) -> usize {
         self.x[17]

@@ -101,7 +101,9 @@ pub unsafe fn write_cpu_local_ptr(ptr: usize) {
 #[cfg(target_arch = "loongarch64")]
 #[inline(always)]
 pub unsafe fn write_cpu_local_ptr(ptr: usize) {
-    super::la64::cpu::write_cpu_local_ptr(ptr);
+    unsafe {
+        super::la64::cpu::write_cpu_local_ptr(ptr);
+    }
 }
 
 #[cfg(all(feature = "qemu-test", target_arch = "riscv64"))]

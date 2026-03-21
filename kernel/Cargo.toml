@@ -8,6 +8,9 @@ name = "kernel"
 path = "src/main.rs"
 
 [features]
+default = ["full-fs"]
+full-fs = ["dep:lwext4_rust"]
+la64-bringup = []
 qemu-test = []
 autotest = []
 log-boot    = []
@@ -37,7 +40,7 @@ bitflags = { workspace = true }
 fdt = "0.1.5"
 spin = "0.10.0"
 linked_list_allocator = { version = "0.10", default-features = false }
-lwext4_rust = { workspace = true }
+lwext4_rust = { workspace = true, optional = true }
 goblin = { version = "0.10.5", default-features = false, features = ["elf64", "elf32", "endian_fd"] }
 
 [lints]

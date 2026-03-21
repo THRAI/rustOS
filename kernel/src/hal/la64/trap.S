@@ -9,7 +9,6 @@
 #   kernel_tp  offset 288
 
 .equ FRAME_SIZE, 296
-.equ CSR_CRMD,   0x0
 .equ CSR_PRMD,   0x1
 .equ CSR_ESTAT,  0x5
 .equ CSR_ERA,    0x6
@@ -27,8 +26,43 @@
 .globl __kernel_trap
 .globl __user_trap
 .globl __trap_return
+.globl __la64_write_kernel_eentry
+.globl __la64_write_user_eentry
+.globl __la64_read_eentry
+.globl __la64_kernel_trap_count
+.globl __la64_user_trap_count
+
+.section .bss
+.align 3
+__la64_kernel_trap_count:
+    .dword 0
+__la64_user_trap_count:
+    .dword 0
+
+.section .text
+
+.align 12
+
+__la64_write_kernel_eentry:
+    la.local $t0, __kernel_trap
+    csrwr   $t0, CSR_EENTRY
+    ret
+
+__la64_write_user_eentry:
+    la.local $t0, __user_trap
+    csrwr   $t0, CSR_EENTRY
+    ret
+
+__la64_read_eentry:
+    csrrd   $a0, CSR_EENTRY
+    ret
 
 __kernel_trap:
+    la.local $t0, __la64_kernel_trap_count
+    ld.d    $t1, $t0, 0
+    addi.d  $t1, $t1, 1
+    st.d    $t1, $t0, 0
+
     addi.d  $sp, $sp, -FRAME_SIZE
 
     st.d    $ra, $sp, 1*8
@@ -62,7 +96,7 @@ __kernel_trap:
     st.d    $s7, $sp, 30*8
     st.d    $s8, $sp, 31*8
 
-    csrrd   $t0, CSR_CRMD
+    csrrd   $t0, CSR_PRMD
     st.d    $t0, $sp, 32*8
     csrrd   $t0, CSR_ERA
     st.d    $t0, $sp, 33*8
@@ -74,11 +108,16 @@ __kernel_trap:
     move    $t0, $tp
     st.d    $t0, $sp, 36*8
 
+    la.local $t0, __la64_kernel_trap_count
+    ld.d    $t1, $t0, 0
+    addi.d  $t1, $t1, 1
+    st.d    $t1, $t0, 0
+
     move    $a0, $sp
     bl      kernel_trap_handler
 
     ld.d    $t0, $sp, 32*8
-    csrwr   $t0, CSR_CRMD
+    csrwr   $t0, CSR_PRMD
     ld.d    $t0, $sp, 33*8
     csrwr   $t0, CSR_ERA
 
@@ -116,6 +155,7 @@ __kernel_trap:
     addi.d  $sp, $sp, FRAME_SIZE
     ertn
 
+.align 12
 __user_trap:
     csrrd   $sp, 0x30
     st.d    $t0, $sp, TC_SCRATCH0
@@ -124,8 +164,6 @@ __user_trap:
     ld.d    $t0, $sp, TC_TRAP_FRAME_PTR
 
     st.d    $ra,  $t0, 1*8
-    csrrd   $t1, 0x30
-    st.d    $t1,  $t0, 2*8
     st.d    $tp,  $t0, 2*8
     st.d    $a0,  $t0, 4*8
     st.d    $a1,  $t0, 5*8
@@ -170,6 +208,11 @@ __user_trap:
     ld.d    $tp,  $sp, TC_KERNEL_TP
     st.d    $tp,  $t0, 36*8
 
+    la.local $t1, __la64_user_trap_count
+    ld.d    $t2, $t1, 0
+    addi.d  $t2, $t2, 1
+    st.d    $t2, $t1, 0
+
     la.local $t1, __kernel_trap
     csrwr    $t1, CSR_EENTRY
 
@@ -190,7 +233,7 @@ __user_trap:
     ret
 
 __trap_return:
-    move    $t8, $a0
+    move    $t0, $a0
     move    $t7, $a1
     move    $t6, $sp
 
@@ -214,41 +257,41 @@ __trap_return:
     la.local $t0, __user_trap
     csrwr    $t0, CSR_EENTRY
 
-    ld.d    $t0, $t8, 32*8
-    csrwr    $t0, CSR_PRMD
-    ld.d    $t0, $t8, 33*8
-    csrwr    $t0, CSR_ERA
+    ld.d    $t1, $t0, 32*8
+    csrwr    $t1, CSR_PRMD
+    ld.d    $t1, $t0, 33*8
+    csrwr    $t1, CSR_ERA
 
-    ld.d    $tp,  $t8, 4*8
-    ld.d    $ra,  $t8, 1*8
-    ld.d    $a0,  $t8, 4*8
-    ld.d    $a1,  $t8, 5*8
-    ld.d    $a2,  $t8, 6*8
-    ld.d    $a3,  $t8, 7*8
-    ld.d    $a4,  $t8, 8*8
-    ld.d    $a5,  $t8, 9*8
-    ld.d    $a6,  $t8, 10*8
-    ld.d    $a7,  $t8, 11*8
-    ld.d    $t0,  $t8, 12*8
-    ld.d    $t1,  $t8, 13*8
-    ld.d    $t2,  $t8, 14*8
-    ld.d    $t3,  $t8, 15*8
-    ld.d    $t4,  $t8, 16*8
-    ld.d    $t5,  $t8, 17*8
-    ld.d    $t6,  $t8, 18*8
-    ld.d    $t7,  $t8, 19*8
-    ld.d    $t8,  $t8, 20*8
-    ld.d    $r21, $t8, 21*8
-    ld.d    $fp,  $t8, 22*8
-    ld.d    $s0,  $t8, 23*8
-    ld.d    $s1,  $t8, 24*8
-    ld.d    $s2,  $t8, 25*8
-    ld.d    $s3,  $t8, 26*8
-    ld.d    $s4,  $t8, 27*8
-    ld.d    $s5,  $t8, 28*8
-    ld.d    $s6,  $t8, 29*8
-    ld.d    $s7,  $t8, 30*8
-    ld.d    $s8,  $t8, 31*8
-    ld.d    $sp,  $t8, 2*8
+    ld.d    $tp,  $t0, 2*8
+    ld.d    $ra,  $t0, 1*8
+    ld.d    $a0,  $t0, 4*8
+    ld.d    $a1,  $t0, 5*8
+    ld.d    $a2,  $t0, 6*8
+    ld.d    $a3,  $t0, 7*8
+    ld.d    $a4,  $t0, 8*8
+    ld.d    $a5,  $t0, 9*8
+    ld.d    $a6,  $t0, 10*8
+    ld.d    $a7,  $t0, 11*8
+    ld.d    $t2,  $t0, 14*8
+    ld.d    $t3,  $t0, 15*8
+    ld.d    $t4,  $t0, 16*8
+    ld.d    $t5,  $t0, 17*8
+    ld.d    $t6,  $t0, 18*8
+    ld.d    $t7,  $t0, 19*8
+    ld.d    $t8,  $t0, 20*8
+    ld.d    $r21, $t0, 21*8
+    ld.d    $fp,  $t0, 22*8
+    ld.d    $s0,  $t0, 23*8
+    ld.d    $s1,  $t0, 24*8
+    ld.d    $s2,  $t0, 25*8
+    ld.d    $s3,  $t0, 26*8
+    ld.d    $s4,  $t0, 27*8
+    ld.d    $s5,  $t0, 28*8
+    ld.d    $s6,  $t0, 29*8
+    ld.d    $s7,  $t0, 30*8
+    ld.d    $s8,  $t0, 31*8
+    ld.d    $sp,  $t0, 3*8
+    ld.d    $t1,  $t0, 13*8
+    ld.d    $t0,  $t0, 12*8
 
     ertn

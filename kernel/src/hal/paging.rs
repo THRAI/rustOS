@@ -97,5 +97,12 @@ pub unsafe fn walk_sv39(
     alloc: bool,
     allocator: &mut dyn FnMut(usize) -> Option<PhysAddr>,
 ) -> Option<*mut u64> {
-    unsafe { crate::hal::rv64::paging::walk_sv39(root_pa, va, alloc, allocator) }
+    #[cfg(target_arch = "riscv64")]
+    {
+        return unsafe { crate::hal::rv64::paging::walk_sv39(root_pa, va, alloc, allocator) };
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        return unsafe { crate::hal::la64::paging::walk(root_pa, va, alloc, allocator) };
+    }
 }

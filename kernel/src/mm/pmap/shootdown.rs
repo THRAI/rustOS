@@ -181,6 +181,11 @@ pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: 
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub fn pmap_shootdown(active: &[AtomicBool; MAX_CPUS], va_start: usize, va_end: usize, asid: u16) {
+    crate::hal::la64::paging::shootdown::pmap_shootdown(active, va_start, va_end, asid);
+}
+
 /// Broadcast full TLB flush to all CPUs (for ASID generation rollover).
 #[cfg(target_arch = "riscv64")]
 pub fn ipi_broadcast_flush_all() {
@@ -205,6 +210,11 @@ pub fn ipi_broadcast_flush_all() {
             core::hint::spin_loop();
         }
     }
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn ipi_broadcast_flush_all() {
+    crate::hal::la64::paging::shootdown::ipi_broadcast_flush_all();
 }
 
 // ---------------------------------------------------------------------------

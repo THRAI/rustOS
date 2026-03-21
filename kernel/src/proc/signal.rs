@@ -381,7 +381,10 @@ impl SignalState {
 
 /// Fixed VA for the sigcode (sigreturn trampoline) page.
 /// Placed just above USER_STACK_TOP to avoid collisions.
+#[cfg(target_arch = "riscv64")]
 pub const SIGCODE_VA: usize = crate::hal::signal_abi::SIGCODE_VA;
+#[cfg(target_arch = "loongarch64")]
+pub const SIGCODE_VA: usize = crate::hal::la64::signal_abi::SIGCODE_VA;
 
 /// Build the sigcode page contents: `li a7, 139; ecall; unimp`
 ///

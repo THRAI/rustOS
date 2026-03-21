@@ -1,10 +1,10 @@
 /* la64-qemu.ld -- QEMU virt machine linker script for LA64 */
-/* BASE_ADDRESS = 0x9000000080200000 (cached XKPRANGE mapping of PA 0x80200000) */
+/* BASE_ADDRESS = 0x9000000000200000 (cached direct map of QEMU virt kernel PA 0x00200000) */
 
 OUTPUT_ARCH(loongarch)
 ENTRY(_start)
 
-BASE_ADDRESS = 0x9000000080200000;
+BASE_ADDRESS = 0x9000000000200000;
 MAX_CPUS = 8;
 STACK_SIZE = 65536;  /* 64KB per CPU */
 

@@ -4,25 +4,34 @@
 .section .text.entry
 .globl _start
 _start:
+    # QEMU virt provides the current CPU id in CSR 0x20.
+    csrrd   $a0, 0x20
+
     # Single-CPU early bring-up for now.
     # Park any CPU other than CPU 0 until SMP boot is implemented.
-    bnez    a0, .park
+    bnez    $a0, .park
 
     # Clear .bss
-    la.local t0, sbss
-    la.local t1, ebss
+    la.local $t0, sbss
+    la.local $t1, ebss
 1:
-    bgeu    t0, t1, 2f
-    st.d    zero, t0, 0
-    addi.d  t0, t0, 8
+    bgeu    $t0, $t1, 2f
+    st.d    $zero, $t0, 0
+    addi.d  $t0, $t0, 8
     b       1b
 
 2:
     # Set early stack. `boot_stack_top` is provided by the linker script.
-    la.local sp, boot_stack_top
+    la.local $sp, boot_stack_top
+
+    # Enable FP/SIMD units for early bring-up.
+    # Current la64 kernel builds still emit LSX/LASX instructions in core/alloc
+    # paths before we have full per-task extended context management.
+    ori     $t0, $zero, 0x7
+    csrwr   $t0, 0x2
 
     # Clear percpu base convention for early bring-up.
-    move    tp, zero
+    move    $tp, $zero
 
     # Call rust_main(boot_cpu_id, boot_blob)
     bl      rust_main

@@ -1,7 +1,7 @@
 #[inline(always)]
 pub fn idle_once() {
     unsafe {
-        core::arch::asm!("idle 0");
+        core::arch::asm!("idle 1");
     }
 }
 

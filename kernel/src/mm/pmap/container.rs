@@ -51,7 +51,14 @@ impl PmapRef {
         self.flags.contains(PteFlags::W)
     }
     pub fn permits_exec(&self) -> bool {
-        self.flags.contains(PteFlags::X)
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.flags.contains(PteFlags::X)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            !self.flags.contains(PteFlags::NX)
+        }
     }
 }
 

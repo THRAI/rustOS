@@ -5,6 +5,8 @@ const MAX_VIRTIO_MMIO: usize = 8;
 const MAX_MEMORY_REGIONS: usize = 4;
 const QEMU_VIRT_UART_BASE: usize = 0x1fe0_01e0;
 const QEMU_VIRT_UART_IRQ: u32 = 66;
+const QEMU_VIRT_KERNEL_WINDOW_BASE: usize = 0x9000_0000_0000_0000;
+const QEMU_VIRT_KERNEL_WINDOW_SIZE: usize = 0x4000_0000;
 
 #[derive(Debug, Copy, Clone)]
 pub struct MemRegion {
@@ -44,8 +46,15 @@ pub fn parse_boot_platform(_boot_info_ptr: usize) {
         plic_size: 0,
         virtio_mmio: [None; MAX_VIRTIO_MMIO],
         virtio_count: 0,
-        memory: [MemRegion { base: 0, size: 0 }; MAX_MEMORY_REGIONS],
-        memory_count: 0,
+        memory: {
+            let mut regions = [MemRegion { base: 0, size: 0 }; MAX_MEMORY_REGIONS];
+            regions[0] = MemRegion {
+                base: QEMU_VIRT_KERNEL_WINDOW_BASE,
+                size: QEMU_VIRT_KERNEL_WINDOW_SIZE,
+            };
+            regions
+        },
+        memory_count: 1,
         hart_to_cpu: {
             let mut map = [None; MAX_HARTS];
             map[0] = Some(0);
@@ -53,7 +62,11 @@ pub fn parse_boot_platform(_boot_info_ptr: usize) {
         },
         cpu_to_hart: [0; MAX_CPUS],
         num_cpus: 1,
-        hartids: [0; MAX_CPUS],
+        hartids: {
+            let mut ids = [0; MAX_CPUS];
+            ids[0] = 0;
+            ids
+        },
     });
 }
 
@@ -76,7 +89,12 @@ pub fn init_external_irq_this_cpu(_boot_id: usize) {}
 pub fn boot_secondary_cpus(_num_cpus: usize, _boot_ids: &[usize], _boot_boot_id: usize) {}
 
 pub fn shutdown() -> ! {
-    panic!("la64 shutdown is not implemented")
+    crate::kprintln!("la64 shutdown requested; fallback to idle loop");
+    loop {
+        unsafe {
+            core::arch::asm!("idle 0");
+        }
+    }
 }
 
 pub fn stop_this_cpu() -> ! {

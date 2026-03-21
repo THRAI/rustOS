@@ -56,7 +56,7 @@ pub fn describe(tf: &TrapFrame) -> TrapInfo {
         const EXC_LOAD_PAGE_FAULT: usize = 13;
         const EXC_STORE_PAGE_FAULT: usize = 15;
 
-        let scause = tf.scause();
+        let scause = tf.cause_bits();
         let code = scause & !SCAUSE_INTERRUPT;
         let cause = if scause & SCAUSE_INTERRUPT != 0 {
             match code {
@@ -81,7 +81,7 @@ pub fn describe(tf: &TrapFrame) -> TrapInfo {
         TrapInfo {
             cause,
             pc: tf.pc(),
-            fault_addr: tf.stval() & !(PAGE_SIZE - 1),
+            fault_addr: tf.fault_addr() & !(PAGE_SIZE - 1),
         }
     }
 }

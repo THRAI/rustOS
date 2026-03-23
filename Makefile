@@ -24,10 +24,11 @@ KERNEL_BIN_rv64 := kernel-rv64.bin
 KERNEL_BIN_la64 := kernel-la64.bin
 USER_INSTALL_rv64 := scripts/initproc
 USER_INSTALL_la64 := scripts/initproc-la64
+USER_INSTALL_la64_AUTOTEST := scripts/initproc-la64-autotest
 USER_LINKER_rv64 := src/linker.ld
 USER_LINKER_la64 := src/linker-la64.ld
 USER_RUSTFLAGS_rv64 := -Clink-arg=-Tsrc/linker.ld
-USER_RUSTFLAGS_la64 := -Clink-arg=-Tsrc/linker-la64.ld
+USER_RUSTFLAGS_la64 := -Clink-arg=-Tsrc/linker-la64.ld -Clink-arg=-z -Clink-arg=max-page-size=0x1000
 KERNEL_LINKER_rv64 := kernel/linker/rv64-qemu.ld
 KERNEL_LINKER_la64 := kernel/linker/la64-qemu.ld
 KERNEL_RUSTFLAGS_rv64 := ["-C","link-arg=-T$(CURDIR)/kernel/linker/rv64-qemu.ld"]
@@ -38,12 +39,19 @@ QEMU_la64 := qemu-system-loongarch64
 SMP ?= 4
 QEMU_TRACE ?=
 DISK_IMG_rv64 := scripts/test.img
-DISK_IMG_la64 :=
+DISK_IMG_la64 := scripts/test-la64.img
+DISK_IMG_la64_AUTOTEST := scripts/test-la64-autotest.img
+LA64_AUTOTEST_GROUPS ?= basic
+LA64_AUTOTEST_LIBC ?= musl
 OBJCOPY_ARCH_rv64 := riscv64
 OBJCOPY_ARCH_la64 := loongarch64
 QEMU_rv64_FLAGS := -machine virt -nographic -bios default -kernel $(KERNEL_BIN_rv64) -smp $(SMP) -m 128M \
 	-drive file=$(DISK_IMG_rv64),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 $(QEMU_TRACE)
-QEMU_la64_FLAGS := -machine virt -cpu la464 -nographic -kernel $(KERNEL_ELF_la64) -smp $(SMP) -m 1G $(QEMU_TRACE)
+# LoongArch QEMU virt exposes block devices through PCI by default.
+# Use the modern non-transitional device so la64 bring-up tracks the
+# capability-based transport we plan to implement next.
+QEMU_la64_FLAGS := -machine virt -cpu la464 -nographic -kernel $(KERNEL_ELF_la64) -smp $(SMP) -m 1G \
+	-drive file=$(DISK_IMG_la64),format=raw,if=none,id=hd0 -device virtio-blk-pci-non-transitional,drive=hd0,rombar=0 $(QEMU_TRACE)
 
 TARGET = $(TARGET_$(ARCH))
 KERNEL_ELF = $(KERNEL_ELF_$(ARCH))
@@ -63,7 +71,7 @@ KERNEL_FEATURE_ARGS_la64 := --no-default-features --features la64-bringup
 KERNEL_FEATURE_ARGS = $(KERNEL_FEATURE_ARGS_$(ARCH))
 
 RUN_DEPS_rv64 := $(DISK_IMG_rv64)
-RUN_DEPS_la64 :=
+RUN_DEPS_la64 := $(DISK_IMG_la64)
 RUN_DEPS = $(RUN_DEPS_$(ARCH))
 
 # ---- 赛题评测标准参数 ----
@@ -103,7 +111,7 @@ else
   _TEST_FEATURES = qemu-test,$(_LOG_LEVEL_FEATURE)
 endif
 
-.PHONY: all kernel kernel-rv kernel-rv64 kernel-la64 kernel-la64-bringup kernel-rv64-test kernel-rv64-autotest user user-rv64 user-la64 user-rv64-autotest run-rv64 run-la64 run-la64-kernel-only smoke-la64-boot run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all oscomp-run debug-rv64 debug-la64 gdbserver-rv64 gdbserver-la64 smoke smoke-la64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean docker-build docker-kernel-rv64 docker-run-rv64 docker-kernel-la64 docker-user-la64 docker-run-la64 docker-debug-la64 docker-gdbserver-la64 docker-smoke-la64 docker-agent-test docker-python-test docker-oscomp docker-oscomp-basic docker-oscomp-basic-all docker-oscomp-run docker-judge docker-shell docker-test-all docker-ltp-build
+.PHONY: all kernel kernel-rv kernel-rv64 kernel-la64 kernel-la64-bringup kernel-la64-full kernel-la64-autotest kernel-rv64-test kernel-rv64-autotest user user-rv64 user-la64 user-rv64-autotest user-la64-autotest run-rv64 run-la64 run-la64-full run-la64-autotest run-la64-kernel-only smoke-la64-boot smoke-la64-full check-la64-full-toolchain run-oscomp sdcard-rv oscomp oscomp-basic oscomp-basic-all oscomp-run debug-rv64 debug-la64 gdbserver-rv64 gdbserver-la64 smoke smoke-la64 qemu-test-rv64 agent-test test test-all disk-img setup-toolchain clean docker-build docker-kernel-rv64 docker-run-rv64 docker-kernel-la64 docker-kernel-la64-full docker-kernel-la64-autotest docker-user-la64 docker-user-la64-autotest docker-run-la64 docker-run-la64-full docker-run-la64-autotest docker-debug-la64 docker-gdbserver-la64 docker-smoke-la64 docker-smoke-la64-full docker-agent-test docker-python-test docker-oscomp docker-oscomp-basic docker-oscomp-basic-all docker-oscomp-run docker-judge docker-shell docker-test-all docker-ltp-build
 
 # 赛题评测入口：make all 产出 ELF 格式的 kernel-rv（autotest 模式，自动跑测试脚本后关机）
 all: kernel-rv
@@ -127,11 +135,26 @@ kernel-la64: kernel
 kernel-la64-bringup: ARCH=la64
 kernel-la64-bringup: kernel
 
+check-la64-full-toolchain:
+	@command -v loongarch64-linux-musl-cc >/dev/null 2>&1 || (echo "ERROR: loongarch64-linux-musl-cc not found in PATH. Use the Docker path ('make docker-kernel-la64-full' or 'make docker-smoke-la64-full'), or run 'make setup-toolchain' after installing zig."; exit 1)
+	@command -v loongarch64-linux-musl-ar >/dev/null 2>&1 || (echo "ERROR: loongarch64-linux-musl-ar not found in PATH. Use the Docker path ('make docker-kernel-la64-full' or 'make docker-smoke-la64-full'), or run 'make setup-toolchain' after installing zig."; exit 1)
+
+kernel-la64-full: check-la64-full-toolchain
+	mkdir -p $(KERNEL_TMPDIR)
+	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' PATH="$(CURDIR)/scripts/toolchain-wrappers:$(WRAPPER_DIR):$$PATH" TMPDIR="$(KERNEL_TMPDIR)" CARGO_TARGET_DIR="$(KERNEL_TARGET_DIR)" cargo build --release -p kernel --target $(TARGET_la64) --features la64-bringup $(_CARGO_LOG) --config 'target.$(TARGET_la64).rustflags=$(KERNEL_RUSTFLAGS_la64)'
+	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH_la64) $(KERNEL_ELF_la64) --strip-all -O binary $(KERNEL_BIN_la64)
+
+kernel-la64-autotest: check-la64-full-toolchain
+	mkdir -p $(KERNEL_TMPDIR)
+	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' PATH="$(CURDIR)/scripts/toolchain-wrappers:$(WRAPPER_DIR):$$PATH" TMPDIR="$(KERNEL_TMPDIR)" CARGO_TARGET_DIR="$(KERNEL_TARGET_DIR)" cargo build --release -p kernel --target $(TARGET_la64) --features la64-bringup,autotest $(_CARGO_LOG) --config 'target.$(TARGET_la64).rustflags=$(KERNEL_RUSTFLAGS_la64)'
+	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH_la64) $(KERNEL_ELF_la64) --strip-all -O binary $(KERNEL_BIN_la64)
+
 user:
 	@if [ "$(ARCH)" = "rv64" ]; then \
 		cd /tmp && PATH='$(WRAPPER_DIR):'$$PATH RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_rv64) --config 'build.target="$(TARGET_rv64)"' --config 'target.$(TARGET_rv64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_rv64)"]'; \
 	else \
-		cd /tmp && PATH='$(WRAPPER_DIR):'$$PATH RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_la64) --config 'build.target="$(TARGET_la64)"' --config 'target.$(TARGET_la64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_la64)"]'; \
+		rm -f '$(CURDIR)/$(USER_ELF_la64)' '$(CURDIR)/$(USER_INSTALL_la64)'; \
+		cd /tmp && PATH='$(WRAPPER_DIR):'$$PATH RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_la64) --config 'build.target="$(TARGET_la64)"' --config 'target.$(TARGET_la64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_la64)","-C","link-arg=-z","-C","link-arg=max-page-size=0x1000"]'; \
 	fi
 	cp $(USER_ELF) $(USER_INSTALL)
 
@@ -145,6 +168,11 @@ user-rv64-autotest:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_rv64) --features autotest --config 'build.target="$(TARGET_rv64)"' --config 'target.$(TARGET_rv64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_rv64)"]'
 	cp $(USER_ELF_rv64) $(USER_INSTALL_rv64)
 
+user-la64-autotest:
+	rm -f '$(CURDIR)/$(USER_ELF_la64)' '$(CURDIR)/$(USER_INSTALL_la64_AUTOTEST)'
+	cd /tmp && PATH='$(WRAPPER_DIR):'$$PATH RUSTUP_TOOLCHAIN=nightly-2025-06-01 CARGO_TARGET_DIR='$(CURDIR)/user/target' cargo build --manifest-path '$(CURDIR)/user/Cargo.toml' --release --target $(TARGET_la64) --features autotest --config 'build.target="$(TARGET_la64)"' --config 'target.$(TARGET_la64).rustflags=["-C","link-arg=-T$(CURDIR)/user/$(USER_LINKER_la64)","-C","link-arg=-z","-C","link-arg=max-page-size=0x1000"]'
+	cp $(USER_ELF_la64) $(USER_INSTALL_la64_AUTOTEST)
+
 kernel-rv64-test:
 	mkdir -p $(KERNEL_TMPDIR)
 	TMPDIR="$(KERNEL_TMPDIR)" CARGO_TARGET_DIR="$(KERNEL_TARGET_DIR)" cargo build --release -p kernel --target $(TARGET_rv64) --features $(_TEST_FEATURES)
@@ -157,9 +185,17 @@ kernel-rv64-autotest:
 	$(OBJCOPY) --binary-architecture=$(OBJCOPY_ARCH_rv64) $(KERNEL_ELF_rv64) --strip-all -O binary $(KERNEL_BIN_rv64)
 
 
-$(DISK_IMG_rv64): user-rv64 scripts/make_test_img.sh $(wildcard scripts/init)
+$(DISK_IMG_rv64): user-rv64 scripts/make_test_img.sh $(wildcard scripts/init scripts/init-la64 scripts/busybox scripts/busybox-la64)
 	rm -f $(DISK_IMG_rv64)
 	cd scripts && ./make_test_img.sh
+
+$(DISK_IMG_la64): user-la64 scripts/make_test_img.sh $(wildcard scripts/init scripts/init-la64 scripts/busybox scripts/busybox-la64)
+	rm -f $(DISK_IMG_la64)
+	cd scripts && RUSTOS_TEST_IMG="$(notdir $(DISK_IMG_la64))" RUSTOS_TEST_INIT="init-la64" RUSTOS_TEST_BUSYBOX="busybox-la64" RUSTOS_TEST_INITPROC="$(notdir $(USER_INSTALL_la64))" ./make_test_img.sh
+
+$(DISK_IMG_la64_AUTOTEST): user-la64-autotest scripts/make_test_img.sh scripts/oscomp/run-la-select.sh
+	rm -f $(DISK_IMG_la64_AUTOTEST)
+	cd scripts && RUSTOS_TEST_IMG="$(notdir $(DISK_IMG_la64_AUTOTEST))" RUSTOS_TEST_INIT="init-la64" RUSTOS_TEST_BUSYBOX="busybox-la64" RUSTOS_TEST_INITPROC="$(notdir $(USER_INSTALL_la64_AUTOTEST))" RUSTOS_TEST_AUTOTEST_ARCH="loongarch" RUSTOS_TEST_AUTOTEST_LIBC="$(LA64_AUTOTEST_LIBC)" RUSTOS_TEST_AUTOTEST_GROUPS="$(LA64_AUTOTEST_GROUPS)" ./make_test_img.sh
 
 disk-img: user-rv64
 	rm -f $(DISK_IMG_rv64)
@@ -179,9 +215,19 @@ run-rv64: kernel-rv64 $(DISK_IMG_rv64)
 	uv run --with pexpect python3 scripts/test_runner.py --interactive $(QEMU_rv64) -- $(QEMU_rv64_FLAGS)
 
 run-la64: ARCH=la64
-run-la64: kernel-la64
+run-la64: kernel-la64 $(DISK_IMG_la64)
 	@echo "=== Running QEMU for ARCH=la64 (LOG=$(_LOG_FEATURES)) ==="
 	$(QEMU_la64) $(QEMU_la64_FLAGS)
+
+run-la64-full: ARCH=la64
+run-la64-full: kernel-la64-full $(DISK_IMG_la64)
+	@echo "=== Running QEMU for ARCH=la64 full-fs (LOG=$(_LOG_FEATURES)) ==="
+	$(QEMU_la64) $(QEMU_la64_FLAGS)
+
+run-la64-autotest: kernel-la64-autotest $(DISK_IMG_la64_AUTOTEST)
+	@echo "=== Running QEMU for ARCH=la64 autotest (groups=$(LA64_AUTOTEST_GROUPS) libc=$(LA64_AUTOTEST_LIBC), LOG=$(_LOG_FEATURES)) ==="
+	$(QEMU_la64) -machine virt -cpu la464 -nographic -kernel $(KERNEL_ELF_la64) -smp $(SMP) -m 1G \
+		-drive file=$(DISK_IMG_la64_AUTOTEST),format=raw,if=none,id=hd0 -device virtio-blk-pci-non-transitional,drive=hd0,rombar=0 $(QEMU_TRACE)
 
 run-la64-kernel-only: ARCH=la64
 run-la64-kernel-only: run-la64
@@ -189,6 +235,10 @@ run-la64-kernel-only: run-la64
 smoke-la64-boot: ARCH=la64
 smoke-la64-boot: kernel-la64
 	bash scripts/la64-smoke.sh
+
+smoke-la64-full: ARCH=la64
+smoke-la64-full: check-la64-full-toolchain
+	bash scripts/la64-full-smoke.sh
 
 # 赛题标准评测：编译 autotest 内核 + 赛题磁盘镜像，直接用赛题 QEMU 参数运行
 run-oscomp: kernel-rv
@@ -255,11 +305,26 @@ docker-run-rv64:
 docker-kernel-la64:
 	$(DOCKER_RUN) make kernel-la64
 
+docker-kernel-la64-full:
+	$(DOCKER_RUN) make kernel-la64-full
+
+docker-kernel-la64-autotest:
+	$(DOCKER_RUN) make kernel-la64-autotest
+
 docker-user-la64:
 	$(DOCKER_RUN) make user-la64
 
+docker-user-la64-autotest:
+	$(DOCKER_RUN) make user-la64-autotest
+
 docker-run-la64:
 	$(DOCKER_RUN) make run-la64
+
+docker-run-la64-full:
+	$(DOCKER_RUN) make run-la64-full
+
+docker-run-la64-autotest:
+	$(DOCKER_RUN) make run-la64-autotest LA64_AUTOTEST_GROUPS="$(LA64_AUTOTEST_GROUPS)" LA64_AUTOTEST_LIBC="$(LA64_AUTOTEST_LIBC)"
 
 docker-debug-la64:
 	$(DOCKER_RUN) make debug-la64
@@ -269,6 +334,9 @@ docker-gdbserver-la64:
 
 docker-smoke-la64:
 	$(DOCKER_RUN) make smoke-la64
+
+docker-smoke-la64-full:
+	$(DOCKER_RUN) make smoke-la64-full
 
 docker-agent-test:
 	$(DOCKER_RUN) make agent-test

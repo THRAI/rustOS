@@ -272,6 +272,16 @@ async fn fault_in_page_async(task: &Arc<Task>, fault_va: VirtAddr) -> Result<(),
         }
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    if vma_perm.contains(MapPerm::X) {
+        // LA64 needs an explicit instruction-barrier after populating a
+        // file-backed executable page, otherwise first user fetch may observe
+        // stale instruction state.
+        unsafe {
+            core::arch::asm!("dbar 0", "ibar 0", options(nostack, preserves_flags));
+        }
+    }
+
     // 5. Time-of-use revalidation and mapping
     {
         let map = task.vm_map.read();

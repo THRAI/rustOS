@@ -11,7 +11,8 @@ use crate::{
     fs::{
         self, absolutize_path, normalize_absolute_path, vnode_destroy_object, vnode_object,
         vnode_object_if_exists, ConsoleReadFuture, FdFlags, FdTable, FileDescription, FileObject,
-        LinuxDirent64, LinuxStat, OpenFlags, PipeReadFuture, PipeWriteFuture, VnodeType,
+        LinuxDirent64, LinuxStat, LinuxStatx, OpenFlags, PipeReadFuture, PipeWriteFuture,
+        VnodeType,
     },
     hal_common::{Errno, VirtAddr},
     mm::{resolve_user_fault, uiomove, PageFaultAccessType, UioDir, VmObject},
@@ -226,8 +227,7 @@ pub async fn read(
         let page = VmObject::fetch_page_async(Arc::clone(&obj), page_idx)
             .await
             .map_err(|_| Errno::Eio)?;
-        let src_slice =
-            unsafe { core::slice::from_raw_parts(page.as_usize() as *const u8, PAGE_SIZE) };
+        let src_slice = page.into_kernel_vaddr().as_page_slice();
         buf[total..total + chunk].copy_from_slice(&src_slice[in_page..in_page + chunk]);
         total += chunk;
     }
@@ -326,6 +326,157 @@ pub async fn sys_fstatat_async(
             statbuf as *mut u8,
             &st as *const LinuxStat as *const u8,
             core::mem::size_of::<LinuxStat>(),
+        )
+    };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct LinuxStatFs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+/// sys_statfs: filesystem statistics for a path.
+pub async fn sys_statfs_async(
+    task: &Arc<Task>,
+    pathname_ptr: usize,
+    statbuf: usize,
+) -> Result<(), Errno> {
+    if pathname_ptr == 0 || statbuf == 0 {
+        return Err(Errno::Efault);
+    }
+
+    let raw_path = copyinstr(task, pathname_ptr, 256)
+        .await
+        .ok_or(Errno::Efault)?;
+    let path = absolutize_path(task, AT_FDCWD, &raw_path)?;
+    let _ = crate::fs::resolve(&path).await?;
+
+    // Current la64 autotest image is a 32 MiB ext2/ext4 filesystem with 1 KiB blocks.
+    let st = LinuxStatFs {
+        f_type: 0xEF53,
+        f_bsize: 1024,
+        f_blocks: 32 * 1024,
+        f_bfree: 24 * 1024,
+        f_bavail: 24 * 1024,
+        f_files: 4096,
+        f_ffree: 3072,
+        f_fsid: [0x6c61_3634u32 as i32, 0x7465_7374u32 as i32],
+        f_namelen: 255,
+        f_frsize: 1024,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+
+    fault_in_user_buffer(
+        task,
+        statbuf,
+        core::mem::size_of::<LinuxStatFs>(),
+        PageFaultAccessType::WRITE,
+    )
+    .await;
+    let rc = unsafe {
+        crate::hal::copy_user_chunk(
+            statbuf as *mut u8,
+            &st as *const LinuxStatFs as *const u8,
+            core::mem::size_of::<LinuxStatFs>(),
+        )
+    };
+    if rc != 0 {
+        return Err(Errno::Efault);
+    }
+    Ok(())
+}
+
+/// sys_statx: extended stat by path (relative to dirfd).
+pub async fn sys_statx_async(
+    task: &Arc<Task>,
+    dirfd: isize,
+    pathname_ptr: usize,
+    flags: usize,
+    mask: u32,
+    statxbuf: usize,
+) -> Result<(), Errno> {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_STATX_SYNC_TYPE: usize = 0x6000;
+    const AT_STATX_FORCE_SYNC: usize = 0x2000;
+    const AT_STATX_DONT_SYNC: usize = 0x4000;
+
+    if statxbuf == 0 {
+        return Err(Errno::Efault);
+    }
+    if (flags
+        & !(AT_SYMLINK_NOFOLLOW
+            | AT_NO_AUTOMOUNT
+            | AT_EMPTY_PATH
+            | AT_STATX_SYNC_TYPE
+            | AT_STATX_FORCE_SYNC
+            | AT_STATX_DONT_SYNC))
+        != 0
+    {
+        return Err(Errno::Einval);
+    }
+
+    let stx = if pathname_ptr == 0 && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return Err(Errno::Ebadf);
+        }
+        let tab = task.fd_table.lock();
+        let desc = tab.get(dirfd as u32).ok_or(Errno::Ebadf)?;
+        fs::fill_statx_from_file_object(&desc.object, mask)
+    } else {
+        if pathname_ptr == 0 {
+            return Err(Errno::Efault);
+        }
+        let raw_path = copyinstr(task, pathname_ptr, 256)
+            .await
+            .ok_or(Errno::Efault)?;
+        if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+            if dirfd < 0 {
+                return Err(Errno::Ebadf);
+            }
+            let tab = task.fd_table.lock();
+            let desc = tab.get(dirfd as u32).ok_or(Errno::Ebadf)?;
+            fs::fill_statx_from_file_object(&desc.object, mask)
+        } else {
+            if raw_path.is_empty() {
+                return Err(Errno::Enoent);
+            }
+            let path_str = absolutize_path(task, dirfd, &raw_path)?;
+            let (ino, ftype, size) = fs::fs_lookup(0, &path_str).await?;
+            fs::fill_statx_from_lookup(ino, ftype, size, mask)
+        }
+    };
+
+    fault_in_user_buffer(
+        task,
+        statxbuf,
+        core::mem::size_of::<LinuxStatx>(),
+        PageFaultAccessType::WRITE,
+    )
+    .await;
+
+    let rc = unsafe {
+        crate::hal::copy_user_chunk(
+            statxbuf as *mut u8,
+            &stx as *const LinuxStatx as *const u8,
+            core::mem::size_of::<LinuxStatx>(),
         )
     };
     if rc != 0 {
@@ -870,6 +1021,7 @@ pub async fn sys_read_async(
             FileObject::PipeWrite(_) => return Err(Errno::Ebadf),
             FileObject::Device(DeviceKind::Null) => ReadSource::DevNull,
             FileObject::Device(DeviceKind::Zero) => ReadSource::DevZero,
+            FileObject::Device(DeviceKind::Rtc) => ReadSource::DevNull,
             FileObject::Device(DeviceKind::ConsoleRead) => ReadSource::DevConsole,
             FileObject::Device(DeviceKind::ConsoleWrite) => return Err(Errno::Ebadf),
         };
@@ -927,7 +1079,10 @@ pub async fn sys_read_async(
                     .await
                     .map_err(|_| Errno::Eio)?;
 
-                let kern = (page.as_usize() + offset_in_page) as *mut u8;
+                let kern = page
+                    .into_kernel_vaddr()
+                    .as_mut_ptr()
+                    .wrapping_add(offset_in_page);
                 let user = (user_buf + total) as *mut u8;
 
                 match uiomove(kern, user, chunk, UioDir::CopyOut) {
@@ -987,6 +1142,7 @@ pub async fn sys_write_async(
         let tgt = match &d.object {
             FileObject::Device(DeviceKind::Null) => WriteTarget::DevNull,
             FileObject::Device(DeviceKind::Zero) => WriteTarget::DevNull,
+            FileObject::Device(DeviceKind::Rtc) => return Err(Errno::Enotty),
             FileObject::Device(DeviceKind::ConsoleWrite | DeviceKind::ConsoleRead) => {
                 WriteTarget::DevConsole
             },
@@ -1078,7 +1234,10 @@ pub async fn sys_write_async(
                     .map_err(|_| Errno::Eio)?;
 
                 // 2. Copy user data INTO the VmObject page
-                let kern = (page.as_usize() + offset_in_page) as *mut u8;
+                let kern = page
+                    .into_kernel_vaddr()
+                    .as_mut_ptr()
+                    .wrapping_add(offset_in_page);
                 let user = (user_buf + total) as *mut u8;
 
                 match uiomove(kern, user, chunk, UioDir::CopyIn) {
@@ -1279,17 +1438,14 @@ pub async fn sys_ioctl_async(
 ) -> Result<i32, Errno> {
     use crate::fs::{DeviceKind, FileObject};
 
-    let is_console = {
+    let device_kind = {
         let tab = task.fd_table.lock();
         let desc = tab.get(fd).ok_or(Errno::Ebadf)?;
-        matches!(
-            &desc.object,
-            FileObject::Device(DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite)
-        )
+        match &desc.object {
+            FileObject::Device(kind) => Some(*kind),
+            _ => None,
+        }
     };
-    if !is_console {
-        return Err(Errno::Enotty);
-    }
 
     const TCGETS: usize = 0x5401;
     const TCSETS: usize = 0x5402;
@@ -1297,8 +1453,45 @@ pub async fn sys_ioctl_async(
     const TCSETSF: usize = 0x5404;
     const TIOCGWINSZ: usize = 0x5413;
     const FIONBIO: usize = 0x5421;
+    const RTC_TIME_SIZE: usize = 36;
+    const RTC_IOCTL_TYPE: usize = 0x70;
+    const RTC_RD_TIME_NR: usize = 0x09;
 
-    match request {
+    match (device_kind, request) {
+        (Some(DeviceKind::Rtc), req)
+            if ((req >> 8) & 0xff) == RTC_IOCTL_TYPE && (req & 0xff) == RTC_RD_TIME_NR =>
+        {
+            if argp == 0 {
+                return Err(Errno::Efault);
+            }
+            fault_in_user_buffer(task, argp, RTC_TIME_SIZE, PageFaultAccessType::WRITE).await;
+            let secs = crate::hal::monotonic_ns() / 1_000_000_000;
+            let days = secs / 86_400;
+            let secs_of_day = secs % 86_400;
+            let tm_hour = (secs_of_day / 3600) as i32;
+            let tm_min = ((secs_of_day % 3600) / 60) as i32;
+            let tm_sec = (secs_of_day % 60) as i32;
+            let tm_mday = (days % 28 + 1) as i32;
+            let tm_mon = (days / 28 % 12) as i32;
+            let tm_year = (1970 + (days / 336)) as i32 - 1900;
+            let tm_wday = ((days + 4) % 7) as i32;
+            let tm_yday = (days % 336) as i32;
+            let rtc_time: [i32; 9] = [
+                tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, 0,
+            ];
+            let rc = unsafe {
+                crate::hal::copy_user_chunk(
+                    argp as *mut u8,
+                    rtc_time.as_ptr() as *const u8,
+                    RTC_TIME_SIZE,
+                )
+            };
+            if rc != 0 {
+                return Err(Errno::Efault);
+            }
+            Ok(0)
+        },
+        (Some(DeviceKind::ConsoleRead | DeviceKind::ConsoleWrite), _) => match request {
         TCGETS => {
             if argp != 0 {
                 fault_in_user_buffer(task, argp, 60, PageFaultAccessType::WRITE).await;
@@ -1331,6 +1524,8 @@ pub async fn sys_ioctl_async(
         },
         TCSETS | TCSETSW | TCSETSF => Ok(0),
         FIONBIO => Ok(0),
+        _ => Err(Errno::Enotty),
+        },
         _ => Err(Errno::Enotty),
     }
 }

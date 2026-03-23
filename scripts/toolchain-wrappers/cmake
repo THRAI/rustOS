@@ -1,0 +1,3 @@
+#!/bin/sh
+
+exec /usr/bin/cmake -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY "$@"

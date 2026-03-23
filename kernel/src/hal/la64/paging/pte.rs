@@ -49,13 +49,13 @@ pub fn pte_is_valid(raw: u64) -> bool {
 #[inline]
 pub fn pte_is_leaf(raw: u64) -> bool {
     let flags = pte_flags(raw);
-    pte_is_valid(raw) && (flags.contains(PteFlags::W) || !flags.contains(PteFlags::NR))
+    pte_is_valid(raw) && (flags & !(PteFlags::V | PteFlags::PRESENT)).bits() != 0
 }
 
 pub fn map_perm_to_pte_flags(perm: MapPerm) -> PteFlags {
-    let mut f = PteFlags::V | PteFlags::A | PteFlags::PRESENT | PteFlags::MAT_CC | PteFlags::M;
+    let mut f = PteFlags::V | PteFlags::A | PteFlags::PRESENT | PteFlags::MAT_CC;
     if perm.contains(MapPerm::W) {
-        f |= PteFlags::W | PteFlags::D;
+        f |= PteFlags::W | PteFlags::D | PteFlags::M;
     }
     if !perm.contains(MapPerm::R) {
         f |= PteFlags::NR;
@@ -64,7 +64,7 @@ pub fn map_perm_to_pte_flags(perm: MapPerm) -> PteFlags {
         f |= PteFlags::NX;
     }
     if perm.contains(MapPerm::U) {
-        f |= PteFlags::PLV_USER;
+        f |= PteFlags::PLV_USER | PteFlags::RPLV;
     }
     f
 }

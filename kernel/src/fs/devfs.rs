@@ -1,4 +1,4 @@
-//! Static device node lookup for /dev/null, /dev/zero, /dev/console.
+//! Static device node lookup for a small set of built-in /dev entries.
 
 use alloc::sync::Arc;
 
@@ -23,6 +23,7 @@ pub fn open_device(name: &str, flags: OpenFlags) -> Result<Arc<FileDescription>,
                 DeviceKind::ConsoleWrite
             }
         },
+        "misc/rtc" => DeviceKind::Rtc,
         _ => return Err(Errno::Enoent),
     };
     Ok(FileDescription::new(FileObject::Device(kind), flags))

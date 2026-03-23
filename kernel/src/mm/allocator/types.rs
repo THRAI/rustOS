@@ -1,5 +1,23 @@
 use crate::hal_common::{PhysAddr, PAGE_SIZE};
 
+#[cfg(target_arch = "loongarch64")]
+const LA64_KERNEL_WIN_BASE: usize = 0x9000_0000_0000_0000;
+#[cfg(target_arch = "loongarch64")]
+const LA64_KERNEL_WIN_LOW_MASK: usize = 0x0000_0000_FFFF_FFFF;
+
+#[inline]
+fn canonical_phys_index(addr: usize) -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        return (addr & LA64_KERNEL_WIN_LOW_MASK) / PAGE_SIZE;
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        addr / PAGE_SIZE
+    }
+}
+
 /// Compact page role, fitting in a single u8.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +67,7 @@ pub(crate) static FRAME_META: AtomicPtr<VmPage> = AtomicPtr::new(core::ptr::null
 pub(crate) static FRAME_META_LEN: AtomicUsize = AtomicUsize::new(0);
 
 pub fn get_frame_meta(phys: PhysAddr) -> Option<&'static VmPage> {
-    let pfn = phys.page_align_down().as_usize() / PAGE_SIZE;
+    let pfn = canonical_phys_index(phys.page_align_down().as_usize());
     let len = FRAME_META_LEN.load(Ordering::Acquire);
     let ptr = FRAME_META.load(Ordering::Acquire);
     if pfn < len && !ptr.is_null() {

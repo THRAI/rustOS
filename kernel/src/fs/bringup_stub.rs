@@ -102,5 +102,5 @@ pub async fn fs_readdir(
 }
 
 pub fn init() {
-    crate::klog!(fs, info, "filesystem delegate disabled for la64 bring-up");
+    crate::klog!(fs, info, "filesystem delegate disabled because full-fs feature is off");
 }

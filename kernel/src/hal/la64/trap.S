@@ -14,7 +14,12 @@
 .equ CSR_ERA,    0x6
 .equ CSR_BADV,   0x7
 .equ CSR_EENTRY, 0xc
-
+.equ CSR_PGD,    0x1b
+.equ CSR_KSAVE0, 0x30
+.equ CSR_KSAVE1, 0x31
+.equ CSR_TLBRSAVE, 0x8b
+.equ CSR_TLBRELO0, 0x8c
+.equ CSR_TLBRELO1, 0x8d
 .equ TC_TRAP_FRAME_PTR, 0
 .equ TC_KERNEL_SP,      8
 .equ TC_KERNEL_TP,      16
@@ -29,6 +34,7 @@
 .globl __la64_write_kernel_eentry
 .globl __la64_write_user_eentry
 .globl __la64_read_eentry
+.globl __tlb_refill
 .globl __la64_kernel_trap_count
 .globl __la64_user_trap_count
 
@@ -42,7 +48,39 @@ __la64_user_trap_count:
 .section .text
 
 .align 12
+__tlb_refill:
+    csrwr   $t0, CSR_TLBRSAVE
+    csrrd   $t0, CSR_PGD
+    lddir   $t0, $t0, 3
+    beqz    $t0, 1f
+    srli.d  $t0, $t0, 12
+    slli.d  $t0, $t0, 12
+    lddir   $t0, $t0, 2
+    beqz    $t0, 2f
+    srli.d  $t0, $t0, 12
+    slli.d  $t0, $t0, 12
+    lddir   $t0, $t0, 1
+    beqz    $t0, 3f
+    srli.d  $t0, $t0, 12
+    slli.d  $t0, $t0, 12
+    ldpte   $t0, 0
+    ldpte   $t0, 1
+    tlbfill
+    csrrd   $t0, CSR_TLBRSAVE
+    ertn
+1:
+    b       4f
+2:
+    b       4f
+3:
+4:
+    csrwr   $zero, CSR_TLBRELO0
+    csrwr   $zero, CSR_TLBRELO1
+    tlbfill
+    csrrd   $t0, CSR_TLBRSAVE
+    ertn
 
+.align 12
 __la64_write_kernel_eentry:
     la.local $t0, __kernel_trap
     csrwr   $t0, CSR_EENTRY
@@ -108,11 +146,6 @@ __kernel_trap:
     move    $t0, $tp
     st.d    $t0, $sp, 36*8
 
-    la.local $t0, __la64_kernel_trap_count
-    ld.d    $t1, $t0, 0
-    addi.d  $t1, $t1, 1
-    st.d    $t1, $t0, 0
-
     move    $a0, $sp
     bl      kernel_trap_handler
 
@@ -157,11 +190,14 @@ __kernel_trap:
 
 .align 12
 __user_trap:
-    csrrd   $sp, 0x30
+    csrwr   $sp, CSR_KSAVE1
+    csrrd   $sp, CSR_KSAVE0
     st.d    $t0, $sp, TC_SCRATCH0
     st.d    $t1, $sp, TC_SCRATCH1
 
     ld.d    $t0, $sp, TC_TRAP_FRAME_PTR
+    csrrd   $t1, CSR_KSAVE1
+    st.d    $t1,  $t0, 3*8
 
     st.d    $ra,  $t0, 1*8
     st.d    $tp,  $t0, 2*8
@@ -233,6 +269,12 @@ __user_trap:
     ret
 
 __trap_return:
+    # Critical section: from here until ertn we must not take a kernel-mode
+    # interrupt, otherwise the CPU can observe partially switched trap state
+    # (user EENTRY + KSAVE context armed) and corrupt the return path.
+    li.w    $t1, 0x4
+    csrxchg $zero, $t1, 0x0
+
     move    $t0, $a0
     move    $t7, $a1
     move    $t6, $sp
@@ -252,10 +294,10 @@ __trap_return:
     st.d    $t6,  $sp, 11*8
 
     st.d    $sp, $t7, TC_KERNEL_SP
-    csrwr    $t7, 0x30
+    csrwr    $t7, CSR_KSAVE0
 
-    la.local $t0, __user_trap
-    csrwr    $t0, CSR_EENTRY
+    la.local $t1, __user_trap
+    csrwr    $t1, CSR_EENTRY
 
     ld.d    $t1, $t0, 32*8
     csrwr    $t1, CSR_PRMD

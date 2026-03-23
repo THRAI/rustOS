@@ -112,8 +112,9 @@ impl Pager for VnodePager {
 
             // Clamp page tail to zero when it crosses the file-backed boundary.
             if file_bytes_this_page < PAGE_SIZE {
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(pa.as_usize() as *mut u8, PAGE_SIZE) };
+                let buf = unsafe {
+                    core::slice::from_raw_parts_mut(pa.into_kernel_vaddr().as_mut_ptr(), PAGE_SIZE)
+                };
                 buf[file_bytes_this_page..].fill(0);
             }
             Ok(())
@@ -131,7 +132,7 @@ impl Pager for VnodePager {
         alloc::boxed::Box::pin(async move {
             let write_len = core::cmp::min(len, PAGE_SIZE);
             let data =
-                unsafe { core::slice::from_raw_parts(pa.as_usize() as *const u8, write_len) };
+                unsafe { core::slice::from_raw_parts(pa.into_kernel_vaddr().as_ptr(), write_len) };
             crate::fs::fs_write_at(&path, offset as u64, data)
                 .await
                 .map(|_| ())

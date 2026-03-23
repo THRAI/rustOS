@@ -24,6 +24,15 @@ _start:
     # Set early stack. `boot_stack_top` is provided by the linker script.
     la.local $sp, boot_stack_top
 
+    # Program direct-map windows explicitly so later PG=1 transitions
+    # can keep executing kernel text/data in the high-half window.
+    ori     $t0, $zero, 0x1
+    lu52i.d $t0, $t0, -2048
+    csrwr   $t0, 0x180
+    ori     $t0, $zero, 0x11
+    lu52i.d $t0, $t0, -1792
+    csrwr   $t0, 0x181
+
     # Enable FP/SIMD units for early bring-up.
     # Current la64 kernel builds still emit LSX/LASX instructions in core/alloc
     # paths before we have full per-task extended context management.

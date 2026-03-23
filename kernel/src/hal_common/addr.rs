@@ -138,8 +138,20 @@ impl PhysAddr {
     }
 
     pub fn into_kernel_vaddr(self) -> VirtAddr {
-        // Identity-mapped in kernel
-        VirtAddr(self.0)
+        #[cfg(target_arch = "loongarch64")]
+        {
+            const LA64_DIRECT_MAP_BASE: usize = 0x9000_0000_0000_0000;
+            if self.0 >= LA64_DIRECT_MAP_BASE {
+                VirtAddr(self.0)
+            } else {
+                VirtAddr(LA64_DIRECT_MAP_BASE | self.0)
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            // Identity-mapped in kernel
+            VirtAddr(self.0)
+        }
     }
 
     pub fn as_slice<'a>(self) -> &'a [u8] {
@@ -452,7 +464,11 @@ impl PageCursor {
         }
         self.offset -= size;
         unsafe {
-            let ptr = (self.base.0 + self.offset) as *mut u8;
+            let ptr = self
+                .base
+                .into_kernel_vaddr()
+                .as_mut_ptr()
+                .add(self.offset);
             Some(core::slice::from_raw_parts_mut(ptr, size))
         }
     }

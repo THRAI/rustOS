@@ -7,8 +7,12 @@ use crate::{
 
 #[cfg(target_arch = "riscv64")]
 pub const USER_MAX_VA: usize = 0x0000_0040_0000_0000;
+#[cfg(target_arch = "loongarch64")]
+pub const USER_MAX_VA: usize = super::la64::signal_abi::USER_MAX_VA;
 #[cfg(target_arch = "riscv64")]
 pub const SIGCODE_VA: usize = 0x0000_003F_FFFF_F000;
+#[cfg(target_arch = "loongarch64")]
+pub const SIGCODE_VA: usize = super::la64::signal_abi::SIGCODE_VA;
 #[cfg(target_arch = "riscv64")]
 const RT_SIGRETURN_SYSNO: usize = 139;
 
@@ -69,12 +73,7 @@ pub fn setup_signal_entry(
         tf.set_arg(2, ucontext_ptr);
         tf.set_sp(new_sp);
         tf.set_ra(restorer.unwrap_or(sigcode_va()));
-        let mut status = tf.status();
-        status = (status & !(1 << 8)) | (1 << 5);
-        if status & (3 << 13) == 0 {
-            status |= 1 << 13;
-        }
-        tf.set_status(status);
+        tf.set_status(TrapFrame::normalize_user_status(tf.status()));
     }
     #[cfg(target_arch = "loongarch64")]
     {
@@ -109,12 +108,7 @@ pub fn restore_after_sigreturn(tf: &mut TrapFrame, saved: &TrapFrame) -> Result<
     {
         validate_sigreturn_frame(saved)?;
         *tf = *saved;
-        let mut status = saved.status();
-        status = (status & !(1 << 8)) | (1 << 5);
-        if status & (3 << 13) == 0 {
-            status |= 1 << 13;
-        }
-        tf.set_status(status);
+        tf.set_status(TrapFrame::normalize_user_status(saved.status()));
         Ok(())
     }
     #[cfg(target_arch = "loongarch64")]

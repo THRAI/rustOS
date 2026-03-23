@@ -142,6 +142,54 @@ impl MemoryRegion {
     }
 }
 
+/// A single page-aligned file-backed mapping derived from one or more ELF
+/// segments that overlap the same final page.
+#[derive(Debug, Clone, Copy)]
+struct PageRegion {
+    page_va: usize,
+    file_offset: usize,
+    file_backed: usize,
+    prot: MapPerm,
+}
+
+fn normalize_page_regions(parse: &ElfParseResult, load_base: usize) -> Vec<PageRegion> {
+    let mut pages = BTreeMap::<(usize, usize), PageRegion>::new();
+
+    for seg in &parse.segments {
+        if seg.memsz == 0 {
+            continue;
+        }
+
+        let region = MemoryRegion::from_segment(seg, load_base);
+        let start = region.va_start().as_usize();
+        let end = region.va_end().as_usize();
+        let file_end = region.vaddr + region.filesz;
+
+        for page_va in (start..end).step_by(PAGE_SIZE) {
+            let file_offset = region.file_offset_aligned() + (page_va - start);
+            let covered_end = file_end.saturating_sub(page_va).min(PAGE_SIZE);
+            let key = (page_va, file_offset);
+
+            if let Some(existing) = pages.get_mut(&key) {
+                existing.prot |= region.prot;
+                existing.file_backed = existing.file_backed.max(covered_end);
+            } else {
+                pages.insert(
+                    key,
+                    PageRegion {
+                        page_va,
+                        file_offset,
+                        file_backed: covered_end,
+                        prot: region.prot,
+                    },
+                );
+            }
+        }
+    }
+
+    pages.into_values().collect()
+}
+
 // ---------------------------------------------------------------------------
 // Auxv
 // ---------------------------------------------------------------------------
@@ -270,32 +318,31 @@ impl ExecPipeline {
             .iter()
             .map(|seg| MemoryRegion::from_segment(seg, load_base))
             .collect();
-
-        let merged = merge_file_coverage(&regions);
+        let page_regions = normalize_page_regions(parse, load_base);
 
         // Track max vaddr for brk.
         let mut max_vaddr: usize = 0;
 
-        for region in regions.iter().filter(|r| r.memsz > 0) {
-            let file_backed = merged
-                .get(&region.merge_key())
-                .copied()
-                .unwrap_or_else(|| region.file_backed_bytes());
-
+        for page in page_regions {
             let obj = VmObject::new_vnode_region(
                 vnode_id,
                 vnode_path,
-                region.page_count(),
-                region.file_offset_aligned(),
-                file_backed,
+                1,
+                page.file_offset,
+                page.file_backed,
             );
             let mapping = VmMapping::FilePrivate {
                 object: obj,
-                offset: region.file_offset_aligned() as u64,
+                offset: page.file_offset as u64,
             };
 
             self.vm
-                .map_or_merge(region.va_start(), region.va_end(), region.prot, mapping)
+                .map_or_merge(
+                    VirtAddr::new(page.page_va),
+                    VirtAddr::new(page.page_va + PAGE_SIZE),
+                    page.prot,
+                    mapping,
+                )
                 .map_err(|_| {
                     kerr!(
                         exec,
@@ -304,7 +351,9 @@ impl ExecPipeline {
                         "exec: VMA insert failed (malformed ELF)"
                     )
                 })?;
+        }
 
+        for region in regions.iter().filter(|r| r.memsz > 0) {
             let end = region.vaddr + region.memsz;
             if end > max_vaddr {
                 max_vaddr = end;
@@ -359,34 +408,28 @@ impl ExecPipeline {
     ) -> Result<Self, Errno> {
         // Preserve the main binary's entry in auxv (already pushed).
         // Map the interpreter segments.
-        let regions: Vec<MemoryRegion> = parse
-            .segments
-            .iter()
-            .map(|seg| MemoryRegion::from_segment(seg, load_base))
-            .collect();
+        let page_regions = normalize_page_regions(parse, load_base);
 
-        let merged = merge_file_coverage(&regions);
-
-        for region in regions.iter().filter(|r| r.memsz > 0) {
-            let file_backed = merged
-                .get(&region.merge_key())
-                .copied()
-                .unwrap_or_else(|| region.file_backed_bytes());
-
+        for page in page_regions {
             let obj = VmObject::new_vnode_region(
                 vnode_id,
                 vnode_path,
-                region.page_count(),
-                region.file_offset_aligned(),
-                file_backed,
+                1,
+                page.file_offset,
+                page.file_backed,
             );
             let mapping = VmMapping::FilePrivate {
                 object: obj,
-                offset: region.file_offset_aligned() as u64,
+                offset: page.file_offset as u64,
             };
 
             self.vm
-                .map_or_merge(region.va_start(), region.va_end(), region.prot, mapping)
+                .map_or_merge(
+                    VirtAddr::new(page.page_va),
+                    VirtAddr::new(page.page_va + PAGE_SIZE),
+                    page.prot,
+                    mapping,
+                )
                 .map_err(|_| kerr!(exec, warn, Errno::Enoexec, "exec: interp VMA insert failed"))?;
         }
 

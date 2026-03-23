@@ -62,6 +62,7 @@ pub enum DeviceKind {
     Zero,
     ConsoleRead,
     ConsoleWrite,
+    Rtc,
 }
 
 // ---- FileObject (Layer 3) ----
@@ -111,7 +112,7 @@ impl FileObject {
                     revents |= POLLOUT;
                 }
             },
-            FileObject::Device(DeviceKind::Null | DeviceKind::Zero) => {
+            FileObject::Device(DeviceKind::Null | DeviceKind::Zero | DeviceKind::Rtc) => {
                 revents |= events_in & (POLLIN | POLLOUT);
             },
             FileObject::PipeRead(pipe) => {

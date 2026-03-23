@@ -78,9 +78,62 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
 }
 
 // --- Memory operations ---
-// memset, memcpy, memmove are provided in assembly (hal/rv64/memops.S)
-// to prevent LLVM from lowering core::ptr intrinsics back into calls
-// to these functions, which causes infinite recursion.
+// rv64 provides these in assembly. For la64 bring-up/autotest, override the
+// compiler-builtins versions with simple byte loops so kernel-side copies over
+// DMW-mapped pages do not depend on toolchain-provided memcpy semantics.
+
+#[cfg(target_arch = "loongarch64")]
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn memset(dst: *mut u8, value: i32, n: usize) -> *mut u8 {
+    unsafe {
+        let byte = value as u8;
+        let mut i = 0usize;
+        while i < n {
+            core::ptr::write_volatile(dst.add(i), byte);
+            i += 1;
+        }
+        dst
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        let mut i = 0usize;
+        while i < n {
+            let byte = core::ptr::read_volatile(src.add(i));
+            core::ptr::write_volatile(dst.add(i), byte);
+            i += 1;
+        }
+        dst
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        if core::ptr::eq(dst, src) || n == 0 {
+            return dst;
+        }
+
+        if (dst as usize) < (src as usize) || (dst as usize) >= (src as usize + n) {
+            memcpy(dst, src, n)
+        } else {
+            let mut i = n;
+            while i != 0 {
+                i -= 1;
+                let byte = core::ptr::read_volatile(src.add(i));
+                core::ptr::write_volatile(dst.add(i), byte);
+            }
+            dst
+        }
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {

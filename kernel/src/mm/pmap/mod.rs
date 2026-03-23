@@ -35,6 +35,8 @@ const MAX_CPUS: usize = 8;
 const PT_LEVELS: usize = 3;
 #[cfg(target_arch = "loongarch64")]
 const PT_LEVELS: usize = crate::hal::la64::paging::walk::LEVELS;
+#[cfg(target_arch = "loongarch64")]
+const LA64_UART_BASE: usize = 0x1fe0_01e0;
 
 #[inline]
 unsafe fn walk_pte(
@@ -126,8 +128,36 @@ impl Pmap {
                 None
             }
         }
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(target_arch = "loongarch64")]
         {
+            if level == 0 {
+                let frame =
+                    super::allocator::alloc_pte_l1_sync().expect("failed to allocate LA64 L1 map");
+                let pa = frame.phys();
+                pmap_zero_page(pa);
+                self.l1_directories.push(frame);
+                Some(pa)
+            } else if level == 1 {
+                let frame =
+                    super::allocator::alloc_pte_l0_sync().expect("failed to allocate LA64 L0 map");
+                let pa = frame.phys();
+                pmap_zero_page(pa);
+                self.l0_tables.push(frame);
+                Some(pa)
+            } else if level == 2 {
+                let frame = super::allocator::alloc_pte_l0_sync()
+                    .expect("failed to allocate LA64 leaf PTE table");
+                let pa = frame.phys();
+                pmap_zero_page(pa);
+                self.l0_tables.push(frame);
+                Some(pa)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+        {
+            let _ = level;
             None
         }
     }
@@ -260,7 +290,8 @@ impl Pmap {
         for idx in start_idx..=end_idx {
             // SAFETY: `table_pa` is a valid, identity-mapped page table page.
             // `idx` is in [0, 512) so the offset is within the 4 KiB page.
-            let pte_ptr = unsafe { (table_pa as *mut u64).add(idx) };
+            let table_va = PhysAddr::new(table_pa).into_kernel_vaddr().as_usize();
+            let pte_ptr = unsafe { (table_va as *mut u64).add(idx) };
             let raw = unsafe { pte_ptr.read_volatile() };
 
             if !pte_is_valid(raw) {
@@ -322,7 +353,7 @@ pub fn pmap_create() -> Pmap {
 
     let (asid, generation) = crate::hal::alloc_asid();
 
-    Pmap {
+    let mut pmap = Pmap {
         l0_tables: Vec::new(),
         l1_directories: {
             #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
@@ -336,7 +367,36 @@ pub fn pmap_create() -> Pmap {
         generation,
         active: array::from_fn(|_| AtomicBool::new(false)),
         stats: PmapStats::default(),
-    }
+    };
+
+    #[cfg(target_arch = "loongarch64")]
+    install_la64_kernel_window(&mut pmap);
+
+    pmap
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn install_la64_kernel_window(pmap: &mut Pmap) {
+    // LA64 kernel text/data/frames are reached through the DMW windows
+    // configured in early boot, not through the paged user address space.
+    //
+    // Mirroring the 0x9000_.... direct-map window into the generic 4-level
+    // pmap walker is actively harmful: the walker derives indices from the
+    // lower paged VA bits, so these DMW aliases collide with low canonical
+    // user addresses like 0x10000 and make a fresh user pmap look as if it
+    // already contains identity-mapped executable pages.
+    //
+    // Keep per-process page tables free of the DMW alias and only install
+    // explicit low MMIO mappings that must remain reachable by VA.
+    let uart_page = LA64_UART_BASE & !(PAGE_SIZE - 1);
+    pmap_enter(
+        pmap,
+        VirtAddr::new(uart_page),
+        PhysAddr::new(uart_page),
+        crate::map_perm!(R, W),
+        false,
+    )
+    .expect("la64 pmap_create: uart mapping failed");
 }
 
 /// Free all page table pages and release the ASID.
@@ -592,8 +652,18 @@ pub fn pmap_clear_modified(pmap: &mut Pmap, va: VirtAddr) {
 
 /// Zero a physical page (identity-mapped).
 pub fn pmap_zero_page(pa: PhysAddr) {
-    let ptr = pa.as_usize() as *mut u8;
+    let ptr = pa.into_kernel_vaddr().as_mut_ptr();
     unsafe {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let mut cur = ptr as *mut u64;
+            let end = cur.add(PAGE_SIZE / 8);
+            while cur < end {
+                cur.write_volatile(0);
+                cur = cur.add(1);
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
         core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
     }
 }

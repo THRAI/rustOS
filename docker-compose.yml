@@ -6,7 +6,13 @@ services:
       dockerfile: Dockerfile
     volumes:
       - .:/workspace
+      - ${HOME}/.cargo:/root/.cargo
+      - ${HOME}/.rustup:/root/.rustup
     working_dir: /workspace
+    environment:
+      RUSTUP_HOME: /root/.rustup
+      CARGO_HOME: /root/.cargo
+      RUSTUP_TOOLCHAIN: nightly-2025-06-01
 
   # Dedicated LTP cross-compilation (opt-in, ~10 min build)
   # Copies built LTP binaries into testcase/ via volume mount.

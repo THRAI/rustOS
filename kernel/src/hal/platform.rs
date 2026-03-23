@@ -69,11 +69,11 @@ pub fn boot_secondary_cpus(num_cpus: usize, boot_ids: &[usize], boot_boot_id: us
 pub fn shutdown() -> ! {
     #[cfg(target_arch = "riscv64")]
     {
-        return super::rv64::sbi::shutdown();
+        super::rv64::sbi::shutdown()
     }
     #[cfg(target_arch = "loongarch64")]
     {
-        return super::la64::platform::shutdown();
+        super::la64::platform::shutdown()
     }
 }
 

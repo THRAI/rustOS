@@ -128,10 +128,10 @@ pub fn do_clone(
         child_tf.set_ret_val(0);
         child_tf.advance_pc(); // skip ecall — parent's sepc is advanced by dispatcher, child's must be done here
         if child_stack != 0 {
-            child_tf.x[2] = child_stack;
+            child_tf.set_sp(child_stack);
         }
         if flags.contains(CloneFlags::SETTLS) && tls != 0 {
-            child_tf.x[4] = tls;
+            child_tf.set_tls(tls);
         }
     }
 

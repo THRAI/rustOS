@@ -18,7 +18,7 @@
 use alloc::{string::String, vec::Vec};
 
 use goblin::elf::{
-    header::{EM_RISCV, ET_DYN, ET_EXEC},
+    header::{EM_LOONGARCH, EM_RISCV, ET_DYN, ET_EXEC},
     program_header::{PT_INTERP, PT_LOAD, PT_PHDR},
     Header, ProgramHeader,
 };
@@ -36,7 +36,7 @@ pub enum ElfError {
     ParseFailed(String),
     /// e_type is not ET_EXEC or ET_DYN.
     UnsupportedType(u16),
-    /// e_machine is not EM_RISCV.
+    /// e_machine does not match the current kernel architecture.
     UnsupportedMachine(u16),
     /// Program headers extend beyond the provided buffer.
     PhdrOverflow { phdr_end: usize, buffer_len: usize },
@@ -91,16 +91,22 @@ pub struct ElfParseResult {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Validate that a parsed ELF header targets our platform.
+#[cfg(target_arch = "riscv64")]
+const EXPECTED_E_MACHINE: u16 = EM_RISCV;
+
+#[cfg(target_arch = "loongarch64")]
+const EXPECTED_E_MACHINE: u16 = EM_LOONGARCH;
+
+/// Validate that a parsed ELF header targets the running kernel architecture.
 ///
-/// Checks `e_type` (ET_EXEC or ET_DYN) and `e_machine` (EM_RISCV).
+/// Checks `e_type` (ET_EXEC or ET_DYN) and `e_machine`.
 /// goblin's own `parse_header` already validated magic, class, and
 /// endianness, so we only check the fields it leaves open.
 pub fn validate_header(ehdr: &Header) -> Result<(), ElfError> {
     if ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN {
         return Err(ElfError::UnsupportedType(ehdr.e_type));
     }
-    if ehdr.e_machine != EM_RISCV {
+    if ehdr.e_machine != EXPECTED_E_MACHINE {
         return Err(ElfError::UnsupportedMachine(ehdr.e_machine));
     }
     Ok(())

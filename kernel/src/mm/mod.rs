@@ -72,6 +72,14 @@ pub(crate) fn get_frame_meta(addr: crate::hal_common::PhysAddr) -> Option<&'stat
     allocator::get_frame_meta(addr)
 }
 
+pub(crate) fn frame_total_pages() -> usize {
+    allocator::total_pages()
+}
+
+pub(crate) fn frame_available_pages() -> usize {
+    allocator::available_pages()
+}
+
 // Types that need to be visible crate-wide.
 pub use allocator::{BuddyAllocator, Magazine, PageRole};
 pub use pmap::{

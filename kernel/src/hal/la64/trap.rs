@@ -7,6 +7,7 @@ use crate::{
 
 const CSR_ECFG: usize = 0x4;
 const CSR_EENTRY: usize = 0xc;
+const CSR_TLBRENTRY: usize = 0x88;
 const EENTRY_ALIGN_MASK: usize = !0xfffusize;
 const CSR_WRITE_ALL_MASK: usize = usize::MAX;
 const ECFG_VS_SHIFT: usize = 16;
@@ -29,6 +30,7 @@ const EXC_SYSCALL: usize = 0x0b;
 const EXC_ADEF: usize = 0x08;
 const EXC_ADEM: usize = 0x09;
 const EXC_FETCH_PAGE_FAULT: usize = 0x03;
+const EXC_PAGE_MODIFIED: usize = 0x04;
 const EXC_LOAD_PAGE_FAULT: usize = 0x01;
 const EXC_STORE_PAGE_FAULT: usize = 0x02;
 const EXC_FETCH_ADDR_ERROR: usize = 0x0d;
@@ -38,6 +40,7 @@ const EXC_BREAKPOINT: usize = 0x0c;
 extern "C" {
     fn __kernel_trap();
     fn __user_trap();
+    fn __tlb_refill();
     static __la64_kernel_trap_count: usize;
     static __la64_user_trap_count: usize;
 }
@@ -50,6 +53,7 @@ static IGNORED_EXEC_FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     set_kernel_trap_entry();
+    set_tlb_refill_entry();
     let ecfg: usize;
     let new_ecfg: usize;
     unsafe {
@@ -59,17 +63,24 @@ pub fn init() {
     }
 }
 
+fn set_tlb_refill_entry() {
+    const LA64_PHYS_MASK: usize = 0x0fff_ffff_ffff_ffff;
+    let entry_pa = (__tlb_refill as *const () as usize) & LA64_PHYS_MASK;
+    unsafe {
+        core::arch::asm!("csrwr {}, {}", in(reg) entry_pa, const CSR_TLBRENTRY);
+    }
+}
+
 pub fn set_kernel_trap_entry() {
     let mut ecfg: usize;
     let entry = (__kernel_trap as *const () as usize) & EENTRY_ALIGN_MASK;
-    let mut write_val = entry;
     unsafe {
         core::arch::asm!("csrrd {}, {}", out(reg) ecfg, const CSR_ECFG);
         ecfg &= !ECFG_VS_MASK;
         core::arch::asm!("csrwr {}, {}", in(reg) ecfg, const CSR_ECFG);
         core::arch::asm!(
             "csrxchg {}, {}, {}",
-            inout(reg) write_val,
+            inlateout(reg) entry => _,
             in(reg) CSR_WRITE_ALL_MASK,
             const CSR_EENTRY
         );
@@ -90,14 +101,13 @@ pub fn clear_swi0_probe() {
 pub fn set_user_trap_entry() {
     let mut ecfg: usize;
     let entry = (__user_trap as *const () as usize) & EENTRY_ALIGN_MASK;
-    let mut write_val = entry;
     unsafe {
         core::arch::asm!("csrrd {}, {}", out(reg) ecfg, const CSR_ECFG);
         ecfg &= !ECFG_VS_MASK;
         core::arch::asm!("csrwr {}, {}", in(reg) ecfg, const CSR_ECFG);
         core::arch::asm!(
             "csrxchg {}, {}, {}",
-            inout(reg) write_val,
+            inlateout(reg) entry => _,
             in(reg) CSR_WRITE_ALL_MASK,
             const CSR_EENTRY
         );
@@ -143,6 +153,10 @@ pub fn describe(tf: &TrapFrame) -> TrapInfo {
         match (estat & ESTAT_EXC_MASK) >> ESTAT_EXC_SHIFT {
             EXC_SYSCALL => TrapCause::Syscall,
             EXC_FETCH_PAGE_FAULT => TrapCause::PageFaultExecute,
+            // LoongArch reports writes to present-but-not-writable/dirty pages as
+            // PME. Route it through the normal write-fault path so COW and lazy
+            // permission upgrades can reuse the generic VM fault handler.
+            EXC_PAGE_MODIFIED => TrapCause::PageFaultWrite,
             EXC_LOAD_PAGE_FAULT => TrapCause::PageFaultRead,
             EXC_STORE_PAGE_FAULT => TrapCause::PageFaultWrite,
             EXC_FETCH_TLB_REFILL => TrapCause::PageFaultExecute,
@@ -165,7 +179,10 @@ pub fn describe(tf: &TrapFrame) -> TrapInfo {
 pub extern "C" fn kernel_trap_handler(frame: &mut TrapFrame) {
     match describe(frame).cause {
         TrapCause::Syscall => {
-            SYSCALL_CAUSE_COUNT.fetch_add(1, Ordering::Relaxed);
+            let n = SYSCALL_CAUSE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 {
+                crate::kprintln!("la64 syscall probe handled");
+            }
             frame.advance_syscall_pc()
         },
         TrapCause::Timer => {

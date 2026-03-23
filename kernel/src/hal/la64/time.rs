@@ -10,7 +10,6 @@ const TCFG_INITVAL_SHIFT: u64 = 2;
 const TCFG_INITVAL_MASK: u64 = (1u64 << 48) - 1;
 const TIMER_INTERVAL_TICKS: u64 = (COUNTER_HZ / TIMER_IRQ_HZ) as u64;
 
-static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMER_HANDLER_ENTER_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
@@ -79,17 +78,8 @@ pub fn init() {
 }
 
 pub fn handle_timer_irq() {
-    let enter = TIMER_HANDLER_ENTER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if enter == 1 {
-        crate::kprintln!("la64 timer handler entered");
-    }
+    TIMER_HANDLER_ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
     clear_timer_irq();
-    let tick = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if enter == 1 {
-        crate::kprintln!("la64 timer interrupt online");
-    } else if enter % 100 == 0 {
-        crate::kprintln!("la64 timer enters={} ticks={}", enter, tick);
-    }
     set_next_trigger();
 
     let pc = crate::executor::current();
@@ -99,7 +89,7 @@ pub fn handle_timer_irq() {
 
 #[inline]
 pub fn tick_count() -> u64 {
-    TICK_COUNT.load(Ordering::Relaxed)
+    TIMER_HANDLER_ENTER_COUNT.load(Ordering::Relaxed)
 }
 
 #[inline]

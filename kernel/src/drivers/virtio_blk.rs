@@ -8,7 +8,7 @@ use core::sync::atomic::{fence, Ordering};
 
 use crate::{
     drivers::*,
-    hal_common::PAGE_SIZE,
+    hal_common::{PhysAddr, PAGE_SIZE},
     mm::{alloc_raw_frame_sync, PageRole},
 };
 
@@ -35,6 +35,19 @@ const VIRTIO_BLK_T_OUT: u32 = 1; // write
 /// Virtqueue descriptor flags.
 const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
+
+const PCI_COMMON_DEVICE_FEATURE_SELECT: usize = 0x00;
+const PCI_COMMON_DEVICE_FEATURE: usize = 0x04;
+const PCI_COMMON_DRIVER_FEATURE_SELECT: usize = 0x08;
+const PCI_COMMON_DRIVER_FEATURE: usize = 0x0c;
+const PCI_COMMON_DEVICE_STATUS: usize = 0x14;
+const PCI_COMMON_QUEUE_SELECT: usize = 0x16;
+const PCI_COMMON_QUEUE_SIZE: usize = 0x18;
+const PCI_COMMON_QUEUE_ENABLE: usize = 0x1c;
+const PCI_COMMON_QUEUE_NOTIFY_OFF: usize = 0x1e;
+const PCI_COMMON_QUEUE_DESC: usize = 0x20;
+const PCI_COMMON_QUEUE_DRIVER: usize = 0x28;
+const PCI_COMMON_QUEUE_DEVICE: usize = 0x30;
 
 /// Virtqueue descriptor (16 bytes).
 #[repr(C)]
@@ -80,7 +93,7 @@ struct VirtioBlkReqHeader {
 
 /// VirtIO-blk driver instance.
 pub struct VirtioBlk {
-    mmio: VirtioMmio,
+    transport: VirtioTransport,
     queue_size: u16,
     /// Physical address of descriptor table.
     desc_pa: usize,
@@ -98,6 +111,19 @@ pub struct VirtioBlk {
     req_hdr_pa: usize,
     /// Physical address of the status byte (reused).
     status_pa: usize,
+    /// Physical address of a one-page DMA bounce buffer.
+    data_bounce_pa: usize,
+}
+
+enum VirtioTransport {
+    Mmio(VirtioMmio),
+    Pci(VirtioPciTransport),
+}
+
+struct VirtioPciTransport {
+    common_cfg_addr: usize,
+    notify_addr: usize,
+    device_cfg_addr: usize,
 }
 
 /// Global driver instance.
@@ -127,13 +153,28 @@ impl VirtioBlk {
                 continue;
             }
             klog!(driver, info, "found block device at {:#x}", base);
-            return Self::init_device(mmio);
+            return Self::init_mmio_device(mmio);
+        }
+
+        if let Some(pci) = crate::drivers::probe_virtio_blk_pci() {
+            let dev = pci.transport.device;
+            klog!(
+                driver,
+                info,
+                "found pci block device at {:02x}:{:02x}.{} common={:#x} notify={:#x}",
+                dev.bus,
+                dev.device,
+                dev.function,
+                pci.common_cfg_addr,
+                pci.notify_cfg_addr
+            );
+            return Self::init_pci_device(pci);
         }
         None
     }
 
     /// Initialize a VirtIO-blk device (spec §3.1).
-    fn init_device(mmio: VirtioMmio) -> Option<Self> {
+    fn init_mmio_device(mmio: VirtioMmio) -> Option<Self> {
         // 1. Reset
         mmio.write(STATUS, 0);
 
@@ -187,9 +228,12 @@ impl VirtioBlk {
         let base_pa = base_frame.as_usize();
 
         // Zero the entire region
-        // Zero the entire region
         unsafe {
-            core::ptr::write_bytes(base_pa as *mut u8, 0, (1 << order) * PAGE_SIZE);
+            core::ptr::write_bytes(
+                PhysAddr::new(base_pa).into_kernel_vaddr().as_mut_ptr(),
+                0,
+                (1 << order) * PAGE_SIZE,
+            );
         }
 
         let desc_pa = base_pa;
@@ -213,9 +257,27 @@ impl VirtioBlk {
         let req_hdr_pa = req_frame.as_usize();
         // Status byte at offset 16 (after the 16-byte header)
         let status_pa = req_hdr_pa + 16;
+        unsafe {
+            core::ptr::write_bytes(
+                PhysAddr::new(req_hdr_pa).into_kernel_vaddr().as_mut_ptr(),
+                0,
+                PAGE_SIZE,
+            );
+        }
+
+        let data_bounce_pa = alloc_raw_frame_sync(PageRole::DriverDma)
+            .expect("virtio-blk: data bounce alloc")
+            .as_usize();
+        unsafe {
+            core::ptr::write_bytes(
+                PhysAddr::new(data_bounce_pa).into_kernel_vaddr().as_mut_ptr(),
+                0,
+                PAGE_SIZE,
+            );
+        }
 
         Some(VirtioBlk {
-            mmio,
+            transport: VirtioTransport::Mmio(mmio),
             queue_size,
             desc_pa,
             avail_pa,
@@ -225,6 +287,115 @@ impl VirtioBlk {
             capacity,
             req_hdr_pa,
             status_pa,
+            data_bounce_pa,
+        })
+    }
+
+    fn init_pci_device(probe: crate::drivers::VirtioBlkPciProbeInfo) -> Option<Self> {
+        let transport = VirtioPciTransport {
+            common_cfg_addr: probe.common_cfg_addr,
+            notify_addr: probe.queue0_notify_addr,
+            device_cfg_addr: probe.device_cfg_addr?,
+        };
+
+        transport.write_status(0);
+        transport.write_status(STATUS_ACKNOWLEDGE);
+        transport.write_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+
+        let features = transport.read_device_features();
+        let accepted = features & !(1 << 28) & !(1 << 29);
+        transport.write_driver_features(accepted);
+
+        let status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
+        transport.write_status(status);
+        if transport.read_status() & STATUS_FEATURES_OK == 0 {
+            klog!(driver, error, "virtio-pci FEATURES_OK not set, aborting");
+            transport.write_status(STATUS_FAILED);
+            return None;
+        }
+
+        let max_size = transport.queue_max_size(0);
+        if max_size == 0 {
+            klog!(driver, error, "virtio-pci queue 0 not available");
+            return None;
+        }
+        let queue_size = max_size.min(QUEUE_SIZE_MAX);
+
+        let qs = queue_size as usize;
+        let desc_size = 16 * qs;
+        let avail_size = 6 + 2 * qs;
+        let used_offset = align_up(desc_size + avail_size, PAGE_SIZE);
+        let used_size = 6 + 8 * qs;
+        let total_size = used_offset + used_size;
+
+        let num_pages = align_up(total_size, PAGE_SIZE) / PAGE_SIZE;
+        let order = num_pages.next_power_of_two().trailing_zeros() as usize;
+        let base_frame = crate::mm::frame_alloc_contiguous(order).expect("virtio-pci-blk: queue alloc");
+        let base_pa = base_frame.as_usize();
+        unsafe {
+            core::ptr::write_bytes(
+                PhysAddr::new(base_pa).into_kernel_vaddr().as_mut_ptr(),
+                0,
+                (1 << order) * PAGE_SIZE,
+            );
+        }
+
+        let desc_pa = base_pa;
+        let avail_pa = base_pa + desc_size;
+        let used_pa = base_pa + used_offset;
+
+        transport.queue_set(0, queue_size, desc_pa, avail_pa, used_pa);
+
+        transport.write_status(status | STATUS_DRIVER_OK);
+
+        let capacity = transport.read_blk_capacity();
+
+        let req_frame = alloc_raw_frame_sync(PageRole::DriverDma).expect("virtio-pci-blk: req alloc");
+        let req_hdr_pa = req_frame.as_usize();
+        let status_pa = req_hdr_pa + 16;
+        let data_bounce_pa = alloc_raw_frame_sync(PageRole::DriverDma)
+            .expect("virtio-pci-blk: data bounce alloc")
+            .as_usize();
+        unsafe {
+            core::ptr::write_bytes(
+                PhysAddr::new(req_hdr_pa).into_kernel_vaddr().as_mut_ptr(),
+                0,
+                PAGE_SIZE,
+            );
+            core::ptr::write_bytes(
+                PhysAddr::new(data_bounce_pa).into_kernel_vaddr().as_mut_ptr(),
+                0,
+                PAGE_SIZE,
+            );
+        }
+
+        klog!(
+            driver,
+            info,
+            "virtio-pci queue0 ready: common={:#x} notify={:#x} devcfg={:#x} desc_pa={:#x} avail_pa={:#x} used_pa={:#x} req_pa={:#x} status_pa={:#x} bounce_pa={:#x}",
+            probe.common_cfg_addr,
+            probe.queue0_notify_addr,
+            transport.device_cfg_addr,
+            desc_pa,
+            avail_pa,
+            used_pa,
+            req_hdr_pa,
+            status_pa,
+            data_bounce_pa
+        );
+
+        Some(VirtioBlk {
+            transport: VirtioTransport::Pci(transport),
+            queue_size,
+            desc_pa,
+            avail_pa,
+            used_pa,
+            next_desc: 0,
+            last_used_idx: 0,
+            capacity,
+            req_hdr_pa,
+            status_pa,
+            data_bounce_pa,
         })
     }
 
@@ -251,11 +422,18 @@ impl VirtioBlk {
 
     /// Read multiple contiguous sectors into a buffer.
     pub fn read_sectors(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), ()> {
+        if !buf.len().is_multiple_of(SECTOR_SIZE) {
+            return Err(());
+        }
         let nsectors = buf.len() / SECTOR_SIZE;
         if sector + nsectors as u64 > self.capacity {
             return Err(());
         }
-        self.do_request(VIRTIO_BLK_T_IN, sector, buf.as_mut_ptr(), buf.len())
+        for (idx, chunk) in buf.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            let sector_buf: &mut [u8; SECTOR_SIZE] = chunk.try_into().map_err(|_| ())?;
+            self.read_sector(sector + idx as u64, sector_buf)?;
+        }
+        Ok(())
     }
 
     /// Perform a single VirtIO-blk request (3-descriptor chain).
@@ -266,13 +444,18 @@ impl VirtioBlk {
         data_ptr: *mut u8,
         data_len: usize,
     ) -> Result<(), ()> {
-        let desc_base = self.desc_pa as *mut VringDesc;
+        if data_len > PAGE_SIZE {
+            return Err(());
+        }
+        let desc_base = PhysAddr::new(self.desc_pa).into_kernel_vaddr().as_mut_ptr() as *mut VringDesc;
         let d0 = self.next_desc;
         let d1 = (d0 + 1) % self.queue_size;
         let d2 = (d1 + 1) % self.queue_size;
+        let bounce_ptr = PhysAddr::new(self.data_bounce_pa).into_kernel_vaddr().as_mut_ptr();
 
         // Write request header
-        let hdr = self.req_hdr_pa as *mut VirtioBlkReqHeader;
+        let hdr = PhysAddr::new(self.req_hdr_pa).into_kernel_vaddr().as_mut_ptr()
+            as *mut VirtioBlkReqHeader;
         unsafe {
             (*hdr).type_ = req_type;
             (*hdr).reserved = 0;
@@ -280,8 +463,15 @@ impl VirtioBlk {
         }
 
         // Clear status byte
+        let status_ptr = PhysAddr::new(self.status_pa).into_kernel_vaddr().as_mut_ptr();
         unsafe {
-            *(self.status_pa as *mut u8) = 0xFF;
+            core::ptr::write_volatile(status_ptr, 0xFF);
+        }
+
+        if req_type == VIRTIO_BLK_T_OUT {
+            unsafe {
+                core::ptr::copy_nonoverlapping(data_ptr as *const u8, bounce_ptr, data_len);
+            }
         }
 
         // Descriptor 0: request header (device-readable)
@@ -301,7 +491,7 @@ impl VirtioBlk {
         };
         unsafe {
             let d = &mut *desc_base.add(d1 as usize);
-            d.addr = data_ptr as u64;
+            d.addr = self.data_bounce_pa as u64;
             d.len = data_len as u32;
             d.flags = data_flags;
             d.next = d2;
@@ -318,11 +508,14 @@ impl VirtioBlk {
 
         // Add to available ring
         fence(Ordering::SeqCst);
-        let avail = self.avail_pa as *mut VringAvail;
+        let avail = PhysAddr::new(self.avail_pa).into_kernel_vaddr().as_mut_ptr() as *mut VringAvail;
         let avail_idx = unsafe { core::ptr::read_volatile(&(*avail).idx) };
-        let ring_entry = self.avail_pa + 4 + (avail_idx % self.queue_size) as usize * 2;
+        let ring_entry =
+            PhysAddr::new(self.avail_pa + 4 + (avail_idx % self.queue_size) as usize * 2)
+                .into_kernel_vaddr()
+                .as_mut_ptr() as *mut u16;
         unsafe {
-            core::ptr::write_volatile(ring_entry as *mut u16, d0);
+            core::ptr::write_volatile(ring_entry, d0);
         }
         fence(Ordering::SeqCst);
         unsafe {
@@ -331,11 +524,25 @@ impl VirtioBlk {
         fence(Ordering::SeqCst);
 
         // Notify device
-        self.mmio.write(QUEUE_NOTIFY, 0);
+        self.transport.notify_queue(0);
 
         // Poll for completion. Enable SIE briefly so timer IRQs cause vCPU exits,
         // allowing QEMU to process the MMIO notification on the device model thread.
-        let used = self.used_pa as *mut VringUsed;
+        let used = PhysAddr::new(self.used_pa).into_kernel_vaddr().as_mut_ptr() as *mut VringUsed;
+        let used_slot = (self.last_used_idx % self.queue_size) as usize;
+        let used_elem = PhysAddr::new(self.used_pa + 4 + used_slot * core::mem::size_of::<VringUsedElem>())
+            .into_kernel_vaddr()
+            .as_mut_ptr() as *mut VringUsedElem;
+        unsafe {
+            core::ptr::write_volatile(
+                used_elem,
+                VringUsedElem {
+                    id: u32::MAX,
+                    len: 0,
+                },
+            );
+        }
+        fence(Ordering::SeqCst);
 
         crate::klog!(
             sched,
@@ -351,14 +558,32 @@ impl VirtioBlk {
             fence(Ordering::SeqCst);
             let cur = unsafe { core::ptr::read_volatile(&(*used).idx) };
             if cur != self.last_used_idx {
+                let elem = unsafe { core::ptr::read_volatile(used_elem as *const VringUsedElem) };
+                let status = unsafe { core::ptr::read_volatile(status_ptr as *const u8) };
+                if elem.id == d0 as u32 && status != 0xFF {
+                    crate::klog!(
+                        sched,
+                        debug,
+                        "do_request: sector {} DONE after {} spins elem.id={} len={} status={:#x}",
+                        sector,
+                        spins,
+                        elem.id,
+                        elem.len,
+                        status
+                    );
+                    break;
+                }
                 crate::klog!(
                     sched,
                     debug,
-                    "do_request: sector {} DONE after {} spins",
+                    "do_request: sector {} completion not ready yet: cur={} expected={} elem.id={} len={} status={:#x}",
                     sector,
-                    spins
+                    cur,
+                    self.last_used_idx,
+                    elem.id,
+                    elem.len,
+                    status
                 );
-                break;
             }
             if spins % 1000000 == 0 && spins > 0 {
                 crate::klog!(
@@ -381,11 +606,35 @@ impl VirtioBlk {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         self.next_desc = (d2 + 1) % self.queue_size;
 
+        // Seeing used.idx advance means the device completed the descriptor
+        // chain, but we still need an acquire barrier before reading the
+        // status byte and bounce buffer contents from guest memory.
+        fence(Ordering::SeqCst);
+
         // Check status
-        let status = unsafe { *(self.status_pa as *const u8) };
+        let status = unsafe { core::ptr::read_volatile(status_ptr as *const u8) };
         if status == 0 {
+            if req_type == VIRTIO_BLK_T_IN {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bounce_ptr, data_ptr, data_len);
+                }
+            }
             Ok(())
         } else {
+            let used_idx = unsafe { core::ptr::read_volatile(&(*used).idx) };
+            klog!(
+                driver,
+                error,
+                "virtio-blk request failed: type={} sector={} status={:#x} used_idx={} last_used_idx={} desc_pa={:#x} avail_pa={:#x} used_pa={:#x}",
+                req_type,
+                sector,
+                status,
+                used_idx,
+                self.last_used_idx,
+                self.desc_pa,
+                self.avail_pa,
+                self.used_pa
+            );
             Err(())
         }
     }
@@ -396,18 +645,120 @@ impl VirtioBlk {
     }
 }
 
+impl VirtioTransport {
+    fn notify_queue(&self, queue: u16) {
+        match self {
+            Self::Mmio(mmio) => mmio.write(QUEUE_NOTIFY, queue as u32),
+            Self::Pci(pci) => pci.notify_queue(queue),
+        }
+    }
+}
+
+impl VirtioPciTransport {
+    #[inline]
+    fn read_u8(&self, offset: usize) -> u8 {
+        unsafe { core::ptr::read_volatile((self.common_cfg_addr + offset) as *const u8) }
+    }
+
+    #[inline]
+    fn write_u8(&self, offset: usize, value: u8) {
+        unsafe { core::ptr::write_volatile((self.common_cfg_addr + offset) as *mut u8, value) }
+    }
+
+    #[inline]
+    fn read_u16(&self, offset: usize) -> u16 {
+        unsafe { core::ptr::read_volatile((self.common_cfg_addr + offset) as *const u16) }
+    }
+
+    #[inline]
+    fn write_u16(&self, offset: usize, value: u16) {
+        unsafe { core::ptr::write_volatile((self.common_cfg_addr + offset) as *mut u16, value) }
+    }
+
+    #[inline]
+    fn read_u32(&self, offset: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((self.common_cfg_addr + offset) as *const u32) }
+    }
+
+    #[inline]
+    fn write_u32(&self, offset: usize, value: u32) {
+        unsafe { core::ptr::write_volatile((self.common_cfg_addr + offset) as *mut u32, value) }
+    }
+
+    #[inline]
+    fn write_u64(&self, offset: usize, value: u64) {
+        unsafe { core::ptr::write_volatile((self.common_cfg_addr + offset) as *mut u64, value) }
+    }
+
+    fn read_device_features(&self) -> u64 {
+        self.write_u32(PCI_COMMON_DEVICE_FEATURE_SELECT, 0);
+        let lo = self.read_u32(PCI_COMMON_DEVICE_FEATURE) as u64;
+        self.write_u32(PCI_COMMON_DEVICE_FEATURE_SELECT, 1);
+        let hi = self.read_u32(PCI_COMMON_DEVICE_FEATURE) as u64;
+        lo | (hi << 32)
+    }
+
+    fn write_driver_features(&self, features: u64) {
+        self.write_u32(PCI_COMMON_DRIVER_FEATURE_SELECT, 0);
+        self.write_u32(PCI_COMMON_DRIVER_FEATURE, features as u32);
+        self.write_u32(PCI_COMMON_DRIVER_FEATURE_SELECT, 1);
+        self.write_u32(PCI_COMMON_DRIVER_FEATURE, (features >> 32) as u32);
+    }
+
+    fn read_status(&self) -> u32 {
+        self.read_u8(PCI_COMMON_DEVICE_STATUS) as u32
+    }
+
+    fn write_status(&self, status: u32) {
+        self.write_u8(PCI_COMMON_DEVICE_STATUS, status as u8);
+    }
+
+    fn queue_max_size(&self, queue: u16) -> u16 {
+        self.write_u16(PCI_COMMON_QUEUE_SELECT, queue);
+        self.read_u16(PCI_COMMON_QUEUE_SIZE)
+    }
+
+    fn queue_set(&self, queue: u16, size: u16, desc: usize, avail: usize, used: usize) {
+        self.write_u16(PCI_COMMON_QUEUE_SELECT, queue);
+        self.write_u16(PCI_COMMON_QUEUE_SIZE, size);
+        self.write_u64(PCI_COMMON_QUEUE_DESC, desc as u64);
+        self.write_u64(PCI_COMMON_QUEUE_DRIVER, avail as u64);
+        self.write_u64(PCI_COMMON_QUEUE_DEVICE, used as u64);
+        self.write_u16(PCI_COMMON_QUEUE_ENABLE, 1);
+    }
+
+    fn notify_queue(&self, queue: u16) {
+        unsafe { core::ptr::write_volatile(self.notify_addr as *mut u16, queue) }
+    }
+
+    fn read_blk_capacity(&self) -> u64 {
+        unsafe { core::ptr::read_volatile(self.device_cfg_addr as *const u64) }
+    }
+}
+
 /// Initialize the VirtIO-blk driver. Called from rust_main after frame allocator init.
+pub fn try_init() -> bool {
+    if VIRTIO_BLK.get().is_some() {
+        return true;
+    }
+
+    let Some(blk) = VirtioBlk::probe_and_init() else {
+        return false;
+    };
+
+    klog!(
+        driver,
+        info,
+        "initialized, capacity = {} sectors",
+        blk.capacity()
+    );
+    VIRTIO_BLK.call_once(|| crate::hal_common::SpinMutex::new(blk));
+    true
+}
+
+/// Initialize the VirtIO-blk driver and panic if no block device is present.
 pub fn init() {
-    VIRTIO_BLK.call_once(|| {
-        let blk = VirtioBlk::probe_and_init().expect("virtio-blk: no block device found");
-        klog!(
-            driver,
-            info,
-            "initialized, capacity = {} sectors",
-            blk.capacity()
-        );
-        crate::hal_common::SpinMutex::new(blk)
-    });
+    assert!(try_init(), "virtio-blk: no block device found");
 }
 
 /// Get a reference to the global VirtIO-blk driver.

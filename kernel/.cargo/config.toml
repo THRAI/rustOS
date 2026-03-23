@@ -1,0 +1,5 @@
+[target.loongarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker/la64-qemu.ld",
+    "-C", "force-frame-pointers=yes",
+]

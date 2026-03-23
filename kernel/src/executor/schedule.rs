@@ -5,6 +5,7 @@
 
 use core::{
     future::Future,
+    panic::Location,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -15,12 +16,26 @@ use super::per_cpu;
 ///
 /// The schedule_fn closure pushes the Runnable to the target CPU's
 /// run queue whenever the future is woken.
+#[track_caller]
 pub fn spawn_kernel_task<F>(future: F, target_cpu: usize) -> async_task::Task<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    let caller = Location::caller();
     let schedule_fn = move |runnable: async_task::Runnable| {
+        #[cfg(target_arch = "loongarch64")]
+        if target_cpu >= per_cpu::MAX_CPUS {
+            let current_cpu = per_cpu::current().cpu_id;
+            panic!(
+                "la64 spawn_kernel_task: bad target_cpu={} current_cpu={} caller={}:{}:{}",
+                target_cpu,
+                current_cpu,
+                caller.file(),
+                caller.line(),
+                caller.column()
+            );
+        }
         per_cpu::get(target_cpu).run_queue.push(runnable);
         // Send IPI if scheduling to a different CPU to wake it from wfi
         let current_cpu = per_cpu::current().cpu_id;

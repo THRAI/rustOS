@@ -17,11 +17,11 @@ pub unsafe fn walk(
     allocator: &mut dyn FnMut(usize) -> Option<PhysAddr>,
 ) -> Option<*mut u64> {
     unsafe {
-        let mut table_pa = root_pa.as_usize();
+        let mut table_va = root_pa.into_kernel_vaddr().as_usize();
 
         for level in 0..LEVELS {
             let idx = vpn_index(va, level);
-            let pte_ptr = (table_pa as *mut u64).add(idx);
+            let pte_ptr = (table_va as *mut u64).add(idx);
             let pte = pte_ptr.read_volatile();
 
             if level == LEVELS - 1 {
@@ -33,14 +33,22 @@ pub unsafe fn walk(
             }
 
             if pte_is_valid(pte) {
-                table_pa = pte_pa(pte);
+                table_va = PhysAddr::new(pte_pa(pte)).into_kernel_vaddr().as_usize();
             } else if alloc {
-                let new_page = allocator(level)?;
+                let Some(new_page) = allocator(level) else {
+                    crate::kprintln!(
+                        "la64 walk alloc failed: va={:#x} level={} idx={}",
+                        va.as_usize(),
+                        level,
+                        idx
+                    );
+                    return None;
+                };
                 pte_ptr.write_volatile(encode_pte(
                     new_page.as_usize(),
                     PteFlags::V | PteFlags::PRESENT,
                 ));
-                table_pa = new_page.as_usize();
+                table_va = new_page.into_kernel_vaddr().as_usize();
             } else {
                 return None;
             }

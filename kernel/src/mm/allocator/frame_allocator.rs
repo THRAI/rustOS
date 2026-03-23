@@ -15,6 +15,37 @@ use crate::{
     },
 };
 
+#[cfg(target_arch = "loongarch64")]
+const LA64_KERNEL_WIN_BASE: usize = 0x9000_0000_0000_0000;
+#[cfg(target_arch = "loongarch64")]
+const LA64_KERNEL_WIN_LOW_MASK: usize = 0x0000_0000_FFFF_FFFF;
+
+#[inline]
+fn canonical_phys_addr(addr: usize) -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        return addr & LA64_KERNEL_WIN_LOW_MASK;
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        addr
+    }
+}
+
+#[inline]
+fn canonical_phys_pfn(addr: usize) -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        return (addr & LA64_KERNEL_WIN_LOW_MASK) / PAGE_SIZE;
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        addr / PAGE_SIZE
+    }
+}
+
 /// Debug-build poison pattern: written to every u64 in a freed frame.
 #[cfg(debug_assertions)]
 const POISON_PATTERN: u64 = 0xDEAD_BEEF_DEAD_BEEF;
@@ -52,10 +83,19 @@ static PER_CPU_MAGAZINES: [IrqSafeSpinLock<Magazine, 7>; 8] = [
 /// Initialize the buddy allocator with the given physical memory range.
 /// Called once during boot after the early bump allocator has reserved its region.
 pub(in crate::mm) fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
+    let start = PhysAddr::new(canonical_phys_addr(start.as_usize()));
+    let end = PhysAddr::new(canonical_phys_addr(end.as_usize()));
+    #[cfg(target_arch = "loongarch64")]
+    crate::kprintln!(
+        "la64 frame init args: start={:#x} end={:#x}",
+        start.as_usize(),
+        end.as_usize()
+    );
+
     // Initialize the global FRAME_META array
     // We need one VmPage per physical page in the system (up to `end` address)
     // To be safe and cover all possible PFNs up to the max address:
-    let max_pfn = end.page_align_down().0 / PAGE_SIZE;
+    let max_pfn = canonical_phys_pfn(end.page_align_down().as_usize());
     let meta_size_bytes = max_pfn * core::mem::size_of::<VmPage>();
     let meta_pages = meta_size_bytes.div_ceil(PAGE_SIZE);
 
@@ -78,13 +118,15 @@ pub(in crate::mm) fn init_frame_allocator(start: PhysAddr, end: PhysAddr) {
 
     // Zero out the allocated metadata memory
     unsafe {
-        let meta_array =
-            core::slice::from_raw_parts_mut(meta_ptr.as_usize() as *mut VmPage, max_pfn);
+        let meta_array = core::slice::from_raw_parts_mut(
+            meta_ptr.into_kernel_vaddr().as_mut_ptr() as *mut VmPage,
+            max_pfn,
+        );
 
         // Initialize each VmPage correctly, particularly its physical address link
         for (pfn, meta) in meta_array.iter_mut().enumerate() {
             *meta = VmPage::new();
-            meta.phys_addr = PhysAddr::new(pfn * PAGE_SIZE);
+            meta.phys_addr = PhysAddr::new(canonical_phys_addr(pfn * PAGE_SIZE));
         }
 
         // Publish with Release ordering so secondary harts see the
@@ -388,6 +430,12 @@ pub(in crate::mm) fn emergency_reclaim_sync() -> Option<PhysAddr> {
 pub(in crate::mm) fn available_pages() -> usize {
     let buddy = GLOBAL_BUDDY.lock();
     buddy.available_pages()
+}
+
+/// Return the total number of managed pages in the buddy allocator.
+pub(in crate::mm) fn total_pages() -> usize {
+    let buddy = GLOBAL_BUDDY.lock();
+    buddy.total_pages()
 }
 
 // ---------------------------------------------------------------------------

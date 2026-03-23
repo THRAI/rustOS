@@ -1,35 +1,15 @@
 # ================================================================
 # BSD-Async Rust OS Kernel — Development & Test Container
 #
-# Two-stage build:
-#   Stage 1 (toolchain): Rust nightly-2025-06-01 + cargo-binutils
-#   Stage 2 (runner):    Ubuntu 24.04 + QEMU + e2fsprogs + uv/Python
+# Runtime image only:
+# - QEMU / ext4 / Python / zig live in the image
+# - Rust toolchain is mounted from the host via docker-compose.yml
 #
 # Usage:
 #   docker compose build oscomp
 #   docker compose run --rm oscomp make oscomp-basic
 # ================================================================
 
-# ---- Stage 1: Rust toolchain (cached, ~1.5 GB) -----------------
-FROM ubuntu:24.04 AS toolchain
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates build-essential && \
-    rm -rf /var/lib/apt/lists/*
-
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:$PATH"
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain nightly-2025-06-01 \
-        --component rust-src,llvm-tools,rustfmt,clippy \
-        --target riscv64gc-unknown-none-elf \
-        --target loongarch64-unknown-none && \
-    cargo install cargo-binutils && \
-    rm -rf /usr/local/cargo/registry /tmp/*
-
-# ---- Stage 2: Runtime ------------------------------------------
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -65,12 +45,13 @@ RUN printf '#!/bin/sh\nexec zig cc -target riscv64-linux-musl "$@"\n' \
              /usr/local/bin/loongarch64-linux-musl-cc \
              /usr/local/bin/loongarch64-linux-musl-ar
 
-# Copy Rust toolchain from stage 1
-COPY --from=toolchain /usr/local/rustup /usr/local/rustup
-COPY --from=toolchain /usr/local/cargo  /usr/local/cargo
+# qemu-system-loongarch64 in this image still probes for the virtio PCI ROM
+# filename even when the device ROM BAR is disabled. Point it at an existing
+# non-empty ROM blob so la64 PCI smoke tests can proceed to the kernel.
+RUN install -d /usr/share/qemu && ln -sf /usr/share/qemu/qboot.rom /usr/share/qemu/efi-virtio.rom
 
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:$PATH"
+ENV RUSTUP_HOME=/root/.rustup \
+    CARGO_HOME=/root/.cargo \
+    PATH="/root/.cargo/bin:/root/.local/bin:$PATH"
 
 WORKDIR /workspace

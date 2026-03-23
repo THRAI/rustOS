@@ -347,15 +347,58 @@ impl Drop for ShootdownBatch {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 pub struct ShootdownBatch;
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 impl ShootdownBatch {
     pub fn new(_active: &[AtomicBool; MAX_CPUS], _asid: u16) -> Self {
         Self
     }
     pub fn add(&mut self, _token: super::container::ShootdownToken) {}
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub struct ShootdownBatch {
+    dirty_vas: alloc::vec::Vec<usize>,
+    asid: u16,
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl ShootdownBatch {
+    pub fn new(_active: &[AtomicBool; MAX_CPUS], asid: u16) -> Self {
+        Self {
+            dirty_vas: alloc::vec::Vec::new(),
+            asid,
+        }
+    }
+
+    pub fn add(&mut self, token: super::container::ShootdownToken) {
+        self.dirty_vas.push(token.va().as_usize());
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl Drop for ShootdownBatch {
+    fn drop(&mut self) {
+        if self.dirty_vas.is_empty() {
+            return;
+        }
+
+        if self.dirty_vas.len() <= SHOOTDOWN_PAGE_THRESHOLD {
+            for &va in &self.dirty_vas {
+                crate::hal::paging::flush_addr_asid(va, self.asid as usize);
+            }
+        } else if let (Some(&min_va), Some(&max_va)) =
+            (self.dirty_vas.iter().min(), self.dirty_vas.iter().max())
+        {
+            crate::hal::la64::paging::shootdown::adaptive_flush(
+                min_va,
+                max_va + crate::hal_common::PAGE_SIZE,
+                self.asid as usize,
+            );
+        }
+    }
 }
 
 /// Adaptive TLB flush: per-page if small range, full ASID flush otherwise.

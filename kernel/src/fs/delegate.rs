@@ -513,13 +513,27 @@ async fn delegate_task() {
             } => {
                 let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
                 let backend_path = map_backend_path(path_str);
-                // Fill the caller-provided page with file contents.
-                let buf = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, 4096) };
+                // `pa` is a physical frame address from the VM fault path, so the
+                // delegate must reach it through the kernel direct map.
+                let buf = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        PhysAddr::new(pa).into_kernel_vaddr().as_mut_ptr(),
+                        4096,
+                    )
+                };
                 buf.fill(0);
+                let read_len = match ext4_stat(&mut tok, &backend_path) {
+                    Ok((_ino, size, _ftype)) => size.saturating_sub(offset).min(4096) as usize,
+                    Err(_) => 4096,
+                };
                 match ext4_open(&mut tok, &backend_path, 0) {
                     Ok(mut file) => {
                         let _ = file.file_seek(offset as i64, 0); // SEEK_SET
-                        let _ = ext4_read(&mut tok, &mut file, buf);
+                        let read_res = if read_len == 0 {
+                            Ok(0)
+                        } else {
+                            ext4_read(&mut tok, &mut file, &mut buf[..read_len])
+                        };
                         let _ = ext4_close(&mut tok, &mut file);
                         reply.complete(Ok(()));
                     },

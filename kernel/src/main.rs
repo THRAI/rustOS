@@ -36,6 +36,13 @@ mod fs;
 mod hal;
 mod hal_common;
 mod ipc;
+#[cfg(all(
+    target_arch = "loongarch64",
+    feature = "la64-bringup",
+    not(feature = "full-fs"),
+    not(feature = "autotest")
+))]
+mod la64_bringup;
 mod libc_stubs;
 mod lockdep;
 mod mm;
@@ -61,11 +68,6 @@ global_asm!(include_str!("hal/la64/memops.S"));
 static BOOT_HART_CLAIMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-#[inline]
-fn la64_kernel_only_bringup() -> bool {
-    cfg!(all(target_arch = "loongarch64", feature = "la64-bringup"))
-}
-
 /// Entry point called from the active architecture's boot stub.
 ///
 /// Current boot-stub contract:
@@ -87,6 +89,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         // causing stray interrupts before per-CPU data is ready.
         hal::local_irq_disable();
         hal::set_kernel_trap_entry();
+        #[cfg(target_arch = "loongarch64")]
+        crate::hal::la64::paging::init_hw();
 
         // Initialize kernel heap first — everything below may allocate
         alloc_early::init_heap();
@@ -96,6 +100,14 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         hal::parse_boot_platform(dtb_ptr);
         let pi = hal::platform();
         let num_cpus = pi.num_cpus;
+        #[cfg(target_arch = "loongarch64")]
+        kprintln!(
+            "la64 platform summary: cpus={} virtio_mmio={} pci_host={} ecam={:#x}",
+            pi.num_cpus,
+            pi.virtio_count,
+            pi.has_pci_host as u8,
+            pi.pci_ecam_base
+        );
 
         // Re-initialize UART with FDT-discovered address (no-op on QEMU virt
         // where it's the same 0x1000_0000, but differs on real hardware).
@@ -153,67 +165,36 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             );
         }
 
-        if la64_kernel_only_bringup() {
-            kprintln!("la64 kernel-only bring-up: skipping fs/init/userland path");
-            kprintln!("la64 bring-up: trap/timer armed, entering idle loop");
-            hal::local_irq_enable();
-            // Prime first exception return path; LA64 QEMU timer starts delivering after first trap.
-            unsafe {
-                core::arch::asm!("syscall 0");
-            }
-            executor::spawn_kernel_task(
-                async {
-                    kprintln!("la64 executor online");
-                    let mut spin: u64 = 0;
-                    loop {
-                        executor::yield_now().await;
-                        spin = spin.wrapping_add(1);
-                        if spin % 5_000_000 == 0 {
-                            let ticks = crate::hal::la64::time::tick_count();
-                            let timer_enters = crate::hal::la64::time::timer_handler_enter_count();
-                            let (k, u) = crate::hal::la64::trap::trap_counts();
-                            let (t, s, e, y, f) = crate::hal::la64::trap::trap_cause_counts();
-                            kprintln!(
-                                "la64 runtime probe: spin={} timer_enters={} ticks={} traps=({},{}) causes(t,s,e,y,f)=({},{},{},{},{})",
-                                spin,
-                                timer_enters,
-                                ticks,
-                                k,
-                                u,
-                                t,
-                                s,
-                                e,
-                                y,
-                                f,
-                            );
-                        }
-                    }
-                },
-                cpu0,
-            )
-            .detach();
-            klog!(
-                boot,
-                info,
-                "interrupts enabled, entering kernel-only executor loop"
-            );
-            executor::executor_loop();
-        }
-
         // Initialize frame allocator with physical memory after kernel image
         {
             extern "C" {
                 static ekernel: u8;
             }
-            let kernel_end = unsafe { &ekernel as *const u8 as usize };
-            let mem_start = crate::hal_common::PhysAddr::new(kernel_end);
+            let kernel_end_raw = unsafe { &ekernel as *const u8 as usize };
+            #[cfg(target_arch = "loongarch64")]
+            let kernel_end = crate::hal::la64::platform::canonical_phys_addr(kernel_end_raw)
+                .div_ceil(crate::hal_common::PAGE_SIZE)
+                * crate::hal_common::PAGE_SIZE;
+            #[cfg(not(target_arch = "loongarch64"))]
+            let kernel_end = kernel_end_raw;
 
-            // Use FDT-discovered memory regions from platform().
+            #[cfg(target_arch = "loongarch64")]
+            let (mem_start, mem_end) = crate::hal::la64::platform::frame_allocator_range(kernel_end_raw);
+            #[cfg(target_arch = "loongarch64")]
+            let mem_start = crate::hal_common::PhysAddr::new(mem_start);
+            #[cfg(target_arch = "loongarch64")]
+            let mem_end = crate::hal_common::PhysAddr::new(mem_end);
+            #[cfg(not(target_arch = "loongarch64"))]
+            let mem_start = crate::hal_common::PhysAddr::new(kernel_end);
+            #[cfg(not(target_arch = "loongarch64"))]
             let mem_end = {
                 let mut end = crate::hal_common::PhysAddr::new(0);
                 for r in pi.memory.iter().take(pi.memory_count) {
+                    let region_base = r.base;
+
                     let region_end = r.base + r.size;
-                    if kernel_end >= r.base && kernel_end < region_end {
+
+                    if kernel_end >= region_base && kernel_end < region_end {
                         end = crate::hal_common::PhysAddr::new(region_end);
                         break;
                     }
@@ -223,6 +204,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     // largest region's end as a conservative fallback.
                     let mut best = 0usize;
                     for r in pi.memory.iter().take(pi.memory_count) {
+                        #[cfg(target_arch = "loongarch64")]
+                        let region_end = r.base + r.size;
+                        #[cfg(not(target_arch = "loongarch64"))]
                         let region_end = r.base + r.size;
                         if region_end > best {
                             best = region_end;
@@ -242,7 +226,18 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             klog!(
                 boot,
                 info,
-                "init_frame_allocator({:#x}..{:#x})",
+                "init_frame_allocator({:#x}..{:#x}) kernel_end={:#x}",
+                mem_start.as_usize(),
+                mem_end.as_usize(),
+                kernel_end
+            );
+            #[cfg(all(
+                target_arch = "loongarch64",
+                feature = "la64-bringup",
+                not(feature = "autotest")
+            ))]
+            kprintln!(
+                "la64 bring-up: frame allocator stage start mem={:#x}..{:#x}",
                 mem_start.as_usize(),
                 mem_end.as_usize()
             );
@@ -253,25 +248,139 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             }
             mm::init_frame_allocator(mem_start, mem_end);
             klog!(boot, info, "frame allocator done");
+            #[cfg(all(
+                target_arch = "loongarch64",
+                feature = "la64-bringup",
+                not(feature = "autotest")
+            ))]
+            kprintln!("la64 bring-up: frame allocator stage done");
         }
 
         // Initialize VirtIO-blk driver (probes MMIO addresses for block device)
+        #[cfg(not(target_arch = "loongarch64"))]
         drivers::init_virtio_blk();
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let virtio_ready = drivers::try_init_virtio_blk();
+            if virtio_ready {
+                let mut sector0 = [0u8; 512];
+                match drivers::virtio_blk_get().lock().read_sector(0, &mut sector0) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        kprintln!("la64 virtio blk sector0 read failed");
+                    }
+                }
+            } else if pi.virtio_count == 0 {
+                if pi.has_pci_host {
+                    if let Some(probe) = drivers::probe_virtio_blk_pci() {
+                        let dev = probe.transport.device;
+                        kprintln!(
+                            "la64 bring-up: modern virtio-blk-pci at {:02x}:{:02x}.{} vendor={:#06x} device={:#06x} common={:#x} notify={:#x} q0_notify={:#x} isr={:#x} devcfg={:#x} feat={:#018x} queues={} q0_max={}",
+                            dev.bus,
+                            dev.device,
+                            dev.function,
+                            dev.vendor_id,
+                            dev.device_id,
+                            probe.common_cfg_addr,
+                            probe.notify_cfg_addr,
+                            probe.queue0_notify_addr,
+                            probe.isr_cfg_addr.unwrap_or(0),
+                            probe.device_cfg_addr.unwrap_or(0),
+                            probe.device_features,
+                            probe.num_queues,
+                            probe.queue0_max_size
+                        );
+                    } else if let Some(transport) = drivers::find_virtio_blk_pci_transport() {
+                        let dev = transport.device;
+                        if let (Some(common), Some(notify)) = (transport.common_cfg, transport.notify_cfg) {
+                            kprintln!(
+                                "la64 bring-up: virtio-blk-pci has modern caps but BARs are unassigned at {:02x}:{:02x}.{} common_bar={} common_pa={:#x} notify_bar={} notify_pa={:#x} status={:#06x} cap_ptr={:#04x}",
+                                dev.bus,
+                                dev.device,
+                                dev.function,
+                                common.bar,
+                                common.bar_addr,
+                                notify.bar,
+                                notify.bar_addr,
+                                transport.status,
+                                transport.cap_ptr
+                            );
+                        } else {
+                            kprintln!(
+                                "la64 bring-up: virtio-blk-pci at {:02x}:{:02x}.{} vendor={:#06x} device={:#06x} bar0={:#010x} status={:#06x} cap_ptr={:#04x} caps=[{:02x}@{:02x},{:02x}@{:02x},{:02x}@{:02x},{:02x}@{:02x}]; modern capability windows not available yet",
+                                dev.bus,
+                                dev.device,
+                                dev.function,
+                                dev.vendor_id,
+                                dev.device_id,
+                                dev.bar0,
+                                transport.status,
+                                transport.cap_ptr,
+                                transport.cap_chain_ids[0],
+                                transport.cap_chain_offsets[0],
+                                transport.cap_chain_ids[1],
+                                transport.cap_chain_offsets[1],
+                                transport.cap_chain_ids[2],
+                                transport.cap_chain_offsets[2],
+                                transport.cap_chain_ids[3],
+                                transport.cap_chain_offsets[3]
+                            );
+                        }
+                    } else {
+                        kprintln!(
+                            "la64 bring-up: pci host discovered (ecam={:#x}) but no virtio-blk-pci function was found",
+                            pi.pci_ecam_base
+                        );
+                    }
+                } else {
+                    kprintln!("la64 bring-up: no virtio-mmio block device discovered");
+                }
+            } else {
+                kprintln!(
+                    "la64 bring-up: virtio devices discovered (count={}) but no block device initialized",
+                    pi.virtio_count
+                );
+            }
+        }
 
         // Initialize VFS caches
+        #[cfg(all(
+            target_arch = "loongarch64",
+            feature = "la64-bringup",
+            not(feature = "autotest")
+        ))]
+        kprintln!("la64 bring-up: vfs cache init start");
         klog!(boot, info, "dentry::init...");
         fs::init_dentry_cache();
         klog!(boot, info, "vnode_cache::init...");
         fs::init_vnode_cache();
+        #[cfg(all(
+            target_arch = "loongarch64",
+            feature = "la64-bringup",
+            not(feature = "autotest")
+        ))]
+        kprintln!("la64 bring-up: vfs cache init done");
 
         klog!(boot, info, "delegate::init...");
         // Initialize filesystem delegate (mounts ext4, spawns delegate task)
         fs::init_delegate();
         klog!(boot, info, "delegate done");
+        #[cfg(all(
+            target_arch = "loongarch64",
+            feature = "la64-bringup",
+            not(feature = "autotest")
+        ))]
+        kprintln!("la64 bring-up: delegate init done");
 
         // Spawn the UBC page daemon (flushes dirty VmObject pages to disk)
         mm::vm::page_daemon::spawn_page_daemon();
         klog!(boot, info, "page daemon spawned");
+        #[cfg(all(
+            target_arch = "loongarch64",
+            feature = "la64-bringup",
+            not(feature = "autotest")
+        ))]
+        kprintln!("la64 bring-up: page daemon spawned");
 
         // Boot secondary harts (always — needed for normal operation)
         if num_cpus > 1 {
@@ -460,26 +569,95 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     executor::sleep(12_000).await;
                     hal::shutdown();
                 },
-                cpu0,
+                init_cpu,
             )
             .detach();
         }
 
+        #[cfg(all(
+            target_arch = "loongarch64",
+            feature = "la64-bringup",
+            not(feature = "full-fs"),
+            not(feature = "autotest")
+        ))]
+        {
+            la64_bringup::spawn_runtime_probe(cpu0);
+        }
+
+        #[cfg(all(
+            target_arch = "loongarch64",
+            feature = "la64-bringup",
+            not(feature = "full-fs"),
+            not(feature = "autotest")
+        ))]
+        {
+            kprintln!("la64 bring-up: full-fs disabled, launching built-in user smoke path");
+            unsafe {
+                core::arch::asm!("syscall 0");
+            }
+            la64_bringup::spawn_builtin_user_smoke(cpu0);
+        }
+
         // Spawn init process: exec /bin/init, then enter user mode
+        #[cfg(not(all(
+            target_arch = "loongarch64",
+            feature = "la64-bringup",
+            not(feature = "full-fs"),
+            not(feature = "autotest")
+        )))]
         {
             let init_task = proc::Task::new_init();
             let init_task2 = init_task;
+            #[cfg(all(
+                target_arch = "loongarch64",
+                feature = "la64-bringup",
+                feature = "full-fs",
+                not(feature = "autotest")
+            ))]
+            let init_cpu = 0usize;
+            #[cfg(not(all(
+                target_arch = "loongarch64",
+                feature = "la64-bringup",
+                feature = "full-fs",
+                not(feature = "autotest")
+            )))]
             let init_cpu = cpu0;
             executor::spawn_kernel_task(
                 async move {
-                    // Wait for delegate mount to complete
+                    // Let the delegate task run first so the rootfs mount is
+                    // established before we attempt the first execve. On LA64
+                    // full-fs bring-up, avoid depending on timer-wheel wakeups
+                    // here and just yield a few times.
+                    #[cfg(all(
+                        target_arch = "loongarch64",
+                        feature = "la64-bringup",
+                        feature = "full-fs",
+                        not(feature = "autotest")
+                    ))]
+                    for _ in 0..16 {
+                        executor::yield_now().await;
+                    }
+
+                    #[cfg(not(all(
+                        target_arch = "loongarch64",
+                        feature = "la64-bringup",
+                        feature = "full-fs",
+                        not(feature = "autotest")
+                    )))]
                     executor::sleep(100).await;
 
-                    #[cfg(feature = "autotest")]
+                    #[cfg(all(feature = "autotest", target_arch = "riscv64"))]
                     let envp = alloc::vec![
                         alloc::string::String::from("PATH=/riscv/musl:/riscv/glibc:/bin:/sbin"),
                         alloc::string::String::from("HOME=/"),
                     ];
+
+                    #[cfg(all(feature = "autotest", target_arch = "loongarch64"))]
+                    let envp = alloc::vec![
+                        alloc::string::String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
+                        alloc::string::String::from("HOME=/"),
+                    ];
+
                     #[cfg(not(feature = "autotest"))]
                     let envp = alloc::vec![
                         alloc::string::String::from(
@@ -488,7 +666,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                         alloc::string::String::from("HOME=/"),
                     ];
 
-                    #[cfg(feature = "autotest")]
+                    #[cfg(all(feature = "autotest", target_arch = "riscv64"))]
                     let launch_attempts = alloc::vec![
                         (
                             "/bin/initproc",
@@ -500,6 +678,22 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                                 alloc::string::String::from("/riscv/musl/busybox"),
                                 alloc::string::String::from("sh"),
                                 alloc::string::String::from("/riscv/run-oj.sh"),
+                            ],
+                        ),
+                    ];
+
+                    #[cfg(all(feature = "autotest", target_arch = "loongarch64"))]
+                    let launch_attempts = alloc::vec![
+                        (
+                            "/bin/initproc",
+                            alloc::vec![alloc::string::String::from("/bin/initproc")],
+                        ),
+                        (
+                            "/bin/busybox",
+                            alloc::vec![
+                                alloc::string::String::from("/bin/busybox"),
+                                alloc::string::String::from("sh"),
+                                alloc::string::String::from("/bin/run-oj.sh"),
                             ],
                         ),
                     ];
@@ -527,27 +721,51 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                     for (exec_path, argv) in launch_attempts {
                         match proc::exec::do_execve(&init_task2, exec_path, &argv, &envp).await {
                             Ok((entry, sp)) => {
+                                #[cfg(target_arch = "loongarch64")]
+                                if let Err(e) = proc::exec::prefault_user_image(&init_task2).await {
+                                    kprintln!(
+                                        "la64 init launch: prefault user image failed: {:?}",
+                                        e
+                                    );
+                                }
                                 {
                                     let mut tf = init_task2.trap_frame.lock();
                                     crate::hal::syscall_abi::setup_exec(
                                         &mut tf, entry, sp, 0, 0, 0,
                                     );
+                                    #[cfg(target_arch = "loongarch64")]
+                                    {
+                                        // Keep first user instructions deterministic on la64
+                                        // while timer-return semantics are still being stabilized.
+                                        let user_status = tf.status() & !(1 << 2);
+                                        tf.set_status(user_status);
+                                    }
                                 }
                                 kprintln!("exec OK: {} entry={:#x} sp={:#x}", exec_path, entry, sp);
-                                executor::spawn_user_task(init_task2, init_cpu);
+                                executor::spawn_user_task(init_task2.clone(), init_cpu);
                                 launched = true;
                                 break;
                             },
                             Err(e) => {
                                 klog!(boot, warn, "exec {} failed: {:?}", exec_path, e);
+                                #[cfg(target_arch = "loongarch64")]
+                                kprintln!("la64 init launch: exec {} failed: {:?}", exec_path, e);
                             },
                         }
                     }
                     if !launched {
+                        #[cfg(all(target_arch = "loongarch64", feature = "autotest"))]
+                        {
+                            kprintln!("la64 user smoke: fallback synthetic syscall path");
+                            let _ =
+                                crate::syscall::syscall(&init_task2, 64, [1, 0, 0, 0, 0, 0]).await;
+                            let _ =
+                                crate::syscall::syscall(&init_task2, 93, [0, 0, 0, 0, 0, 0]).await;
+                        }
                         klog!(boot, error, "no usable init program found");
                     }
                 },
-                cpu0,
+                init_cpu,
             )
             .detach();
         }

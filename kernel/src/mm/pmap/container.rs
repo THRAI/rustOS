@@ -249,17 +249,13 @@ impl OccupiedEntryMut<'_> {
 
 /// Read-only range iterator over valid leaf PTEs in `[start, end)`.
 ///
-/// Skips empty subtrees in the Sv39 3-level page table:
-/// - Invalid L0 PTE → skip 1 GiB
-/// - Invalid L1 PTE → skip 2 MiB
-///
 /// Yields `(VirtAddr, PhysAddr, PteFlags)` for each valid leaf PTE.
 pub struct PmapRange<'a> {
     _pmap: &'a super::Pmap,
     start_va: usize,
     end_va: usize,
     /// Per-level state: (table_pa, current_idx, end_idx_inclusive)
-    stack: [(usize, usize, usize); 3],
+    stack: [(usize, usize, usize); super::PT_LEVELS],
     depth: usize,
 }
 
@@ -275,16 +271,15 @@ impl<'a> PmapRange<'a> {
             _pmap: pmap,
             start_va,
             end_va,
-            stack: [root_stack_entry, (0, 0, 0), (0, 0, 0)],
+            stack: [root_stack_entry; super::PT_LEVELS],
             depth: 0,
         }
     }
 
-    /// Sv39 bit-shift for a given depth.
-    /// depth 0 (L0/root) → 30, depth 1 (L1) → 21, depth 2 (L2) → 12.
+    /// Page-table bit-shift for a given depth.
     #[inline]
     fn shift_for(depth: usize) -> usize {
-        12 + 9 * (2 - depth)
+        12 + 9 * (super::PT_LEVELS - 1 - depth)
     }
 
     /// Reconstruct the virtual address from indices stored in the stack
@@ -355,7 +350,8 @@ impl Iterator for PmapRange<'_> {
             // `current_idx` is in [0, 512) so the offset is within the 4 KiB page.
             // We only read (no mutation), and hold `&Pmap` for lifetime safety.
             let raw = unsafe {
-                let pte_ptr = (table_pa as *const u64).add(current_idx);
+                let table_va = PhysAddr::new(table_pa).into_kernel_vaddr().as_usize();
+                let pte_ptr = (table_va as *const u64).add(current_idx);
                 pte_ptr.read_volatile()
             };
 
@@ -377,7 +373,7 @@ impl Iterator for PmapRange<'_> {
             }
 
             // Valid non-leaf → descend if not at max depth.
-            if self.depth < 2 {
+            if self.depth < super::PT_LEVELS - 1 {
                 let child_table_pa = pte_pa(raw);
                 let (child_start, child_end) = self.child_index_range(self.depth);
                 self.depth += 1;
@@ -385,7 +381,8 @@ impl Iterator for PmapRange<'_> {
                 continue;
             }
 
-            // Depth 2 but non-leaf — shouldn't happen in valid Sv39.
+            // Reaching a non-leaf at the final depth should not happen in a
+            // valid page table; skip defensively.
             // Skip defensively.
             self.stack[self.depth].1 += 1;
         }

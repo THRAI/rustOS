@@ -41,8 +41,9 @@ use crate::{
     fs::{resolve, VnodeType},
     hal_common::{Errno, PageCursor, SpinMutex, VirtAddr, PAGE_SIZE},
     mm::{
-        pmap_activate, pmap_create, pmap_destroy, pmap_enter, vm::VObjIndex, MapPerm, VmMap,
-        VmObject,
+        pmap_activate, pmap_create, pmap_destroy, pmap_enter,
+        vm::{MapPerm, PageFaultAccessType, VObjIndex},
+        VmMap, VmObject,
     },
     proc::{SigSet, Task, SIG_DFL, SIG_IGN},
 };
@@ -262,6 +263,42 @@ pub async fn do_execve(
     envp: &[String],
 ) -> Result<(usize, usize), Errno> {
     do_execve_inner(task, elf_path, argv, envp, 0).await
+}
+
+/// Eagerly resolve the current image's user pages into the task pmap.
+///
+/// LA64 full-system bring-up still lacks a complete TLB-refill/demand-fault
+/// story for the very first user instructions, so callers can prefault the
+/// freshly exec'd image before the first `trap_return`.
+pub async fn prefault_user_image(task: &Arc<Task>) -> Result<(), Errno> {
+    let pages: Vec<(VirtAddr, PageFaultAccessType)> = {
+        let vm = task.vm_map.read();
+        let mut pages = Vec::new();
+
+        for vma in vm.iter() {
+            let access = if vma.protection.contains(MapPerm::X) {
+                PageFaultAccessType::EXECUTE
+            } else if vma.protection.contains(MapPerm::W) {
+                PageFaultAccessType::WRITE
+            } else {
+                PageFaultAccessType::READ
+            };
+
+            let mut va = vma.start().as_usize();
+            while va < vma.end().as_usize() {
+                pages.push((VirtAddr::new(va), access));
+                va += PAGE_SIZE;
+            }
+        }
+
+        pages
+    };
+
+    for (va, access) in pages {
+        crate::mm::resolve_user_fault(task, va, access).await?;
+    }
+
+    Ok(())
 }
 
 /// Inner exec with shebang depth tracking.

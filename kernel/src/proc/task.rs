@@ -99,7 +99,7 @@ pub struct Task {
 /// Allocate a kernel stack (2 pages) and return (base, sp_top).
 fn alloc_kstack() -> (PhysAddr, usize) {
     let base = frame_alloc_contiguous(KSTACK_ORDER).expect("failed to allocate kernel stack");
-    let sp = base.as_usize() + KSTACK_SIZE;
+    let sp = base.into_kernel_vaddr().as_usize() + KSTACK_SIZE;
     (base, sp)
 }
 
@@ -146,12 +146,6 @@ impl Task {
         let (kstack_base, kernel_sp) = alloc_kstack();
         let pid = alloc_pid();
         let pmap = Arc::new(Mutex::new(pmap::pmap_create()));
-        crate::kprintln!(
-            "[task] new_init pid={} kstack_base={:#x} kernel_sp={:#x}",
-            pid,
-            kstack_base.as_usize(),
-            kernel_sp
-        );
         Arc::new(Self {
             pid,
             parent: Weak::new(),

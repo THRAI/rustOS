@@ -1,0 +1,10 @@
+/data/home-ljs/ljslll/os/test/rustOS/.target-kernel/loongarch64-unknown-none/release/deps/lock_api-04a43f65295af37b.d: /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/lib.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/mutex.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/remutex.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/rwlock.rs
+
+/data/home-ljs/ljslll/os/test/rustOS/.target-kernel/loongarch64-unknown-none/release/deps/liblock_api-04a43f65295af37b.rlib: /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/lib.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/mutex.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/remutex.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/rwlock.rs
+
+/data/home-ljs/ljslll/os/test/rustOS/.target-kernel/loongarch64-unknown-none/release/deps/liblock_api-04a43f65295af37b.rmeta: /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/lib.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/mutex.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/remutex.rs /home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/rwlock.rs
+
+/home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/lib.rs:
+/home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/mutex.rs:
+/home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/remutex.rs:
+/home/ljs/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/lock_api-0.4.14/src/rwlock.rs:

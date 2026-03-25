@@ -1,0 +1,1 @@
+/home/ljs/ljslll/os/test/rustOS/user/target-test-la64/loongarch64-unknown-none/release/libuser_lib.rlib: /home/ljs/ljslll/os/test/rustOS/user/src/console.rs /home/ljs/ljslll/os/test/rustOS/user/src/entry-la64.S /home/ljs/ljslll/os/test/rustOS/user/src/lib.rs /home/ljs/ljslll/os/test/rustOS/user/src/syscall.rs
